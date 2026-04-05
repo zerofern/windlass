@@ -6,6 +6,9 @@ use uom::si::information::byte;
 /// so the Core never triggers a false low-space alert.
 pub fn check_disk_space(path: &str) -> Information {
     match available_bytes(path) {
+        #[allow(clippy::cast_precision_loss)]
+        // f64 mantissa is 52 bits (~8 PiB exact range). Practical disk sizes
+        // are well under this, so the precision loss is negligible for alerting.
         Ok(bytes) => Information::new::<byte>(bytes as f64),
         Err(e) => {
             warn!("Failed to check disk space at {path}: {e}");
@@ -25,7 +28,7 @@ fn available_bytes(path: &str) -> anyhow::Result<u64> {
         anyhow::bail!("statvfs failed: {}", std::io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Ok(stat.f_bavail * stat.f_frsize)
 }
 
 #[cfg(test)]

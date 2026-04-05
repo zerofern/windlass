@@ -20,11 +20,11 @@ pub enum VpnState {
 impl fmt::Display for VpnState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VpnState::Stopped        => f.write_str("stopped"),
-            VpnState::DumpingLogs    => f.write_str("dumping-logs"),
-            VpnState::Starting       => f.write_str("starting"),
-            VpnState::AwaitingTunnel => f.write_str("awaiting-tunnel"),
-            VpnState::Connected { ip, port } =>
+            Self::Stopped        => f.write_str("stopped"),
+            Self::DumpingLogs    => f.write_str("dumping-logs"),
+            Self::Starting       => f.write_str("starting"),
+            Self::AwaitingTunnel => f.write_str("awaiting-tunnel"),
+            Self::Connected { ip, port } =>
                 write!(f, "connected({}:{})", ip.0, port.into_inner()),
         }
     }
@@ -42,12 +42,12 @@ pub enum QbitState {
 impl fmt::Display for QbitState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            QbitState::Offline                          => f.write_str("offline"),
-            QbitState::Authenticating { attempt }       => write!(f, "authenticating(#{})", attempt.0),
-            QbitState::Authenticated { .. }             => f.write_str("authenticated"),
-            QbitState::SyncingPort { attempt, target, .. } =>
+            Self::Offline                          => f.write_str("offline"),
+            Self::Authenticating { attempt }       => write!(f, "authenticating(#{})", attempt.0),
+            Self::Authenticated { .. }             => f.write_str("authenticated"),
+            Self::SyncingPort { attempt, target, .. } =>
                 write!(f, "syncing-port({}:#{})", target.into_inner(), attempt.0),
-            QbitState::Ready { port }                   => write!(f, "ready({})", port.into_inner()),
+            Self::Ready { port }                   => write!(f, "ready({})", port.into_inner()),
         }
     }
 }
@@ -63,10 +63,10 @@ pub enum MamState {
 impl fmt::Display for MamState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MamState::Unknown                          => f.write_str("unknown"),
-            MamState::SyncPending { target_ip, .. }    => write!(f, "sync-pending({})", target_ip.0),
-            MamState::Synced { ip, port }              => write!(f, "synced({}:{})", ip.0, port.into_inner()),
-            MamState::AsnBlocked { ip }                => write!(f, "asn-blocked({})", ip.0),
+            Self::Unknown                          => f.write_str("unknown"),
+            Self::SyncPending { target_ip, .. }    => write!(f, "sync-pending({})", target_ip.0),
+            Self::Synced { ip, port }              => write!(f, "synced({}:{})", ip.0, port.into_inner()),
+            Self::AsnBlocked { ip }                => write!(f, "asn-blocked({})", ip.0),
         }
     }
 }

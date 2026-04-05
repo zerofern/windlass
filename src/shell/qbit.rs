@@ -31,10 +31,12 @@ pub async fn authenticate(client: &Client, base_url: &str, user: &str, pass: &st
             let body = resp.text().await.unwrap_or_default();
 
             if status.is_success() && body.trim() == "Ok." {
-                if let Some(cookie) = sid {
-                    debug!("qBit auth success");
-                    return Event::QbitAuthSuccess(AuthCookie(cookie));
-                }
+                let Some(cookie) = sid else {
+                    warn!("qBit auth: ok status but no SID cookie in response");
+                    return Event::QbitAuthFailed;
+                };
+                debug!("qBit auth success");
+                return Event::QbitAuthSuccess(AuthCookie(cookie));
             }
             warn!("qBit auth failed: status={status}, body={body:?}");
             Event::QbitAuthFailed

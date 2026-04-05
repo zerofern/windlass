@@ -22,7 +22,7 @@ pub async fn is_gluetun_healthy(docker: &Docker) -> bool {
     is_container_healthy(docker, GLUETUN).await
 }
 
-pub(crate) async fn is_container_healthy(docker: &Docker, name: &str) -> bool {
+pub async fn is_container_healthy(docker: &Docker, name: &str) -> bool {
     let Ok(info) = docker.inspect_container(name, None).await else {
         return false;
     };
@@ -59,7 +59,7 @@ pub async fn discover_dependents(docker: &Docker) -> Vec<String> {
     discover_dependents_for(docker, GLUETUN).await
 }
 
-pub(crate) async fn discover_dependents_for(docker: &Docker, anchor: &str) -> Vec<String> {
+pub async fn discover_dependents_for(docker: &Docker, anchor: &str) -> Vec<String> {
     // Resolve the anchor's container ID so we match both forms Docker may store:
     //   "container:<name>" — written by docker-compose
     //   "container:<id>"   — written by plain `docker run --network container:<name>`
@@ -84,8 +84,7 @@ pub(crate) async fn discover_dependents_for(docker: &Docker, anchor: &str) -> Ve
             c.host_config
                 .as_ref()
                 .and_then(|hc| hc.network_mode.as_deref())
-                .map(|nm| nm == by_name || nm == by_id)
-                .unwrap_or(false)
+                .is_some_and(|nm| nm == by_name || nm == by_id)
         })
         .filter_map(|c| {
             c.names?
@@ -204,7 +203,7 @@ pub fn spawn_event_watcher(docker: Docker, tx: mpsc::Sender<Event>) {
 /// into one event per 100ms window. After the storm settles, the Shell reads both
 /// VPN files immediately and emits `PortFileReadResult` — no Core round-trip needed.
 pub fn spawn_file_watcher(
-    watch_dir: String,
+    watch_dir: &str,
     ip_file: String,
     port_file: String,
     tx: mpsc::Sender<Event>,
@@ -244,7 +243,7 @@ pub fn spawn_file_watcher(
                 if last_sent.as_ref() == Some(val) {
                     continue;
                 }
-                last_sent = Some(val.clone());
+                last_sent = Some(*val);
             }
 
             if tx.send(Event::PortFileReadResult(result)).await.is_err() {
@@ -380,7 +379,7 @@ mod tests {
         std::fs::write(&port_path, "51820").unwrap();
 
         spawn_file_watcher(
-            dir.path().to_str().unwrap().to_string(),
+            dir.path().to_str().unwrap(),
             ip_path.to_str().unwrap().to_string(),
             port_path.to_str().unwrap().to_string(),
             tx,
@@ -417,7 +416,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(32);
         spawn_file_watcher(
-            dir.path().to_str().unwrap().to_string(),
+            dir.path().to_str().unwrap(),
             ip_path.to_str().unwrap().to_string(),
             port_path.to_str().unwrap().to_string(),
             tx,
@@ -451,7 +450,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(8);
         spawn_file_watcher(
-            dir.path().to_str().unwrap().to_string(),
+            dir.path().to_str().unwrap(),
             ip_path.to_str().unwrap().to_string(),
             port_path.to_str().unwrap().to_string(),
             tx,

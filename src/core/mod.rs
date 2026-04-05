@@ -346,15 +346,15 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                 .cloned()
                 .collect();
             state.known_torrents.extend(current);
-            if !new_names.is_empty() {
+            if new_names.is_empty() {
+                debug!("torrent check: no new torrents");
+            } else {
                 info!(names = ?new_names, "new torrent(s) detected");
                 let list = new_names.join(", ");
                 actions.push(Action::SendGotifyAlert(
                     AlertPriority::Info,
                     format!("🧲 New torrent(s) added: {list}"),
                 ));
-            } else {
-                debug!("torrent check: no new torrents");
             }
             actions.push(Action::ScheduleWakeup(WakeupId::TorrentCheck, TORRENT_CHECK_INTERVAL.into()));
         }

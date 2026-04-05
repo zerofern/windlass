@@ -19,7 +19,7 @@ pub enum Event {
 
     /// Fired by the debounced file watcher after the inotify storm settles.
     /// The Shell reads both VPN files and embeds the result directly —
-    /// no separate ReadPortFiles round-trip required.
+    /// no separate `ReadPortFiles` round-trip required.
     PortFileReadResult(Result<(VpnIp, VpnPort), String>),
 
     QbitAuthSuccess(AuthCookie),

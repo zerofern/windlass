@@ -34,7 +34,7 @@ pub async fn check_connectability(client: &Client, session: &str) -> (Event, Opt
     check_connectability_at(client, session, MAM_LOAD_URL).await
 }
 
-pub(crate) async fn update_seedbox_at(
+pub async fn update_seedbox_at(
     client: &Client,
     session: &str,
     url: &str,
@@ -79,7 +79,7 @@ pub(crate) async fn update_seedbox_at(
     }
 }
 
-pub(crate) async fn check_connectability_at(
+pub async fn check_connectability_at(
     client: &Client,
     session: &str,
     url: &str,
@@ -107,8 +107,7 @@ pub(crate) async fn check_connectability_at(
                     let connectable = body
                         .connectable
                         .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case("yes"))
-                        .unwrap_or(false);
+                        .is_some_and(|s| s.eq_ignore_ascii_case("yes"));
                     debug!("MAM connectable={connectable}");
                     (Event::MamConnectabilityObserved(connectable), new_session)
                 }

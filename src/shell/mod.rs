@@ -33,8 +33,7 @@ pub async fn run() -> Result<()> {
     // Derive the watch directory from the ip-file path.
     let watch_dir = std::path::Path::new(&config.vpn_ip_file)
         .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/tmp/gluetun".to_string());
+        .map_or_else(|| "/tmp/gluetun".to_string(), |p| p.to_string_lossy().into_owned());
 
     // Read VPN files once at boot so the Core can fast-forward if Gluetun is already up.
     let boot_port_files = tokio::task::spawn_blocking({
@@ -56,7 +55,7 @@ pub async fn run() -> Result<()> {
 
     docker::spawn_event_watcher(docker.clone(), tx.clone());
     docker::spawn_file_watcher(
-        watch_dir,
+        &watch_dir,
         config.vpn_ip_file.clone(),
         config.vpn_port_file.clone(),
         tx.clone(),
@@ -155,6 +154,9 @@ fn dispatch(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+// dispatch_one is a match over every Action variant — one arm per action.
+// Splitting it would just scatter related code without reducing real complexity.
 fn dispatch_one(
     action: Action,
     config: &Config,

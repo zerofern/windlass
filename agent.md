@@ -44,40 +44,62 @@ wrapped in their newtype.
    the core or only inside the shell. This applies to values that cross the
    core/shell boundary and to those that do not.
 
-2. **Validated types use `nutype`.** Use the `nutype` crate when the primitive
+2. **Use exsiting types before making oure own** We use existeng rust types
+   before we make our own type. secrecy and std::path are good exampels of this.
+
+3. **Validated types use `nutype`.** Use the `nutype` crate when the primitive
    has invariants (e.g. port must be 1–65535). `nutype` makes the inner field
    private and enforces validation at construction time via `try_new()`.
    Do not add `pub` to a nutype field or bypass it with `unsafe`.
 
-3. **Unvalidated wrappers use plain tuple structs.** When wrapping for
+4. **Unvalidated wrappers use plain tuple structs.** When wrapping for
    type-safety without validation (e.g. `ContainerId(String)`), a plain
    `#[derive(...)] pub struct Foo(pub T)` is fine.
 
-4. **Secrets use `secrecy`.** Any type that wraps a password, key, or session
+5. **Secrets use `secrecy`.** Any type that wraps a password, key, or session
    token must wrap `SecretString` (from the `secrecy` crate) so it is
    redacted in logs and not accidentally cloned into plain memory.
    Construction: `SecretString::new(value.into())` (`Box<str>`, not `String`).
 
-5. **Derive `PartialEq + Eq` on everything in `types.rs`.** The core tests
+6. **Derive `PartialEq + Eq` on everything in `types.rs`.** The core tests
    and prop tests rely on equality. `nutype` types need these listed explicitly
    in `derive(...)`.
 
 ### Existing types (`src/types.rs`)
 
-| Type | Wraps | Notes |
-|------|-------|-------|
-| `VpnIp` | `Ipv4Addr` | plain newtype, `pub` field |
-| `VpnPort` | `u16` | nutype, validated 1–65535, private field — use `try_new()` |
-| `AuthCookie` | `String` | qBittorrent SID cookie |
-| `ContainerId` | `String` | Docker container ID |
-| `ContainerName` | `String` | Docker container name |
-| `MamSessionId` | `SecretString` | MAM session cookie — secret |
-| `QbitPassword` | `SecretString` | qBit WebUI password — secret |
-| `RetryCount` | `u8` | saturating increment via `.increment()` |
-| `Interval` | `Duration` | recurring wakeup period |
-| `Backoff` | `Duration` | one-shot retry delay; `.exponential(attempt)` for exp backoff |
-| `WakeupId` | enum | identifies which scheduled timer fired |
-| `AlertPriority` | enum | `Info / Warning / Critical` mapped to Gotify priority |
+| Type            | Wraps          | Notes                                                         |
+| --------------- | -------------- | ------------------------------------------------------------- |
+| `VpnIp`         | `Ipv4Addr`     | plain newtype, `pub` field                                    |
+| `VpnPort`       | `u16`          | nutype, validated 1–65535, private field — use `try_new()`    |
+| `AuthCookie`    | `String`       | qBittorrent SID cookie                                        |
+| `ContainerId`   | `String`       | Docker container ID                                           |
+| `ContainerName` | `String`       | Docker container name                                         |
+| `MamSessionId`  | `SecretString` | MAM session cookie — secret                                   |
+| `QbitPassword`  | `SecretString` | qBit WebUI password — secret                                  |
+| `RetryCount`    | `u8`           | saturating increment via `.increment()`                       |
+| `Interval`      | `Duration`     | recurring wakeup period                                       |
+| `Backoff`       | `Duration`     | one-shot retry delay; `.exponential(attempt)` for exp backoff |
+| `WakeupId`      | enum           | identifies which scheduled timer fired                        |
+| `AlertPriority` | enum           | `Info / Warning / Critical` mapped to Gotify priority         |
+
+## Clippy
+
+The project runs `cargo clippy -- -W clippy::pedantic -W clippy::nursery` with
+**no suppressed rules** in the justfile. The goal is zero warnings.
+
+### Rules for `#[allow(...)]`
+
+- Every `#[allow(clippy::...)]` in the source code **must** be accompanied by
+  an inline comment explaining why the suppression is justified.
+- A lint can only be added to the justfile's allow-list with explicit user
+  approval. Do not add `-A clippy::*` flags to silence warnings you cannot fix.
+- When clippy flags a warning, fix the code — don't suppress the lint.
+
+### The one current exception
+
+`dispatch_one` in `shell/mod.rs` carries `#[allow(clippy::too_many_lines)]`
+because it is a match over every `Action` variant (a dispatch table). Splitting
+it would scatter related code without reducing real complexity.
 
 ## Build & test
 
@@ -90,12 +112,12 @@ cargo test -- --include-ignored     # also runs Tier 4 Docker tests (needs socke
 
 ### Test tiers
 
-| Tier | What | Gate |
-|------|------|------|
-| 1 | Pure unit tests (no I/O) | always |
-| 2 | Mock HTTP via wiremock | always |
-| 3 | Real filesystem (tempdir) | always |
-| 4 | Real Docker containers | `#[ignore]` — needs Docker socket |
+| Tier | What                      | Gate                              |
+| ---- | ------------------------- | --------------------------------- |
+| 1    | Pure unit tests (no I/O)  | always                            |
+| 2    | Mock HTTP via wiremock    | always                            |
+| 3    | Real filesystem (tempdir) | always                            |
+| 4    | Real Docker containers    | `#[ignore]` — needs Docker socket |
 
 ## Key invariants — do not break these
 
@@ -106,7 +128,7 @@ cargo test -- --include-ignored     # also runs Tier 4 Docker tests (needs socke
    - `PortFileReadResult(Ok)` — no-op if ip+port match current `VpnState::Connected`
    - `QbitConnectionRefused` — ignored if qbit is not `Authenticating`
    - `Wakeup(QbitAuthRetry)` — ignored if qbit is not `Authenticating`
-   Do not remove these without adding equivalent protection.
+     Do not remove these without adding equivalent protection.
 
 3. **File watcher sends one event per content change.** `spawn_file_watcher` uses
    `notify-debouncer-mini` (100 ms window) + a capacity-1 `try_send` + content
@@ -121,6 +143,7 @@ cargo test -- --include-ignored     # also runs Tier 4 Docker tests (needs socke
 ## Important gotchas
 
 ### bollard 0.18
+
 - No builder pattern: use `ListContainersOptions::<String> { all: true, ..Default::default() }`
 - `StartContainerOptions` needs explicit type: `None::<bollard::container::StartContainerOptions<String>>`
 - `discover_dependents_for` resolves the anchor's container ID via
@@ -128,13 +151,16 @@ cargo test -- --include-ignored     # also runs Tier 4 Docker tests (needs socke
   plain `docker run` stores `container:<id>`.
 
 ### nutype
+
 - `VpnPort` is a nutype newtype. Its inner field is private — use
   `VpnPort::try_new(n).unwrap()` to construct, not `VpnPort(n)`.
 
 ### secrecy 0.10
+
 - `SecretString::new()` takes `Box<str>`, not `String`. Call `.into()`.
 
 ### WireMock 3.5.4 (integration tests)
+
 - Health endpoint returns `{"status": "healthy"}`, not `"UP"`.
 - No `curl` in the WireMock image — use `wget`.
 
