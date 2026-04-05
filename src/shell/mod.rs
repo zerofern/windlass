@@ -4,6 +4,7 @@ mod gotify;
 mod mam;
 mod monitors;
 mod qbit;
+mod vpn_files;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -26,15 +27,12 @@ pub use config::Config;
 pub async fn run() -> Result<()> {
     let config = Config::from_env()?;
 
-    let docker = docker::DockerClient::connect(
-        config.dump_dir.clone(),
-        config.vpn_ip_file.clone(),
-        config.vpn_port_file.clone(),
-    )?;
+    let docker = docker::DockerClient::connect(config.dump_dir.clone())?;
 
     let is_gluetun_healthy = docker.is_gluetun_healthy().await;
     let dependents = docker.discover_dependents().await;
-    let boot_port_files = docker.read_boot_port_files().await;
+    let boot_port_files =
+        vpn_files::read_boot_port_files(&config.vpn_ip_file, &config.vpn_port_file).await;
 
     info!(
         gluetun_healthy = is_gluetun_healthy,
@@ -46,7 +44,7 @@ pub async fn run() -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Event>(128);
 
     docker.spawn_event_watcher(tx.clone());
-    docker.spawn_file_watcher(tx.clone());
+    vpn_files::spawn_file_watcher(&config.vpn_ip_file, &config.vpn_port_file, tx.clone());
 
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -196,10 +194,11 @@ impl<'a> ShellContext<'a> {
         let port_file = self.config.vpn_port_file.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result =
-                tokio::task::spawn_blocking(move || docker::read_port_files(&ip_file, &port_file))
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()));
+            let result = tokio::task::spawn_blocking(move || {
+                vpn_files::read_port_files(&ip_file, &port_file)
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
             let _ = tx.send(Event::PortFileReadResult(result)).await;
         });
     }

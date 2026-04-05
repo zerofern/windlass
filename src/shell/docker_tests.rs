@@ -1,171 +1,10 @@
-use super::*;
-use std::io::Write;
-use tempfile::NamedTempFile;
-
-fn write_temp(content: &str) -> NamedTempFile {
-    let mut f = NamedTempFile::new().unwrap();
-    writeln!(f, "{content}").unwrap();
-    f
-}
-
-#[test]
-fn read_port_files_parses_valid_input() {
-    let ip_f = write_temp("10.8.0.1");
-    let port_f = write_temp("51820");
-    let (ip, port) = read_port_files(
-        ip_f.path().to_str().unwrap(),
-        port_f.path().to_str().unwrap(),
-    )
-    .unwrap();
-    assert_eq!(ip.0.to_string(), "10.8.0.1");
-    assert_eq!(port.into_inner(), 51820);
-}
-
-#[test]
-fn read_port_files_trims_trailing_whitespace() {
-    let ip_f = write_temp("  10.8.0.1  ");
-    let port_f = write_temp("  51820  ");
-    assert!(
-        read_port_files(
-            ip_f.path().to_str().unwrap(),
-            port_f.path().to_str().unwrap(),
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn read_port_files_missing_ip_file_returns_err() {
-    let port_f = write_temp("51820");
-    let err = read_port_files("/nonexistent/ip_xyz", port_f.path().to_str().unwrap()).unwrap_err();
-    assert!(err.contains("ip file"), "unexpected error: {err}");
-}
-
-#[test]
-fn read_port_files_missing_port_file_returns_err() {
-    let ip_f = write_temp("10.8.0.1");
-    let err = read_port_files(ip_f.path().to_str().unwrap(), "/nonexistent/port_xyz").unwrap_err();
-    assert!(err.contains("port file"), "unexpected error: {err}");
-}
-
-#[test]
-fn read_port_files_malformed_ip_returns_err() {
-    let ip_f = write_temp("not-an-ip");
-    let port_f = write_temp("51820");
-    let err = read_port_files(
-        ip_f.path().to_str().unwrap(),
-        port_f.path().to_str().unwrap(),
-    )
-    .unwrap_err();
-    assert!(err.contains("ip parse"), "unexpected error: {err}");
-}
-
-#[test]
-fn read_port_files_malformed_port_returns_err() {
-    let ip_f = write_temp("10.8.0.1");
-    let port_f = write_temp("notaport");
-    let err = read_port_files(
-        ip_f.path().to_str().unwrap(),
-        port_f.path().to_str().unwrap(),
-    )
-    .unwrap_err();
-    assert!(err.contains("port parse"), "unexpected error: {err}");
-}
-
-// ── Tier 3: File-system integration ──────────────────────────────────────
-
-#[tokio::test]
-async fn file_watcher_fires_port_file_result_on_write() {
-    use std::time::Duration;
-    let dir = tempfile::TempDir::new().unwrap();
-    let ip_path = dir.path().join("ip");
-    let port_path = dir.path().join("forwarded_port");
-    std::fs::write(&ip_path, "10.8.0.1").unwrap();
-    std::fs::write(&port_path, "51820").unwrap();
-    let (tx, mut rx) = mpsc::channel(8);
-    spawn_file_watcher_inner(
-        dir.path().to_str().unwrap(),
-        ip_path.to_str().unwrap().to_string(),
-        port_path.to_str().unwrap().to_string(),
-        tx,
-    );
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    std::fs::write(&port_path, "51821").unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-        .await
-        .expect("timed out waiting for PortFileReadResult")
-        .expect("channel closed unexpectedly");
-    let expected_port = VpnPort::try_new(51821).unwrap();
-    assert!(
-        matches!(event, Event::PortFileReadResult(Ok((_, p))) if p == expected_port),
-        "expected PortFileReadResult(Ok(_, 51821)), got {event:?}"
-    );
-}
-
-#[tokio::test]
-async fn file_watcher_fires_exactly_once_per_write() {
-    use std::time::Duration;
-    let dir = tempfile::TempDir::new().unwrap();
-    let ip_path = dir.path().join("ip");
-    let port_path = dir.path().join("forwarded_port");
-    std::fs::write(&ip_path, "10.8.0.1").unwrap();
-    std::fs::write(&port_path, "51820").unwrap();
-    let (tx, mut rx) = mpsc::channel(32);
-    spawn_file_watcher_inner(
-        dir.path().to_str().unwrap(),
-        ip_path.to_str().unwrap().to_string(),
-        port_path.to_str().unwrap().to_string(),
-        tx,
-    );
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    std::fs::write(&port_path, "51821").unwrap();
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    let mut count = 0;
-    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(10), rx.recv()).await {
-        count += 1;
-    }
-    assert_eq!(
-        count, 1,
-        "debouncer must emit exactly 1 event per write burst, got {count}"
-    );
-}
-
-#[tokio::test]
-async fn file_watcher_fires_on_subsequent_writes() {
-    use std::time::Duration;
-    let dir = tempfile::TempDir::new().unwrap();
-    let ip_path = dir.path().join("ip");
-    let port_path = dir.path().join("forwarded_port");
-    std::fs::write(&ip_path, "10.8.0.1").unwrap();
-    std::fs::write(&port_path, "51820").unwrap();
-    let (tx, mut rx) = mpsc::channel(8);
-    spawn_file_watcher_inner(
-        dir.path().to_str().unwrap(),
-        ip_path.to_str().unwrap().to_string(),
-        port_path.to_str().unwrap().to_string(),
-        tx,
-    );
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    std::fs::write(&port_path, "51821").unwrap();
-    tokio::time::timeout(Duration::from_secs(3), rx.recv())
-        .await
-        .expect("timed out on first write")
-        .unwrap();
-    // Wait for the debounce window to fully settle before the second write.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    std::fs::write(&port_path, "51822").unwrap();
-    tokio::time::timeout(Duration::from_secs(3), rx.recv())
-        .await
-        .expect("timed out on second write — watcher stopped after first event")
-        .unwrap();
-}
-
 // ── Tier 4: Docker container integration ─────────────────────────────────
 // Run with: cargo test -- --include-ignored
 
+use super::*;
+
 fn test_client() -> DockerClient {
-    DockerClient::connect("/tmp".into(), "/tmp/ip".into(), "/tmp/port".into())
-        .expect("Docker socket unavailable")
+    DockerClient::connect("/tmp".into()).expect("Docker socket unavailable")
 }
 
 #[tokio::test]
@@ -315,12 +154,8 @@ async fn docker_fetch_and_dump_logs_creates_log_file() {
         .expect("start container");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let dump_client = DockerClient::connect(
-        dump_dir.path().to_str().unwrap().to_string(),
-        "/tmp/ip".into(),
-        "/tmp/port".into(),
-    )
-    .expect("Docker socket unavailable");
+    let dump_client = DockerClient::connect(dump_dir.path().to_str().unwrap().to_string())
+        .expect("Docker socket unavailable");
     dump_client
         .fetch_and_dump_logs(&[container_name.to_string()])
         .await;

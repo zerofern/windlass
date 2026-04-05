@@ -1,44 +1,35 @@
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
-use bollard::container::{LogsOptions, RestartContainerOptions, StopContainerOptions};
+use bollard::container::{LogsOptions, RestartContainerOptions};
 use bollard::models::{EventMessageTypeEnum, HealthStatusEnum};
 use futures_util::StreamExt;
-use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
-use std::net::Ipv4Addr;
-use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::core::events::Event;
-use crate::types::{VpnIp, VpnPort};
+
+// Re-exported so docker_tests.rs (via `use super::*`) can use it in Tier 4 tests.
+pub use bollard::container::StopContainerOptions;
 
 const GLUETUN: &str = "gluetun";
 
 /// Wraps a `bollard::Docker` connection together with the project-level
-/// configuration it needs. All Docker and file-watcher operations are methods
-/// so call sites only pass `&self` instead of a long argument list.
+/// configuration it needs. All Docker operations are methods so call sites
+/// only pass `&self` instead of a long argument list.
 #[derive(Clone)]
 pub struct DockerClient {
     pub(crate) inner: Docker,
     pub gluetun_anchor: String,
     pub dump_dir: String,
-    pub vpn_ip_file: String,
-    pub vpn_port_file: String,
 }
 
 impl DockerClient {
     /// Connects to the Docker socket using the default system path.
-    pub fn connect(
-        dump_dir: String,
-        vpn_ip_file: String,
-        vpn_port_file: String,
-    ) -> anyhow::Result<Self> {
+    pub fn connect(dump_dir: String) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Docker::connect_with_socket_defaults()?,
             gluetun_anchor: GLUETUN.to_string(),
             dump_dir,
-            vpn_ip_file,
-            vpn_port_file,
         })
     }
 
@@ -89,16 +80,6 @@ impl DockerClient {
                     .map(|n| n.trim_start_matches('/').to_string())
             })
             .collect()
-    }
-
-    /// Reads both VPN files once at boot. Called before the event loop starts
-    /// so the Core can fast-forward to connected state immediately.
-    pub async fn read_boot_port_files(&self) -> Result<(VpnIp, VpnPort), String> {
-        let ip_file = self.vpn_ip_file.clone();
-        let port_file = self.vpn_port_file.clone();
-        tokio::task::spawn_blocking(move || read_port_files(&ip_file, &port_file))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
     }
 
     // ── Background watchers ───────────────────────────────────────────────────
@@ -157,22 +138,6 @@ impl DockerClient {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
-    }
-
-    /// Spawns a debounced inotify watcher on the Gluetun directory.
-    /// Collapses the raw inotify storm from a single write into one event per
-    /// 100ms window, then reads both VPN files and emits `PortFileReadResult`.
-    pub fn spawn_file_watcher(&self, tx: mpsc::Sender<Event>) {
-        let watch_dir = Path::new(&self.vpn_ip_file).parent().map_or_else(
-            || "/tmp/gluetun".to_string(),
-            |p| p.to_string_lossy().into_owned(),
-        );
-        spawn_file_watcher_inner(
-            &watch_dir,
-            self.vpn_ip_file.clone(),
-            self.vpn_port_file.clone(),
-            tx,
-        );
     }
 
     // ── Container lifecycle ───────────────────────────────────────────────────
@@ -260,82 +225,6 @@ impl DockerClient {
             }
         }
     }
-}
-
-// ── Free functions ────────────────────────────────────────────────────────────
-
-/// Reads and parses both VPN files. Returns `Err` if either file is missing,
-/// empty, or unparseable — the Core schedules a retry on error.
-pub fn read_port_files(ip_file: &str, port_file: &str) -> Result<(VpnIp, VpnPort), String> {
-    let ip_str = std::fs::read_to_string(ip_file).map_err(|e| format!("ip file: {e}"))?;
-    let port_str = std::fs::read_to_string(port_file).map_err(|e| format!("port file: {e}"))?;
-
-    let ip: Ipv4Addr = ip_str
-        .trim()
-        .parse()
-        .map_err(|e| format!("ip parse: {e}"))?;
-
-    let port_num: u16 = port_str
-        .trim()
-        .parse()
-        .map_err(|e| format!("port parse: {e}"))?;
-
-    let port = VpnPort::try_new(port_num).map_err(|e| format!("port validate: {e}"))?;
-
-    Ok((VpnIp(ip), port))
-}
-
-/// Inner file-watcher spawn used by both `DockerClient::spawn_file_watcher`
-/// and the Tier 3 tests (which construct paths manually).
-pub fn spawn_file_watcher_inner(
-    watch_dir: &str,
-    ip_file: String,
-    port_file: String,
-    tx: mpsc::Sender<Event>,
-) {
-    // Capacity 1: if a read is already queued, drop extra signals.
-    let (notify_tx, mut notify_rx) = mpsc::channel::<()>(1);
-
-    let mut debouncer = new_debouncer(
-        std::time::Duration::from_millis(100),
-        move |_: DebounceEventResult| {
-            // try_send: drop the signal if one is already pending so we never
-            // queue more work than the processing loop can handle.
-            let _ = notify_tx.try_send(());
-        },
-    )
-    .expect("Failed to create file watcher debouncer");
-
-    debouncer
-        .watcher()
-        .watch(Path::new(watch_dir), RecursiveMode::NonRecursive)
-        .expect("Failed to watch gluetun dir");
-
-    tokio::spawn(async move {
-        let _debouncer = debouncer; // keep alive for the duration of the task
-        let mut last_sent: Option<(VpnIp, VpnPort)> = None;
-        while notify_rx.recv().await.is_some() {
-            let ip_f = ip_file.clone();
-            let port_f = port_file.clone();
-            let result = tokio::task::spawn_blocking(move || read_port_files(&ip_f, &port_f))
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-
-            // Deduplicate: skip sending if content is identical to the last
-            // successful send — prevents feedback loops where read-triggered
-            // inotify events re-fire the debouncer.
-            if let Ok(ref val) = result {
-                if last_sent.as_ref() == Some(val) {
-                    continue;
-                }
-                last_sent = Some(*val);
-            }
-
-            if tx.send(Event::PortFileReadResult(result)).await.is_err() {
-                break;
-            }
-        }
-    });
 }
 
 #[cfg(test)]
