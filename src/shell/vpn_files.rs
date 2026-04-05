@@ -27,6 +27,19 @@ pub fn read_port_files(ip_file: &str, port_file: &str) -> Result<(VpnIp, VpnPort
     Ok((VpnIp(ip), port))
 }
 
+/// Reads both VPN files once at boot, then spawns the debounced file watcher.
+/// These two always happen together — boot read gives the Core its initial
+/// state, and the watcher keeps it updated as Gluetun rotates the port.
+pub async fn read_and_watch(
+    vpn_ip_file: &str,
+    vpn_port_file: &str,
+    tx: mpsc::Sender<Event>,
+) -> Result<(VpnIp, VpnPort), String> {
+    let result = read_boot_port_files(vpn_ip_file, vpn_port_file).await;
+    spawn_file_watcher(vpn_ip_file, vpn_port_file, tx);
+    result
+}
+
 /// Reads both VPN files once at boot. Called before the event loop starts
 /// so the Core can fast-forward to connected state immediately.
 pub async fn read_boot_port_files(

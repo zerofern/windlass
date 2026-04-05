@@ -27,24 +27,13 @@ pub use config::Config;
 pub async fn run() -> Result<()> {
     let config = Config::from_env()?;
 
-    let docker = docker::DockerClient::connect(config.dump_dir.clone())?;
-
-    let is_gluetun_healthy = docker.is_gluetun_healthy().await;
-    let dependents = docker.discover_dependents().await;
-    let boot_port_files =
-        vpn_files::read_boot_port_files(&config.vpn_ip_file, &config.vpn_port_file).await;
-
-    info!(
-        gluetun_healthy = is_gluetun_healthy,
-        dependents = ?dependents,
-        port_files_ok = boot_port_files.is_ok(),
-        "Windlass started"
-    );
-
     let (tx, mut rx) = mpsc::channel::<Event>(128);
 
-    docker.spawn_event_watcher(tx.clone());
-    vpn_files::spawn_file_watcher(&config.vpn_ip_file, &config.vpn_port_file, tx.clone());
+    let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone(), tx.clone()).await?;
+    let port_files =
+        vpn_files::read_and_watch(&config.vpn_ip_file, &config.vpn_port_file, tx.clone()).await;
+
+    info!("Windlass started");
 
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -68,8 +57,8 @@ pub async fn run() -> Result<()> {
     let (new_state, actions) = process_event(
         state,
         Event::Init {
-            is_gluetun_healthy,
-            port_files: boot_port_files,
+            is_gluetun_healthy: boot.is_gluetun_healthy,
+            port_files,
         },
     );
     state = new_state;
@@ -80,7 +69,7 @@ pub async fn run() -> Result<()> {
         &vpn,
         &mut wakeups,
         &mam_session,
-        &dependents,
+        &boot.dependents,
         &mut cached_cookie,
         &tx,
     )
@@ -97,7 +86,7 @@ pub async fn run() -> Result<()> {
             &vpn,
             &mut wakeups,
             &mam_session,
-            &dependents,
+            &boot.dependents,
             &mut cached_cookie,
             &tx,
         )

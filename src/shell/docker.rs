@@ -23,6 +23,12 @@ pub struct DockerClient {
     pub dump_dir: String,
 }
 
+/// Returned by [`DockerClient::boot`] — boot-time state needed to fire `Event::Init`.
+pub struct DockerBootInfo {
+    pub is_gluetun_healthy: bool,
+    pub dependents: Vec<String>,
+}
+
 impl DockerClient {
     /// Connects to the Docker socket using the default system path.
     pub fn connect(dump_dir: String) -> anyhow::Result<Self> {
@@ -31,6 +37,30 @@ impl DockerClient {
             gluetun_anchor: GLUETUN.to_string(),
             dump_dir,
         })
+    }
+
+    /// Connects, probes Gluetun state, discovers dependents, and spawns the
+    /// Docker event watcher. Returns the boot state needed for `Event::Init`.
+    pub async fn boot(
+        dump_dir: String,
+        tx: mpsc::Sender<Event>,
+    ) -> anyhow::Result<(Self, DockerBootInfo)> {
+        let client = Self::connect(dump_dir)?;
+        let is_gluetun_healthy = client.is_gluetun_healthy().await;
+        let dependents = client.discover_dependents().await;
+        info!(
+            gluetun_healthy = is_gluetun_healthy,
+            dependents = ?dependents,
+            "Docker ready"
+        );
+        client.spawn_event_watcher(tx);
+        Ok((
+            client,
+            DockerBootInfo {
+                is_gluetun_healthy,
+                dependents,
+            },
+        ))
     }
 
     // ── Boot helpers ──────────────────────────────────────────────────────────
