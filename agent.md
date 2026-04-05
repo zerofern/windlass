@@ -29,6 +29,56 @@ shell/ (executes actions)
 If code makes a decision ("should I retry?", "is this a new value?"), it belongs
 in `core/`. If code talks to the OS, network, or Docker, it belongs in `shell/`.
 
+## Newtypes
+
+Windlass uses newtypes extensively to make invalid states unrepresentable and
+to prevent primitive obsession (passing a raw `u16` where an `Ipv4Addr` is
+expected, etc.). All domain values crossing the core/shell boundary must be
+wrapped in their newtype.
+
+### Requirements when adding a new type
+
+1. **Wrap all domain values — no raw primitives anywhere.** A `u16` is a port
+   number, an index, a count, or a year — the type system cannot tell. Every
+   domain concept must be its own newtype, even if it only ever lives inside
+   the core or only inside the shell. This applies to values that cross the
+   core/shell boundary and to those that do not.
+
+2. **Validated types use `nutype`.** Use the `nutype` crate when the primitive
+   has invariants (e.g. port must be 1–65535). `nutype` makes the inner field
+   private and enforces validation at construction time via `try_new()`.
+   Do not add `pub` to a nutype field or bypass it with `unsafe`.
+
+3. **Unvalidated wrappers use plain tuple structs.** When wrapping for
+   type-safety without validation (e.g. `ContainerId(String)`), a plain
+   `#[derive(...)] pub struct Foo(pub T)` is fine.
+
+4. **Secrets use `secrecy`.** Any type that wraps a password, key, or session
+   token must wrap `SecretString` (from the `secrecy` crate) so it is
+   redacted in logs and not accidentally cloned into plain memory.
+   Construction: `SecretString::new(value.into())` (`Box<str>`, not `String`).
+
+5. **Derive `PartialEq + Eq` on everything in `types.rs`.** The core tests
+   and prop tests rely on equality. `nutype` types need these listed explicitly
+   in `derive(...)`.
+
+### Existing types (`src/types.rs`)
+
+| Type | Wraps | Notes |
+|------|-------|-------|
+| `VpnIp` | `Ipv4Addr` | plain newtype, `pub` field |
+| `VpnPort` | `u16` | nutype, validated 1–65535, private field — use `try_new()` |
+| `AuthCookie` | `String` | qBittorrent SID cookie |
+| `ContainerId` | `String` | Docker container ID |
+| `ContainerName` | `String` | Docker container name |
+| `MamSessionId` | `SecretString` | MAM session cookie — secret |
+| `QbitPassword` | `SecretString` | qBit WebUI password — secret |
+| `RetryCount` | `u8` | saturating increment via `.increment()` |
+| `Interval` | `Duration` | recurring wakeup period |
+| `Backoff` | `Duration` | one-shot retry delay; `.exponential(attempt)` for exp backoff |
+| `WakeupId` | enum | identifies which scheduled timer fired |
+| `AlertPriority` | enum | `Info / Warning / Critical` mapped to Gotify priority |
+
 ## Build & test
 
 ```bash
