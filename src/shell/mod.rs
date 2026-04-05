@@ -17,7 +17,7 @@ use tracing::{debug, info};
 use uom::si::information::byte;
 
 use crate::core::{actions::Action, events::Event, process_event, types::SystemState};
-use crate::types::{AuthCookie, VpnIp, VpnPort, WakeupId};
+use crate::types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 
 pub use config::Config;
 
@@ -26,23 +26,15 @@ pub use config::Config;
 pub async fn run() -> Result<()> {
     let config = Config::from_env()?;
 
-    let docker = docker::connect()?;
-    let is_gluetun_healthy = docker::is_gluetun_healthy(&docker).await;
-    let dependents = docker::discover_dependents(&docker).await;
+    let docker = docker::DockerClient::connect(
+        config.dump_dir.clone(),
+        config.vpn_ip_file.clone(),
+        config.vpn_port_file.clone(),
+    )?;
 
-    // Derive the watch directory from the ip-file path.
-    let watch_dir = std::path::Path::new(&config.vpn_ip_file)
-        .parent()
-        .map_or_else(|| "/tmp/gluetun".to_string(), |p| p.to_string_lossy().into_owned());
-
-    // Read VPN files once at boot so the Core can fast-forward if Gluetun is already up.
-    let boot_port_files = tokio::task::spawn_blocking({
-        let ip_file = config.vpn_ip_file.clone();
-        let port_file = config.vpn_port_file.clone();
-        move || docker::read_port_files(&ip_file, &port_file)
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()));
+    let is_gluetun_healthy = docker.is_gluetun_healthy().await;
+    let dependents = docker.discover_dependents().await;
+    let boot_port_files = docker.read_boot_port_files().await;
 
     info!(
         gluetun_healthy = is_gluetun_healthy,
@@ -53,13 +45,8 @@ pub async fn run() -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
 
-    docker::spawn_event_watcher(docker.clone(), tx.clone());
-    docker::spawn_file_watcher(
-        &watch_dir,
-        config.vpn_ip_file.clone(),
-        config.vpn_port_file.clone(),
-        tx.clone(),
-    );
+    docker.spawn_event_watcher(tx.clone());
+    docker.spawn_file_watcher(tx.clone());
 
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -78,44 +65,22 @@ pub async fn run() -> Result<()> {
     let mam_session: Arc<Mutex<String>> = Arc::new(Mutex::new(config.mam_session.clone()));
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
     let mut cached_cookie: Option<AuthCookie> = None;
-
     let mut state = SystemState::initial();
 
-    // Bootstrap the state machine with the real world's current state.
     let (new_state, actions) = process_event(
         state,
         Event::Init { is_gluetun_healthy, port_files: boot_port_files },
     );
     state = new_state;
-    let mut ctx = ShellContext {
-        config: &config,
-        docker: &docker,
-        direct: &direct,
-        vpn: &vpn,
-        wakeups: &mut wakeups,
-        mam_session: &mam_session,
-        dependents: &dependents,
-        cached_cookie: &mut cached_cookie,
-        tx: &tx,
-    };
-    ctx.dispatch(actions);
+    ShellContext::new(&config, &docker, &direct, &vpn, &mut wakeups, &mam_session, &dependents, &mut cached_cookie, &tx)
+        .dispatch(actions);
 
     while let Some(event) = rx.recv().await {
         debug!(?event, "←");
         let (new_state, actions) = process_event(state, event);
         state = new_state;
-        let mut ctx = ShellContext {
-            config: &config,
-            docker: &docker,
-            direct: &direct,
-            vpn: &vpn,
-            wakeups: &mut wakeups,
-            mam_session: &mam_session,
-            dependents: &dependents,
-            cached_cookie: &mut cached_cookie,
-            tx: &tx,
-        };
-        ctx.dispatch(actions);
+        ShellContext::new(&config, &docker, &direct, &vpn, &mut wakeups, &mam_session, &dependents, &mut cached_cookie, &tx)
+            .dispatch(actions);
     }
 
     Ok(())
@@ -125,7 +90,7 @@ pub async fn run() -> Result<()> {
 /// a long argument list.
 struct ShellContext<'a> {
     config: &'a Config,
-    docker: &'a bollard::Docker,
+    docker: &'a docker::DockerClient,
     direct: &'a reqwest::Client,
     vpn: &'a reqwest::Client,
     wakeups: &'a mut HashMap<WakeupId, JoinHandle<()>>,
@@ -135,7 +100,24 @@ struct ShellContext<'a> {
     tx: &'a mpsc::Sender<Event>,
 }
 
-impl ShellContext<'_> {
+impl<'a> ShellContext<'a> {
+    #[allow(clippy::too_many_arguments)]
+    // Constructor for a struct containing mutable references — const fn is not applicable here
+    // despite what clippy suggests, since &mut references cannot be used in const context.
+    fn new(
+        config: &'a Config,
+        docker: &'a docker::DockerClient,
+        direct: &'a reqwest::Client,
+        vpn: &'a reqwest::Client,
+        wakeups: &'a mut HashMap<WakeupId, JoinHandle<()>>,
+        mam_session: &'a Arc<Mutex<String>>,
+        dependents: &'a [String],
+        cached_cookie: &'a mut Option<AuthCookie>,
+        tx: &'a mpsc::Sender<Event>,
+    ) -> Self {
+        Self { config, docker, direct, vpn, wakeups, mam_session, dependents, cached_cookie, tx }
+    }
+
     /// Dispatches every action produced by the Core in one synchronous pass.
     fn dispatch(&mut self, actions: Vec<Action>) {
         for action in actions {
@@ -194,11 +176,10 @@ impl ShellContext<'_> {
 
     fn fetch_and_dump_all_logs(&self) {
         let docker = self.docker.clone();
-        let dump_dir = self.config.dump_dir.clone();
         let deps = self.dependents.to_vec();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            docker::fetch_and_dump_logs(&docker, &dump_dir, &deps).await;
+            docker.fetch_and_dump_logs(&deps).await;
             let _ = tx.send(Event::LogsDumped).await;
         });
     }
@@ -207,7 +188,7 @@ impl ShellContext<'_> {
         let docker = self.docker.clone();
         let deps = self.dependents.to_vec();
         tokio::spawn(async move {
-            docker::stop_dependents(&docker, &deps).await;
+            docker.stop_dependents(&deps).await;
         });
     }
 
@@ -215,14 +196,14 @@ impl ShellContext<'_> {
         let docker = self.docker.clone();
         let deps = self.dependents.to_vec();
         tokio::spawn(async move {
-            docker::start_dependents(&docker, &deps).await;
+            docker.start_dependents(&deps).await;
         });
     }
 
     fn restart_gluetun(&self) {
         let docker = self.docker.clone();
         tokio::spawn(async move {
-            docker::restart_gluetun(&docker).await;
+            docker.restart_gluetun().await;
         });
     }
 
@@ -297,7 +278,7 @@ impl ShellContext<'_> {
         });
     }
 
-    fn check_new_torrents(&mut self) {
+    fn check_new_torrents(&self) {
         let tx = self.tx.clone();
         let Some(cookie) = self.cached_cookie.clone() else {
             // qBit not yet authenticated — send empty so Core re-arms the timer.
@@ -317,7 +298,7 @@ impl ShellContext<'_> {
 
     // ── Alerts ────────────────────────────────────────────────────────────────
 
-    fn send_gotify_alert(&self, priority: crate::types::AlertPriority, message: String) {
+    fn send_gotify_alert(&self, priority: AlertPriority, message: String) {
         let client = self.direct.clone();
         let url = self.config.gotify_url.clone();
         let token = self.config.gotify_token.clone();
