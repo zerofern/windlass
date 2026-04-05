@@ -21,4 +21,7 @@ fmt-check:
 clippy:
     cargo clippy -- -W clippy::pedantic -W clippy::nursery
 
+coverage:
+    cargo tarpaulin --exclude-files "mlm/*" "mousehole/*" --ignore-tests
+
 check: fmt-check clippy test

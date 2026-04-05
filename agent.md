@@ -29,6 +29,21 @@ shell/ (executes actions)
 If code makes a decision ("should I retry?", "is this a new value?"), it belongs
 in `core/`. If code talks to the OS, network, or Docker, it belongs in `shell/`.
 
+## File size
+
+Keep source files small. LLMs and humans both work better with focused,
+short files. The rough guide:
+
+- **Hard limit: 300 lines.** If a file approaches this, it must be split.
+- **Target: under 200 lines.** Aim for this on new files.
+- Each file should have a single clear responsibility. If you find yourself
+  writing a second `impl` block on a different concept, that concept belongs
+  in its own file.
+- Tests live in `#[cfg(test)] mod tests` inside the same file for unit tests,
+  but large integration test suites should be in `tests/`.
+- When splitting, prefer splitting by concept (e.g. one file per HTTP client)
+  over splitting by layer.
+
 ## Newtypes
 
 Windlass uses newtypes extensively to make invalid states unrepresentable and
@@ -97,18 +112,31 @@ The project runs `cargo clippy -- -W clippy::pedantic -W clippy::nursery` with
 
 ### The one current exception
 
-`dispatch_one` in `shell/mod.rs` carries `#[allow(clippy::too_many_lines)]`
-because it is a match over every `Action` variant (a dispatch table). Splitting
-it would scatter related code without reducing real complexity.
+`ShellContext::new` in `shell/mod.rs` carries `#[allow(clippy::too_many_arguments)]`
+because it is a constructor for a context struct that genuinely needs all those
+fields. The `#[allow]` is accompanied by a comment explaining why.
 
 ## Build & test
 
+The project uses [`just`](https://github.com/casey/just) as a task runner.
+
 ```bash
-cargo build
-cargo test                          # all unit + mock HTTP + Tier 3 fs tests
-cargo test -- --include-ignored     # also runs Tier 4 Docker tests (needs socket)
-./tests/integration/run.sh          # full Docker Compose integration test
+just build          # cargo build
+just test           # unit + mock HTTP + Tier 3 fs tests
+just test-all       # also runs Tier 4 Docker tests (needs Docker socket)
+just fmt            # cargo fmt
+just fmt-check      # check formatting without modifying
+just clippy         # cargo clippy -W pedantic -W nursery
+just check          # fmt-check + clippy + test
+just coverage       # cargo tarpaulin coverage report
+just integration    # full Docker Compose integration test
 ```
+
+### Before every commit
+
+Run `just check && just coverage`. Both must pass with zero warnings, zero test
+failures, and no regression in coverage before any commit is made. This is not
+optional.
 
 ### Test tiers
 
@@ -118,6 +146,23 @@ cargo test -- --include-ignored     # also runs Tier 4 Docker tests (needs socke
 | 2    | Mock HTTP via wiremock    | always                            |
 | 3    | Real filesystem (tempdir) | always                            |
 | 4    | Real Docker containers    | `#[ignore]` — needs Docker socket |
+
+### Coverage goal
+
+The project targets **100% coverage on all code that can be tested without a
+live Docker socket or external service**. That means Tiers 1–3 must cover
+everything in `core/` and the pure parts of `shell/`. Tier 4 and
+`shell/mod.rs` entry point are excluded from the coverage target because they
+require a full running stack.
+
+Check coverage with:
+
+```bash
+cargo tarpaulin --exclude-files "mlm/*" "mousehole/*" --ignore-tests
+```
+
+When adding new logic, add tests alongside it. Do not ship untested business
+logic.
 
 ## Key invariants — do not break these
 
