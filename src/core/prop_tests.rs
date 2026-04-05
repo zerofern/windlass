@@ -5,10 +5,10 @@ use uom::si::f64::Information;
 use uom::si::information::gigabyte;
 
 use super::{
+    HARD_RECOVERY_LIMIT,
     events::Event,
     process_event,
     types::{MamState, QbitState, RunMode, SystemState, VpnState},
-    HARD_RECOVERY_LIMIT,
 };
 use crate::types::{AuthCookie, RetryCount, VpnIp, VpnPort, WakeupId};
 
@@ -55,8 +55,7 @@ fn any_vpn_state() -> impl Strategy<Value = VpnState> {
         Just(VpnState::DumpingLogs),
         Just(VpnState::Starting),
         Just(VpnState::AwaitingTunnel),
-        (any_vpn_ip(), any_vpn_port())
-            .prop_map(|(ip, port)| VpnState::Connected { ip, port }),
+        (any_vpn_ip(), any_vpn_port()).prop_map(|(ip, port)| VpnState::Connected { ip, port }),
     ]
 }
 
@@ -65,8 +64,13 @@ fn any_qbit_state() -> impl Strategy<Value = QbitState> {
         Just(QbitState::Offline),
         any_retry_count().prop_map(|attempt| QbitState::Authenticating { attempt }),
         any_auth_cookie().prop_map(|cookie| QbitState::Authenticated { cookie }),
-        (any_retry_count(), any_auth_cookie(), any_vpn_port())
-            .prop_map(|(attempt, cookie, target)| QbitState::SyncingPort { attempt, cookie, target }),
+        (any_retry_count(), any_auth_cookie(), any_vpn_port()).prop_map(
+            |(attempt, cookie, target)| QbitState::SyncingPort {
+                attempt,
+                cookie,
+                target
+            }
+        ),
         any_vpn_port().prop_map(|port| QbitState::Ready { port }),
     ]
 }
@@ -74,10 +78,11 @@ fn any_qbit_state() -> impl Strategy<Value = QbitState> {
 fn any_mam_state() -> impl Strategy<Value = MamState> {
     prop_oneof![
         Just(MamState::Unknown),
-        (any_vpn_ip(), any_vpn_port())
-            .prop_map(|(ip, port)| MamState::SyncPending { target_ip: ip, target_port: port }),
-        (any_vpn_port(), any_vpn_ip())
-            .prop_map(|(port, ip)| MamState::Synced { port, ip }),
+        (any_vpn_ip(), any_vpn_port()).prop_map(|(ip, port)| MamState::SyncPending {
+            target_ip: ip,
+            target_port: port
+        }),
+        (any_vpn_port(), any_vpn_ip()).prop_map(|(port, ip)| MamState::Synced { port, ip }),
         any_vpn_ip().prop_map(|ip| MamState::AsnBlocked { ip }),
     ]
 }
@@ -92,7 +97,13 @@ fn any_run_mode() -> impl Strategy<Value = RunMode> {
 }
 
 fn any_system_state() -> impl Strategy<Value = SystemState> {
-    (any_run_mode(), any_retry_count(), any_vpn_state(), any_qbit_state(), any_mam_state())
+    (
+        any_run_mode(),
+        any_retry_count(),
+        any_vpn_state(),
+        any_qbit_state(),
+        any_mam_state(),
+    )
         .prop_map(|(run_mode, hard_recoveries, vpn, qbit, mam)| SystemState {
             run_mode,
             hard_recoveries,
@@ -104,7 +115,12 @@ fn any_system_state() -> impl Strategy<Value = SystemState> {
 }
 
 fn any_active_state() -> impl Strategy<Value = SystemState> {
-    (any_retry_count(), any_vpn_state(), any_qbit_state(), any_mam_state())
+    (
+        any_retry_count(),
+        any_vpn_state(),
+        any_qbit_state(),
+        any_mam_state(),
+    )
         .prop_map(|(hard_recoveries, vpn, qbit, mam)| SystemState {
             run_mode: RunMode::Active,
             hard_recoveries,
@@ -118,7 +134,12 @@ fn any_active_state() -> impl Strategy<Value = SystemState> {
 /// Active state where hard_recoveries is strictly below the fatal limit —
 /// the only valid region for asserting the counter stays bounded.
 fn any_active_state_with_valid_recoveries() -> impl Strategy<Value = SystemState> {
-    (0u8..HARD_RECOVERY_LIMIT.0, any_vpn_state(), any_qbit_state(), any_mam_state())
+    (
+        0u8..HARD_RECOVERY_LIMIT.0,
+        any_vpn_state(),
+        any_qbit_state(),
+        any_mam_state(),
+    )
         .prop_map(|(recoveries, vpn, qbit, mam)| SystemState {
             run_mode: RunMode::Active,
             hard_recoveries: RetryCount(recoveries),
@@ -149,26 +170,39 @@ fn any_fatal_state() -> impl Strategy<Value = SystemState> {
 
 /// A fully healthy, synced state: VPN connected, qBit ready, MAM synced.
 fn any_synced_state() -> impl Strategy<Value = SystemState> {
-    (any_vpn_ip(), any_vpn_port(), any_vpn_port(), any_vpn_ip(), 0u8..HARD_RECOVERY_LIMIT.0)
-        .prop_map(|(vpn_ip, vpn_port, q_port, mam_ip, recoveries)| SystemState {
-            run_mode: RunMode::Active,
-            hard_recoveries: RetryCount(recoveries),
-            vpn: VpnState::Connected { ip: vpn_ip, port: vpn_port },
-            qbit: QbitState::Ready { port: q_port },
-            mam: MamState::Synced { ip: mam_ip, port: q_port },
-            known_torrents: std::collections::HashSet::new(),
-        })
+    (
+        any_vpn_ip(),
+        any_vpn_port(),
+        any_vpn_port(),
+        any_vpn_ip(),
+        0u8..HARD_RECOVERY_LIMIT.0,
+    )
+        .prop_map(
+            |(vpn_ip, vpn_port, q_port, mam_ip, recoveries)| SystemState {
+                run_mode: RunMode::Active,
+                hard_recoveries: RetryCount(recoveries),
+                vpn: VpnState::Connected {
+                    ip: vpn_ip,
+                    port: vpn_port,
+                },
+                qbit: QbitState::Ready { port: q_port },
+                mam: MamState::Synced {
+                    ip: mam_ip,
+                    port: q_port,
+                },
+                known_torrents: std::collections::HashSet::new(),
+            },
+        )
 }
 
 // ── Event strategies ──────────────────────────────────────────────────────────
 
 fn any_event() -> impl Strategy<Value = Event> {
     prop_oneof![
-        (any::<bool>(), any_vpn_ip(), any_vpn_port())
-            .prop_map(|(healthy, ip, port)| Event::Init {
-                is_gluetun_healthy: healthy,
-                port_files: Ok((ip, port)),
-            }),
+        (any::<bool>(), any_vpn_ip(), any_vpn_port()).prop_map(|(healthy, ip, port)| Event::Init {
+            is_gluetun_healthy: healthy,
+            port_files: Ok((ip, port)),
+        }),
         any::<bool>().prop_map(|healthy| Event::Init {
             is_gluetun_healthy: healthy,
             port_files: Err("not ready".into()),
@@ -194,7 +228,8 @@ fn any_event() -> impl Strategy<Value = Event> {
         prop::collection::vec(
             proptest::string::string_regex("[a-zA-Z0-9. ]{1,30}").unwrap(),
             0..5
-        ).prop_map(Event::NewTorrentsObserved),
+        )
+        .prop_map(Event::NewTorrentsObserved),
         Just(Event::LogsDumped),
         any_wakeup_id().prop_map(Event::Wakeup),
     ]

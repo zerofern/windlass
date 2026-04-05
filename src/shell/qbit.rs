@@ -80,11 +80,7 @@ pub async fn sync_port(
 /// Fetches the current list of torrent names from qBittorrent.
 /// Returns an empty vec on error rather than propagating — the torrent
 /// checker treats an empty result as "no new torrents" and reschedules.
-pub async fn list_torrents(
-    client: &Client,
-    base_url: &str,
-    cookie: &AuthCookie,
-) -> Vec<String> {
+pub async fn list_torrents(client: &Client, base_url: &str, cookie: &AuthCookie) -> Vec<String> {
     let url = format!("{base_url}/api/v2/torrents/info");
     match client
         .get(&url)
@@ -223,12 +219,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                    {"name": "Album A", "hash": "aaa"},
-                    {"name": "Album B", "hash": "bbb"}
-                ])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "Album A", "hash": "aaa"},
+                {"name": "Album B", "hash": "bbb"}
+            ])))
             .mount(&server)
             .await;
 
@@ -242,9 +236,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/torrents/info"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&server)
             .await;
 

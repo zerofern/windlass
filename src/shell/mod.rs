@@ -69,18 +69,41 @@ pub async fn run() -> Result<()> {
 
     let (new_state, actions) = process_event(
         state,
-        Event::Init { is_gluetun_healthy, port_files: boot_port_files },
+        Event::Init {
+            is_gluetun_healthy,
+            port_files: boot_port_files,
+        },
     );
     state = new_state;
-    ShellContext::new(&config, &docker, &direct, &vpn, &mut wakeups, &mam_session, &dependents, &mut cached_cookie, &tx)
-        .dispatch(actions);
+    ShellContext::new(
+        &config,
+        &docker,
+        &direct,
+        &vpn,
+        &mut wakeups,
+        &mam_session,
+        &dependents,
+        &mut cached_cookie,
+        &tx,
+    )
+    .dispatch(actions);
 
     while let Some(event) = rx.recv().await {
         debug!(?event, "←");
         let (new_state, actions) = process_event(state, event);
         state = new_state;
-        ShellContext::new(&config, &docker, &direct, &vpn, &mut wakeups, &mam_session, &dependents, &mut cached_cookie, &tx)
-            .dispatch(actions);
+        ShellContext::new(
+            &config,
+            &docker,
+            &direct,
+            &vpn,
+            &mut wakeups,
+            &mam_session,
+            &dependents,
+            &mut cached_cookie,
+            &tx,
+        )
+        .dispatch(actions);
     }
 
     Ok(())
@@ -102,8 +125,8 @@ struct ShellContext<'a> {
 
 impl<'a> ShellContext<'a> {
     #[allow(clippy::too_many_arguments)]
-    // Constructor for a struct containing mutable references — const fn is not applicable here
-    // despite what clippy suggests, since &mut references cannot be used in const context.
+    #[allow(clippy::missing_const_for_fn)]
+    // Not actually useful as const fn — contains &mut references.
     fn new(
         config: &'a Config,
         docker: &'a docker::DockerClient,
@@ -115,7 +138,17 @@ impl<'a> ShellContext<'a> {
         cached_cookie: &'a mut Option<AuthCookie>,
         tx: &'a mpsc::Sender<Event>,
     ) -> Self {
-        Self { config, docker, direct, vpn, wakeups, mam_session, dependents, cached_cookie, tx }
+        Self {
+            config,
+            docker,
+            direct,
+            vpn,
+            wakeups,
+            mam_session,
+            dependents,
+            cached_cookie,
+            tx,
+        }
     }
 
     /// Dispatches every action produced by the Core in one synchronous pass.
@@ -123,18 +156,18 @@ impl<'a> ShellContext<'a> {
         for action in actions {
             debug!(?action, "→");
             match action {
-                Action::ScheduleWakeup(id, duration)  => self.schedule_wakeup(id, duration),
-                Action::ReadPortFiles                  => self.read_port_files(),
-                Action::FetchAndDumpAllLogs            => self.fetch_and_dump_all_logs(),
-                Action::StopDependentContainers        => self.stop_dependent_containers(),
-                Action::StartDependentContainers       => self.start_dependent_containers(),
-                Action::RestartGluetun                 => self.restart_gluetun(),
-                Action::AuthenticateQbit               => self.authenticate_qbit(),
-                Action::SyncQbitPort(cookie, port)     => self.sync_qbit_port(cookie, port),
-                Action::UpdateMam(ip)                  => self.update_mam(ip),
-                Action::CheckMamConnectability         => self.check_mam_connectability(),
-                Action::CheckDiskSpace                 => self.check_disk_space(),
-                Action::CheckNewTorrents               => self.check_new_torrents(),
+                Action::ScheduleWakeup(id, duration) => self.schedule_wakeup(id, duration),
+                Action::ReadPortFiles => self.read_port_files(),
+                Action::FetchAndDumpAllLogs => self.fetch_and_dump_all_logs(),
+                Action::StopDependentContainers => self.stop_dependent_containers(),
+                Action::StartDependentContainers => self.start_dependent_containers(),
+                Action::RestartGluetun => self.restart_gluetun(),
+                Action::AuthenticateQbit => self.authenticate_qbit(),
+                Action::SyncQbitPort(cookie, port) => self.sync_qbit_port(cookie, port),
+                Action::UpdateMam(ip) => self.update_mam(ip),
+                Action::CheckMamConnectability => self.check_mam_connectability(),
+                Action::CheckDiskSpace => self.check_disk_space(),
+                Action::CheckNewTorrents => self.check_new_torrents(),
                 Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
             }
         }
@@ -163,11 +196,10 @@ impl<'a> ShellContext<'a> {
         let port_file = self.config.vpn_port_file.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                docker::read_port_files(&ip_file, &port_file)
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
+            let result =
+                tokio::task::spawn_blocking(move || docker::read_port_files(&ip_file, &port_file))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
             let _ = tx.send(Event::PortFileReadResult(result)).await;
         });
     }
@@ -256,8 +288,7 @@ impl<'a> ShellContext<'a> {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let current = session.lock().unwrap().clone();
-            let (event, new_session) =
-                mam::check_connectability_at(&client, &current, &url).await;
+            let (event, new_session) = mam::check_connectability_at(&client, &current, &url).await;
             if let Some(rotated) = new_session {
                 *session.lock().unwrap() = rotated;
             }

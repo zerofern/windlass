@@ -149,18 +149,15 @@ mod tests {
     async fn update_seedbox_success_returns_mam_update_success() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "Success": true,
-                    "msg": "No change",
-                    "ip": "79.127.184.201"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Success": true,
+                "msg": "No change",
+                "ip": "79.127.184.201"
+            })))
             .mount(&server)
             .await;
 
-        let (event, cookie) =
-            update_seedbox_at(&client(), "my_session", &server.uri()).await;
+        let (event, cookie) = update_seedbox_at(&client(), "my_session", &server.uri()).await;
         assert!(matches!(event, Event::MamUpdateSuccess));
         assert!(cookie.is_none());
     }
@@ -169,18 +166,15 @@ mod tests {
     async fn update_seedbox_asn_mismatch_returns_event_with_ip() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "Success": false,
-                    "msg": "Invalid session - ASN mismatch",
-                    "ip": "79.127.184.201"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Success": false,
+                "msg": "Invalid session - ASN mismatch",
+                "ip": "79.127.184.201"
+            })))
             .mount(&server)
             .await;
 
-        let (event, _) =
-            update_seedbox_at(&client(), "my_session", &server.uri()).await;
+        let (event, _) = update_seedbox_at(&client(), "my_session", &server.uri()).await;
         assert!(matches!(event, Event::MamAsnMismatch(ip) if ip.0.to_string() == "79.127.184.201"));
     }
 
@@ -200,8 +194,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, cookie) =
-            update_seedbox_at(&client(), "old_cookie", &server.uri()).await;
+        let (_, cookie) = update_seedbox_at(&client(), "old_cookie", &server.uri()).await;
         assert_eq!(cookie.as_deref(), Some("rotated_cookie"));
     }
 
@@ -210,18 +203,15 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(header_exists("cookie"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "Success": true,
-                    "msg": "No change",
-                    "ip": "79.127.184.201"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Success": true,
+                "msg": "No change",
+                "ip": "79.127.184.201"
+            })))
             .mount(&server)
             .await;
 
-        let (event, _) =
-            update_seedbox_at(&client(), "my_session", &server.uri()).await;
+        let (event, _) = update_seedbox_at(&client(), "my_session", &server.uri()).await;
         assert!(matches!(event, Event::MamUpdateSuccess));
     }
 
@@ -231,17 +221,14 @@ mod tests {
     async fn check_connectability_returns_true_when_connectable_yes() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "connectable": "yes",
-                    "username": "BrightVoyage"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "connectable": "yes",
+                "username": "BrightVoyage"
+            })))
             .mount(&server)
             .await;
 
-        let (event, _) =
-            check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
         assert!(matches!(event, Event::MamConnectabilityObserved(true)));
     }
 
@@ -249,17 +236,14 @@ mod tests {
     async fn check_connectability_returns_false_when_connectable_no() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "connectable": "no",
-                    "username": "BrightVoyage"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "connectable": "no",
+                "username": "BrightVoyage"
+            })))
             .mount(&server)
             .await;
 
-        let (event, _) =
-            check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
         assert!(matches!(event, Event::MamConnectabilityObserved(false)));
     }
 
@@ -274,8 +258,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) =
-            check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
         assert!(matches!(event, Event::MamConnectabilityObserved(false)));
     }
 
@@ -291,8 +274,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, cookie) =
-            check_connectability_at(&client(), "old_cookie", &server.uri()).await;
+        let (_, cookie) = check_connectability_at(&client(), "old_cookie", &server.uri()).await;
         assert_eq!(cookie.as_deref(), Some("new_cookie"));
     }
 
@@ -304,8 +286,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) =
-            check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
         assert!(matches!(event, Event::MamConnectabilityObserved(false)));
     }
 }

@@ -52,7 +52,14 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        send_alert(&client, &server.uri(), "my_token", AlertPriority::Warning, "disk low").await;
+        send_alert(
+            &client,
+            &server.uri(),
+            "my_token",
+            AlertPriority::Warning,
+            "disk low",
+        )
+        .await;
 
         // wiremock asserts all mounted mocks were called when the server drops
         server.verify().await;
@@ -69,14 +76,28 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        send_alert(&client, &server.uri(), "tok", AlertPriority::Critical, "vpn down").await;
+        send_alert(
+            &client,
+            &server.uri(),
+            "tok",
+            AlertPriority::Critical,
+            "vpn down",
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn send_alert_silently_ignores_network_errors() {
         // Fire-and-forget: a network failure must not panic or propagate.
         let client = reqwest::Client::new();
-        send_alert(&client, "http://127.0.0.1:1", "tok", AlertPriority::Info, "hi").await;
+        send_alert(
+            &client,
+            "http://127.0.0.1:1",
+            "tok",
+            AlertPriority::Info,
+            "hi",
+        )
+        .await;
         // reaching here means no panic
     }
 }

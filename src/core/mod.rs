@@ -49,18 +49,32 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
 
     match event {
         // ── Initialisation ────────────────────────────────────────────────
-        Event::Init { is_gluetun_healthy, port_files } => {
+        Event::Init {
+            is_gluetun_healthy,
+            port_files,
+        } => {
             info!(gluetun_healthy = is_gluetun_healthy, "initialising");
-            actions.push(Action::ScheduleWakeup(WakeupId::Heartbeat, HEARTBEAT_INTERVAL.into()));
-            actions.push(Action::ScheduleWakeup(WakeupId::DiskCheck, DISK_CHECK_INTERVAL.into()));
-            actions.push(Action::ScheduleWakeup(WakeupId::TorrentCheck, TORRENT_CHECK_INTERVAL.into()));
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::Heartbeat,
+                HEARTBEAT_INTERVAL.into(),
+            ));
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::DiskCheck,
+                DISK_CHECK_INTERVAL.into(),
+            ));
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::TorrentCheck,
+                TORRENT_CHECK_INTERVAL.into(),
+            ));
 
             if is_gluetun_healthy {
                 match port_files {
                     Ok((ip, port)) => {
                         info!(ip = %ip.0, port = port.into_inner(), "boot: VPN already up, fast-forwarding");
                         state.vpn = VpnState::Connected { ip, port };
-                        state.qbit = QbitState::Authenticating { attempt: RetryCount(0) };
+                        state.qbit = QbitState::Authenticating {
+                            attempt: RetryCount(0),
+                        };
                         actions.push(Action::AuthenticateQbit);
                     }
                     Err(e) => {
@@ -124,7 +138,11 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
         Event::PortFileReadResult(Ok((ip, port))) => {
             // No-op if content is identical to current state — the debounced
             // watcher sends this event on every write; the Core ignores no-change reads.
-            if let VpnState::Connected { ip: cur_ip, port: cur_port } = &state.vpn {
+            if let VpnState::Connected {
+                ip: cur_ip,
+                port: cur_port,
+            } = &state.vpn
+            {
                 if *cur_ip == ip && *cur_port == port {
                     debug!(ip = %ip.0, port = port.into_inner(), "VPN files read: no change");
                     return (state, actions);
@@ -139,20 +157,29 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
             }
 
             state.vpn = VpnState::Connected { ip, port };
-            state.qbit = QbitState::Authenticating { attempt: RetryCount(0) };
+            state.qbit = QbitState::Authenticating {
+                attempt: RetryCount(0),
+            };
             actions.push(Action::AuthenticateQbit);
         }
 
         Event::PortFileReadResult(Err(e)) => {
             debug!(err = %e, "VPN port files not ready — scheduling retry");
-            actions.push(Action::ScheduleWakeup(WakeupId::RetryPortRead, PORT_READ_RETRY_DELAY.into()));
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::RetryPortRead,
+                PORT_READ_RETRY_DELAY.into(),
+            ));
         }
 
         Event::QbitAuthSuccess(cookie) => {
             info!("qBittorrent authenticated");
             if let VpnState::Connected { port, .. } = &state.vpn {
                 let target = *port;
-                state.qbit = QbitState::SyncingPort { attempt: RetryCount(0), cookie: cookie.clone(), target };
+                state.qbit = QbitState::SyncingPort {
+                    attempt: RetryCount(0),
+                    cookie: cookie.clone(),
+                    target,
+                };
                 actions.push(Action::SyncQbitPort(cookie, target));
             } else {
                 state.qbit = QbitState::Authenticated { cookie };
@@ -180,10 +207,16 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
             error!("qBittorrent rejected credentials — check QBITTORRENT_USER / QBITTORRENT_PASS");
             actions.push(Action::SendGotifyAlert(
                 AlertPriority::Critical,
-                "🔐 qBittorrent rejected credentials. Check QBITTORRENT_USER / QBITTORRENT_PASS.".into(),
+                "🔐 qBittorrent rejected credentials. Check QBITTORRENT_USER / QBITTORRENT_PASS."
+                    .into(),
             ));
-            state.qbit = QbitState::Authenticating { attempt: RetryCount(0) };
-            actions.push(Action::ScheduleWakeup(WakeupId::QbitAuthRetry, QBIT_AUTH_BACKOFF_BASE.into()));
+            state.qbit = QbitState::Authenticating {
+                attempt: RetryCount(0),
+            };
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::QbitAuthRetry,
+                QBIT_AUTH_BACKOFF_BASE.into(),
+            ));
         }
 
         Event::QbitApiError(_) => {
@@ -192,7 +225,9 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                 _ => RetryCount(0),
             };
             let backoff = QBIT_AUTH_BACKOFF_BASE.exponential(attempt);
-            state.qbit = QbitState::Authenticating { attempt: attempt.increment() };
+            state.qbit = QbitState::Authenticating {
+                attempt: attempt.increment(),
+            };
             actions.push(Action::ScheduleWakeup(WakeupId::QbitAuthRetry, backoff));
         }
 
@@ -203,28 +238,45 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                     let ip = *ip;
                     info!(port = port.into_inner(), "qBittorrent port synced");
                     state.qbit = QbitState::Ready { port };
-                    state.mam = MamState::SyncPending { target_ip: ip, target_port: port };
+                    state.mam = MamState::SyncPending {
+                        target_ip: ip,
+                        target_port: port,
+                    };
                     actions.push(Action::UpdateMam(ip));
                 }
             }
         }
 
         Event::QbitPortSyncFailed(err_code) => {
-            if let QbitState::SyncingPort { attempt, cookie, target } = &state.qbit {
+            if let QbitState::SyncingPort {
+                attempt,
+                cookie,
+                target,
+            } = &state.qbit
+            {
                 let attempt = *attempt;
                 let cookie = cookie.clone();
                 let target = *target;
                 if attempt < QBIT_SYNC_RETRY_LIMIT {
-                    warn!(port = target.into_inner(), attempt = attempt.0, "qBittorrent port sync failed — retrying");
+                    warn!(
+                        port = target.into_inner(),
+                        attempt = attempt.0,
+                        "qBittorrent port sync failed — retrying"
+                    );
                     state.qbit = QbitState::SyncingPort {
                         attempt: attempt.increment(),
                         cookie,
                         target,
                     };
-                    actions.push(Action::ScheduleWakeup(WakeupId::QbitSyncRetry, QBIT_SYNC_BACKOFF.into()));
+                    actions.push(Action::ScheduleWakeup(
+                        WakeupId::QbitSyncRetry,
+                        QBIT_SYNC_BACKOFF.into(),
+                    ));
                 } else {
                     warn!(
-                        port = target.into_inner(), err_code, retries = attempt.0,
+                        port = target.into_inner(),
+                        err_code,
+                        retries = attempt.0,
                         "qBittorrent port sync failed at retry limit — re-authenticating"
                     );
                     actions.push(Action::SendGotifyAlert(
@@ -234,7 +286,9 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                             QBIT_SYNC_RETRY_LIMIT.0,
                         ),
                     ));
-                    state.qbit = QbitState::Authenticating { attempt: RetryCount(0) };
+                    state.qbit = QbitState::Authenticating {
+                        attempt: RetryCount(0),
+                    };
                     actions.push(Action::AuthenticateQbit);
                 }
             }
@@ -258,7 +312,10 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
             state.mam = MamState::AsnBlocked { ip };
             actions.push(Action::SendGotifyAlert(
                 AlertPriority::Critical,
-                format!("🚨 MAM ASN mismatch for {}. Log into MAM and whitelist the new IP manually.", ip.0),
+                format!(
+                    "🚨 MAM ASN mismatch for {}. Log into MAM and whitelist the new IP manually.",
+                    ip.0
+                ),
             ));
         }
 
@@ -266,7 +323,10 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
         Event::MamConnectabilityObserved(true) => {
             debug!(mam = %state.mam, "MAM reports connectable — heartbeat OK");
             state.hard_recoveries = RetryCount(0);
-            actions.push(Action::ScheduleWakeup(WakeupId::Heartbeat, HEARTBEAT_INTERVAL.into()));
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::Heartbeat,
+                HEARTBEAT_INTERVAL.into(),
+            ));
         }
 
         Event::MamConnectabilityObserved(false) => {
@@ -281,9 +341,14 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                 // Soft recovery: assume qBit dropped the port, re-trigger Workflow B.
                 QbitState::Ready { .. } | QbitState::Authenticated { .. } => {
                     info!("soft recovery: re-triggering qBit auth");
-                    state.qbit = QbitState::Authenticating { attempt: RetryCount(0) };
+                    state.qbit = QbitState::Authenticating {
+                        attempt: RetryCount(0),
+                    };
                     actions.push(Action::AuthenticateQbit);
-                    actions.push(Action::ScheduleWakeup(WakeupId::Heartbeat, HEARTBEAT_INTERVAL.into()));
+                    actions.push(Action::ScheduleWakeup(
+                        WakeupId::Heartbeat,
+                        HEARTBEAT_INTERVAL.into(),
+                    ));
                 }
                 // Soft recovery already in flight or qBit offline — escalate.
                 _ => {
@@ -292,7 +357,8 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
 
                     if recoveries >= HARD_RECOVERY_LIMIT {
                         error!(
-                            recoveries = recoveries.0, limit = HARD_RECOVERY_LIMIT.0,
+                            recoveries = recoveries.0,
+                            limit = HARD_RECOVERY_LIMIT.0,
                             "FATAL: hard recovery limit reached — manual intervention required"
                         );
                         state.run_mode = RunMode::Fatal {
@@ -304,7 +370,8 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                         ));
                     } else {
                         warn!(
-                            attempt = recoveries.0, limit = HARD_RECOVERY_LIMIT.0,
+                            attempt = recoveries.0,
+                            limit = HARD_RECOVERY_LIMIT.0,
                             "hard recovery: NAT frozen — restarting stack"
                         );
                         state.vpn = VpnState::DumpingLogs;
@@ -334,7 +401,10 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
             } else {
                 debug!(space_gib = format_args!("{gib:.1}"), "disk space OK");
             }
-            actions.push(Action::ScheduleWakeup(WakeupId::DiskCheck, DISK_CHECK_INTERVAL.into()));
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::DiskCheck,
+                DISK_CHECK_INTERVAL.into(),
+            ));
         }
 
         // Shell sends the raw full list; Core diffs against known_torrents and
@@ -356,15 +426,18 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                     format!("🧲 New torrent(s) added: {list}"),
                 ));
             }
-            actions.push(Action::ScheduleWakeup(WakeupId::TorrentCheck, TORRENT_CHECK_INTERVAL.into()));
+            actions.push(Action::ScheduleWakeup(
+                WakeupId::TorrentCheck,
+                TORRENT_CHECK_INTERVAL.into(),
+            ));
         }
 
         // ── Wakeup dispatch ───────────────────────────────────────────────
         Event::Wakeup(id) => match id {
-            WakeupId::Heartbeat      => actions.push(Action::CheckMamConnectability),
-            WakeupId::DiskCheck      => actions.push(Action::CheckDiskSpace),
-            WakeupId::TorrentCheck   => actions.push(Action::CheckNewTorrents),
-            WakeupId::QbitAuthRetry  => {
+            WakeupId::Heartbeat => actions.push(Action::CheckMamConnectability),
+            WakeupId::DiskCheck => actions.push(Action::CheckDiskSpace),
+            WakeupId::TorrentCheck => actions.push(Action::CheckNewTorrents),
+            WakeupId::QbitAuthRetry => {
                 if matches!(state.qbit, QbitState::Authenticating { .. }) {
                     actions.push(Action::AuthenticateQbit);
                 } else {
@@ -376,7 +449,7 @@ pub fn process_event(mut state: SystemState, event: Event) -> (SystemState, Vec<
                     actions.push(Action::SyncQbitPort(cookie.clone(), *target));
                 }
             }
-            WakeupId::RetryPortRead  => actions.push(Action::ReadPortFiles),
+            WakeupId::RetryPortRead => actions.push(Action::ReadPortFiles),
         },
     }
 

@@ -34,7 +34,9 @@ impl Config {
             qbit_url: var("QBITTORRENT_URL").context("QBITTORRENT_URL missing")?,
             qbit_user: var("QBITTORRENT_USER").context("QBITTORRENT_USER missing")?,
             qbit_pass: QbitPassword(SecretString::new(
-                var("QBITTORRENT_PASS").context("QBITTORRENT_PASS missing")?.into(),
+                var("QBITTORRENT_PASS")
+                    .context("QBITTORRENT_PASS missing")?
+                    .into(),
             )),
             mam_session: var("MAM_SESSION").context("MAM_SESSION missing")?,
             gotify_url: var("GOTIFY_URL").context("GOTIFY_URL missing")?,
@@ -47,10 +49,8 @@ impl Config {
                 "https://www.myanonamouse.net/jsonLoad.php?clientStats".to_string()
             }),
             data_path: var("DATA_PATH").unwrap_or_else(|_| "/mnt/Data".to_string()),
-            dump_dir: var("DUMP_DIR")
-                .unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),
-            vpn_ip_file: var("VPN_IP_FILE")
-                .unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),
+            dump_dir: var("DUMP_DIR").unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),
+            vpn_ip_file: var("VPN_IP_FILE").unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),
             vpn_port_file: var("VPN_PORT_FILE")
                 .unwrap_or_else(|_| "/tmp/gluetun/forwarded_port".to_string()),
         })
