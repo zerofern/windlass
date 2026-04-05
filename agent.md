@@ -80,22 +80,10 @@ wrapped in their newtype.
    and prop tests rely on equality. `nutype` types need these listed explicitly
    in `derive(...)`.
 
-### Existing types (`src/types.rs`)
+### Existing types
 
-| Type            | Wraps          | Notes                                                         |
-| --------------- | -------------- | ------------------------------------------------------------- |
-| `VpnIp`         | `Ipv4Addr`     | plain newtype, `pub` field                                    |
-| `VpnPort`       | `u16`          | nutype, validated 1–65535, private field — use `try_new()`    |
-| `AuthCookie`    | `String`       | qBittorrent SID cookie                                        |
-| `ContainerId`   | `String`       | Docker container ID                                           |
-| `ContainerName` | `String`       | Docker container name                                         |
-| `MamSessionId`  | `SecretString` | MAM session cookie — secret                                   |
-| `QbitPassword`  | `SecretString` | qBit WebUI password — secret                                  |
-| `RetryCount`    | `u8`           | saturating increment via `.increment()`                       |
-| `Interval`      | `Duration`     | recurring wakeup period                                       |
-| `Backoff`       | `Duration`     | one-shot retry delay; `.exponential(attempt)` for exp backoff |
-| `WakeupId`      | enum           | identifies which scheduled timer fired                        |
-| `AlertPriority` | enum           | `Info / Warning / Critical` mapped to Gotify priority         |
+All primitive domain types live in `src/types.rs`. Before adding a new type,
+read that file to see what already exists.
 
 ## Clippy
 
@@ -118,25 +106,13 @@ fields. The `#[allow]` is accompanied by a comment explaining why.
 
 ## Build & test
 
-The project uses [`just`](https://github.com/casey/just) as a task runner.
-
-```bash
-just build          # cargo build
-just test           # unit + mock HTTP + Tier 3 fs tests
-just test-all       # also runs Tier 4 Docker tests (needs Docker socket)
-just fmt            # cargo fmt
-just fmt-check      # check formatting without modifying
-just clippy         # cargo clippy -W pedantic -W nursery
-just check          # fmt-check + clippy + test
-just coverage       # cargo tarpaulin coverage report
-just integration    # full Docker Compose integration test
-```
+A `justfile` is at the repo root — always use `just` rather than bare `cargo`
+commands. Run `just` with no arguments to see all recipes.
 
 ### Before every commit
 
 Run `just check && just coverage`. Both must pass with zero warnings, zero test
-failures, and no regression in coverage before any commit is made. This is not
-optional.
+failures, and no coverage regression.
 
 ### Test tiers
 
@@ -149,20 +125,9 @@ optional.
 
 ### Coverage goal
 
-The project targets **100% coverage on all code that can be tested without a
-live Docker socket or external service**. That means Tiers 1–3 must cover
-everything in `core/` and the pure parts of `shell/`. Tier 4 and
-`shell/mod.rs` entry point are excluded from the coverage target because they
-require a full running stack.
-
-Check coverage with:
-
-```bash
-cargo tarpaulin --exclude-files "mlm/*" "mousehole/*" --ignore-tests
-```
-
-When adding new logic, add tests alongside it. Do not ship untested business
-logic.
+Target 100% on all code testable without a live Docker socket. Tiers 1–3 must
+cover everything in `core/` and the pure parts of `shell/`. When adding new
+logic, add tests alongside it.
 
 ## Key invariants — do not break these
 
@@ -218,28 +183,9 @@ testing: `MAM_SEEDBOX_URL`, `MAM_LOAD_URL` (override MAM endpoints),
 ## File layout
 
 ```
-src/
-  core/
-    mod.rs          ← process_event state machine
-    events.rs       ← Event enum
-    actions.rs      ← Action enum
-    types.rs        ← VpnState, QbitState, MamState, SystemState, domain types
-    tests.rs        ← deterministic unit tests
-    prop_tests.rs   ← proptest property tests
-  shell/
-    mod.rs          ← async event loop + action dispatcher
-    config.rs       ← Config struct (env vars)
-    docker.rs       ← bollard + inotify file watcher
-    qbit.rs         ← qBittorrent HTTP client
-    mam.rs          ← MAM seedbox HTTP client
-    gotify.rs       ← Gotify push notification client
-    monitors.rs     ← disk space check, torrent list
-  main.rs           ← entry point
-  types.rs          ← shared primitive types (VpnIp, VpnPort, AuthCookie, …)
-tests/
-  integration/
-    run.sh          ← two-scenario bash test runner
-    stubs/          ← WireMock stub mappings for qBit, Gotify, MAM
-Dockerfile          ← multi-stage build (rust builder + debian-slim runtime)
-docker-compose.test.yml ← integration test stack
+src/core/       ← pure state machine (events, actions, types, tests)
+src/shell/      ← async I/O (Docker, HTTP clients, config, event loop)
+src/types.rs    ← shared primitive newtypes
+src/main.rs     ← entry point
+tests/          ← integration test runner and WireMock stubs
 ```
