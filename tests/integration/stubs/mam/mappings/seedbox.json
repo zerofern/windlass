@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "GET",
+    "urlPath": "/json/dynamicSeedbox.php"
+  },
+  "response": {
+    "status": 200,
+    "jsonBody": {
+      "Success": true,
+      "msg": "No change",
+      "ip": "10.8.0.1",
+      "ASN": 212238,
+      "AS": "Datacamp Limited"
+    }
+  }
+}

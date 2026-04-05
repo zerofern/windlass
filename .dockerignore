@@ -1,0 +1,6 @@
+target/
+mlm/
+mousehole/
+*.zip
+proptest-regressions/
+.git/

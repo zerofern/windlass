@@ -1,0 +1,10 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/api/v2/torrents/info"
+  },
+  "response": {
+    "status": 200,
+    "jsonBody": []
+  }
+}

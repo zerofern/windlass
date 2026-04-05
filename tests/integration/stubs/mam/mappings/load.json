@@ -1,0 +1,13 @@
+{
+  "request": {
+    "method": "GET",
+    "urlPath": "/jsonLoad.php"
+  },
+  "response": {
+    "status": 200,
+    "jsonBody": {
+      "connectable": "yes",
+      "username": "BrightVoyage"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+target/
+mlm/
+mousehole/
+*.zip
+proptest-regressions/
+dynamicSeedbox.md
+load_user_data.md
+plan.md
