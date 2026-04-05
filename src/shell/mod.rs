@@ -17,7 +17,7 @@ use tracing::{debug, info};
 use uom::si::information::byte;
 
 use crate::core::{actions::Action, events::Event, process_event, types::SystemState};
-use crate::types::{AuthCookie, WakeupId};
+use crate::types::{AuthCookie, VpnIp, VpnPort, WakeupId};
 
 pub use config::Config;
 
@@ -87,250 +87,242 @@ pub async fn run() -> Result<()> {
         Event::Init { is_gluetun_healthy, port_files: boot_port_files },
     );
     state = new_state;
-    dispatch(
-        actions,
-        &config,
-        &docker,
-        &direct,
-        &vpn,
-        &mut wakeups,
-        &mam_session,
-        &dependents,
-        &mut cached_cookie,
-        &tx,
-    );
+    let mut ctx = ShellContext {
+        config: &config,
+        docker: &docker,
+        direct: &direct,
+        vpn: &vpn,
+        wakeups: &mut wakeups,
+        mam_session: &mam_session,
+        dependents: &dependents,
+        cached_cookie: &mut cached_cookie,
+        tx: &tx,
+    };
+    ctx.dispatch(actions);
 
     while let Some(event) = rx.recv().await {
         debug!(?event, "←");
         let (new_state, actions) = process_event(state, event);
         state = new_state;
-        dispatch(
-            actions,
-            &config,
-            &docker,
-            &direct,
-            &vpn,
-            &mut wakeups,
-            &mam_session,
-            &dependents,
-            &mut cached_cookie,
-            &tx,
-        );
+        let mut ctx = ShellContext {
+            config: &config,
+            docker: &docker,
+            direct: &direct,
+            vpn: &vpn,
+            wakeups: &mut wakeups,
+            mam_session: &mam_session,
+            dependents: &dependents,
+            cached_cookie: &mut cached_cookie,
+            tx: &tx,
+        };
+        ctx.dispatch(actions);
     }
 
     Ok(())
 }
 
-/// Dispatches every action produced by the Core in one synchronous pass.
-/// Side effects (HTTP, Docker, file I/O) are spawned as background tasks
-/// that send result events back through `tx`.
-#[allow(clippy::too_many_arguments)]
-fn dispatch(
-    actions: Vec<Action>,
-    config: &Config,
-    docker: &bollard::Docker,
-    direct: &reqwest::Client,
-    vpn: &reqwest::Client,
-    wakeups: &mut HashMap<WakeupId, JoinHandle<()>>,
-    mam_session: &Arc<Mutex<String>>,
-    dependents: &[String],
-    cached_cookie: &mut Option<AuthCookie>,
-    tx: &mpsc::Sender<Event>,
-) {
-    for action in actions {
-        dispatch_one(
-            action,
-            config,
-            docker,
-            direct,
-            vpn,
-            wakeups,
-            mam_session,
-            dependents,
-            cached_cookie,
-            tx,
-        );
-    }
+/// All shared shell state bundled together so action handlers don't need
+/// a long argument list.
+struct ShellContext<'a> {
+    config: &'a Config,
+    docker: &'a bollard::Docker,
+    direct: &'a reqwest::Client,
+    vpn: &'a reqwest::Client,
+    wakeups: &'a mut HashMap<WakeupId, JoinHandle<()>>,
+    mam_session: &'a Arc<Mutex<String>>,
+    dependents: &'a [String],
+    cached_cookie: &'a mut Option<AuthCookie>,
+    tx: &'a mpsc::Sender<Event>,
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-// dispatch_one is a match over every Action variant — one arm per action.
-// Splitting it would just scatter related code without reducing real complexity.
-fn dispatch_one(
-    action: Action,
-    config: &Config,
-    docker: &bollard::Docker,
-    direct: &reqwest::Client,
-    vpn: &reqwest::Client,
-    wakeups: &mut HashMap<WakeupId, JoinHandle<()>>,
-    mam_session: &Arc<Mutex<String>>,
-    dependents: &[String],
-    cached_cookie: &mut Option<AuthCookie>,
-    tx: &mpsc::Sender<Event>,
-) {
-    debug!(?action, "→");
-    match action {
-        // ── Timers ────────────────────────────────────────────────────────
-        Action::ScheduleWakeup(id, duration) => {
-            // Cancel any existing timer for this id before spawning a new one
-            // to prevent leaked duplicate wakeup loops.
-            if let Some(handle) = wakeups.remove(&id) {
-                handle.abort();
+impl ShellContext<'_> {
+    /// Dispatches every action produced by the Core in one synchronous pass.
+    fn dispatch(&mut self, actions: Vec<Action>) {
+        for action in actions {
+            debug!(?action, "→");
+            match action {
+                Action::ScheduleWakeup(id, duration)  => self.schedule_wakeup(id, duration),
+                Action::ReadPortFiles                  => self.read_port_files(),
+                Action::FetchAndDumpAllLogs            => self.fetch_and_dump_all_logs(),
+                Action::StopDependentContainers        => self.stop_dependent_containers(),
+                Action::StartDependentContainers       => self.start_dependent_containers(),
+                Action::RestartGluetun                 => self.restart_gluetun(),
+                Action::AuthenticateQbit               => self.authenticate_qbit(),
+                Action::SyncQbitPort(cookie, port)     => self.sync_qbit_port(cookie, port),
+                Action::UpdateMam(ip)                  => self.update_mam(ip),
+                Action::CheckMamConnectability         => self.check_mam_connectability(),
+                Action::CheckDiskSpace                 => self.check_disk_space(),
+                Action::CheckNewTorrents               => self.check_new_torrents(),
+                Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
             }
-            let tx = tx.clone();
-            let handle = tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
-                let _ = tx.send(Event::Wakeup(id)).await;
-            });
-            wakeups.insert(id, handle);
         }
+    }
 
-        // ── Port files (retry path only — watcher handles normal reads) ──
-        Action::ReadPortFiles => {
-            let ip_file = config.vpn_ip_file.clone();
-            let port_file = config.vpn_port_file.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    docker::read_port_files(&ip_file, &port_file)
-                })
+    // ── Timers ────────────────────────────────────────────────────────────────
+
+    fn schedule_wakeup(&mut self, id: WakeupId, duration: Duration) {
+        // Cancel any existing timer for this id to prevent duplicate wakeup loops.
+        if let Some(handle) = self.wakeups.remove(&id) {
+            handle.abort();
+        }
+        let tx = self.tx.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            let _ = tx.send(Event::Wakeup(id)).await;
+        });
+        self.wakeups.insert(id, handle);
+    }
+
+    // ── Port files ────────────────────────────────────────────────────────────
+
+    /// Retry path only — the debounced file watcher handles normal reads.
+    fn read_port_files(&self) {
+        let ip_file = self.config.vpn_ip_file.clone();
+        let port_file = self.config.vpn_port_file.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                docker::read_port_files(&ip_file, &port_file)
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            let _ = tx.send(Event::PortFileReadResult(result)).await;
+        });
+    }
+
+    // ── Docker ────────────────────────────────────────────────────────────────
+
+    fn fetch_and_dump_all_logs(&self) {
+        let docker = self.docker.clone();
+        let dump_dir = self.config.dump_dir.clone();
+        let deps = self.dependents.to_vec();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            docker::fetch_and_dump_logs(&docker, &dump_dir, &deps).await;
+            let _ = tx.send(Event::LogsDumped).await;
+        });
+    }
+
+    fn stop_dependent_containers(&self) {
+        let docker = self.docker.clone();
+        let deps = self.dependents.to_vec();
+        tokio::spawn(async move {
+            docker::stop_dependents(&docker, &deps).await;
+        });
+    }
+
+    fn start_dependent_containers(&self) {
+        let docker = self.docker.clone();
+        let deps = self.dependents.to_vec();
+        tokio::spawn(async move {
+            docker::start_dependents(&docker, &deps).await;
+        });
+    }
+
+    fn restart_gluetun(&self) {
+        let docker = self.docker.clone();
+        tokio::spawn(async move {
+            docker::restart_gluetun(&docker).await;
+        });
+    }
+
+    // ── qBittorrent ───────────────────────────────────────────────────────────
+
+    fn authenticate_qbit(&self) {
+        let client = self.direct.clone();
+        let url = self.config.qbit_url.clone();
+        let user = self.config.qbit_user.clone();
+        let pass = self.config.qbit_pass.0.expose_secret().to_owned();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let event = qbit::authenticate(&client, &url, &user, &pass).await;
+            let _ = tx.send(event).await;
+        });
+    }
+
+    fn sync_qbit_port(&mut self, cookie: AuthCookie, port: VpnPort) {
+        *self.cached_cookie = Some(cookie.clone());
+        let client = self.direct.clone();
+        let url = self.config.qbit_url.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let event = qbit::sync_port(&client, &url, &cookie, port).await;
+            let _ = tx.send(event).await;
+        });
+    }
+
+    // ── MAM ───────────────────────────────────────────────────────────────────
+
+    fn update_mam(&self, _ip: VpnIp) {
+        let client = self.vpn.clone();
+        let session = self.mam_session.clone();
+        let url = self.config.mam_seedbox_url.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let current = session.lock().unwrap().clone();
+            let (event, new_session) = mam::update_seedbox_at(&client, &current, &url).await;
+            if let Some(rotated) = new_session {
+                *session.lock().unwrap() = rotated;
+            }
+            let _ = tx.send(event).await;
+        });
+    }
+
+    fn check_mam_connectability(&self) {
+        let client = self.vpn.clone();
+        let session = self.mam_session.clone();
+        let url = self.config.mam_load_url.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let current = session.lock().unwrap().clone();
+            let (event, new_session) =
+                mam::check_connectability_at(&client, &current, &url).await;
+            if let Some(rotated) = new_session {
+                *session.lock().unwrap() = rotated;
+            }
+            let _ = tx.send(event).await;
+        });
+    }
+
+    // ── Monitoring ────────────────────────────────────────────────────────────
+
+    fn check_disk_space(&self) {
+        let path = self.config.data_path.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let space = tokio::task::spawn_blocking(move || monitors::check_disk_space(&path))
                 .await
-                .unwrap_or_else(|e| Err(e.to_string()));
-                let _ = tx.send(Event::PortFileReadResult(result)).await;
-            });
-        }
+                .unwrap_or_else(|_| uom::si::f64::Information::new::<byte>(f64::MAX));
+            let _ = tx.send(Event::DiskSpaceObserved(space)).await;
+        });
+    }
 
-        // ── Docker ────────────────────────────────────────────────────────
-        Action::FetchAndDumpAllLogs => {
-            let docker = docker.clone();
-            let dump_dir = config.dump_dir.clone();
-            let deps = dependents.to_vec();
-            let tx = tx.clone();
+    fn check_new_torrents(&mut self) {
+        let tx = self.tx.clone();
+        let Some(cookie) = self.cached_cookie.clone() else {
+            // qBit not yet authenticated — send empty so Core re-arms the timer.
             tokio::spawn(async move {
-                docker::fetch_and_dump_logs(&docker, &dump_dir, &deps).await;
-                let _ = tx.send(Event::LogsDumped).await;
+                let _ = tx.send(Event::NewTorrentsObserved(vec![])).await;
             });
-        }
+            return;
+        };
+        let client = self.direct.clone();
+        let url = self.config.qbit_url.clone();
+        tokio::spawn(async move {
+            // Shell sends the raw full list — Core owns the deduplication logic.
+            let current = qbit::list_torrents(&client, &url, &cookie).await;
+            let _ = tx.send(Event::NewTorrentsObserved(current)).await;
+        });
+    }
 
-        Action::StopDependentContainers => {
-            let docker = docker.clone();
-            let deps = dependents.to_vec();
-            tokio::spawn(async move {
-                docker::stop_dependents(&docker, &deps).await;
-            });
-        }
+    // ── Alerts ────────────────────────────────────────────────────────────────
 
-        Action::StartDependentContainers => {
-            let docker = docker.clone();
-            let deps = dependents.to_vec();
-            tokio::spawn(async move {
-                docker::start_dependents(&docker, &deps).await;
-            });
-        }
-
-        Action::RestartGluetun => {
-            let docker = docker.clone();
-            tokio::spawn(async move {
-                docker::restart_gluetun(&docker).await;
-            });
-        }
-
-        // ── qBittorrent ───────────────────────────────────────────────────
-        Action::AuthenticateQbit => {
-            let client = direct.clone();
-            let url = config.qbit_url.clone();
-            let user = config.qbit_user.clone();
-            let pass = config.qbit_pass.0.expose_secret().to_owned();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let event = qbit::authenticate(&client, &url, &user, &pass).await;
-                let _ = tx.send(event).await;
-            });
-        }
-
-        Action::SyncQbitPort(cookie, port) => {
-            *cached_cookie = Some(cookie.clone());
-            let client = direct.clone();
-            let url = config.qbit_url.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let event = qbit::sync_port(&client, &url, &cookie, port).await;
-                let _ = tx.send(event).await;
-            });
-        }
-
-        // ── MAM ───────────────────────────────────────────────────────────
-        Action::UpdateMam(_ip) => {
-            let client = vpn.clone();
-            let session = mam_session.clone();
-            let url = config.mam_seedbox_url.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let current = session.lock().unwrap().clone();
-                let (event, new_session) = mam::update_seedbox_at(&client, &current, &url).await;
-                if let Some(rotated) = new_session {
-                    *session.lock().unwrap() = rotated;
-                }
-                let _ = tx.send(event).await;
-            });
-        }
-
-        Action::CheckMamConnectability => {
-            let client = vpn.clone();
-            let session = mam_session.clone();
-            let url = config.mam_load_url.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let current = session.lock().unwrap().clone();
-                let (event, new_session) =
-                    mam::check_connectability_at(&client, &current, &url).await;
-                if let Some(rotated) = new_session {
-                    *session.lock().unwrap() = rotated;
-                }
-                let _ = tx.send(event).await;
-            });
-        }
-
-        // ── Monitoring ────────────────────────────────────────────────────
-        Action::CheckDiskSpace => {
-            let path = config.data_path.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let space = tokio::task::spawn_blocking(move || monitors::check_disk_space(&path))
-                    .await
-                    .unwrap_or_else(|_| uom::si::f64::Information::new::<byte>(f64::MAX));
-                let _ = tx.send(Event::DiskSpaceObserved(space)).await;
-            });
-        }
-
-        Action::CheckNewTorrents => {
-            let Some(cookie) = cached_cookie.clone() else {
-                // qBit not yet authenticated — send empty so Core re-arms the timer.
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(Event::NewTorrentsObserved(vec![])).await;
-                });
-                return;
-            };
-            let client = direct.clone();
-            let url = config.qbit_url.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                // Shell sends the raw full list — Core owns the deduplication logic.
-                let current = qbit::list_torrents(&client, &url, &cookie).await;
-                let _ = tx.send(Event::NewTorrentsObserved(current)).await;
-            });
-        }
-
-        // ── Alerts ────────────────────────────────────────────────────────
-        Action::SendGotifyAlert(priority, message) => {
-            let client = direct.clone();
-            let url = config.gotify_url.clone();
-            let token = config.gotify_token.clone();
-            tokio::spawn(async move {
-                gotify::send_alert(&client, &url, &token, priority, &message).await;
-            });
-        }
+    fn send_gotify_alert(&self, priority: crate::types::AlertPriority, message: String) {
+        let client = self.direct.clone();
+        let url = self.config.gotify_url.clone();
+        let token = self.config.gotify_token.clone();
+        tokio::spawn(async move {
+            gotify::send_alert(&client, &url, &token, priority, &message).await;
+        });
     }
 }
