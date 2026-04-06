@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// All stub mappings for the happy-path scenario (normal boot, everything works).
 pub fn happy_path_qbit() -> Vec<Value> {
@@ -45,12 +45,10 @@ pub fn happy_path_mam() -> Vec<Value> {
 }
 
 pub fn happy_path_gotify() -> Vec<Value> {
-    vec![
-        json!({
-            "request": { "method": "POST", "url": "/message" },
-            "response": { "status": 200, "jsonBody": { "id": 1 } }
-        }),
-    ]
+    vec![json!({
+        "request": { "method": "POST", "url": "/message" },
+        "response": { "status": 200, "jsonBody": { "id": 1 } }
+    })]
 }
 
 pub fn qbit_auth_fail() -> Vec<Value> {

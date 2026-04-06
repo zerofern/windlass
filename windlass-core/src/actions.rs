@@ -1,6 +1,6 @@
 use serde::Serialize;
-use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 use std::time::Duration;
+use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 
 mod serde_duration_secs {
     pub(super) fn serialize<S: serde::Serializer>(
@@ -20,7 +20,10 @@ pub enum Action {
     /// Sleep for `duration`, then emit `Wakeup(id)` into the event channel.
     /// The Shell MUST cancel any existing timer for the same `WakeupId` before
     /// spawning a new one to prevent timer leaks.
-    ScheduleWakeup(WakeupId, #[serde(serialize_with = "serde_duration_secs::serialize")] Duration),
+    ScheduleWakeup(
+        WakeupId,
+        #[serde(serialize_with = "serde_duration_secs::serialize")] Duration,
+    ),
 
     /// Read both `/tmp/gluetun/ip` and `/tmp/gluetun/forwarded_port`.
     /// Shell returns `PortFileReadResult(Ok/Err)`.

@@ -1,6 +1,6 @@
-use axum::{extract::State, routing::get, Json, Router};
-use serde_json::{json, Value};
 use crate::AppState;
+use axum::{Json, Router, extract::State, routing::get};
+use serde_json::{Value, json};
 
 /// Builds the router for liveness-probe and configuration endpoints.
 #[must_use = "pass to axum::serve or Router::merge"]

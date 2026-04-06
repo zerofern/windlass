@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 windlass-types = { workspace = true }
 windlass-core  = { workspace = true }
+windlass-debug = { workspace = true }
 axum           = { workspace = true }
 tokio          = { workspace = true }
 serde          = { workspace = true }

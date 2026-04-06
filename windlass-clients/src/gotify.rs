@@ -1,6 +1,8 @@
 use serde_json::json;
 use tracing::warn;
 
+use windlass_core::Observation;
+use windlass_debug::DebugController;
 use windlass_types::AlertPriority;
 
 /// Wraps a `reqwest::Client` together with the Gotify connection details.
@@ -10,15 +12,24 @@ pub struct GotifyClient {
     client: reqwest::Client,
     base_url: String,
     token: String,
+    debug_ctrl: DebugController,
 }
 
 impl GotifyClient {
     #[must_use]
-    pub const fn new(client: reqwest::Client, base_url: String, token: String) -> Self {
+    // DebugController wraps an Arc — cannot be const.
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(
+        client: reqwest::Client,
+        base_url: String,
+        token: String,
+        debug_ctrl: DebugController,
+    ) -> Self {
         Self {
             client,
             base_url,
             token,
+            debug_ctrl,
         }
     }
 
@@ -32,19 +43,38 @@ impl GotifyClient {
         };
 
         let url = format!("{}/message", self.base_url);
-        if let Err(e) = self
+        let req_body = json!({
+            "title": "Windlass",
+            "message": message,
+            "priority": gotify_priority,
+        });
+        let req_body_str = req_body.to_string();
+
+        match self
             .client
             .post(&url)
             .header("X-Gotify-Key", &self.token)
-            .json(&json!({
-                "title": "Windlass",
-                "message": message,
-                "priority": gotify_priority,
-            }))
+            .json(&req_body)
             .send()
             .await
         {
-            warn!("Gotify alert failed to send: {e}");
+            Err(e) => {
+                warn!("Gotify alert failed to send: {e}");
+            }
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                if let Some(tx) = self.debug_ctrl.obs_sender() {
+                    let _ = tx.send(Observation::HttpExchange {
+                        module: "gotify".into(),
+                        method: "POST".into(),
+                        url: url.clone(),
+                        request_body: Some(req_body_str),
+                        response_status: status,
+                        response_body: body,
+                    });
+                }
+            }
         }
     }
 }
@@ -52,6 +82,7 @@ impl GotifyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windlass_debug::DebugController;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -65,7 +96,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = GotifyClient::new(reqwest::Client::new(), server.uri(), "my_token".into());
+        let client = GotifyClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            "my_token".into(),
+            DebugController::new(),
+        );
         client.send_alert(AlertPriority::Warning, "disk low").await;
 
         // wiremock asserts all mounted mocks were called when the server drops
@@ -82,7 +118,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = GotifyClient::new(reqwest::Client::new(), server.uri(), "tok".into());
+        let client = GotifyClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            "tok".into(),
+            DebugController::new(),
+        );
         client.send_alert(AlertPriority::Critical, "vpn down").await;
     }
 
@@ -93,6 +134,7 @@ mod tests {
             reqwest::Client::new(),
             "http://127.0.0.1:1".into(),
             "tok".into(),
+            DebugController::new(),
         );
         client.send_alert(AlertPriority::Info, "hi").await;
         // reaching here means no panic

@@ -1,7 +1,7 @@
 use super::helpers::*;
 use crate::{actions::Action, events::Event, types::*};
-use windlass_types::{AlertPriority, HttpStatusCode, RetryCount, WakeupId};
 use std::time::Duration;
+use windlass_types::{AlertPriority, HttpStatusCode, RetryCount, WakeupId};
 
 #[test]
 fn connection_refused_is_ignored_when_not_authenticating() {

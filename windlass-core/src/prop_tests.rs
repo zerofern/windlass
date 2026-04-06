@@ -72,7 +72,10 @@ fn any_qbit_state() -> impl Strategy<Value = QbitState> {
                 target
             }
         ),
-        any_vpn_port().prop_map(|port| QbitState::Ready { port, cookie: AuthCookie("prop".into()) }),
+        any_vpn_port().prop_map(|port| QbitState::Ready {
+            port,
+            cookie: AuthCookie("prop".into())
+        }),
     ]
 }
 
@@ -186,7 +189,10 @@ fn any_synced_state() -> impl Strategy<Value = SystemState> {
                     ip: vpn_ip,
                     port: vpn_port,
                 },
-                qbit: QbitState::Ready { port: q_port, cookie: AuthCookie("prop".into()) },
+                qbit: QbitState::Ready {
+                    port: q_port,
+                    cookie: AuthCookie("prop".into()),
+                },
                 mam: MamState::Synced {
                     ip: mam_ip,
                     port: q_port,

@@ -2593,6 +2593,7 @@ dependencies = [
  "uom",
  "windlass-clients",
  "windlass-core",
+ "windlass-debug",
  "windlass-local",
  "windlass-types",
  "windlass-web",
@@ -2609,6 +2610,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windlass-core",
+ "windlass-debug",
  "windlass-types",
  "wiremock",
 ]
@@ -2622,6 +2624,16 @@ dependencies = [
  "tracing",
  "uom",
  "windlass-types",
+]
+
+[[package]]
+name = "windlass-debug"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "windlass-core",
 ]
 
 [[package]]
@@ -2681,6 +2693,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "windlass-core",
+ "windlass-debug",
  "windlass-types",
 ]
 

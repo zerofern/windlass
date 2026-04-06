@@ -5,7 +5,8 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use windlass_core::events::Event;
-use windlass_types::{DebugGate, MamStatus, VpnIp};
+use windlass_debug::DebugController;
+use windlass_types::{MamStatus, VpnIp};
 
 #[derive(Deserialize)]
 struct DynamicSeedboxResponse {
@@ -38,7 +39,7 @@ pub struct MamClient {
     seedbox_url: String,
     load_url: String,
     last_request_at: Arc<Mutex<Option<std::time::Instant>>>,
-    debug_gate: DebugGate,
+    debug_ctrl: DebugController,
 }
 
 impl MamClient {
@@ -50,7 +51,7 @@ impl MamClient {
         seedbox_url: String,
         load_url: String,
         user_agent: &str,
-        debug_gate: DebugGate,
+        debug_ctrl: DebugController,
     ) -> anyhow::Result<Self> {
         let builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -67,7 +68,7 @@ impl MamClient {
             seedbox_url,
             load_url,
             last_request_at: Arc::new(Mutex::new(None)),
-            debug_gate,
+            debug_ctrl,
         })
     }
 
@@ -138,11 +139,24 @@ impl MamClient {
             && t.elapsed() < std::time::Duration::from_millis(400)
         {
             warn!("MAM rate limit guard triggered — freezing system");
-            self.debug_gate.freeze();
+            self.debug_ctrl.freeze();
             return false;
         }
         *last = Some(std::time::Instant::now());
         true
+    }
+
+    fn emit_http(&self, url: &str, response_status: u16, response_body: &str) {
+        if let Some(tx) = self.debug_ctrl.obs_sender() {
+            let _ = tx.send(windlass_core::Observation::HttpExchange {
+                module: "mam".into(),
+                method: "GET".into(),
+                url: url.into(),
+                request_body: None,
+                response_status,
+                response_body: response_body.into(),
+            });
+        }
     }
 
     async fn do_update_seedbox(&self, session: &str) -> (Event, Option<String>) {
@@ -160,30 +174,35 @@ impl MamClient {
                 warn!("MAM seedbox update request failed: {e}");
                 (Event::MamUpdateSuccess, new_session)
             }
-            Ok(resp) => match resp.json::<DynamicSeedboxResponse>().await {
-                Ok(body) if body.success => {
-                    info!("MAM seedbox: {}", body.msg);
-                    (Event::MamUpdateSuccess, new_session)
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let raw = resp.text().await.unwrap_or_default();
+                self.emit_http(&self.seedbox_url, status, &raw);
+                match serde_json::from_str::<DynamicSeedboxResponse>(&raw) {
+                    Ok(body) if body.success => {
+                        info!("MAM seedbox: {}", body.msg);
+                        (Event::MamUpdateSuccess, new_session)
+                    }
+                    Ok(body) if body.msg.contains("ASN mismatch") => {
+                        let ip = body
+                            .ip
+                            .trim()
+                            .parse()
+                            .map(VpnIp)
+                            .unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
+                        warn!("MAM ASN mismatch: ip={}", ip.0);
+                        (Event::MamAsnMismatch(ip), new_session)
+                    }
+                    Ok(body) => {
+                        warn!("MAM seedbox non-success: {}", body.msg);
+                        (Event::MamUpdateSuccess, new_session)
+                    }
+                    Err(e) => {
+                        warn!("MAM seedbox response parse failed: {e}");
+                        (Event::MamUpdateSuccess, new_session)
+                    }
                 }
-                Ok(body) if body.msg.contains("ASN mismatch") => {
-                    let ip = body
-                        .ip
-                        .trim()
-                        .parse()
-                        .map(VpnIp)
-                        .unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
-                    warn!("MAM ASN mismatch: ip={}", ip.0);
-                    (Event::MamAsnMismatch(ip), new_session)
-                }
-                Ok(body) => {
-                    warn!("MAM seedbox non-success: {}", body.msg);
-                    (Event::MamUpdateSuccess, new_session)
-                }
-                Err(e) => {
-                    warn!("MAM seedbox response parse failed: {e}");
-                    (Event::MamUpdateSuccess, new_session)
-                }
-            },
+            }
         }
     }
 
@@ -206,14 +225,18 @@ impl MamClient {
                 )
             }
             Ok(resp) => {
-                if !resp.status().is_success() {
-                    warn!("MAM connectivity check HTTP {}", resp.status());
+                let status = resp.status();
+                if !status.is_success() {
+                    warn!("MAM connectivity check HTTP {}", status);
+                    self.emit_http(&self.load_url, status.as_u16(), "");
                     return (
                         Event::MamStatusObserved(MamStatus::Unreachable),
                         new_session,
                     );
                 }
-                match resp.json::<JsonLoadResponse>().await {
+                let raw = resp.text().await.unwrap_or_default();
+                self.emit_http(&self.load_url, status.as_u16(), &raw);
+                match serde_json::from_str::<JsonLoadResponse>(&raw) {
                     Ok(body) => {
                         let connectable = body
                             .connectable
@@ -223,12 +246,12 @@ impl MamClient {
                         if let Some(ref unsat) = body.unsat {
                             debug!("MAM unsat: {}/{}", unsat.count, unsat.limit);
                         }
-                        let status = if connectable {
+                        let mam_status = if connectable {
                             MamStatus::Connectable
                         } else {
                             MamStatus::NotConnectable
                         };
-                        (Event::MamStatusObserved(status), new_session)
+                        (Event::MamStatusObserved(mam_status), new_session)
                     }
                     Err(e) => {
                         warn!("MAM connectivity parse failed: {e}");
@@ -287,7 +310,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -312,7 +335,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -341,7 +364,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         mam.update_seedbox().await;
@@ -367,7 +390,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -393,7 +416,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         let event = mam.check_connectability().await;
@@ -420,7 +443,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         let event = mam.check_connectability().await;
@@ -447,7 +470,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         let event = mam.check_connectability().await;
@@ -475,7 +498,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         mam.check_connectability().await;
@@ -496,7 +519,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugGate::new(),
+            DebugController::new(),
         )
         .unwrap();
         let event = mam.check_connectability().await;

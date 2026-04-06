@@ -50,7 +50,28 @@ export interface SystemState {
 export type RustEvent = unknown
 export type RustAction = unknown
 
+export interface HttpExchange {
+  module: string
+  method: string
+  url: string
+  request_body?: string
+  response_status: number
+  response_body: string
+}
+
 export type Observation =
   | { type: "StateSnapshot"; data: SystemState }
   | { type: "EventReceived"; data: RustEvent }
   | { type: "ActionDispatched"; data: RustAction }
+  | { type: "HttpExchange"; data: HttpExchange }
+
+// ── Debug ─────────────────────────────────────────────────────────────────
+
+export interface DebugState {
+  frozen: boolean
+  debug_mode: boolean
+  pending_event: unknown | null
+  pending_actions: unknown[]
+  event_breakpoints: string[]
+  action_breakpoints: string[]
+}

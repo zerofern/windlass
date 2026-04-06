@@ -1,8 +1,8 @@
 use axum::{
     extract::State,
     response::{
-        sse::{Event as SseEvent, KeepAlive},
         Sse,
+        sse::{Event as SseEvent, KeepAlive},
     },
 };
 use futures_util::stream::{self, StreamExt};

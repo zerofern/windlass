@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Clone)]
 pub struct WireMockAdmin {
@@ -45,23 +45,22 @@ impl WireMockAdmin {
     /// Count requests matching a URL fragment.
     #[allow(dead_code)]
     pub async fn count_requests(&self, url_fragment: &str) -> anyhow::Result<usize> {
-        let resp: Value = self.client
+        let resp: Value = self
+            .client
             .get(format!("{}/requests", self.base))
             .send()
             .await?
             .json()
             .await?;
-        let count = resp["requests"]
-            .as_array()
-            .map_or(0, |arr| {
-                arr.iter()
-                    .filter(|r| {
-                        r["request"]["url"]
-                            .as_str()
-                            .is_some_and(|u| u.contains(url_fragment))
-                    })
-                    .count()
-            });
+        let count = resp["requests"].as_array().map_or(0, |arr| {
+            arr.iter()
+                .filter(|r| {
+                    r["request"]["url"]
+                        .as_str()
+                        .is_some_and(|u| u.contains(url_fragment))
+                })
+                .count()
+        });
         Ok(count)
     }
 
@@ -72,27 +71,26 @@ impl WireMockAdmin {
         url_fragment: &str,
         body_fragment: &str,
     ) -> anyhow::Result<usize> {
-        let resp: Value = self.client
+        let resp: Value = self
+            .client
             .get(format!("{}/requests", self.base))
             .send()
             .await?
             .json()
             .await?;
-        let count = resp["requests"]
-            .as_array()
-            .map_or(0, |arr| {
-                arr.iter()
-                    .filter(|r| {
-                        let url_ok = r["request"]["url"]
-                            .as_str()
-                            .is_some_and(|u| u.contains(url_fragment));
-                        let body_ok = r["request"]["body"]
-                            .as_str()
-                            .is_some_and(|b| b.contains(body_fragment));
-                        url_ok && body_ok
-                    })
-                    .count()
-            });
+        let count = resp["requests"].as_array().map_or(0, |arr| {
+            arr.iter()
+                .filter(|r| {
+                    let url_ok = r["request"]["url"]
+                        .as_str()
+                        .is_some_and(|u| u.contains(url_fragment));
+                    let body_ok = r["request"]["body"]
+                        .as_str()
+                        .is_some_and(|b| b.contains(body_fragment));
+                    url_ok && body_ok
+                })
+                .count()
+        });
         Ok(count)
     }
 }

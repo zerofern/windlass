@@ -4,50 +4,73 @@
 //! These tests are ignored by default so `cargo test` doesn't require Docker.
 //! The `just integration` recipe starts the stack, runs them, and tears down.
 
-use std::time::Duration;
 use reqwest::Client;
 use serde_json::Value;
+use std::time::Duration;
 
-const WINDLASS:     &str = "http://localhost:5010";
-const CHAOS:        &str = "http://localhost:9000";
-const GLUETUN_CTL:  &str = "http://localhost:9001";
-const QBIT_ADMIN:   &str = "http://localhost:18080/__admin";
+const WINDLASS: &str = "http://localhost:5010";
+const CHAOS: &str = "http://localhost:9000";
+const GLUETUN_CTL: &str = "http://localhost:9001";
+const QBIT_ADMIN: &str = "http://localhost:18080/__admin";
 const GOTIFY_ADMIN: &str = "http://localhost:18081/__admin";
-const MAM_ADMIN:    &str = "http://localhost:18082/__admin";
+const MAM_ADMIN: &str = "http://localhost:18082/__admin";
 
 async fn reset(client: &Client) {
-    client.post(format!("{CHAOS}/reset"))
-        .send().await.expect("chaos reset failed");
+    client
+        .post(format!("{CHAOS}/reset"))
+        .send()
+        .await
+        .expect("chaos reset failed");
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 async fn count_requests(client: &Client, admin: &str, url_fragment: &str) -> usize {
-    let resp: Value = client.get(format!("{admin}/requests"))
-        .send().await.unwrap()
-        .json().await.unwrap();
-    resp["requests"]
-        .as_array()
-        .map_or(0, |arr| arr.iter().filter(|r| {
-            r["request"]["url"].as_str()
-                .is_some_and(|u| u.contains(url_fragment))
-        }).count())
+    let resp: Value = client
+        .get(format!("{admin}/requests"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    resp["requests"].as_array().map_or(0, |arr| {
+        arr.iter()
+            .filter(|r| {
+                r["request"]["url"]
+                    .as_str()
+                    .is_some_and(|u| u.contains(url_fragment))
+            })
+            .count()
+    })
 }
 
 async fn count_requests_with_body(
-    client: &Client, admin: &str, url_fragment: &str, body_fragment: &str,
+    client: &Client,
+    admin: &str,
+    url_fragment: &str,
+    body_fragment: &str,
 ) -> usize {
-    let resp: Value = client.get(format!("{admin}/requests"))
-        .send().await.unwrap()
-        .json().await.unwrap();
-    resp["requests"]
-        .as_array()
-        .map_or(0, |arr| arr.iter().filter(|r| {
-            let url_ok = r["request"]["url"].as_str()
-                .is_some_and(|u| u.contains(url_fragment));
-            let body_ok = r["request"]["body"].as_str()
-                .is_some_and(|b| b.contains(body_fragment));
-            url_ok && body_ok
-        }).count())
+    let resp: Value = client
+        .get(format!("{admin}/requests"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    resp["requests"].as_array().map_or(0, |arr| {
+        arr.iter()
+            .filter(|r| {
+                let url_ok = r["request"]["url"]
+                    .as_str()
+                    .is_some_and(|u| u.contains(url_fragment));
+                let body_ok = r["request"]["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains(body_fragment));
+                url_ok && body_ok
+            })
+            .count()
+    })
 }
 
 /// Wait for a condition with timeout.
@@ -58,7 +81,9 @@ where
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        if f().await { return; }
+        if f().await {
+            return;
+        }
         if tokio::time::Instant::now() >= deadline {
             panic!("Timed out waiting for: {label}");
         }
@@ -72,8 +97,11 @@ where
 #[ignore = "requires dev stack"]
 async fn windlass_health_endpoint_returns_ok() {
     let client = Client::new();
-    let resp = client.get(format!("{WINDLASS}/api/v1/health"))
-        .send().await.expect("health request failed");
+    let resp = client
+        .get(format!("{WINDLASS}/api/v1/health"))
+        .send()
+        .await
+        .expect("health request failed");
     assert_eq!(resp.status(), 200);
 }
 
@@ -97,7 +125,8 @@ async fn boot_sequence_syncs_port_to_51820() {
     reset(&client).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let n = count_requests_with_body(&client, QBIT_ADMIN, "/api/v2/app/setPreferences", "51820").await;
+    let n =
+        count_requests_with_body(&client, QBIT_ADMIN, "/api/v2/app/setPreferences", "51820").await;
     assert!(n >= 1, "Port sync to 51820 not called (got {n})");
 }
 
@@ -130,26 +159,37 @@ async fn vpn_reconnect_resyncs_port() {
     reset(&client).await;
 
     // Simulate VPN reconnect with new port via gluetun control API
-    client.post("http://localhost:9001/set")
+    client
+        .post("http://localhost:9001/set")
         .json(&serde_json::json!({ "ip": "10.8.0.2", "port": 51821 }))
-        .send().await.expect("gluetun set failed");
+        .send()
+        .await
+        .expect("gluetun set failed");
 
     // Wait for Windlass to detect file change and re-sync
     wait_for("port re-sync to 51821", 30, || {
         let client = client.clone();
         async move {
-            count_requests_with_body(&client, QBIT_ADMIN, "/api/v2/app/setPreferences", "51821").await >= 1
+            count_requests_with_body(&client, QBIT_ADMIN, "/api/v2/app/setPreferences", "51821")
+                .await
+                >= 1
         }
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
 async fn windlass_state_endpoint_returns_system_state() {
     let client = Client::new();
-    let resp: Value = client.get(format!("{WINDLASS}/api/v1/operator/state"))
-        .send().await.expect("state request failed")
-        .json().await.expect("state parse failed");
+    let resp: Value = client
+        .get(format!("{WINDLASS}/api/v1/operator/state"))
+        .send()
+        .await
+        .expect("state request failed")
+        .json()
+        .await
+        .expect("state parse failed");
 
     assert!(resp.get("vpn").is_some(), "state missing 'vpn' field");
     assert!(resp.get("qbit").is_some(), "state missing 'qbit' field");
@@ -163,27 +203,41 @@ async fn qbit_auth_fail_scenario_causes_retry() {
     reset(&client).await;
 
     // Apply qbit-auth-fail scenario
-    client.post(format!("{CHAOS}/scenario/qbit-auth-fail"))
-        .send().await.expect("scenario request failed");
+    client
+        .post(format!("{CHAOS}/scenario/qbit-auth-fail"))
+        .send()
+        .await
+        .expect("scenario request failed");
 
     // Wait for Windlass to attempt auth and fail/retry
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     let n = count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await;
-    assert!(n >= 2, "Expected ≥2 auth attempts after auth-fail (got {n})");
+    assert!(
+        n >= 2,
+        "Expected ≥2 auth attempts after auth-fail (got {n})"
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
 async fn state_endpoint_includes_frozen_field() {
     let client = Client::new();
-    let resp: Value = client.get(format!("{WINDLASS}/api/v1/operator/state"))
-        .send().await.expect("state request failed")
-        .json().await.expect("state parse failed");
+    let resp: Value = client
+        .get(format!("{WINDLASS}/api/v1/operator/state"))
+        .send()
+        .await
+        .expect("state request failed")
+        .json()
+        .await
+        .expect("state parse failed");
 
     assert!(resp.get("frozen").is_some(), "state missing 'frozen' field");
     assert_eq!(resp["frozen"], false, "'frozen' should be false at rest");
-    assert!(resp.get("state").is_some(), "state missing nested 'state' field");
+    assert!(
+        resp.get("state").is_some(),
+        "state missing nested 'state' field"
+    );
 }
 
 #[tokio::test]
@@ -196,18 +250,20 @@ async fn manual_reset_re_authenticates_qbit() {
     let before = count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await;
 
     // Trigger manual reset
-    let status = client.post(format!("{WINDLASS}/api/v1/operator/reset"))
-        .send().await.expect("reset request failed")
+    let status = client
+        .post(format!("{WINDLASS}/api/v1/operator/reset"))
+        .send()
+        .await
+        .expect("reset request failed")
         .status();
     assert_eq!(status.as_u16(), 202, "reset should return 202 Accepted");
 
     // Wait for re-authentication
     wait_for("qBit re-authentication after manual reset", 15, || {
         let client = client.clone();
-        async move {
-            count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await > before
-        }
-    }).await;
+        async move { count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await > before }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -220,9 +276,12 @@ async fn vpn_reconnect_updates_mam_with_new_ip() {
     let before_mam = count_requests(&client, MAM_ADMIN, "/json/dynamicSeedbox.php").await;
 
     // Simulate VPN reconnect with a different IP
-    client.post(format!("{GLUETUN_CTL}/set"))
+    client
+        .post(format!("{GLUETUN_CTL}/set"))
         .json(&serde_json::json!({ "ip": "10.8.0.9", "port": 51829 }))
-        .send().await.expect("gluetun set failed");
+        .send()
+        .await
+        .expect("gluetun set failed");
 
     // Wait for MAM to be called after the IP change
     wait_for("MAM update after IP change to 10.8.0.9", 30, || {
@@ -231,12 +290,16 @@ async fn vpn_reconnect_updates_mam_with_new_ip() {
         async move {
             count_requests(&client, MAM_ADMIN, "/json/dynamicSeedbox.php").await > before_count
         }
-    }).await;
+    })
+    .await;
 
     // Restore original IP for subsequent tests
-    client.post(format!("{GLUETUN_CTL}/set"))
+    client
+        .post(format!("{GLUETUN_CTL}/set"))
         .json(&serde_json::json!({ "ip": "10.8.0.1", "port": 51820 }))
-        .send().await.expect("gluetun restore failed");
+        .send()
+        .await
+        .expect("gluetun restore failed");
 }
 
 #[tokio::test]
@@ -257,13 +320,21 @@ async fn gluetun_death_triggers_recovery_to_ready() {
     wait_for("recovery to Ready after gluetun death", 60, || {
         let client = client.clone();
         async move {
-            let Ok(resp) = client.get(format!("{WINDLASS}/api/v1/operator/state"))
-                .send().await else { return false; };
-            let Ok(body): Result<Value, _> = resp.json().await else { return false; };
+            let Ok(resp) = client
+                .get(format!("{WINDLASS}/api/v1/operator/state"))
+                .send()
+                .await
+            else {
+                return false;
+            };
+            let Ok(body): Result<Value, _> = resp.json().await else {
+                return false;
+            };
             body["state"]["qbit"].get("Ready").is_some()
                 && body["state"]["mam"].get("Synced").is_some()
         }
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -276,19 +347,33 @@ async fn mam_rate_limit_scenario_does_not_break_recovery() {
     reset(&client).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    client.post(format!("{CHAOS}/scenario/mam-rate-limit"))
-        .send().await.expect("scenario request failed");
+    client
+        .post(format!("{CHAOS}/scenario/mam-rate-limit"))
+        .send()
+        .await
+        .expect("scenario request failed");
 
     // Trigger a manual reset so MAM update runs
-    client.post(format!("{WINDLASS}/api/v1/operator/reset"))
-        .send().await.expect("reset failed");
+    client
+        .post(format!("{WINDLASS}/api/v1/operator/reset"))
+        .send()
+        .await
+        .expect("reset failed");
 
     // Wait and confirm Windlass remains in Active run_mode (not Fatal)
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    let resp: Value = client.get(format!("{WINDLASS}/api/v1/operator/state"))
-        .send().await.expect("state request failed")
-        .json().await.expect("parse failed");
+    let resp: Value = client
+        .get(format!("{WINDLASS}/api/v1/operator/state"))
+        .send()
+        .await
+        .expect("state request failed")
+        .json()
+        .await
+        .expect("parse failed");
 
-    assert_eq!(resp["state"]["run_mode"], "Active", "Windlass should stay Active under MAM 429s");
+    assert_eq!(
+        resp["state"]["run_mode"], "Active",
+        "Windlass should stay Active under MAM 429s"
+    );
 }

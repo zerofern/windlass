@@ -11,10 +11,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uom::si::information::byte;
 
-use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
-use windlass_local::{docker, monitors, vpn_files};
 use windlass_clients::{gotify, mam, qbit};
+use windlass_core::{actions::Action, events::Event, types::SystemState};
+use windlass_debug::DebugController;
+use windlass_local::{docker, monitors, vpn_files};
+use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 
 pub use config::Config;
 
@@ -32,7 +33,13 @@ pub async fn run() -> Result<()> {
 
     info!("Windlass started");
 
-    let debug_gate = windlass_types::DebugGate::new();
+    let debug_ctrl = DebugController::new();
+
+    // Enable debug mode at startup if the env var is set.
+    if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
+        // obs_tx isn't built yet — enable after the broadcast channel is created below.
+        info!("DEBUG_MODE_ON_START=true — debug mode will be enabled at startup");
+    }
 
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -43,6 +50,7 @@ pub async fn run() -> Result<()> {
         config.qbit_url.clone(),
         config.qbit_user.clone(),
         config.qbit_pass.0.expose_secret().to_owned(),
+        debug_ctrl.clone(),
     );
     let mam = mam::MamClient::new(
         config.gluetun_proxy_url.as_deref(),
@@ -50,12 +58,13 @@ pub async fn run() -> Result<()> {
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
         &config.mam_user_agent,
-        debug_gate.clone(),
+        debug_ctrl.clone(),
     )?;
     let gotify = gotify::GotifyClient::new(
         direct.clone(),
         config.gotify_url.clone(),
         config.gotify_token.clone(),
+        debug_ctrl.clone(),
     );
 
     let vpn_ip_file = config.vpn_ip_file.clone();
@@ -64,15 +73,19 @@ pub async fn run() -> Result<()> {
 
     let shared_state = Arc::new(tokio::sync::RwLock::new(SystemState::initial()));
     let (obs_tx, _) = tokio::sync::broadcast::channel::<windlass_core::Observation>(256);
+
+    if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
+        debug_ctrl.enable_debug(obs_tx.clone());
+        info!("Debug mode enabled");
+    }
     let app_state = windlass_web::AppState {
         event_tx: tx.clone(),
         state: shared_state.clone(),
-        debug_gate: debug_gate.clone(),
+        debug_ctrl: debug_ctrl.clone(),
         observations: obs_tx.clone(),
         chaos_url: std::env::var("CHAOS_URL").ok(),
     };
-    let bind_addr = std::env::var("WINDLASS_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:5010".to_string());
+    let bind_addr = std::env::var("WINDLASS_BIND").unwrap_or_else(|_| "0.0.0.0:5010".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(addr = %bind_addr, "HTTP server listening");
     tokio::spawn(async move {
@@ -95,9 +108,6 @@ pub async fn run() -> Result<()> {
     state = new_state;
     *shared_state.write().await = state.clone();
     let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
-    for action in &actions {
-        let _ = obs_tx.send(windlass_core::Observation::ActionDispatched(action.clone()));
-    }
     ShellContext {
         docker: &docker,
         qbit: &qbit,
@@ -109,13 +119,16 @@ pub async fn run() -> Result<()> {
         vpn_ip_file: &vpn_ip_file,
         vpn_port_file: &vpn_port_file,
         data_path: &data_path,
+        debug_ctrl: &debug_ctrl,
+        obs_tx: &obs_tx,
     }
-    .dispatch(actions);
+    .dispatch(actions)
+    .await;
 
     while let Some(event) = rx.recv().await {
         debug!(?event, "←");
 
-        if debug_gate.is_frozen() {
+        if debug_ctrl.is_frozen() {
             debug!(?event, "system frozen: dropping event");
             continue;
         }
@@ -132,15 +145,28 @@ pub async fn run() -> Result<()> {
             continue;
         }
 
+        // Pause if debug mode is on or the event variant has a breakpoint.
+        // The event is pushed to the queue (visible via GET /debug) then we wait
+        // for a step permit from POST /debug/step/event before continuing.
+        let event = if debug_ctrl.should_pause_on_event(event_variant(&event)) {
+            debug_ctrl.enqueue_event(event.clone());
+            let _ = obs_tx.send(windlass_core::Observation::EventReceived(event));
+            debug_ctrl.acquire_event_step().await;
+            match debug_ctrl.dequeue_event() {
+                Some(e) => e,
+                // Disabled while paused — discard and fetch the next event.
+                None => continue,
+            }
+        } else {
+            event
+        };
+
         let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
         let (new_state, actions) = state.process_event(event);
         state = new_state;
         *shared_state.write().await = state.clone();
         let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
-        for action in &actions {
-            let _ = obs_tx.send(windlass_core::Observation::ActionDispatched(action.clone()));
-        }
         ShellContext {
             docker: &docker,
             qbit: &qbit,
@@ -152,8 +178,11 @@ pub async fn run() -> Result<()> {
             vpn_ip_file: &vpn_ip_file,
             vpn_port_file: &vpn_port_file,
             data_path: &data_path,
+            debug_ctrl: &debug_ctrl,
+            obs_tx: &obs_tx,
         }
-        .dispatch(actions);
+        .dispatch(actions)
+        .await;
     }
 
     Ok(())
@@ -172,13 +201,41 @@ struct ShellContext<'a> {
     vpn_ip_file: &'a str,
     vpn_port_file: &'a str,
     data_path: &'a str,
+    debug_ctrl: &'a DebugController,
+    obs_tx: &'a tokio::sync::broadcast::Sender<windlass_core::Observation>,
 }
 
 impl ShellContext<'_> {
-    /// Dispatches every action produced by the Core in one synchronous pass.
-    fn dispatch(&mut self, actions: Vec<Action>) {
+    /// Dispatches every action produced by the Core.
+    /// In debug mode (or when an action variant has a breakpoint) the action is
+    /// queued and waits for a step permit from `POST /debug/step/action`.
+    async fn dispatch(&mut self, actions: Vec<Action>) {
         for action in actions {
             debug!(?action, "→");
+
+            // Pause if debug mode is on or this action variant has a breakpoint.
+            let action = if self
+                .debug_ctrl
+                .should_pause_on_action(action_variant(&action))
+            {
+                self.debug_ctrl.enqueue_action(action.clone());
+                let _ = self
+                    .obs_tx
+                    .send(windlass_core::Observation::ActionDispatched(action));
+                self.debug_ctrl.acquire_action_step().await;
+                match self.debug_ctrl.dequeue_action() {
+                    Some(a) => a,
+                    // Debug disabled while paused — skip this action.
+                    None => continue,
+                }
+            } else {
+                action
+            };
+
+            let _ = self
+                .obs_tx
+                .send(windlass_core::Observation::ActionDispatched(action.clone()));
+
             match action {
                 Action::ScheduleWakeup(id, duration) => self.schedule_wakeup(id, duration),
                 Action::ReadPortFiles => self.read_port_files(),
@@ -334,5 +391,52 @@ impl ShellContext<'_> {
         tokio::spawn(async move {
             gotify.send_alert(priority, &message).await;
         });
+    }
+}
+
+// ── Variant name helpers ──────────────────────────────────────────────────────
+
+/// Returns the variant name of an [`Event`] as a static string.
+/// Used to look up breakpoints without heap allocation.
+const fn event_variant(event: &Event) -> &'static str {
+    match event {
+        Event::Init { .. } => "Init",
+        Event::ManualReset => "ManualReset",
+        Event::DockerGluetunDied => "DockerGluetunDied",
+        Event::DockerGluetunHealthy => "DockerGluetunHealthy",
+        Event::PortFileReadResult(_) => "PortFileReadResult",
+        Event::QbitAuthSuccess(_) => "QbitAuthSuccess",
+        Event::QbitAuthFailed => "QbitAuthFailed",
+        Event::QbitConnectionRefused => "QbitConnectionRefused",
+        Event::QbitApiError(_) => "QbitApiError",
+        Event::QbitPortSyncSuccess => "QbitPortSyncSuccess",
+        Event::QbitPortSyncFailed(_) => "QbitPortSyncFailed",
+        Event::MamUpdateSuccess => "MamUpdateSuccess",
+        Event::MamAsnMismatch(_) => "MamAsnMismatch",
+        Event::MamStatusObserved(_) => "MamStatusObserved",
+        Event::DiskSpaceObserved(_) => "DiskSpaceObserved",
+        Event::NewTorrentsObserved(_) => "NewTorrentsObserved",
+        Event::LogsDumped => "LogsDumped",
+        Event::Wakeup(_) => "Wakeup",
+        Event::MamRateLimitViolation => "MamRateLimitViolation",
+    }
+}
+
+/// Returns the variant name of an [`Action`] as a static string.
+const fn action_variant(action: &Action) -> &'static str {
+    match action {
+        Action::ScheduleWakeup(_, _) => "ScheduleWakeup",
+        Action::ReadPortFiles => "ReadPortFiles",
+        Action::FetchAndDumpAllLogs => "FetchAndDumpAllLogs",
+        Action::StopDependentContainers => "StopDependentContainers",
+        Action::StartDependentContainers => "StartDependentContainers",
+        Action::RestartGluetun => "RestartGluetun",
+        Action::AuthenticateQbit => "AuthenticateQbit",
+        Action::SyncQbitPort(_, _) => "SyncQbitPort",
+        Action::UpdateMam(_) => "UpdateMam",
+        Action::CheckMamConnectability => "CheckMamConnectability",
+        Action::CheckDiskSpace => "CheckDiskSpace",
+        Action::CheckNewTorrents(_) => "CheckNewTorrents",
+        Action::SendGotifyAlert(_, _) => "SendGotifyAlert",
     }
 }

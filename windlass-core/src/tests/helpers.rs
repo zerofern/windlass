@@ -1,6 +1,6 @@
 use crate::types::*;
-use windlass_types::{AuthCookie, VpnIp, VpnPort};
 use std::net::Ipv4Addr;
+use windlass_types::{AuthCookie, VpnIp, VpnPort};
 
 pub fn ip() -> VpnIp {
     VpnIp(Ipv4Addr::new(10, 8, 0, 1))
@@ -20,7 +20,10 @@ pub fn connected_state() -> SystemState {
             ip: ip(),
             port: port(),
         },
-        qbit: QbitState::Ready { port: port(), cookie: cookie() },
+        qbit: QbitState::Ready {
+            port: port(),
+            cookie: cookie(),
+        },
         mam: MamState::Synced {
             port: port(),
             ip: ip(),

@@ -1,7 +1,7 @@
 use crate::{actions::Action, events::Event, types::*};
-use windlass_types::{AlertPriority, TorrentName, WakeupId};
 use uom::si::f64::Information;
 use uom::si::information::gigabyte;
+use windlass_types::{AlertPriority, TorrentName, WakeupId};
 
 #[test]
 fn low_disk_space_sends_alert() {

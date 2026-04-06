@@ -1,6 +1,7 @@
-use axum::Router;
 use crate::AppState;
+use axum::Router;
 
+mod debug;
 mod health;
 mod operator;
 mod stream;
@@ -11,5 +12,6 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(health::router(state.clone()))
         .merge(operator::router(state.clone()))
-        .merge(stream::router(state))
+        .merge(stream::router(state.clone()))
+        .merge(debug::router(state))
 }

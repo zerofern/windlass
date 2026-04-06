@@ -13,12 +13,12 @@ mod tests;
 #[cfg(test)]
 mod prop_tests;
 
-use windlass_types::{AlertPriority, Backoff, Interval, MamStatus, RetryCount, WakeupId};
 use actions::Action;
 use events::Event;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use types::{MamState, QbitState, RunMode, SystemState, VpnState};
+use windlass_types::{AlertPriority, Backoff, Interval, MamStatus, RetryCount, WakeupId};
 
 const HARD_RECOVERY_LIMIT: RetryCount = RetryCount(3);
 const QBIT_SYNC_RETRY_LIMIT: RetryCount = RetryCount(3);
@@ -472,7 +472,9 @@ impl SystemState {
 
             Event::MamRateLimitViolation => {
                 // Handled by the shell event loop before reaching the core.
-                warn!("MamRateLimitViolation reached core — this should be intercepted by the shell");
+                warn!(
+                    "MamRateLimitViolation reached core — this should be intercepted by the shell"
+                );
             }
         }
 

@@ -1,20 +1,20 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use crate::scenarios;
+use crate::wiremock_admin::WireMockAdmin;
 use axum::{
+    Json, Router,
     extract::{Path, State},
     routing::{get, post},
-    Json, Router,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use crate::wiremock_admin::WireMockAdmin;
-use crate::scenarios;
 
 #[derive(Clone)]
 pub struct ChaosState {
-    pub qbit:   WireMockAdmin,
-    pub mam:    WireMockAdmin,
+    pub qbit: WireMockAdmin,
+    pub mam: WireMockAdmin,
     pub gotify: WireMockAdmin,
     /// Currently active scenario IDs (empty = happy path).
     pub active: Arc<RwLock<HashSet<String>>>,
@@ -22,8 +22,8 @@ pub struct ChaosState {
 
 pub async fn run(qbit_admin: &str, mam_admin: &str, gotify_admin: &str) -> anyhow::Result<()> {
     let state = Arc::new(ChaosState {
-        qbit:   WireMockAdmin::new(qbit_admin),
-        mam:    WireMockAdmin::new(mam_admin),
+        qbit: WireMockAdmin::new(qbit_admin),
+        mam: WireMockAdmin::new(mam_admin),
         gotify: WireMockAdmin::new(gotify_admin),
         active: Arc::new(RwLock::new(HashSet::new())),
     });
@@ -46,9 +46,15 @@ pub async fn run(qbit_admin: &str, mam_admin: &str, gotify_admin: &str) -> anyho
 }
 
 async fn apply_happy_path(state: &ChaosState) -> anyhow::Result<()> {
-    state.qbit.set_mappings(scenarios::happy_path_qbit()).await?;
+    state
+        .qbit
+        .set_mappings(scenarios::happy_path_qbit())
+        .await?;
     state.mam.set_mappings(scenarios::happy_path_mam()).await?;
-    state.gotify.set_mappings(scenarios::happy_path_gotify()).await?;
+    state
+        .gotify
+        .set_mappings(scenarios::happy_path_gotify())
+        .await?;
     state.qbit.reset_requests().await?;
     state.mam.reset_requests().await?;
     state.gotify.reset_requests().await?;

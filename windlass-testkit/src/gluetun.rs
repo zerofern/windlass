@@ -1,7 +1,7 @@
+use axum::{Json, Router, extract::State, routing::post};
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use axum::{extract::State, routing::post, Json, Router};
-use serde::Deserialize;
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
@@ -48,9 +48,7 @@ async fn set_handler(
     axum::http::StatusCode::OK
 }
 
-async fn clear_port_handler(
-    State(s): State<Arc<RwLock<GluetunState>>>,
-) -> axum::http::StatusCode {
+async fn clear_port_handler(State(s): State<Arc<RwLock<GluetunState>>>) -> axum::http::StatusCode {
     let port_file = s.read().await.port_file.clone();
     let _ = tokio::fs::write(&port_file, "").await;
     tracing::info!("Gluetun: cleared port file");

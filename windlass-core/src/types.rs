@@ -1,7 +1,7 @@
-use windlass_types::{AuthCookie, RetryCount, TorrentName, VpnIp, VpnPort};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
-use serde::Serialize;
+use windlass_types::{AuthCookie, RetryCount, TorrentName, VpnIp, VpnPort};
 
 /// Serializes any value as the string `"[redacted]"`.
 mod redact {

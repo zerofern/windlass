@@ -1,7 +1,9 @@
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use windlass_core::Observation;
 use windlass_core::events::Event;
+use windlass_debug::DebugController;
 use windlass_types::{AuthCookie, HttpStatusCode, TorrentName, VpnPort};
 
 #[derive(Deserialize)]
@@ -17,21 +19,46 @@ pub struct QbitClient {
     base_url: String,
     user: String,
     pass: String,
+    debug_ctrl: DebugController,
 }
 
 impl QbitClient {
     #[must_use]
-    pub const fn new(
+    // DebugController wraps an Arc — cannot be const.
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(
         client: reqwest::Client,
         base_url: String,
         user: String,
         pass: String,
+        debug_ctrl: DebugController,
     ) -> Self {
         Self {
             client,
             base_url,
             user,
             pass,
+            debug_ctrl,
+        }
+    }
+
+    fn emit_http(
+        &self,
+        method: &str,
+        url: &str,
+        request_body: Option<String>,
+        response_status: u16,
+        response_body: &str,
+    ) {
+        if let Some(tx) = self.debug_ctrl.obs_sender() {
+            let _ = tx.send(Observation::HttpExchange {
+                module: "qbit".into(),
+                method: method.into(),
+                url: url.into(),
+                request_body,
+                response_status,
+                response_body: response_body.into(),
+            });
         }
     }
 
@@ -58,6 +85,7 @@ impl QbitClient {
                 let status = resp.status();
                 let sid = extract_sid_cookie(&resp);
                 let body = resp.text().await.unwrap_or_default();
+                self.emit_http("POST", &url, None, status.as_u16(), &body);
 
                 if status.is_success() && body.trim() == "Ok." {
                     let Some(cookie) = sid else {
@@ -80,12 +108,12 @@ impl QbitClient {
     /// Updates qBittorrent's listen port via the preferences API.
     pub async fn sync_port(&self, cookie: &AuthCookie, port: VpnPort) -> Event {
         let url = format!("{}/api/v2/app/setPreferences", self.base_url);
-        let body = format!(r#"{{"listen_port":"{}"}}"#, port.into_inner());
+        let req_body = format!(r#"{{"listen_port":"{}"}}"#, port.into_inner());
         match self
             .client
             .post(&url)
             .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
-            .form(&[("json", &body)])
+            .form(&[("json", &req_body)])
             .send()
             .await
         {
@@ -95,6 +123,8 @@ impl QbitClient {
             }
             Ok(resp) => {
                 let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                self.emit_http("POST", &url, Some(req_body), status.as_u16(), &body);
                 if status.is_success() {
                     debug!("qBit port sync success");
                     Event::QbitPortSyncSuccess
@@ -149,6 +179,7 @@ fn extract_sid_cookie(resp: &reqwest::Response) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windlass_debug::DebugController;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -172,6 +203,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let event = qbit.authenticate().await;
         assert!(
@@ -194,6 +226,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let event = qbit.authenticate().await;
         assert!(matches!(event, Event::QbitAuthFailed));
@@ -213,6 +246,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "wrong_pass".into(),
+            DebugController::new(),
         );
         let event = qbit.authenticate().await;
         assert!(matches!(event, Event::QbitAuthFailed));
@@ -226,6 +260,7 @@ mod tests {
             "http://127.0.0.1:1".into(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let event = qbit.authenticate().await;
         assert!(matches!(event, Event::QbitConnectionRefused));
@@ -247,6 +282,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let cookie = AuthCookie("abc123".into());
         let port = VpnPort::try_new(51820).unwrap();
@@ -268,6 +304,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let cookie = AuthCookie("abc123".into());
         let port = VpnPort::try_new(51820).unwrap();
@@ -297,6 +334,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let cookie = AuthCookie("abc123".into());
         let names = qbit.list_torrents(&cookie).await;
@@ -320,6 +358,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let cookie = AuthCookie("abc123".into());
         let names = qbit.list_torrents(&cookie).await;
@@ -340,6 +379,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
+            DebugController::new(),
         );
         let cookie = AuthCookie("abc123".into());
         let names = qbit.list_torrents(&cookie).await;
