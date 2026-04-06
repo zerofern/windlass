@@ -17,6 +17,18 @@ pub struct VpnIp(pub Ipv4Addr);
 )]
 pub struct VpnPort(u16);
 
+// ── HTTP ─────────────────────────────────────────────────────────────────────
+
+/// An HTTP status code returned by an external service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpStatusCode(pub u16);
+
+// ── Torrents ─────────────────────────────────────────────────────────────────
+
+/// The display name of a torrent as reported by qBittorrent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TorrentName(pub String);
+
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 /// The SID cookie returned by qBittorrent on successful login.
@@ -96,4 +108,17 @@ pub enum AlertPriority {
     Info,
     Warning,
     Critical,
+}
+
+// ── MAM connectivity ─────────────────────────────────────────────────────────
+
+/// The result of a MAM connectivity heartbeat check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MamStatus {
+    /// MAM reached and qBit is listed as connectable (accepts incoming connections).
+    Connectable,
+    /// MAM reached but qBit is not connectable — port forward or firewall issue.
+    NotConnectable,
+    /// Network failure, HTTP error, or parse failure reaching MAM.
+    Unreachable,
 }

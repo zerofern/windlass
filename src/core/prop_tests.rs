@@ -7,10 +7,11 @@ use uom::si::information::gigabyte;
 use super::{
     HARD_RECOVERY_LIMIT,
     events::Event,
-    process_event,
     types::{MamState, QbitState, RunMode, SystemState, VpnState},
 };
-use crate::types::{AuthCookie, RetryCount, VpnIp, VpnPort, WakeupId};
+use crate::types::{
+    AuthCookie, HttpStatusCode, MamStatus, RetryCount, TorrentName, VpnIp, VpnPort, WakeupId,
+};
 
 // ── Primitive strategies ──────────────────────────────────────────────────────
 
@@ -218,18 +219,22 @@ fn any_event() -> impl Strategy<Value = Event> {
         any_auth_cookie().prop_map(Event::QbitAuthSuccess),
         Just(Event::QbitAuthFailed),
         Just(Event::QbitConnectionRefused),
-        any::<u16>().prop_map(Event::QbitApiError),
+        any::<u16>().prop_map(|c| Event::QbitApiError(HttpStatusCode(c))),
         Just(Event::QbitPortSyncSuccess),
-        any::<u16>().prop_map(Event::QbitPortSyncFailed),
+        any::<u16>().prop_map(|c| Event::QbitPortSyncFailed(HttpStatusCode(c))),
         Just(Event::MamUpdateSuccess),
         any_vpn_ip().prop_map(Event::MamAsnMismatch),
-        any::<bool>().prop_map(Event::MamConnectabilityObserved),
+        prop_oneof![
+            Just(Event::MamStatusObserved(MamStatus::Connectable)),
+            Just(Event::MamStatusObserved(MamStatus::NotConnectable)),
+            Just(Event::MamStatusObserved(MamStatus::Unreachable)),
+        ],
         any_information().prop_map(Event::DiskSpaceObserved),
         prop::collection::vec(
             proptest::string::string_regex("[a-zA-Z0-9. ]{1,30}").unwrap(),
             0..5
         )
-        .prop_map(Event::NewTorrentsObserved),
+        .prop_map(|v| Event::NewTorrentsObserved(v.into_iter().map(TorrentName).collect())),
         Just(Event::LogsDumped),
         any_wakeup_id().prop_map(Event::Wakeup),
     ]
@@ -248,7 +253,7 @@ proptest! {
         state in any_system_state(),
         event in any_event(),
     ) {
-        let _ = process_event(state, event);
+        let _ = state.process_event(event);
     }
 
     // 2. Timing — single call must return within 1ms on any input.
@@ -262,7 +267,7 @@ proptest! {
         // still catching accidental blocking I/O or sleep calls.
         let deadline = Duration::from_millis(100);
         let start = Instant::now();
-        let _ = process_event(state, event);
+        let _ = state.process_event(event);
         let elapsed = start.elapsed();
         prop_assert!(
             elapsed < deadline,
@@ -281,7 +286,7 @@ proptest! {
         let start = Instant::now();
         let mut state = SystemState::initial();
         for event in events {
-            let (new_state, _) = process_event(state, event);
+            let (new_state, _) = state.process_event(event);
             state = new_state;
         }
         let elapsed = start.elapsed();
@@ -295,7 +300,7 @@ proptest! {
         state in any_fatal_state(),
         event in any_non_reset_event(),
     ) {
-        let (new_state, actions) = process_event(state.clone(), event);
+        let (new_state, actions) = state.clone().process_event(event);
         prop_assert!(matches!(new_state.run_mode, RunMode::Fatal { .. }), "run_mode should remain Fatal");
         prop_assert!(actions.is_empty(), "actions should be empty in Fatal mode");
         prop_assert_eq!(new_state, state);
@@ -305,7 +310,7 @@ proptest! {
     //    active state. Prevents stale state from surviving a VPN death.
     #[test]
     fn gluetun_death_always_clears_qbit_and_mam(state in any_active_state()) {
-        let (new_state, _) = process_event(state, Event::DockerGluetunDied);
+        let (new_state, _) = state.process_event(Event::DockerGluetunDied);
         prop_assert_eq!(new_state.qbit, QbitState::Offline);
         prop_assert_eq!(new_state.mam, MamState::Unknown);
     }
@@ -318,7 +323,7 @@ proptest! {
         ip in any_vpn_ip(),
     ) {
         state.mam = MamState::AsnBlocked { ip };
-        let (_, actions) = process_event(state, Event::MamConnectabilityObserved(false));
+        let (_, actions) = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
         prop_assert!(actions.is_empty());
     }
 
@@ -330,7 +335,7 @@ proptest! {
         state in any_active_state_with_valid_recoveries(),
         event in any_event(),
     ) {
-        let (new_state, _) = process_event(state, event);
+        let (new_state, _) = state.process_event(event);
         if matches!(new_state.run_mode, RunMode::Active) {
             prop_assert!(
                 new_state.hard_recoveries < HARD_RECOVERY_LIMIT,
@@ -349,7 +354,7 @@ proptest! {
         let mut state = SystemState::initial();
         for event in &events {
             let prior = state.clone();
-            let (new_state, actions) = process_event(state, event.clone());
+            let (new_state, actions) = state.process_event(event.clone());
 
             // Fatal mode must never emit actions on non-reset events.
             if matches!(prior.run_mode, RunMode::Fatal { .. })
@@ -376,7 +381,7 @@ proptest! {
     #[test]
     fn monitoring_wakeups_do_not_mutate_state(state in any_active_state()) {
         for wakeup in [WakeupId::Heartbeat, WakeupId::DiskCheck, WakeupId::TorrentCheck] {
-            let (new_state, _) = process_event(state.clone(), Event::Wakeup(wakeup));
+            let (new_state, _) = state.clone().process_event(Event::Wakeup(wakeup));
             prop_assert_eq!(
                 new_state, state.clone(),
                 "Wakeup({:?}) must not mutate state", wakeup
@@ -392,13 +397,13 @@ proptest! {
         free_gb in 51.0f64..1000.0f64,
     ) {
         let observations = [
-            Event::MamConnectabilityObserved(true),
+            Event::MamStatusObserved(MamStatus::Connectable),
             Event::DiskSpaceObserved(Information::new::<gigabyte>(free_gb)),
             Event::NewTorrentsObserved(vec![]),
         ];
 
         for event in observations {
-            let (new_state, _) = process_event(state.clone(), event.clone());
+            let (new_state, _) = state.clone().process_event(event.clone());
             prop_assert!(
                 matches!(new_state.run_mode, RunMode::Active),
                 "{:?} disrupted RunMode", event

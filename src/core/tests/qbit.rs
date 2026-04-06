@@ -1,11 +1,11 @@
 use super::helpers::*;
-use crate::core::{actions::Action, events::Event, process_event, types::*};
-use crate::types::{AlertPriority, RetryCount, WakeupId};
+use crate::core::{actions::Action, events::Event, types::*};
+use crate::types::{AlertPriority, HttpStatusCode, RetryCount, WakeupId};
 use std::time::Duration;
 
 #[test]
 fn connection_refused_is_ignored_when_not_authenticating() {
-    let (_, actions) = process_event(connected_state(), Event::QbitConnectionRefused);
+    let (_, actions) = connected_state().process_event(Event::QbitConnectionRefused);
     assert!(
         actions.is_empty(),
         "stale QbitConnectionRefused must produce no actions"
@@ -14,7 +14,7 @@ fn connection_refused_is_ignored_when_not_authenticating() {
 
 #[test]
 fn qbit_auth_retry_wakeup_is_ignored_when_not_authenticating() {
-    let (_, actions) = process_event(connected_state(), Event::Wakeup(WakeupId::QbitAuthRetry));
+    let (_, actions) = connected_state().process_event(Event::Wakeup(WakeupId::QbitAuthRetry));
     assert!(
         !actions
             .iter()
@@ -33,7 +33,7 @@ fn qbit_auth_success_starts_port_sync_when_connected() {
     state.qbit = QbitState::Authenticating {
         attempt: RetryCount(0),
     };
-    let (new_state, actions) = process_event(state, Event::QbitAuthSuccess(cookie()));
+    let (new_state, actions) = state.process_event(Event::QbitAuthSuccess(cookie()));
     assert!(matches!(
         new_state.qbit,
         QbitState::SyncingPort {
@@ -53,7 +53,7 @@ fn qbit_auth_success_stores_cookie_when_vpn_not_yet_connected() {
     // Auth completes before the port file is read (race condition edge case).
     let mut state = SystemState::initial();
     state.vpn = VpnState::AwaitingTunnel;
-    let (new_state, actions) = process_event(state, Event::QbitAuthSuccess(cookie()));
+    let (new_state, actions) = state.process_event(Event::QbitAuthSuccess(cookie()));
     assert!(matches!(new_state.qbit, QbitState::Authenticated { .. }));
     assert!(
         !actions
@@ -68,7 +68,7 @@ fn qbit_auth_failed_emits_critical_alert_and_schedules_retry() {
     state.qbit = QbitState::Authenticating {
         attempt: RetryCount(0),
     };
-    let (new_state, actions) = process_event(state, Event::QbitAuthFailed);
+    let (new_state, actions) = state.process_event(Event::QbitAuthFailed);
     // Credentials rejected: alert immediately, reset to attempt 0.
     assert!(matches!(
         new_state.qbit,
@@ -94,7 +94,7 @@ fn qbit_connection_refused_schedules_silent_retry() {
     state.qbit = QbitState::Authenticating {
         attempt: RetryCount(0),
     };
-    let (new_state, actions) = process_event(state, Event::QbitConnectionRefused);
+    let (new_state, actions) = state.process_event(Event::QbitConnectionRefused);
     // Connection refused is normal startup — no alert, no attempt increment.
     assert!(matches!(
         new_state.qbit,
@@ -126,7 +126,7 @@ fn qbit_api_error_schedules_exponential_backoff_retry() {
     state.qbit = QbitState::Authenticating {
         attempt: RetryCount(0),
     };
-    let (new_state, actions) = process_event(state, Event::QbitApiError(403));
+    let (new_state, actions) = state.process_event(Event::QbitApiError(HttpStatusCode(403)));
     assert!(matches!(
         new_state.qbit,
         QbitState::Authenticating {
@@ -145,7 +145,7 @@ fn qbit_auth_failed_when_not_authenticating_stays_at_attempt_zero() {
     // Stale response arrives after state machine moved on — doesn't increment.
     let mut state = SystemState::initial();
     state.qbit = QbitState::Offline;
-    let (new_state, actions) = process_event(state, Event::QbitAuthFailed);
+    let (new_state, actions) = state.process_event(Event::QbitAuthFailed);
     assert!(matches!(
         new_state.qbit,
         QbitState::Authenticating {
@@ -167,7 +167,7 @@ fn qbit_api_error_backoff_is_exponential() {
         state.qbit = QbitState::Authenticating {
             attempt: RetryCount(attempt),
         };
-        let (_, actions) = process_event(state, Event::QbitApiError(500));
+        let (_, actions) = state.process_event(Event::QbitApiError(HttpStatusCode(500)));
         let backoff = actions.iter().find_map(|a| match a {
             Action::ScheduleWakeup(WakeupId::QbitAuthRetry, d) => Some(*d),
             _ => None,
@@ -192,7 +192,7 @@ fn qbit_port_sync_success_updates_mam() {
         cookie: cookie(),
         target: port(),
     };
-    let (new_state, actions) = process_event(state, Event::QbitPortSyncSuccess);
+    let (new_state, actions) = state.process_event(Event::QbitPortSyncSuccess);
     assert!(matches!(new_state.qbit, QbitState::Ready { .. }));
     assert!(
         matches!(new_state.mam, MamState::SyncPending { .. }),
@@ -210,7 +210,7 @@ fn qbit_port_sync_success_is_noop_when_vpn_not_connected() {
         cookie: cookie(),
         target: port(),
     };
-    let (new_state, actions) = process_event(state, Event::QbitPortSyncSuccess);
+    let (new_state, actions) = state.process_event(Event::QbitPortSyncSuccess);
     assert!(!matches!(new_state.qbit, QbitState::Ready { .. }));
     assert!(!actions.iter().any(|a| matches!(a, Action::UpdateMam(_))));
 }
@@ -223,7 +223,7 @@ fn qbit_port_sync_success_is_noop_when_not_syncing() {
         port: port(),
     };
     state.qbit = QbitState::Authenticated { cookie: cookie() };
-    let (_, actions) = process_event(state, Event::QbitPortSyncSuccess);
+    let (_, actions) = state.process_event(Event::QbitPortSyncSuccess);
     assert!(!actions.iter().any(|a| matches!(a, Action::UpdateMam(_))));
 }
 
@@ -235,7 +235,7 @@ fn qbit_port_sync_failed_retries_under_limit() {
         cookie: cookie(),
         target: port(),
     };
-    let (new_state, actions) = process_event(state, Event::QbitPortSyncFailed(500));
+    let (new_state, actions) = state.process_event(Event::QbitPortSyncFailed(HttpStatusCode(500)));
     assert!(matches!(
         new_state.qbit,
         QbitState::SyncingPort {
@@ -258,7 +258,7 @@ fn qbit_port_sync_failed_falls_back_at_limit() {
         cookie: cookie(),
         target: port(),
     };
-    let (new_state, actions) = process_event(state, Event::QbitPortSyncFailed(500));
+    let (new_state, actions) = state.process_event(Event::QbitPortSyncFailed(HttpStatusCode(500)));
     assert!(matches!(
         new_state.qbit,
         QbitState::Authenticating {
@@ -281,7 +281,7 @@ fn qbit_port_sync_failed_falls_back_at_limit() {
 fn qbit_port_sync_failed_is_noop_when_not_syncing() {
     let mut state = SystemState::initial();
     state.qbit = QbitState::Offline;
-    let (new_state, actions) = process_event(state, Event::QbitPortSyncFailed(503));
+    let (new_state, actions) = state.process_event(Event::QbitPortSyncFailed(HttpStatusCode(503)));
     assert_eq!(new_state.qbit, QbitState::Offline);
     assert!(actions.is_empty());
 }

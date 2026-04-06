@@ -3,7 +3,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::core::events::Event;
-use crate::types::VpnIp;
+use crate::types::{MamStatus, VpnIp};
 
 const MAM_SEEDBOX_URL: &str = "https://t.myanonamouse.net/json/dynamicSeedbox.php";
 const MAM_LOAD_URL: &str = "https://www.myanonamouse.net/jsonLoad.php?clientStats";
@@ -95,12 +95,18 @@ pub async fn check_connectability_at(
     match result {
         Err(e) => {
             warn!("MAM connectivity check request failed: {e}");
-            (Event::MamConnectabilityObserved(false), new_session)
+            (
+                Event::MamStatusObserved(MamStatus::Unreachable),
+                new_session,
+            )
         }
         Ok(resp) => {
             if !resp.status().is_success() {
                 warn!("MAM connectivity check HTTP {}", resp.status());
-                return (Event::MamConnectabilityObserved(false), new_session);
+                return (
+                    Event::MamStatusObserved(MamStatus::Unreachable),
+                    new_session,
+                );
             }
             match resp.json::<JsonLoadResponse>().await {
                 Ok(body) => {
@@ -109,11 +115,19 @@ pub async fn check_connectability_at(
                         .as_deref()
                         .is_some_and(|s| s.eq_ignore_ascii_case("yes"));
                     debug!("MAM connectable={connectable}");
-                    (Event::MamConnectabilityObserved(connectable), new_session)
+                    let status = if connectable {
+                        MamStatus::Connectable
+                    } else {
+                        MamStatus::NotConnectable
+                    };
+                    (Event::MamStatusObserved(status), new_session)
                 }
                 Err(e) => {
                     warn!("MAM connectivity parse failed: {e}");
-                    (Event::MamConnectabilityObserved(false), new_session)
+                    (
+                        Event::MamStatusObserved(MamStatus::Unreachable),
+                        new_session,
+                    )
                 }
             }
         }
@@ -229,7 +243,10 @@ mod tests {
             .await;
 
         let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
-        assert!(matches!(event, Event::MamConnectabilityObserved(true)));
+        assert!(matches!(
+            event,
+            Event::MamStatusObserved(MamStatus::Connectable)
+        ));
     }
 
     #[tokio::test]
@@ -244,7 +261,10 @@ mod tests {
             .await;
 
         let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
-        assert!(matches!(event, Event::MamConnectabilityObserved(false)));
+        assert!(matches!(
+            event,
+            Event::MamStatusObserved(MamStatus::NotConnectable)
+        ));
     }
 
     #[tokio::test]
@@ -259,7 +279,10 @@ mod tests {
             .await;
 
         let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
-        assert!(matches!(event, Event::MamConnectabilityObserved(false)));
+        assert!(matches!(
+            event,
+            Event::MamStatusObserved(MamStatus::NotConnectable)
+        ));
     }
 
     #[tokio::test]
@@ -287,6 +310,9 @@ mod tests {
             .await;
 
         let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
-        assert!(matches!(event, Event::MamConnectabilityObserved(false)));
+        assert!(matches!(
+            event,
+            Event::MamStatusObserved(MamStatus::Unreachable)
+        ));
     }
 }

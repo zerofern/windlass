@@ -1,4 +1,6 @@
-use crate::types::{AuthCookie, Information, VpnIp, VpnPort, WakeupId};
+use crate::types::{
+    AuthCookie, HttpStatusCode, Information, MamStatus, TorrentName, VpnIp, VpnPort, WakeupId,
+};
 
 /// Everything the outside world (via the Shell) can tell the Core.
 #[derive(Debug, Clone)]
@@ -29,17 +31,17 @@ pub enum Event {
     /// Network-level failure (connection refused, timeout) while reaching qBittorrent.
     /// Normal during container startup — the Core retries silently.
     QbitConnectionRefused,
-    QbitApiError(u16),
+    QbitApiError(HttpStatusCode),
 
     QbitPortSyncSuccess,
-    QbitPortSyncFailed(u16),
+    QbitPortSyncFailed(HttpStatusCode),
 
     MamUpdateSuccess,
     MamAsnMismatch(VpnIp),
-    MamConnectabilityObserved(bool),
+    MamStatusObserved(MamStatus),
 
     DiskSpaceObserved(Information),
-    NewTorrentsObserved(Vec<String>),
+    NewTorrentsObserved(Vec<TorrentName>),
 
     LogsDumped,
 

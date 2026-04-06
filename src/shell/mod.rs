@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info};
 use uom::si::information::byte;
 
-use crate::core::{actions::Action, events::Event, process_event, types::SystemState};
+use crate::core::{actions::Action, events::Event, types::SystemState};
 use crate::types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 
 pub use config::Config;
@@ -54,13 +54,10 @@ pub async fn run() -> Result<()> {
     let mut cached_cookie: Option<AuthCookie> = None;
     let mut state = SystemState::initial();
 
-    let (new_state, actions) = process_event(
-        state,
-        Event::Init {
-            is_gluetun_healthy: boot.is_gluetun_healthy,
-            port_files,
-        },
-    );
+    let (new_state, actions) = state.process_event(Event::Init {
+        is_gluetun_healthy: boot.is_gluetun_healthy,
+        port_files,
+    });
     state = new_state;
     ShellContext::new(
         &config,
@@ -77,7 +74,7 @@ pub async fn run() -> Result<()> {
 
     while let Some(event) = rx.recv().await {
         debug!(?event, "←");
-        let (new_state, actions) = process_event(state, event);
+        let (new_state, actions) = state.process_event(event);
         state = new_state;
         ShellContext::new(
             &config,

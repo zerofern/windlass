@@ -1,4 +1,4 @@
-use crate::types::{AuthCookie, RetryCount, VpnIp, VpnPort};
+use crate::types::{AuthCookie, RetryCount, TorrentName, VpnIp, VpnPort};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -98,7 +98,7 @@ pub struct SystemState {
     pub mam: MamState,
     /// Full list of torrent names seen so far. Used by the Core to diff
     /// against the raw list from `NewTorrentsObserved` and only alert on new ones.
-    pub known_torrents: HashSet<String>,
+    pub known_torrents: HashSet<TorrentName>,
 }
 
 impl SystemState {

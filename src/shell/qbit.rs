@@ -3,7 +3,7 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::core::events::Event;
-use crate::types::{AuthCookie, VpnPort};
+use crate::types::{AuthCookie, HttpStatusCode, TorrentName, VpnPort};
 
 #[derive(Deserialize)]
 struct TorrentInfo {
@@ -38,8 +38,12 @@ pub async fn authenticate(client: &Client, base_url: &str, user: &str, pass: &st
                 debug!("qBit auth success");
                 return Event::QbitAuthSuccess(AuthCookie(cookie));
             }
-            warn!("qBit auth failed: status={status}, body={body:?}");
-            Event::QbitAuthFailed
+            if body.trim() == "Fails." {
+                warn!("qBit auth: credentials rejected (Fails.)");
+                return Event::QbitAuthFailed;
+            }
+            warn!("qBit auth unexpected response: status={status}, body={body:?}");
+            Event::QbitApiError(HttpStatusCode(status.as_u16()))
         }
     }
 }
@@ -62,7 +66,7 @@ pub async fn sync_port(
     {
         Err(e) => {
             warn!("qBit port sync request failed: {e}");
-            Event::QbitPortSyncFailed(0)
+            Event::QbitPortSyncFailed(HttpStatusCode(0))
         }
         Ok(resp) => {
             let status = resp.status();
@@ -71,7 +75,7 @@ pub async fn sync_port(
                 Event::QbitPortSyncSuccess
             } else {
                 warn!("qBit port sync failed: status={status}");
-                Event::QbitPortSyncFailed(status.as_u16())
+                Event::QbitPortSyncFailed(HttpStatusCode(status.as_u16()))
             }
         }
     }
@@ -80,7 +84,11 @@ pub async fn sync_port(
 /// Fetches the current list of torrent names from qBittorrent.
 /// Returns an empty vec on error rather than propagating — the torrent
 /// checker treats an empty result as "no new torrents" and reschedules.
-pub async fn list_torrents(client: &Client, base_url: &str, cookie: &AuthCookie) -> Vec<String> {
+pub async fn list_torrents(
+    client: &Client,
+    base_url: &str,
+    cookie: &AuthCookie,
+) -> Vec<TorrentName> {
     let url = format!("{base_url}/api/v2/torrents/info");
     match client
         .get(&url)
@@ -93,7 +101,7 @@ pub async fn list_torrents(client: &Client, base_url: &str, cookie: &AuthCookie)
             vec![]
         }
         Ok(resp) => match resp.json::<Vec<TorrentInfo>>().await {
-            Ok(torrents) => torrents.into_iter().map(|t| t.name).collect(),
+            Ok(torrents) => torrents.into_iter().map(|t| TorrentName(t.name)).collect(),
             Err(e) => {
                 warn!("Failed to parse torrent list: {e}");
                 vec![]
@@ -209,7 +217,10 @@ mod tests {
         let cookie = AuthCookie("abc123".into());
         let port = VpnPort::try_new(51820).unwrap();
         let event = sync_port(&client(), &server.uri(), &cookie, port).await;
-        assert!(matches!(event, Event::QbitPortSyncFailed(403)));
+        assert!(matches!(
+            event,
+            Event::QbitPortSyncFailed(HttpStatusCode(403))
+        ));
     }
 
     // ── list_torrents ─────────────────────────────────────────────────────────
@@ -228,7 +239,10 @@ mod tests {
 
         let cookie = AuthCookie("abc123".into());
         let names = list_torrents(&client(), &server.uri(), &cookie).await;
-        assert_eq!(names, vec!["Album A", "Album B"]);
+        assert_eq!(
+            names,
+            vec![TorrentName("Album A".into()), TorrentName("Album B".into())]
+        );
     }
 
     #[tokio::test]
