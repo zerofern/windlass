@@ -247,6 +247,56 @@ list of all event/action variant names with toggle switches).
 
 ---
 
+## Pre-requisite refactor: Core cleanup
+
+Before the HTTP client refactor, clean up the core state machine:
+
+### New types
+
+- **`TorrentName(pub String)`** — replaces raw `String` in `known_torrents` and
+  `NewTorrentsObserved`. Plain tuple struct, no validation needed.
+- **`HttpStatusCode(pub u16)`** — replaces raw `u16` in `QbitPortSyncFailed` and
+  `QbitApiError`. Makes intent clear at call sites.
+- **`MamStatus`** enum — replaces `bool` in `MamConnectabilityObserved`:
+  ```rust
+  pub enum MamStatus {
+      Connectable,     // MAM reached, qBit listed as connectable
+      NotConnectable,  // MAM reached, qBit not connectable (port forward issue)
+      Unreachable,     // Network failure or parse error reaching MAM
+  }
+  ```
+  Event becomes `MamStatusObserved(MamStatus)`. Allows differentiated recovery
+  logic in future (e.g. `NotConnectable` may indicate a port forward issue rather
+  than a VPN problem).
+
+### Fix `QbitApiError` gap
+
+`QbitApiError` exists in core and tests but the shell never emits it — dead code.
+Shell `authenticate` currently collapses all non-success responses to `QbitAuthFailed`.
+Fix: emit `QbitAuthFailed` only when qBit returns body `"Fails."` (wrong credentials),
+and `QbitApiError(HttpStatusCode)` for all other HTTP errors (transient failures).
+Core's exponential backoff for `QbitApiError` becomes live code.
+
+### `process_event` as a method
+
+`process_event` moves from a free function to a method on `SystemState`:
+
+```rust
+impl SystemState {
+    pub fn process_event(self, event: Event) -> (Self, Vec<Action>) { ... }
+}
+```
+
+All call sites updated (shell event loop, all core tests).
+
+### Handler methods
+
+Each event branch becomes a private method on `SystemState`, pulling the large
+`match` in `mod.rs` into focused handler functions. Lives in `src/core/handlers.rs`;
+split by area (vpn, qbit, mam, monitoring) if it exceeds 300 lines.
+
+---
+
 ## Pre-requisite refactor: HTTP client structs
 
 Before Tier 1, refactor `qbit.rs`, `mam.rs`, `gotify.rs` to match the `DockerClient`
@@ -267,12 +317,13 @@ debug observer channel to each client.
 
 ## Build order
 
-1. HTTP client struct refactor (`windlass-clients` pattern)
-2. Cargo workspace extraction (split into `windlass-types`, `windlass-core`, `windlass-local`, `windlass-clients`, `windlass-web`, `windlass`)
-3. **Tier 1** — axum server, `/api/v1/operator/state`, `/api/v1/operator/reset`, basic dashboard
-4. **Tier 2** — broadcast channel, SSE stream, live log
-5. **Tier 3** — debug gate, breakpoints, stepper, HTTP logging
-6. Beyond — queue management, library/ABS, AI pipeline, series calendar
+1. Core cleanup (new types, `MamStatus`, fix `QbitApiError` gap, `process_event` as method, handler methods)
+2. HTTP client struct refactor (`windlass-clients` pattern)
+3. Cargo workspace extraction
+4. **Tier 1** — axum server, `/api/v1/operator/state`, `/api/v1/operator/reset`, basic dashboard
+5. **Tier 2** — broadcast channel, SSE stream, live log
+6. **Tier 3** — debug gate, breakpoints, stepper, HTTP logging
+7. Beyond — queue management, library/ABS, AI pipeline, series calendar
 
 ---
 
