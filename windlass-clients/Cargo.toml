@@ -1,0 +1,17 @@
+[package]
+name = "windlass-clients"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+windlass-types = { workspace = true }
+windlass-core  = { workspace = true }
+reqwest        = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio    = { workspace = true }

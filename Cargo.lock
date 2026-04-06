@@ -2390,23 +2390,67 @@ name = "windlass"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bollard",
- "futures-util",
- "libc",
- "notify-debouncer-mini",
- "nutype",
- "proptest",
  "reqwest",
  "secrecy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uom",
+ "windlass-clients",
+ "windlass-core",
+ "windlass-local",
+ "windlass-types",
+]
+
+[[package]]
+name = "windlass-clients"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "windlass-core",
+ "windlass-types",
  "wiremock",
+]
+
+[[package]]
+name = "windlass-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "tracing",
+ "uom",
+ "windlass-types",
+]
+
+[[package]]
+name = "windlass-local"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bollard",
+ "futures-util",
+ "libc",
+ "notify-debouncer-mini",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uom",
+ "windlass-core",
+ "windlass-types",
+]
+
+[[package]]
+name = "windlass-types"
+version = "0.1.0"
+dependencies = [
+ "nutype",
+ "secrecy",
+ "serde",
+ "uom",
 ]
 
 [[package]]

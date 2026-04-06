@@ -1,0 +1,19 @@
+[package]
+name = "windlass-local"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+windlass-types = { workspace = true }
+windlass-core  = { workspace = true }
+bollard        = { workspace = true }
+notify-debouncer-mini = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+anyhow         = { workspace = true }
+futures-util   = { workspace = true }
+libc           = { workspace = true }
+uom            = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

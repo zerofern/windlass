@@ -1,0 +1,10 @@
+[package]
+name = "windlass-types"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nutype   = { workspace = true }
+secrecy  = { workspace = true }
+uom      = { workspace = true }
+serde    = { workspace = true }

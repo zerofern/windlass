@@ -1,0 +1,21 @@
+[package]
+name = "windlass"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "windlass"
+path = "src/main.rs"
+
+[dependencies]
+windlass-types   = { workspace = true }
+windlass-core    = { workspace = true }
+windlass-local   = { workspace = true }
+windlass-clients = { workspace = true }
+tokio            = { workspace = true }
+anyhow           = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+secrecy          = { workspace = true }
+reqwest          = { workspace = true }
+uom              = { workspace = true }
