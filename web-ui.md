@@ -31,7 +31,7 @@ windlass/                   workspace root
   windlass-web/             axum server, SSE, API route handlers, rust-embed of frontend
   windlass/                 binary — config, ShellContext, event loop, wires everything
 
-  web/                      React + Vite + shadcn/ui SPA (not a Cargo crate)
+  app/                      React + Vite + shadcn/ui SPA (not a Cargo crate)
     src/
     dist/                   built output, embedded into windlass-web at compile time
     package.json
@@ -330,7 +330,7 @@ debug observer channel to each client.
 ## File layout (target)
 
 ```
-web/                        React + Vite + shadcn/ui SPA
+app/                        React + Vite + shadcn/ui SPA
   src/
   dist/                     built output, embedded in binary at compile time
   package.json

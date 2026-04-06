@@ -2,11 +2,11 @@ default: test
 
 # Build the React frontend (required before cargo build)
 build-web:
-    cd web && npm run build
+    cd app && npm run build
 
 # Run Vite dev server (proxies /api to localhost:5010)
 dev-web:
-    cd web && npm run dev
+    cd app && npm run dev
 
 build:
     cargo build
