@@ -2,20 +2,21 @@
 
 use nutype::nutype;
 use secrecy::SecretString;
+use serde::Serialize;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 pub use uom::si::f64::Information;
 
 // ── IPs ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct VpnIp(pub Ipv4Addr);
 
 // ── Ports ────────────────────────────────────────────────────────────────────
 
 #[nutype(
     validate(greater = 0, less_or_equal = 65535),
-    derive(Debug, Clone, Copy, PartialEq, Eq)
+    derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)
 )]
 pub struct VpnPort(u16);
 
@@ -28,7 +29,7 @@ pub struct HttpStatusCode(pub u16);
 // ── Torrents ─────────────────────────────────────────────────────────────────
 
 /// The display name of a torrent as reported by qBittorrent.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct TorrentName(pub String);
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
@@ -53,7 +54,7 @@ pub struct QbitPassword(pub SecretString);
 // ── Retry / recovery counts ───────────────────────────────────────────────────
 
 /// A count of retry attempts or recovery cycles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct RetryCount(pub u8);
 
 impl RetryCount {

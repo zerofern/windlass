@@ -5,6 +5,7 @@ members = [
     "windlass-core",
     "windlass-local",
     "windlass-clients",
+    "windlass-web",
     "windlass",
 ]
 
@@ -27,8 +28,10 @@ libc         = "0.2"
 proptest     = "1"
 wiremock     = "0.6"
 tempfile     = "3"
+axum             = { version = "0.8", features = ["json"] }
 windlass-types   = { path = "windlass-types" }
 windlass-core    = { path = "windlass-core" }
 windlass-local   = { path = "windlass-local" }
 windlass-clients = { path = "windlass-clients" }
+windlass-web     = { path = "windlass-web" }
 

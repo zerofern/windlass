@@ -1,6 +1,7 @@
 mod config;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -66,6 +67,21 @@ pub async fn run() -> Result<()> {
     let vpn_port_file = config.vpn_port_file.clone();
     let data_path = config.data_path.clone();
 
+    let shared_state = Arc::new(tokio::sync::RwLock::new(SystemState::initial()));
+    let app_state = windlass_web::AppState {
+        event_tx: tx.clone(),
+        state: shared_state.clone(),
+    };
+    let bind_addr = std::env::var("WINDLASS_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:5010".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    info!(addr = %bind_addr, "HTTP server listening");
+    tokio::spawn(async move {
+        axum::serve(listener, windlass_web::router(app_state))
+            .await
+            .expect("HTTP server crashed");
+    });
+
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
     let mut state = SystemState::initial();
 
@@ -74,6 +90,7 @@ pub async fn run() -> Result<()> {
         port_files,
     });
     state = new_state;
+    *shared_state.write().await = state.clone();
     ShellContext {
         docker: &docker,
         qbit: &qbit,
@@ -92,6 +109,7 @@ pub async fn run() -> Result<()> {
         debug!(?event, "←");
         let (new_state, actions) = state.process_event(event);
         state = new_state;
+        *shared_state.write().await = state.clone();
         ShellContext {
             docker: &docker,
             qbit: &qbit,

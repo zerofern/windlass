@@ -1,14 +1,23 @@
 use windlass_types::{AuthCookie, RetryCount, TorrentName, VpnIp, VpnPort};
 use std::collections::HashSet;
 use std::fmt;
+use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serializes any value as the string `"[redacted]"`.
+mod redact {
+    use serde::Serializer;
+    pub fn serialize<T, S: Serializer>(_: &T, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("[redacted]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RunMode {
     Active,
     Fatal { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum VpnState {
     Stopped,
     DumpingLogs,
@@ -29,22 +38,25 @@ impl fmt::Display for VpnState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum QbitState {
     Offline,
     Authenticating {
         attempt: RetryCount,
     },
     Authenticated {
+        #[serde(serialize_with = "redact::serialize")]
         cookie: AuthCookie,
     },
     SyncingPort {
         attempt: RetryCount,
+        #[serde(serialize_with = "redact::serialize")]
         cookie: AuthCookie,
         target: VpnPort,
     },
     Ready {
         port: VpnPort,
+        #[serde(serialize_with = "redact::serialize")]
         cookie: AuthCookie,
     },
 }
@@ -63,7 +75,7 @@ impl fmt::Display for QbitState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum MamState {
     Unknown,
     SyncPending {
@@ -90,7 +102,7 @@ impl fmt::Display for MamState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SystemState {
     pub run_mode: RunMode,
     pub hard_recoveries: RetryCount,
