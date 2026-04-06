@@ -16,4 +16,7 @@ pub struct AppState {
     pub debug_gate: DebugGate,
     /// Broadcast channel for live observations streamed to SSE clients.
     pub observations: broadcast::Sender<Observation>,
+    /// URL of the chaos controller, if running (dev stack only).
+    /// Set via `CHAOS_URL` env var. `None` in production.
+    pub chaos_url: Option<String>,
 }

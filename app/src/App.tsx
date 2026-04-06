@@ -2,8 +2,11 @@ import { Routes, Route, NavLink } from 'react-router-dom'
 import { Dashboard } from '@/routes/Dashboard'
 import { Log } from '@/routes/Log'
 import { Chaos } from '@/routes/Chaos'
+import { useConfig } from '@/hooks/useConfig'
 
 export default function App() {
+  const config = useConfig()
+
   return (
     <div className="min-h-screen bg-background">
       <header className="border-b">
@@ -26,21 +29,25 @@ export default function App() {
           >
             Live Log
           </NavLink>
-          <NavLink
-            to="/chaos"
-            className={({ isActive }) =>
-              `text-sm font-medium transition-colors ${isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`
-            }
-          >
-            Chaos
-          </NavLink>
+          {config.chaos_url && (
+            <NavLink
+              to="/chaos"
+              className={({ isActive }) =>
+                `text-sm font-medium transition-colors ${isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`
+              }
+            >
+              Chaos
+            </NavLink>
+          )}
         </nav>
       </header>
       <main className="container mx-auto px-4 py-6">
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/log" element={<Log />} />
-          <Route path="/chaos" element={<Chaos />} />
+          {config.chaos_url && (
+            <Route path="/chaos" element={<Chaos chaosUrl={config.chaos_url} />} />
+          )}
         </Routes>
       </main>
     </div>

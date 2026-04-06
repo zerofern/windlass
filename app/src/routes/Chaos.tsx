@@ -3,8 +3,6 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 
-const CHAOS_BASE = 'http://localhost:9000'
-
 interface Scenario {
   id: string
   label: string
@@ -35,15 +33,19 @@ const SCENARIOS: Scenario[] = [
 
 type Status = 'idle' | 'loading' | 'ok' | 'error'
 
-export function Chaos() {
+interface Props {
+  chaosUrl: string
+}
+
+export function Chaos({ chaosUrl }: Props) {
   const [statuses, setStatuses] = useState<Record<string, Status>>({})
 
   async function applyScenario(scenario: Scenario) {
     setStatuses(s => ({ ...s, [scenario.id]: 'loading' }))
     try {
       const url = scenario.id === 'reset'
-        ? `${CHAOS_BASE}/reset`
-        : `${CHAOS_BASE}/scenario/${scenario.id}`
+        ? `${chaosUrl}/reset`
+        : `${chaosUrl}/scenario/${scenario.id}`
       const res = await fetch(url, { method: 'POST' })
       setStatuses(s => ({ ...s, [scenario.id]: res.ok ? 'ok' : 'error' }))
     } catch {

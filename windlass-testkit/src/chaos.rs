@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
+use tower_http::cors::CorsLayer;
 use crate::wiremock_admin::WireMockAdmin;
 use crate::scenarios;
 
@@ -29,7 +30,8 @@ pub async fn run(qbit_admin: &str, mam_admin: &str, gotify_admin: &str) -> anyho
         .route("/scenario/{name}", post(scenario_handler))
         .route("/reset", post(reset_handler))
         .route("/health", axum::routing::get(|| async { axum::http::StatusCode::OK }))
-        .with_state(state);
+        .with_state(state)
+        .layer(CorsLayer::permissive());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9000").await?;
     tracing::info!("Chaos controller listening on :9000");

@@ -9,7 +9,7 @@ mod stream;
 #[must_use = "pass to axum::serve"]
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .merge(health::router())
+        .merge(health::router(state.clone()))
         .merge(operator::router(state.clone()))
         .merge(stream::router(state))
 }

@@ -132,6 +132,7 @@ services:
       VPN_IP_FILE:      /tmp/gluetun/ip
       VPN_PORT_FILE:    /tmp/gluetun/forwarded_port
       WINDLASS_BIND:    0.0.0.0:5010
+      CHAOS_URL:        http://localhost:9000
       RUST_LOG:         windlass=debug,info
 
 volumes:

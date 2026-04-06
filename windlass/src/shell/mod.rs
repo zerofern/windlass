@@ -69,6 +69,7 @@ pub async fn run() -> Result<()> {
         state: shared_state.clone(),
         debug_gate: debug_gate.clone(),
         observations: obs_tx.clone(),
+        chaos_url: std::env::var("CHAOS_URL").ok(),
     };
     let bind_addr = std::env::var("WINDLASS_BIND")
         .unwrap_or_else(|_| "0.0.0.0:5010".to_string());
