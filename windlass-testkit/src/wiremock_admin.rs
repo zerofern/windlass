@@ -16,8 +16,15 @@ impl WireMockAdmin {
 
     /// Replace ALL stub mappings with the provided list.
     pub async fn set_mappings(&self, mappings: Vec<Value>) -> anyhow::Result<()> {
+        // First reset all existing stubs, then bulk-import via the /import endpoint.
         self.client
-            .post(format!("{}/mappings", self.base))
+            .delete(format!("{}/mappings", self.base))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        self.client
+            .post(format!("{}/mappings/import", self.base))
             .json(&json!({ "mappings": mappings }))
             .send()
             .await?

@@ -46,14 +46,27 @@ or add something manually. It is not the primary interaction surface.
 All persistent state is stored in a local SQLite database (`windlass.db`). There is no
 flat JSON state file.
 
-### Core tables
+### Table overview
+
+`books` is the canonical library record for every title Windlass knows about — whether it
+downloaded the file, discovered it in ABS from a manual add, or just fetched metadata while
+evaluating a series. Everything else hangs off `books`.
 
 | Table | Contents |
 |---|---|
-| `user_profile` | Core identity, dealbreakers, dynamic genre weights, target pipeline depth |
-| `reading_ledger` | Completed books, user ratings, parsed DNF reasons, last-played timestamp — retained permanently even after a torrent is deleted from disk |
-| `download_queue` | Pending torrents, AI scores, metadata |
-| `alerts` | All fired alerts with ID, severity, timestamp, triggering event, system state snapshot |
+| `books` | Every title Windlass knows about. Library status lifecycle (`known → queued → downloading → seeding → completed`), source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`), Audnexus ASIN, Hardcover ID, ABS item ID. A book record survives disk deletion. |
+| `series` | Series identity and health (Audnexus data, user started/following flags) |
+| `torrents` | File data once a download starts: qBittorrent hash, seed time, HnR status, ratio, disk path |
+| `download_queue` | Thin table: books actively in the approval/download funnel only. Holds priority, stage (`suggested` / `approved` / `upcoming`), AI score, MAM torrent ID. Row deleted once `books.library_status` advances to `downloading`. |
+| `reading_ledger` | One row per listening attempt (supports re-reads). Retained permanently after disk deletion. |
+| `listening_progress` | Sub-daily poll snapshots from ABS. Used for slog detection and pipeline depth calculation. |
+| `reviews` | User feedback rows keyed by ledger entry: completion review, optional midway note, DNF autopsy. |
+| `book_blurbs` | LLM-generated pitch blurbs with FK to `books` and a `context_snapshot_json` field so we know what the model saw when it generated the text. |
+| `slog_detector` | Pacing stall detection state per active ledger entry. |
+| `series_check_ins` | Records of the 60–75% series check-in: what was offered, what the user chose. |
+| `profile_preferences` | Stable identity layer: flexible tag-style rows (e.g. `narrator:Ray Porter = love`, `genre:LitRPG = avoid`). |
+| `profile_signals` | Dynamic LLM-updated weights per dimension. Updated after each listening session. |
+| `alerts` | All fired alerts. UUID primary key for Gotify deep-links. Severity, timestamp, triggering event, system state snapshot. |
 
 ### JIT (Just-In-Time) Context Injection
 

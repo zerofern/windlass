@@ -91,7 +91,7 @@ services:
       mock-mam:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/health 2>/dev/null | grep -q '' || exit 1"]
+      test: ["CMD-SHELL", "bash -c 'echo -e \"GET /health HTTP/1.0\\r\\n\\r\\n\" > /dev/tcp/localhost/9000' 2>/dev/null || exit 1"]
       interval: 3s
       timeout: 2s
       retries: 10
