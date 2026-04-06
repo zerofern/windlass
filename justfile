@@ -24,4 +24,10 @@ clippy:
 coverage:
     cargo tarpaulin --exclude-files "mlm/*" "mousehole/*" --ignore-tests
 
+audit:
+    cargo audit
+
+outdated:
+    cargo outdated --workspace
+
 check: fmt-check clippy test
