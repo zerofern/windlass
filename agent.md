@@ -104,6 +104,44 @@ The project runs `cargo clippy -- -W clippy::pedantic -W clippy::nursery` with
 because it is a constructor for a context struct that genuinely needs all those
 fields. The `#[allow]` is accompanied by a comment explaining why.
 
+## Web layer communication
+
+The axum web server (`windlass-web`) is **just another event producer** — it has no
+special status over the Docker watcher or file watcher. It never calls `process_event`
+directly and never reads the core internals.
+
+Communication goes through `AppState`, which is an `Arc`-wrapped struct shared across
+all axum handlers:
+
+```rust
+pub struct AppState {
+    pub event_tx: mpsc::Sender<Event>,           // inject events INTO the loop
+    pub state: Arc<RwLock<SystemState>>,          // read current state OUT
+    pub observations: broadcast::Sender<Observation>, // stream of everything happening
+    pub debug_gate: Arc<DebugGate>,
+}
+```
+
+**Inbound (browser → core):**
+```
+POST /api/v1/operator/reset
+  → axum handler clones event_tx
+  → event_tx.send(Event::ManualReset).await
+  → main event loop receives it, calls process_event normally
+```
+
+**Outbound (core → browser):**
+```
+process_event() runs in the main loop
+  → broadcasts EventReceived, StateSnapshot, ActionDispatched
+  → SSE handler streams these to all connected browser clients
+```
+
+**The rule:** if a web handler needs to cause something to happen, it sends an `Event`.
+It never directly calls shell functions. The effect flows back to the browser via the
+SSE broadcast channel, not via the HTTP response body (which returns `202 Accepted`
+immediately).
+
 ## Build & test
 
 A `justfile` is at the repo root — always use `just` rather than bare `cargo`
