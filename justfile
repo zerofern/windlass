@@ -18,7 +18,21 @@ test-all:
     cargo test -- --include-ignored
 
 integration:
-    ./tests/integration/run.sh
+    docker compose -f docker-compose.dev.yml up --build -d
+    cargo test --test integration -- --ignored --test-threads=1 --nocapture; \
+    docker compose -f docker-compose.dev.yml down -v --remove-orphans
+
+# Bring up the dev/test stack
+stack-up:
+    docker compose -f docker-compose.dev.yml up --build -d
+
+# Tear down the dev/test stack
+stack-down:
+    docker compose -f docker-compose.dev.yml down -v --remove-orphans
+
+# View live logs from the dev stack
+stack-logs:
+    docker compose -f docker-compose.dev.yml logs -f windlass
 
 fmt:
     cargo fmt

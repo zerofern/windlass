@@ -246,5 +246,20 @@ src/core/       ← pure state machine (events, actions, types, tests)
 src/shell/      ← async I/O (Docker, HTTP clients, config, event loop)
 src/types.rs    ← shared primitive newtypes
 src/main.rs     ← entry point
-tests/          ← integration test runner and WireMock stubs
+windlass/tests/ ← Rust integration tests (ignored by default, require dev stack)
+windlass-testkit/ ← chaos controller and gluetun mock binary
 ```
+
+## Integration tests
+
+Before marking any feature done that touches the shell, external API clients,
+the event loop, or Docker integration: run `just integration` and confirm all
+tests pass. The integration tests bring up the full mock stack, run scenarios,
+and tear down automatically.
+
+Integration tests live in `windlass/tests/integration.rs`. They are `#[ignore]`
+by default so `cargo test` doesn't require Docker. `just integration` runs them
+with `--ignored`.
+
+When adding new external API behaviour, add a corresponding scenario to
+`windlass-testkit/src/scenarios.rs` and a test to `windlass/tests/integration.rs`.

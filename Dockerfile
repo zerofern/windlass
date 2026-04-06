@@ -2,15 +2,17 @@
 FROM rust:latest AS builder
 WORKDIR /app
 
-# Pre-fetch dependencies in a separate layer for faster rebuilds.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
-    && cargo build --release \
-    && rm -rf src
+COPY windlass-types/   windlass-types/
+COPY windlass-core/    windlass-core/
+COPY windlass-local/   windlass-local/
+COPY windlass-clients/ windlass-clients/
+COPY windlass-web/     windlass-web/
+COPY windlass/         windlass/
+COPY windlass-testkit/ windlass-testkit/
+COPY app/dist/         app/dist/
 
-# Build the real binary
-COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN cargo build --release -p windlass
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim

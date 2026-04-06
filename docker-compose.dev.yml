@@ -1,32 +1,29 @@
-# Integration test stack for Windlass.
+# Development and integration test stack for Windlass.
 #
-# Starts Windlass against mock services so the full event loop can be exercised
-# without touching production MAM, a real VPN, or real qBittorrent.
+# Runs Windlass against mock services. Use for:
+#   - Viewing the web UI locally without a production VPN stack
+#   - Running integration tests: just integration
+#   - Manual chaos testing via the chaos controller API
 #
 # ⚠ Uses container_name: gluetun — do NOT run alongside the production stack.
 #
 # Usage:
-#   ./tests/integration/run.sh
-#
-# Or manually:
-#   docker compose -f docker-compose.test.yml up --build
-#   docker compose -f docker-compose.test.yml down -v
+#   docker compose -f docker-compose.dev.yml up --build
+#   docker compose -f docker-compose.dev.yml down -v
 
 services:
 
-  # ── Mock Gluetun ─────────────────────────────────────────────────────────────
-  # Must be named "gluetun": Windlass inspects this container by name via Docker API.
+  # ── Gluetun mock ─────────────────────────────────────────────────────────────
   mock-gluetun:
-    image: alpine:latest
+    build:
+      context: .
+      dockerfile: windlass-testkit/Dockerfile
     container_name: gluetun
-    command:
-      - sh
-      - -c
-      - |
-        mkdir -p /tmp/gluetun
-        printf '10.8.0.1' > /tmp/gluetun/ip
-        printf '51820'    > /tmp/gluetun/forwarded_port
-        sleep infinity
+    environment:
+      TESTKIT_MODE: gluetun
+      VPN_IP_FILE: /tmp/gluetun/ip
+      VPN_PORT_FILE: /tmp/gluetun/forwarded_port
+      RUST_LOG: info
     volumes:
       - vpn-files:/tmp/gluetun
     healthcheck:
@@ -34,16 +31,14 @@ services:
       interval: 2s
       timeout: 1s
       retries: 5
-      start_period: 3s
+      start_period: 5s
 
   # ── Mock qBittorrent (WireMock) ───────────────────────────────────────────────
   mock-qbittorrent:
     image: wiremock/wiremock:3.5.4-alpine
     ports:
       - "18080:8080"
-    volumes:
-      - ./tests/integration/stubs/qbittorrent/mappings:/home/wiremock/mappings:ro
-    command: ["--port", "8080", "--verbose"]
+    command: ["--port", "8080"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health | grep -q healthy"]
       interval: 3s
@@ -55,8 +50,6 @@ services:
     image: wiremock/wiremock:3.5.4-alpine
     ports:
       - "18081:8080"
-    volumes:
-      - ./tests/integration/stubs/gotify/mappings:/home/wiremock/mappings:ro
     command: ["--port", "8080"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health | grep -q healthy"]
@@ -69,11 +62,36 @@ services:
     image: wiremock/wiremock:3.5.4-alpine
     ports:
       - "18082:8080"
-    volumes:
-      - ./tests/integration/stubs/mam/mappings:/home/wiremock/mappings:ro
     command: ["--port", "8080"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health | grep -q healthy"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  # ── Chaos controller ──────────────────────────────────────────────────────────
+  chaos-controller:
+    build:
+      context: .
+      dockerfile: windlass-testkit/Dockerfile
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      TESTKIT_MODE: chaos
+      QBIT_ADMIN_URL: http://mock-qbittorrent:8080/__admin
+      MAM_ADMIN_URL: http://mock-mam:8080/__admin
+      GOTIFY_ADMIN_URL: http://mock-gotify:8080/__admin
+      RUST_LOG: info
+    depends_on:
+      mock-qbittorrent:
+        condition: service_healthy
+      mock-gotify:
+        condition: service_healthy
+      mock-mam:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/health 2>/dev/null | grep -q '' || exit 1"]
       interval: 3s
       timeout: 2s
       retries: 10
@@ -84,6 +102,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: windlass-test
+    ports:
+      - "5010:5010"
     depends_on:
       mock-gluetun:
         condition: service_healthy
@@ -92,6 +112,8 @@ services:
       mock-gotify:
         condition: service_healthy
       mock-mam:
+        condition: service_healthy
+      chaos-controller:
         condition: service_healthy
     volumes:
       - vpn-files:/tmp/gluetun:ro
@@ -103,16 +125,14 @@ services:
       MAM_SESSION:      test_session
       GOTIFY_URL:       http://mock-gotify:8080
       GOTIFY_TOKEN:     test_token
-      # Point MAM calls at the local mock — no VPN proxy needed.
       MAM_SEEDBOX_URL:  http://mock-mam:8080/json/dynamicSeedbox.php
-      MAM_LOAD_URL:     http://mock-mam:8080/jsonLoad.php
-      # GLUETUN_PROXY_URL intentionally absent → vpn_client makes direct connections.
+      MAM_LOAD_URL:     "http://mock-mam:8080/jsonLoad.php?snatch_summary=true&clientStats"
       DATA_PATH:        /tmp
       DUMP_DIR:         /tmp/windlass_dumps
       VPN_IP_FILE:      /tmp/gluetun/ip
       VPN_PORT_FILE:    /tmp/gluetun/forwarded_port
+      WINDLASS_BIND:    0.0.0.0:5010
       RUST_LOG:         windlass=debug,info
-    restart: "no"
 
 volumes:
   vpn-files:

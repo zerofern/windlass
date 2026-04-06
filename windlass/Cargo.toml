@@ -21,3 +21,6 @@ tracing-subscriber = { workspace = true }
 secrecy          = { workspace = true }
 reqwest          = { workspace = true }
 uom              = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
