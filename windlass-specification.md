@@ -13,6 +13,14 @@ manages the lifecycle, network synchronisation, and intelligent curation of a Do
 VPN audiobook torrenting stack (Gluetun + qBittorrent + MLM + Mousehole) while syncing
 seamlessly with Audiobookshelf.
 
+### Design Philosophy: Notification-First
+
+The ideal Windlass experience is one where the user never needs to open the web UI. Windlass
+runs silently, makes decisions autonomously, and nudges the user via Gotify at exactly the
+right moment with a deep-link to a focused UI card. The web UI (Action Center) is a
+**pipeline oversight tool** — for users who want to check what is queued, adjust priorities,
+or add something manually. It is not the primary interaction surface.
+
 ---
 
 ## 2. Architectural Foundation
@@ -134,11 +142,9 @@ intent:
 
 - **Direct MAM torrent URL:** Queued immediately with no LLM call. The book card is created
   from Audnexus metadata and placed directly in the Download Queue.
-- **Goodreads, Audible, or ABS URL:** Metadata is resolved, Series Health is run if it is
-  Book 1 in a series, a "Sell It To Me" pitch is generated, and the card appears in
-  Suggested Next Listens for approval.
-- **Goodreads shelf URL:** Imports the entire shelf. Every book receives an AI score and
-  pitch; the user reviews them as a batch.
+- **Audible or ABS URL:** Metadata is resolved, Series Health is run if it is
+  Book 1 in a series, a "Sell It To Me" pitch is generated when the card is opened, and
+  the card appears in Suggested Next Listens for approval.
 - **Author / title search:** Queries MAM, returns ranked results. User picks one — same
   flow as URL paste.
 - **Vibe query** (e.g. *"short snarky sci-fi under 10 hours"*): LLM picks the best match
@@ -162,11 +168,21 @@ entire series and returns a `SeriesHealthReport` JSON.
 
 #### The "Sell It To Me" Custom Pitch
 
-> Replaces generic publisher blurbs with personalised justifications.
+> Replaces generic publisher blurbs with personalised, mood-aware justifications.
 
-**Execution:** For every book added to the Action Center (except direct MAM URL pastes),
-the LLM generates a `personalized_pitch` — e.g., *"Cures the 'too YA' feeling you hated
-in Mistborn and replaces it with the gritty factional politics you loved in Red Rising."*
+**Timing:** Pitches are generated **just-in-time at the moment of decision** — never
+pre-stored and served cold. A pitch generated weeks before the user encounters a book does
+not account for their current mood, what they just finished, or how much energy they have.
+
+**Context injected at generation time:**
+- The last 1–2 books the user finished and their ratings
+- Current listening velocity (high = in the zone; low = might need a change of pace)
+- Time of day and approximate season
+- How long the book has been waiting in the queue
+
+**Delivery:** Pitches appear in Gotify notification cards (series check-ins, recommendations,
+freeleech alerts) and in individual book cards when opened in the Action Center. They are
+*not* shown in the queue list view — that surface is for pipeline management, not decisions.
 
 #### Vibe-Based Query Engine (The "Palate Cleanser" Search)
 
@@ -243,9 +259,16 @@ minutes per day per book). If velocity on a specific book drops significantly be
 user's baseline for 3+ consecutive days, the core flags a `Pacing_Stall` state.
 
 **LLM Magic:** Windlass sends a Gotify notification with a deep-link to a UI card:
-*"Your listening pace on [Book Title] has dropped by 80%. Is it dragging?"* The card shows
-two options — "See what's ahead (spoiler-free)" and "Trigger Bailout Protocol" — along with
-the LLM's evaluation of whether the second half picks up pace.
+*"Your listening pace on [Book Title] has dropped by 80%. Is it dragging?"* The card
+presents three options:
+
+| Option | Meaning | System behaviour |
+|---|---|---|
+| "See what's ahead (spoiler-free)" | Evaluating the book | LLM assesses upcoming pacing and advises |
+| "Trigger Bailout Protocol" | Done with this book | Mark DNF, find a palate cleanser |
+| "I'm just busy right now" | Life, not the book | Snooze the detector for this book for 5 days; no profile weight changes |
+
+After a "just busy" response, the detector will not re-fire for that book for 5 days.
 
 ---
 
@@ -302,20 +325,23 @@ Subsequent DNF Autopsies and Post-Book Debriefs continuously refine the profile 
 
 ### Action Center
 
-The Action Center is the primary UI surface — a unified funnel from discovery to playback,
-organised into five panels.
+The Action Center is a **pipeline oversight panel** — not the primary interaction surface.
+Most users will interact with Windlass primarily through Gotify notifications and never need
+to open it. It exists for users who want to inspect the current state of their pipeline,
+adjust priorities, or add something manually.
+
+It is organised into five panels.
 
 #### 1. Suggested Next Listens
 
-AI-curated recommendations based on `user_profile`, reading history, and current mood. Also
-the landing zone for books discovered via the universal input box (URL paste, search, vibe
-query). Each card shows:
+AI-curated recommendations based on `user_profile`, reading history, and current mood
+signals. Also the landing zone for books discovered via the universal input box (URL paste,
+search, vibe query). Each card in the list shows book cover, title, author, narrator,
+duration, format badge, and series health badge (if applicable). **"Sell It To Me" pitches
+are not shown in the list** — they are generated fresh when the user opens a specific card
+or receives a notification, ensuring the pitch reflects current context.
 
-- Book cover, title, author, narrator, duration, format badge
-- Series position and health badge (complete / incomplete / abandoned / authorial drift)
-- Personalised "Sell It To Me" pitch
-
-Actions: **Approve** (sends to Download Queue) · **Reject** · **Snooze**
+Actions per card: **Approve** (sends to Download Queue) · **Reject** · **Snooze**
 
 The universal input box sits at the top of this panel:
 
@@ -327,7 +353,7 @@ The universal input box sits at the top of this panel:
 
 - **Direct MAM URL** → queued immediately, no LLM call
 - **Any other URL / author search** → resolves metadata, runs Series Health if Book 1,
-  generates pitch, card appears as "Analysing…" then populates
+  card appears for approval
 - **Vibe query** → LLM picks best match; card appears for approval
 
 #### 2. Download Queue
