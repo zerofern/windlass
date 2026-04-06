@@ -57,7 +57,7 @@ export function Log() {
             </Badge>
             <span className="truncate text-muted-foreground">
               {obs.type === 'StateSnapshot'
-                ? `vpn=${JSON.stringify((obs.data).vpn)} qbit=${JSON.stringify((obs.data).qbit)}`
+                ? `mode=${JSON.stringify(obs.data.run_mode)} recoveries=${obs.data.hard_recoveries} vpn=${JSON.stringify(obs.data.vpn)} qbit=${JSON.stringify(obs.data.qbit)} mam=${JSON.stringify(obs.data.mam)} torrents=${obs.data.known_torrents.length}`
                 : JSON.stringify(obs.data)}
             </span>
           </div>
