@@ -48,8 +48,7 @@ impl MamClient {
     /// Registers the current VPN IP with MAM via the dynamic seedbox endpoint.
     pub async fn update_seedbox(&self) -> Event {
         let current = self.session.lock().unwrap().clone();
-        let (event, new_session) =
-            update_seedbox_at(&self.client, &current, &self.seedbox_url).await;
+        let (event, new_session) = self.do_update_seedbox(&current).await;
         if let Some(rotated) = new_session {
             *self.session.lock().unwrap() = rotated;
         }
@@ -59,117 +58,110 @@ impl MamClient {
     /// Checks whether MAM reports the seedbox as connectable.
     pub async fn check_connectability(&self) -> Event {
         let current = self.session.lock().unwrap().clone();
-        let (event, new_session) =
-            check_connectability_at(&self.client, &current, &self.load_url).await;
+        let (event, new_session) = self.do_check_connectability(&current).await;
         if let Some(rotated) = new_session {
             *self.session.lock().unwrap() = rotated;
         }
         event
     }
 
+    async fn do_update_seedbox(&self, session: &str) -> (Event, Option<String>) {
+        let result = self
+            .client
+            .get(&self.seedbox_url)
+            .header(reqwest::header::COOKIE, format!("mam_id={session}"))
+            .send()
+            .await;
+
+        let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
+
+        match result {
+            Err(e) => {
+                warn!("MAM seedbox update request failed: {e}");
+                (Event::MamUpdateSuccess, new_session)
+            }
+            Ok(resp) => match resp.json::<DynamicSeedboxResponse>().await {
+                Ok(body) if body.success => {
+                    info!("MAM seedbox: {}", body.msg);
+                    (Event::MamUpdateSuccess, new_session)
+                }
+                Ok(body) if body.msg.contains("ASN mismatch") => {
+                    let ip = body
+                        .ip
+                        .trim()
+                        .parse()
+                        .map(VpnIp)
+                        .unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
+                    warn!("MAM ASN mismatch: ip={}", ip.0);
+                    (Event::MamAsnMismatch(ip), new_session)
+                }
+                Ok(body) => {
+                    warn!("MAM seedbox non-success: {}", body.msg);
+                    (Event::MamUpdateSuccess, new_session)
+                }
+                Err(e) => {
+                    warn!("MAM seedbox response parse failed: {e}");
+                    (Event::MamUpdateSuccess, new_session)
+                }
+            },
+        }
+    }
+
+    async fn do_check_connectability(&self, session: &str) -> (Event, Option<String>) {
+        let result = self
+            .client
+            .get(&self.load_url)
+            .header(reqwest::header::COOKIE, format!("mam_id={session}"))
+            .send()
+            .await;
+
+        let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
+
+        match result {
+            Err(e) => {
+                warn!("MAM connectivity check request failed: {e}");
+                (
+                    Event::MamStatusObserved(MamStatus::Unreachable),
+                    new_session,
+                )
+            }
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    warn!("MAM connectivity check HTTP {}", resp.status());
+                    return (
+                        Event::MamStatusObserved(MamStatus::Unreachable),
+                        new_session,
+                    );
+                }
+                match resp.json::<JsonLoadResponse>().await {
+                    Ok(body) => {
+                        let connectable = body
+                            .connectable
+                            .as_deref()
+                            .is_some_and(|s| s.eq_ignore_ascii_case("yes"));
+                        debug!("MAM connectable={connectable}");
+                        let status = if connectable {
+                            MamStatus::Connectable
+                        } else {
+                            MamStatus::NotConnectable
+                        };
+                        (Event::MamStatusObserved(status), new_session)
+                    }
+                    Err(e) => {
+                        warn!("MAM connectivity parse failed: {e}");
+                        (
+                            Event::MamStatusObserved(MamStatus::Unreachable),
+                            new_session,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn session_value(&self) -> String {
         self.session.lock().unwrap().clone()
-    }
-}
-
-async fn update_seedbox_at(
-    client: &reqwest::Client,
-    session: &str,
-    url: &str,
-) -> (Event, Option<String>) {
-    let result = client
-        .get(url)
-        .header(reqwest::header::COOKIE, format!("mam_id={session}"))
-        .send()
-        .await;
-
-    let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
-
-    match result {
-        Err(e) => {
-            warn!("MAM seedbox update request failed: {e}");
-            (Event::MamUpdateSuccess, new_session)
-        }
-        Ok(resp) => match resp.json::<DynamicSeedboxResponse>().await {
-            Ok(body) if body.success => {
-                info!("MAM seedbox: {}", body.msg);
-                (Event::MamUpdateSuccess, new_session)
-            }
-            Ok(body) if body.msg.contains("ASN mismatch") => {
-                let ip = body
-                    .ip
-                    .trim()
-                    .parse()
-                    .map(VpnIp)
-                    .unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
-                warn!("MAM ASN mismatch: ip={}", ip.0);
-                (Event::MamAsnMismatch(ip), new_session)
-            }
-            Ok(body) => {
-                warn!("MAM seedbox non-success: {}", body.msg);
-                (Event::MamUpdateSuccess, new_session)
-            }
-            Err(e) => {
-                warn!("MAM seedbox response parse failed: {e}");
-                (Event::MamUpdateSuccess, new_session)
-            }
-        },
-    }
-}
-
-async fn check_connectability_at(
-    client: &reqwest::Client,
-    session: &str,
-    url: &str,
-) -> (Event, Option<String>) {
-    let result = client
-        .get(url)
-        .header(reqwest::header::COOKIE, format!("mam_id={session}"))
-        .send()
-        .await;
-
-    let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
-
-    match result {
-        Err(e) => {
-            warn!("MAM connectivity check request failed: {e}");
-            (
-                Event::MamStatusObserved(MamStatus::Unreachable),
-                new_session,
-            )
-        }
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                warn!("MAM connectivity check HTTP {}", resp.status());
-                return (
-                    Event::MamStatusObserved(MamStatus::Unreachable),
-                    new_session,
-                );
-            }
-            match resp.json::<JsonLoadResponse>().await {
-                Ok(body) => {
-                    let connectable = body
-                        .connectable
-                        .as_deref()
-                        .is_some_and(|s| s.eq_ignore_ascii_case("yes"));
-                    debug!("MAM connectable={connectable}");
-                    let status = if connectable {
-                        MamStatus::Connectable
-                    } else {
-                        MamStatus::NotConnectable
-                    };
-                    (Event::MamStatusObserved(status), new_session)
-                }
-                Err(e) => {
-                    warn!("MAM connectivity parse failed: {e}");
-                    (
-                        Event::MamStatusObserved(MamStatus::Unreachable),
-                        new_session,
-                    )
-                }
-            }
-        }
     }
 }
 
