@@ -51,7 +51,7 @@ flat JSON state file.
 | Table | Contents |
 |---|---|
 | `user_profile` | Core identity, dealbreakers, dynamic genre weights, target pipeline depth |
-| `reading_ledger` | Completed books, user ratings, parsed DNF reasons |
+| `reading_ledger` | Completed books, user ratings, parsed DNF reasons, last-played timestamp — retained permanently even after a torrent is deleted from disk |
 | `download_queue` | Pending torrents, AI scores, metadata |
 | `alerts` | All fired alerts with ID, severity, timestamp, triggering event, system state snapshot |
 
@@ -93,8 +93,29 @@ the account from automated bans.
 - **Upload Health Math (Rule 1.4):** Enforced before queueing new downloads:
   - Global Ratio must remain ≥ 2.0 (well above the 1.0 minimum).
   - Upload credit buffer must remain ≥ 25 GB.
-- **Disk Auto-Eviction:** Monitors the mounted volume. If free space drops below a defined
-  threshold, Windlass automatically deletes the oldest HnR-satisfied torrents.
+- **Disk Space Management:** Monitors the mounted volume continuously. Disk management
+  operates at two levels:
+
+  *Automatic (silent):* If free space drops below a hard floor threshold, Windlass
+  immediately auto-evicts the lowest-value HnR-satisfied torrents (completed + low rating
+  + longest time since last play) without user input. This is the emergency brake.
+
+  *User-directed (proactive):* When projected free space over the next month (based on
+  expected downloads) drops below a configurable buffer, Windlass sends a Gotify
+  notification with a deep-link to a deletion suggestion card:
+
+  > *"Windlass has 47 GB free. To comfortably fit this month's queue, we need ~80 GB.*
+  > *Here are the best candidates to remove — confirm to free the space."*
+
+  The suggestion list is ranked by deletion value:
+  1. Completed + low rating (≤ 2★) + HnR satisfied
+  2. DNF + HnR satisfied
+  3. Completed + high rating but long since listened + HnR satisfied (user can un-tick these)
+  4. Unstarted + long wait + low AI score
+
+  HnR-unsatisfied torrents are never shown as deletion candidates. The user reviews the
+  list, un-ticks anything they want to keep, and confirms. Ratings and listening history
+  are retained in `reading_ledger` after deletion so the data is never lost.
 
 ---
 
@@ -314,21 +335,19 @@ After a "just busy" response, the detector will not re-fire for that book for 5 
 > Maximises MAM economy (ratio/buffer) while discovering zero-risk reads.
 
 **Execution:** When MAM publishes a new free books list, Windlass scrapes it and evaluates
-each title against `user_profile`. The number of titles grabbed is **not fixed** — it is
-governed entirely by current pipeline depth:
+each title against `user_profile`. Pipeline depth determines the **selectivity threshold**
+for what counts as a good enough match — it is not a cap on quantity. If the LLM scores 11
+books as strong matches in a given month, all 11 are queued. A great month should be fully
+exploited: next month might only yield 2 good titles, so a healthy buffer now protects
+against that.
 
-- **Thin pipeline** (< 1 week): grab everything that clears the profile threshold, including
-  borderline matches. This is the moment to bulk up.
-- **Healthy pipeline** (1–4 weeks): curated selection — only strong matches.
-- **Deep pipeline** (> 4 weeks): skip unless a title is an exceptional match.
-
-This means a great freeleech month results in more acquisitions, deliberately building a
-buffer against future slow months. The goal is always pipeline health, not a fixed cadence.
+- **Thin pipeline** (< 1 week): threshold is relaxed — queue borderline matches too
+- **Healthy pipeline** (1–4 weeks): curated — only strong profile matches
+- **Deep pipeline** (> 4 weeks): conservative — only exceptional matches
 
 Approved torrents are snatched, seeded for upload credit, and added to a "Free Discovery"
 collection in ABS. The Freeleech Scavenger panel in the Action Center shows the current
-batch with pitches for each title; the user can override individual approvals or the whole
-batch before snatching begins.
+batch; the user can override individual approvals before snatching begins.
 
 ---
 
