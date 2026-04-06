@@ -50,7 +50,7 @@ flat JSON state file.
 
 | Table | Contents |
 |---|---|
-| `user_profile` | Core identity, dealbreakers, dynamic genre weights |
+| `user_profile` | Core identity, dealbreakers, dynamic genre weights, target pipeline depth |
 | `reading_ledger` | Completed books, user ratings, parsed DNF reasons |
 | `download_queue` | Pending torrents, AI scores, metadata |
 | `alerts` | All fired alerts with ID, severity, timestamp, triggering event, system state snapshot |
@@ -112,13 +112,47 @@ Windlass evaluates raw tracker search results to automatically select the optima
 
 - **Audiobookshelf (ABS) Sync:** Continuously polls ABS for playback progress and triggers
   library scans upon completed downloads.
-- **Predictive Series Syncing:** When a user is actively listening to a series, the next
-  entry is automatically queued and downloaded in the background — no notification, no
-  approval required. The goal is that book N+1 is always ready before the user finishes
-  book N. At 60–75% progress through the current book, Windlass sends a brief check-in
-  (deep-link to a UI card): *"You're getting close to the end of [Book]. Still enjoying the
-  series? Book N+1 is queued and ready."* If the user signals they're done with the series,
-  auto-queuing stops.
+- **Pipeline Depth Management:** Windlass continuously tracks pipeline depth — the total
+  hours of approved, ready-to-play content across the Download Queue and the In Library
+  (Unread) panel. This is the primary metric governing acquisition aggressiveness:
+
+  | Depth | State | Acquisition behaviour |
+  |---|---|---|
+  | < 1 week of listening | Thin | Aggressive — push curated recs, grab all strong freeleech matches |
+  | 1–4 weeks | Healthy | Normal — curated recommendations only |
+  | > 4 weeks | Deep | Conservative — only exceptional scores or pure freeleech |
+
+  *"1 week of listening" is computed from the user's rolling average listening velocity.*
+
+- **Predictive Series Syncing:** For a series the user has already started and rated
+  positively, the next entry is automatically queued and downloaded in the background with
+  no approval required. The check-in timing is **dynamic** — it fires when the estimated
+  time remaining in the current book equals the time needed to acquire the next book plus
+  a safety buffer. In practice:
+  - Next book already on disk → check-in at ~1 day estimated remaining (confirmation only)
+  - Next book needs downloading → check-in at ~2 days estimated remaining
+  - Next book availability unknown → check-in at ~3 days estimated remaining
+  - Hard limits: never before 30% remaining; never after 90% remaining
+
+  The check-in is a Gotify notification with a deep-link to a card offering:
+  **Continue series** · **Pause series** · **Skip to Book N+2** · **Find me something else**
+
+  If the user ignores the check-in, Windlass assumes continuation and ensures the next book
+  is ready. The check-in is only decision-critical when the next book has not yet been
+  pre-fetched.
+
+- **Finish-Book Notification:** When ABS marks a book complete, a single Gotify notification
+  delivers both the debrief prompt and the "what's next" suggestion:
+
+  > *"You finished [Book Title].*
+  > ★ [tap to rate]*
+  > *Next up: [Book N+1] · [duration] · [format] · ready to play.*
+  > **[Continue]   [I want something different]**"
+
+  The "Sell It To Me" pitch for the next book is generated here, fresh, using the just-
+  completed book as context. If nothing is queued, the notification prompts the user to
+  open the vibe query instead.
+
 - **Audnexus API Integration:** Provides perfect series ordering, blurbs, and release dates
   from the public `api.audnex.us` endpoint (wraps Audible's database).
 - **Auto-Queuing:** For a series the user has already started and rated positively, Windlass
@@ -242,13 +276,14 @@ updates the negative/positive weights in `user_profile`, and refines future sear
 
 #### The Post-Book Debrief
 
-> Captures immediate user sentiment upon finishing a book.
+> Captures immediate user sentiment upon finishing a book — combined with the "what's next" handoff.
 
-**Execution:** When the ABS webhook fires a "Completed" event, Windlass sends a Gotify
-notification with a deep-link to a rating card: *"You finished [Book Title]. Quick rating
-and any thoughts?"* The user opens the card, rates 1–5 stars, and optionally adds a note.
-The LLM parses the note, logs the rating into `reading_ledger`, and extracts specific
-feedback to tweak `user_profile` weights for future RAG prompts.
+**Execution:** The ABS "Completed" webhook fires a single Gotify notification that handles
+both the debrief and the next-book handoff (see §6 Finish-Book Notification). The LLM
+parses any note the user adds, logs the rating into `reading_ledger`, and extracts specific
+feedback to tweak `user_profile` weights for future RAG prompts. If pipeline depth is below
+the healthy threshold after this book is marked complete, acquisition aggressiveness
+increases immediately.
 
 #### The Listening Velocity Monitor (The "Slog Detector")
 
@@ -274,16 +309,26 @@ After a "just busy" response, the detector will not re-fire for that book for 5 
 
 ### 7.4 Tracker Economy
 
-#### The Monthly MAM "Freeleech" Scavenger
+#### The MAM "Freeleech" Scavenger
 
 > Maximises MAM economy (ratio/buffer) while discovering zero-risk reads.
 
-**Execution:** A cron job fires on the 1st of every month to scrape the MAM "Free Books of
-the Month" list. Since freeleech costs zero ratio, the LLM receives relaxed instructions:
-*"Discard absolute dealbreakers, but aggressively queue anything that aligns with
-'Competence Porn' or 'Sci-Fi/Fantasy' preferences."* Approved torrents are snatched,
-seeded for upload credit, and added to a "Free Discovery" collection in ABS — each with a
-personalised "Sell It To Me" pitch.
+**Execution:** When MAM publishes a new free books list, Windlass scrapes it and evaluates
+each title against `user_profile`. The number of titles grabbed is **not fixed** — it is
+governed entirely by current pipeline depth:
+
+- **Thin pipeline** (< 1 week): grab everything that clears the profile threshold, including
+  borderline matches. This is the moment to bulk up.
+- **Healthy pipeline** (1–4 weeks): curated selection — only strong matches.
+- **Deep pipeline** (> 4 weeks): skip unless a title is an exceptional match.
+
+This means a great freeleech month results in more acquisitions, deliberately building a
+buffer against future slow months. The goal is always pipeline health, not a fixed cadence.
+
+Approved torrents are snatched, seeded for upload credit, and added to a "Free Discovery"
+collection in ABS. The Freeleech Scavenger panel in the Action Center shows the current
+batch with pitches for each title; the user can override individual approvals or the whole
+batch before snatching begins.
 
 ---
 
