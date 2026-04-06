@@ -7,7 +7,6 @@ mod qbit;
 mod vpn_files;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -49,7 +48,28 @@ pub async fn run() -> Result<()> {
         builder.build()?
     };
 
-    let mam_session: Arc<Mutex<String>> = Arc::new(Mutex::new(config.mam_session.clone()));
+    let qbit = qbit::QbitClient::new(
+        direct.clone(),
+        config.qbit_url.clone(),
+        config.qbit_user.clone(),
+        config.qbit_pass.0.expose_secret().to_owned(),
+    );
+    let mam = mam::MamClient::new(
+        vpn,
+        config.mam_session.clone(),
+        config.mam_seedbox_url.clone(),
+        config.mam_load_url.clone(),
+    );
+    let gotify = gotify::GotifyClient::new(
+        direct.clone(),
+        config.gotify_url.clone(),
+        config.gotify_token.clone(),
+    );
+
+    let vpn_ip_file = config.vpn_ip_file.clone();
+    let vpn_port_file = config.vpn_port_file.clone();
+    let data_path = config.data_path.clone();
+
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
     let mut cached_cookie: Option<AuthCookie> = None;
     let mut state = SystemState::initial();
@@ -59,34 +79,38 @@ pub async fn run() -> Result<()> {
         port_files,
     });
     state = new_state;
-    ShellContext::new(
-        &config,
-        &docker,
-        &direct,
-        &vpn,
-        &mut wakeups,
-        &mam_session,
-        &boot.dependents,
-        &mut cached_cookie,
-        &tx,
-    )
+    ShellContext {
+        docker: &docker,
+        qbit: &qbit,
+        mam: &mam,
+        gotify: &gotify,
+        wakeups: &mut wakeups,
+        dependents: &boot.dependents,
+        cached_cookie: &mut cached_cookie,
+        tx: &tx,
+        vpn_ip_file: &vpn_ip_file,
+        vpn_port_file: &vpn_port_file,
+        data_path: &data_path,
+    }
     .dispatch(actions);
 
     while let Some(event) = rx.recv().await {
         debug!(?event, "←");
         let (new_state, actions) = state.process_event(event);
         state = new_state;
-        ShellContext::new(
-            &config,
-            &docker,
-            &direct,
-            &vpn,
-            &mut wakeups,
-            &mam_session,
-            &boot.dependents,
-            &mut cached_cookie,
-            &tx,
-        )
+        ShellContext {
+            docker: &docker,
+            qbit: &qbit,
+            mam: &mam,
+            gotify: &gotify,
+            wakeups: &mut wakeups,
+            dependents: &boot.dependents,
+            cached_cookie: &mut cached_cookie,
+            tx: &tx,
+            vpn_ip_file: &vpn_ip_file,
+            vpn_port_file: &vpn_port_file,
+            data_path: &data_path,
+        }
         .dispatch(actions);
     }
 
@@ -96,45 +120,20 @@ pub async fn run() -> Result<()> {
 /// All shared shell state bundled together so action handlers don't need
 /// a long argument list.
 struct ShellContext<'a> {
-    config: &'a Config,
     docker: &'a docker::DockerClient,
-    direct: &'a reqwest::Client,
-    vpn: &'a reqwest::Client,
+    qbit: &'a qbit::QbitClient,
+    mam: &'a mam::MamClient,
+    gotify: &'a gotify::GotifyClient,
     wakeups: &'a mut HashMap<WakeupId, JoinHandle<()>>,
-    mam_session: &'a Arc<Mutex<String>>,
     dependents: &'a [String],
     cached_cookie: &'a mut Option<AuthCookie>,
     tx: &'a mpsc::Sender<Event>,
+    vpn_ip_file: &'a str,
+    vpn_port_file: &'a str,
+    data_path: &'a str,
 }
 
-impl<'a> ShellContext<'a> {
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::missing_const_for_fn)]
-    // Not actually useful as const fn — contains &mut references.
-    fn new(
-        config: &'a Config,
-        docker: &'a docker::DockerClient,
-        direct: &'a reqwest::Client,
-        vpn: &'a reqwest::Client,
-        wakeups: &'a mut HashMap<WakeupId, JoinHandle<()>>,
-        mam_session: &'a Arc<Mutex<String>>,
-        dependents: &'a [String],
-        cached_cookie: &'a mut Option<AuthCookie>,
-        tx: &'a mpsc::Sender<Event>,
-    ) -> Self {
-        Self {
-            config,
-            docker,
-            direct,
-            vpn,
-            wakeups,
-            mam_session,
-            dependents,
-            cached_cookie,
-            tx,
-        }
-    }
-
+impl ShellContext<'_> {
     /// Dispatches every action produced by the Core in one synchronous pass.
     fn dispatch(&mut self, actions: Vec<Action>) {
         for action in actions {
@@ -176,8 +175,8 @@ impl<'a> ShellContext<'a> {
 
     /// Retry path only — the debounced file watcher handles normal reads.
     fn read_port_files(&self) {
-        let ip_file = self.config.vpn_ip_file.clone();
-        let port_file = self.config.vpn_port_file.clone();
+        let ip_file = self.vpn_ip_file.to_owned();
+        let port_file = self.vpn_port_file.to_owned();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -227,24 +226,20 @@ impl<'a> ShellContext<'a> {
     // ── qBittorrent ───────────────────────────────────────────────────────────
 
     fn authenticate_qbit(&self) {
-        let client = self.direct.clone();
-        let url = self.config.qbit_url.clone();
-        let user = self.config.qbit_user.clone();
-        let pass = self.config.qbit_pass.0.expose_secret().to_owned();
+        let qbit = self.qbit.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let event = qbit::authenticate(&client, &url, &user, &pass).await;
+            let event = qbit.authenticate().await;
             let _ = tx.send(event).await;
         });
     }
 
     fn sync_qbit_port(&mut self, cookie: AuthCookie, port: VpnPort) {
         *self.cached_cookie = Some(cookie.clone());
-        let client = self.direct.clone();
-        let url = self.config.qbit_url.clone();
+        let qbit = self.qbit.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let event = qbit::sync_port(&client, &url, &cookie, port).await;
+            let event = qbit.sync_port(&cookie, port).await;
             let _ = tx.send(event).await;
         });
     }
@@ -252,31 +247,19 @@ impl<'a> ShellContext<'a> {
     // ── MAM ───────────────────────────────────────────────────────────────────
 
     fn update_mam(&self, _ip: VpnIp) {
-        let client = self.vpn.clone();
-        let session = self.mam_session.clone();
-        let url = self.config.mam_seedbox_url.clone();
+        let mam = self.mam.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let current = session.lock().unwrap().clone();
-            let (event, new_session) = mam::update_seedbox_at(&client, &current, &url).await;
-            if let Some(rotated) = new_session {
-                *session.lock().unwrap() = rotated;
-            }
+            let event = mam.update_seedbox().await;
             let _ = tx.send(event).await;
         });
     }
 
     fn check_mam_connectability(&self) {
-        let client = self.vpn.clone();
-        let session = self.mam_session.clone();
-        let url = self.config.mam_load_url.clone();
+        let mam = self.mam.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let current = session.lock().unwrap().clone();
-            let (event, new_session) = mam::check_connectability_at(&client, &current, &url).await;
-            if let Some(rotated) = new_session {
-                *session.lock().unwrap() = rotated;
-            }
+            let event = mam.check_connectability().await;
             let _ = tx.send(event).await;
         });
     }
@@ -284,7 +267,7 @@ impl<'a> ShellContext<'a> {
     // ── Monitoring ────────────────────────────────────────────────────────────
 
     fn check_disk_space(&self) {
-        let path = self.config.data_path.clone();
+        let path = self.data_path.to_owned();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let space = tokio::task::spawn_blocking(move || monitors::check_disk_space(&path))
@@ -303,11 +286,10 @@ impl<'a> ShellContext<'a> {
             });
             return;
         };
-        let client = self.direct.clone();
-        let url = self.config.qbit_url.clone();
+        let qbit = self.qbit.clone();
         tokio::spawn(async move {
             // Shell sends the raw full list — Core owns the deduplication logic.
-            let current = qbit::list_torrents(&client, &url, &cookie).await;
+            let current = qbit.list_torrents(&cookie).await;
             let _ = tx.send(Event::NewTorrentsObserved(current)).await;
         });
     }
@@ -315,11 +297,9 @@ impl<'a> ShellContext<'a> {
     // ── Alerts ────────────────────────────────────────────────────────────────
 
     fn send_gotify_alert(&self, priority: AlertPriority, message: String) {
-        let client = self.direct.clone();
-        let url = self.config.gotify_url.clone();
-        let token = self.config.gotify_token.clone();
+        let gotify = self.gotify.clone();
         tokio::spawn(async move {
-            gotify::send_alert(&client, &url, &token, priority, &message).await;
+            gotify.send_alert(priority, &message).await;
         });
     }
 }

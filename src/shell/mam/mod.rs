@@ -1,12 +1,10 @@
-use reqwest::Client;
+use std::sync::{Arc, Mutex};
+
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::core::events::Event;
 use crate::types::{MamStatus, VpnIp};
-
-const MAM_SEEDBOX_URL: &str = "https://t.myanonamouse.net/json/dynamicSeedbox.php";
-const MAM_LOAD_URL: &str = "https://www.myanonamouse.net/jsonLoad.php?clientStats";
 
 #[derive(Deserialize)]
 struct DynamicSeedboxResponse {
@@ -21,21 +19,62 @@ struct JsonLoadResponse {
     connectable: Option<String>,
 }
 
-/// Registers the current VPN IP with MAM via the dynamic seedbox endpoint.
-/// IP is determined server-side from the proxied TCP connection — we send
-/// no IP ourselves. Returns an updated session cookie if MAM rotated it.
-pub async fn update_seedbox(client: &Client, session: &str) -> (Event, Option<String>) {
-    update_seedbox_at(client, session, MAM_SEEDBOX_URL).await
+/// Wraps a VPN-routed `reqwest::Client` together with the MAM connection
+/// details and a rotating session cookie. All MAM operations are methods
+/// so call sites only pass `&self`.
+#[derive(Clone)]
+pub struct MamClient {
+    client: reqwest::Client,
+    session: Arc<Mutex<String>>,
+    seedbox_url: String,
+    load_url: String,
 }
 
-/// Checks whether MAM reports the seedbox as connectable.
-/// Uses `?clientStats` which includes the connectable field with a 30-min cache.
-pub async fn check_connectability(client: &Client, session: &str) -> (Event, Option<String>) {
-    check_connectability_at(client, session, MAM_LOAD_URL).await
+impl MamClient {
+    pub fn new(
+        client: reqwest::Client,
+        session: String,
+        seedbox_url: String,
+        load_url: String,
+    ) -> Self {
+        Self {
+            client,
+            session: Arc::new(Mutex::new(session)),
+            seedbox_url,
+            load_url,
+        }
+    }
+
+    /// Registers the current VPN IP with MAM via the dynamic seedbox endpoint.
+    pub async fn update_seedbox(&self) -> Event {
+        let current = self.session.lock().unwrap().clone();
+        let (event, new_session) =
+            update_seedbox_at(&self.client, &current, &self.seedbox_url).await;
+        if let Some(rotated) = new_session {
+            *self.session.lock().unwrap() = rotated;
+        }
+        event
+    }
+
+    /// Checks whether MAM reports the seedbox as connectable.
+    pub async fn check_connectability(&self) -> Event {
+        let current = self.session.lock().unwrap().clone();
+        let (event, new_session) =
+            check_connectability_at(&self.client, &current, &self.load_url).await;
+        if let Some(rotated) = new_session {
+            *self.session.lock().unwrap() = rotated;
+        }
+        event
+    }
+
+    #[cfg(test)]
+    pub fn session_value(&self) -> String {
+        self.session.lock().unwrap().clone()
+    }
 }
 
-pub async fn update_seedbox_at(
-    client: &Client,
+async fn update_seedbox_at(
+    client: &reqwest::Client,
     session: &str,
     url: &str,
 ) -> (Event, Option<String>) {
@@ -79,8 +118,8 @@ pub async fn update_seedbox_at(
     }
 }
 
-pub async fn check_connectability_at(
-    client: &Client,
+async fn check_connectability_at(
+    client: &reqwest::Client,
     session: &str,
     url: &str,
 ) -> (Event, Option<String>) {
@@ -153,10 +192,6 @@ mod tests {
     use wiremock::matchers::{header_exists, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn client() -> Client {
-        reqwest::Client::new()
-    }
-
     // ── update_seedbox ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -171,9 +206,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, cookie) = update_seedbox_at(&client(), "my_session", &server.uri()).await;
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+        );
+        let event = mam.update_seedbox().await;
         assert!(matches!(event, Event::MamUpdateSuccess));
-        assert!(cookie.is_none());
     }
 
     #[tokio::test]
@@ -188,7 +228,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) = update_seedbox_at(&client(), "my_session", &server.uri()).await;
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+        );
+        let event = mam.update_seedbox().await;
         assert!(matches!(event, Event::MamAsnMismatch(ip) if ip.0.to_string() == "79.127.184.201"));
     }
 
@@ -208,8 +254,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, cookie) = update_seedbox_at(&client(), "old_cookie", &server.uri()).await;
-        assert_eq!(cookie.as_deref(), Some("rotated_cookie"));
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "old_cookie".into(),
+            server.uri(),
+            server.uri(),
+        );
+        mam.update_seedbox().await;
+        assert_eq!(mam.session_value(), "rotated_cookie");
     }
 
     #[tokio::test]
@@ -225,7 +277,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) = update_seedbox_at(&client(), "my_session", &server.uri()).await;
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+        );
+        let event = mam.update_seedbox().await;
         assert!(matches!(event, Event::MamUpdateSuccess));
     }
 
@@ -242,7 +300,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+        );
+        let event = mam.check_connectability().await;
         assert!(matches!(
             event,
             Event::MamStatusObserved(MamStatus::Connectable)
@@ -260,7 +324,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+        );
+        let event = mam.check_connectability().await;
         assert!(matches!(
             event,
             Event::MamStatusObserved(MamStatus::NotConnectable)
@@ -278,7 +348,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+        );
+        let event = mam.check_connectability().await;
         assert!(matches!(
             event,
             Event::MamStatusObserved(MamStatus::NotConnectable)
@@ -297,8 +373,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (_, cookie) = check_connectability_at(&client(), "old_cookie", &server.uri()).await;
-        assert_eq!(cookie.as_deref(), Some("new_cookie"));
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "old_cookie".into(),
+            server.uri(),
+            server.uri(),
+        );
+        mam.check_connectability().await;
+        assert_eq!(mam.session_value(), "new_cookie");
     }
 
     #[tokio::test]
@@ -309,7 +391,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (event, _) = check_connectability_at(&client(), "my_session", &server.uri()).await;
+        let mam = MamClient::new(
+            reqwest::Client::new(),
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+        );
+        let event = mam.check_connectability().await;
         assert!(matches!(
             event,
             Event::MamStatusObserved(MamStatus::Unreachable)

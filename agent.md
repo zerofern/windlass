@@ -29,6 +29,27 @@ shell/ (executes actions)
 If code makes a decision ("should I retry?", "is this a new value?"), it belongs
 in `core/`. If code talks to the OS, network, or Docker, it belongs in `shell/`.
 
+## Design decisions — always ask
+
+The owner wants to be included in design decisions. When you spot an
+improvement that goes beyond the literal requirements — even a small one —
+**ask before deciding to skip it**.
+
+The pattern to avoid:
+
+> "This would be cleaner but it's beyond the scope of what's described,
+> so I'll leave it for now."
+
+The pattern to use instead:
+
+> "While implementing X, I noticed Y would be cleaner (e.g. moving
+> `cached_cookie` into `QbitClient` as `Arc<Mutex<Option<AuthCookie>>>`).
+> It's a small extra change — want me to do it now or save it for later?"
+
+This applies even when the current requirements are explicit. The owner's
+answer may well be "yes, do it." Never silently skip an improvement you
+have spotted — surface it as a question.
+
 ## File size
 
 Keep source files small. LLMs and humans both work better with focused,

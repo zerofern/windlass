@@ -1,37 +1,50 @@
-use reqwest::Client;
 use serde_json::json;
 use tracing::warn;
 
 use crate::types::AlertPriority;
 
-/// Sends a push notification to Gotify. Fire-and-forget — failures are
-/// logged but never propagated back to the Core.
-pub async fn send_alert(
-    client: &Client,
-    base_url: &str,
-    token: &str,
-    priority: AlertPriority,
-    message: &str,
-) {
-    let gotify_priority: u8 = match priority {
-        AlertPriority::Info => 3,
-        AlertPriority::Warning => 5,
-        AlertPriority::Critical => 8,
-    };
+/// Wraps a `reqwest::Client` together with the Gotify connection details.
+/// All Gotify operations are methods so call sites only pass `&self`.
+#[derive(Clone)]
+pub struct GotifyClient {
+    client: reqwest::Client,
+    base_url: String,
+    token: String,
+}
 
-    let url = format!("{base_url}/message");
-    if let Err(e) = client
-        .post(&url)
-        .header("X-Gotify-Key", token)
-        .json(&json!({
-            "title": "Windlass",
-            "message": message,
-            "priority": gotify_priority,
-        }))
-        .send()
-        .await
-    {
-        warn!("Gotify alert failed to send: {e}");
+impl GotifyClient {
+    pub const fn new(client: reqwest::Client, base_url: String, token: String) -> Self {
+        Self {
+            client,
+            base_url,
+            token,
+        }
+    }
+
+    /// Sends a push notification to Gotify. Fire-and-forget — failures are
+    /// logged but never propagated back to the Core.
+    pub async fn send_alert(&self, priority: AlertPriority, message: &str) {
+        let gotify_priority: u8 = match priority {
+            AlertPriority::Info => 3,
+            AlertPriority::Warning => 5,
+            AlertPriority::Critical => 8,
+        };
+
+        let url = format!("{}/message", self.base_url);
+        if let Err(e) = self
+            .client
+            .post(&url)
+            .header("X-Gotify-Key", &self.token)
+            .json(&json!({
+                "title": "Windlass",
+                "message": message,
+                "priority": gotify_priority,
+            }))
+            .send()
+            .await
+        {
+            warn!("Gotify alert failed to send: {e}");
+        }
     }
 }
 
@@ -51,15 +64,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = reqwest::Client::new();
-        send_alert(
-            &client,
-            &server.uri(),
-            "my_token",
-            AlertPriority::Warning,
-            "disk low",
-        )
-        .await;
+        let client = GotifyClient::new(reqwest::Client::new(), server.uri(), "my_token".into());
+        client.send_alert(AlertPriority::Warning, "disk low").await;
 
         // wiremock asserts all mounted mocks were called when the server drops
         server.verify().await;
@@ -75,29 +81,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = reqwest::Client::new();
-        send_alert(
-            &client,
-            &server.uri(),
-            "tok",
-            AlertPriority::Critical,
-            "vpn down",
-        )
-        .await;
+        let client = GotifyClient::new(reqwest::Client::new(), server.uri(), "tok".into());
+        client.send_alert(AlertPriority::Critical, "vpn down").await;
     }
 
     #[tokio::test]
     async fn send_alert_silently_ignores_network_errors() {
         // Fire-and-forget: a network failure must not panic or propagate.
-        let client = reqwest::Client::new();
-        send_alert(
-            &client,
-            "http://127.0.0.1:1",
-            "tok",
-            AlertPriority::Info,
-            "hi",
-        )
-        .await;
+        let client = GotifyClient::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            "tok".into(),
+        );
+        client.send_alert(AlertPriority::Info, "hi").await;
         // reaching here means no panic
     }
 }
