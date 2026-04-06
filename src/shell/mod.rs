@@ -71,7 +71,6 @@ pub async fn run() -> Result<()> {
     let data_path = config.data_path.clone();
 
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
-    let mut cached_cookie: Option<AuthCookie> = None;
     let mut state = SystemState::initial();
 
     let (new_state, actions) = state.process_event(Event::Init {
@@ -86,7 +85,6 @@ pub async fn run() -> Result<()> {
         gotify: &gotify,
         wakeups: &mut wakeups,
         dependents: &boot.dependents,
-        cached_cookie: &mut cached_cookie,
         tx: &tx,
         vpn_ip_file: &vpn_ip_file,
         vpn_port_file: &vpn_port_file,
@@ -105,7 +103,6 @@ pub async fn run() -> Result<()> {
             gotify: &gotify,
             wakeups: &mut wakeups,
             dependents: &boot.dependents,
-            cached_cookie: &mut cached_cookie,
             tx: &tx,
             vpn_ip_file: &vpn_ip_file,
             vpn_port_file: &vpn_port_file,
@@ -126,7 +123,6 @@ struct ShellContext<'a> {
     gotify: &'a gotify::GotifyClient,
     wakeups: &'a mut HashMap<WakeupId, JoinHandle<()>>,
     dependents: &'a [String],
-    cached_cookie: &'a mut Option<AuthCookie>,
     tx: &'a mpsc::Sender<Event>,
     vpn_ip_file: &'a str,
     vpn_port_file: &'a str,
@@ -150,7 +146,7 @@ impl ShellContext<'_> {
                 Action::UpdateMam(ip) => self.update_mam(ip),
                 Action::CheckMamConnectability => self.check_mam_connectability(),
                 Action::CheckDiskSpace => self.check_disk_space(),
-                Action::CheckNewTorrents => self.check_new_torrents(),
+                Action::CheckNewTorrents(cookie) => self.check_new_torrents(cookie),
                 Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
             }
         }
@@ -234,8 +230,7 @@ impl ShellContext<'_> {
         });
     }
 
-    fn sync_qbit_port(&mut self, cookie: AuthCookie, port: VpnPort) {
-        *self.cached_cookie = Some(cookie.clone());
+    fn sync_qbit_port(&self, cookie: AuthCookie, port: VpnPort) {
         let qbit = self.qbit.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -277,15 +272,8 @@ impl ShellContext<'_> {
         });
     }
 
-    fn check_new_torrents(&self) {
+    fn check_new_torrents(&self, cookie: AuthCookie) {
         let tx = self.tx.clone();
-        let Some(cookie) = self.cached_cookie.clone() else {
-            // qBit not yet authenticated — send empty so Core re-arms the timer.
-            tokio::spawn(async move {
-                let _ = tx.send(Event::NewTorrentsObserved(vec![])).await;
-            });
-            return;
-        };
         let qbit = self.qbit.clone();
         tokio::spawn(async move {
             // Shell sends the raw full list — Core owns the deduplication logic.

@@ -20,11 +20,22 @@ fn wakeup_disk_check_checks_disk_space() {
 
 #[test]
 fn wakeup_torrent_check_checks_new_torrents() {
-    let (_, actions) = SystemState::initial().process_event(Event::Wakeup(WakeupId::TorrentCheck));
+    let (_, actions) = connected_state().process_event(Event::Wakeup(WakeupId::TorrentCheck));
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::CheckNewTorrents))
+            .any(|a| matches!(a, Action::CheckNewTorrents(_)))
+    );
+}
+
+#[test]
+fn wakeup_torrent_check_is_noop_when_qbit_not_ready() {
+    // Core must not emit CheckNewTorrents if we have no valid cookie.
+    let (_, actions) = SystemState::initial().process_event(Event::Wakeup(WakeupId::TorrentCheck));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::CheckNewTorrents(_)))
     );
 }
 

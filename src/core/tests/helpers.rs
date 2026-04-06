@@ -20,7 +20,7 @@ pub fn connected_state() -> SystemState {
             ip: ip(),
             port: port(),
         },
-        qbit: QbitState::Ready { port: port() },
+        qbit: QbitState::Ready { port: port(), cookie: cookie() },
         mam: MamState::Synced {
             port: port(),
             ip: ip(),

@@ -45,6 +45,7 @@ pub enum QbitState {
     },
     Ready {
         port: VpnPort,
+        cookie: AuthCookie,
     },
 }
 
@@ -57,7 +58,7 @@ impl fmt::Display for QbitState {
             Self::SyncingPort {
                 attempt, target, ..
             } => write!(f, "syncing-port({}:#{})", target.into_inner(), attempt.0),
-            Self::Ready { port } => write!(f, "ready({})", port.into_inner()),
+            Self::Ready { port, .. } => write!(f, "ready({})", port.into_inner()),
         }
     }
 }

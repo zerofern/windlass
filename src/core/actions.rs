@@ -37,7 +37,7 @@ pub enum Action {
     CheckMamConnectability,
 
     CheckDiskSpace,
-    CheckNewTorrents,
+    CheckNewTorrents(AuthCookie),
 
     SendGotifyAlert(AlertPriority, String),
 }

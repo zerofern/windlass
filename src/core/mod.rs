@@ -235,12 +235,13 @@ impl SystemState {
             }
 
             Event::QbitPortSyncSuccess => {
-                if let QbitState::SyncingPort { target, .. } = &self.qbit {
+                if let QbitState::SyncingPort { target, cookie, .. } = &self.qbit {
                     let port = *target;
+                    let cookie = cookie.clone();
                     if let VpnState::Connected { ip, .. } = &self.vpn {
                         let ip = *ip;
                         info!(port = port.into_inner(), "qBittorrent port synced");
-                        self.qbit = QbitState::Ready { port };
+                        self.qbit = QbitState::Ready { port, cookie };
                         self.mam = MamState::SyncPending {
                             target_ip: ip,
                             target_port: port,
@@ -444,7 +445,11 @@ impl SystemState {
             Event::Wakeup(id) => match id {
                 WakeupId::Heartbeat => actions.push(Action::CheckMamConnectability),
                 WakeupId::DiskCheck => actions.push(Action::CheckDiskSpace),
-                WakeupId::TorrentCheck => actions.push(Action::CheckNewTorrents),
+                WakeupId::TorrentCheck => {
+                    if let QbitState::Ready { cookie, .. } = &self.qbit {
+                        actions.push(Action::CheckNewTorrents(cookie.clone()));
+                    }
+                }
                 WakeupId::QbitAuthRetry => {
                     if matches!(self.qbit, QbitState::Authenticating { .. }) {
                         actions.push(Action::AuthenticateQbit);
