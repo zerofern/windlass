@@ -63,10 +63,12 @@ pub async fn run() -> Result<()> {
     let data_path = config.data_path.clone();
 
     let shared_state = Arc::new(tokio::sync::RwLock::new(SystemState::initial()));
+    let (obs_tx, _) = tokio::sync::broadcast::channel::<windlass_core::Observation>(256);
     let app_state = windlass_web::AppState {
         event_tx: tx.clone(),
         state: shared_state.clone(),
         debug_gate: debug_gate.clone(),
+        observations: obs_tx.clone(),
     };
     let bind_addr = std::env::var("WINDLASS_BIND")
         .unwrap_or_else(|_| "0.0.0.0:5010".to_string());
@@ -91,6 +93,10 @@ pub async fn run() -> Result<()> {
     });
     state = new_state;
     *shared_state.write().await = state.clone();
+    let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
+    for action in &actions {
+        let _ = obs_tx.send(windlass_core::Observation::ActionDispatched(action.clone()));
+    }
     ShellContext {
         docker: &docker,
         qbit: &qbit,
@@ -125,9 +131,15 @@ pub async fn run() -> Result<()> {
             continue;
         }
 
+        let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
+
         let (new_state, actions) = state.process_event(event);
         state = new_state;
         *shared_state.write().await = state.clone();
+        let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
+        for action in &actions {
+            let _ = obs_tx.send(windlass_core::Observation::ActionDispatched(action.clone()));
+        }
         ShellContext {
             docker: &docker,
             qbit: &qbit,

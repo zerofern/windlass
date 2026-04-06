@@ -2,7 +2,10 @@
 
 pub mod actions;
 pub mod events;
+pub mod observation;
 pub mod types;
+
+pub use observation::Observation;
 
 #[cfg(test)]
 mod tests;

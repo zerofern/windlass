@@ -23,7 +23,7 @@ pub struct VpnPort(u16);
 // ── HTTP ─────────────────────────────────────────────────────────────────────
 
 /// An HTTP status code returned by an external service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct HttpStatusCode(pub u16);
 
 // ── Torrents ─────────────────────────────────────────────────────────────────
@@ -35,8 +35,15 @@ pub struct TorrentName(pub String);
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 /// The SID cookie returned by qBittorrent on successful login.
+/// Always serializes as `"[redacted]"` to prevent leaking credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthCookie(pub String);
+
+impl serde::Serialize for AuthCookie {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("[redacted]")
+    }
+}
 
 // ── Container identity ───────────────────────────────────────────────────────
 
@@ -96,7 +103,7 @@ impl From<Backoff> for Duration {
 
 // ── Wakeup IDs ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum WakeupId {
     Heartbeat,
     DiskCheck,
@@ -108,7 +115,7 @@ pub enum WakeupId {
 
 // ── Alert priority ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AlertPriority {
     Info,
     Warning,
@@ -146,7 +153,7 @@ impl DebugGate {
 // ── MAM connectivity ─────────────────────────────────────────────────────────
 
 /// The result of a MAM connectivity heartbeat check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MamStatus {
     /// MAM reached and qBit is listed as connectable (accepts incoming connections).
     Connectable,
