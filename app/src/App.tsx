@@ -1,55 +1,48 @@
 import { Routes, Route, NavLink } from 'react-router-dom'
 import { Dashboard } from '@/routes/Dashboard'
-import { Log } from '@/routes/Log'
+import { Debug } from '@/routes/Debug'
 import { Chaos } from '@/routes/Chaos'
 import { useConfig } from '@/hooks/useConfig'
+import { ObservationsProvider } from '@/contexts/ObservationsContext'
+
+function NavItem({ to, end, label }: { to: string; end?: boolean; label: string }) {
+  return (
+    <NavLink
+      to={to}
+      end={end}
+      className={({ isActive }) =>
+        `text-sm font-medium transition-colors ${isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`
+      }
+    >
+      {label}
+    </NavLink>
+  )
+}
 
 export default function App() {
   const config = useConfig()
 
   return (
-    <div className="min-h-screen bg-background">
-      <header className="border-b">
-        <nav className="container mx-auto flex h-14 items-center gap-6 px-4">
-          <span className="font-bold text-lg">⚓ Windlass</span>
-          <NavLink
-            to="/"
-            end
-            className={({ isActive }) =>
-              `text-sm font-medium transition-colors ${isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`
-            }
-          >
-            Dashboard
-          </NavLink>
-          <NavLink
-            to="/log"
-            className={({ isActive }) =>
-              `text-sm font-medium transition-colors ${isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`
-            }
-          >
-            Live Log
-          </NavLink>
-          {config.chaos_url && (
-            <NavLink
-              to="/chaos"
-              className={({ isActive }) =>
-                `text-sm font-medium transition-colors ${isActive ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`
-              }
-            >
-              Chaos
-            </NavLink>
-          )}
-        </nav>
-      </header>
-      <main className="container mx-auto px-4 py-6">
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/log" element={<Log />} />
-          {config.chaos_url && (
-            <Route path="/chaos" element={<Chaos chaosUrl={config.chaos_url} />} />
-          )}
-        </Routes>
-      </main>
-    </div>
+    <ObservationsProvider>
+      <div className="min-h-screen bg-background">
+        <header className="border-b">
+          <nav className="container mx-auto flex h-14 items-center gap-6 px-4">
+            <span className="font-bold text-lg tracking-tight">⚓ Windlass</span>
+            <NavItem to="/" end label="Dashboard" />
+            <NavItem to="/debug" label="Debug" />
+            {config.chaos_url && <NavItem to="/chaos" label="Chaos" />}
+          </nav>
+        </header>
+        <main className="container mx-auto px-4 py-6">
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/debug" element={<Debug />} />
+            {config.chaos_url && (
+              <Route path="/chaos" element={<Chaos chaosUrl={config.chaos_url} />} />
+            )}
+          </Routes>
+        </main>
+      </div>
+    </ObservationsProvider>
   )
 }

@@ -143,6 +143,11 @@ impl DebugGate {
         self.0.store(true, Ordering::SeqCst);
     }
 
+    /// Unfreeze the event loop. Idempotent.
+    pub fn unfreeze(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
     /// Returns true if the gate is currently frozen.
     #[must_use]
     pub fn is_frozen(&self) -> bool {

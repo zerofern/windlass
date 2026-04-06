@@ -63,11 +63,14 @@ function runModeLabel(m: RunMode): string {
   return 'Unknown'
 }
 
-interface Props { state: SystemState }
+interface Props { state: SystemState; compact?: boolean }
 
-export function StateDisplay({ state }: Props) {
+export function StateDisplay({ state, compact }: Props) {
+  const grid = compact
+    ? 'grid grid-cols-2 gap-2'
+    : 'grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3'
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+    <div className={grid}>
       <Card>
         <CardHeader><CardTitle>System</CardTitle></CardHeader>
         <CardContent className="space-y-2">
