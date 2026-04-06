@@ -31,6 +31,14 @@ export function Chaos({ chaosUrl }: Props) {
   const [applying, setApplying] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
 
+  // Fetch real active state from chaos controller on mount
+  useEffect(() => {
+    fetch(`${chaosUrl}/active`)
+      .then(r => r.json())
+      .then((data: { active: string[] }) => setActive(new Set(data.active)))
+      .catch(() => {/* controller unreachable, leave empty */})
+  }, [chaosUrl])
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [log.length])
