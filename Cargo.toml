@@ -29,6 +29,8 @@ libc         = "0.2"
 proptest     = "1"
 wiremock     = "0.6"
 tempfile     = "3"
+rust-embed  = { version = "8", features = ["axum"] }
+mime_guess  = "2"
 axum             = { version = "0.8", features = ["json"] }
 windlass-types   = { path = "windlass-types" }
 windlass-core    = { path = "windlass-core" }
