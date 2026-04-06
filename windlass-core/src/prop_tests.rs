@@ -237,6 +237,7 @@ fn any_event() -> impl Strategy<Value = Event> {
         .prop_map(|v| Event::NewTorrentsObserved(v.into_iter().map(TorrentName).collect())),
         Just(Event::LogsDumped),
         any_wakeup_id().prop_map(Event::Wakeup),
+        Just(Event::MamRateLimitViolation),
     ]
 }
 

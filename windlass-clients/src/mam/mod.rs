@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 
+use anyhow::bail;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use windlass_core::events::Event;
-use windlass_types::{MamStatus, VpnIp};
+use windlass_types::{DebugGate, MamStatus, VpnIp};
 
 #[derive(Deserialize)]
 struct DynamicSeedboxResponse {
@@ -17,6 +18,14 @@ struct DynamicSeedboxResponse {
 #[derive(Deserialize)]
 struct JsonLoadResponse {
     connectable: Option<String>,
+    #[serde(rename = "unsat")]
+    unsat: Option<UnsatSummary>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UnsatSummary {
+    pub count: u64,
+    pub limit: u64,
 }
 
 /// Wraps a VPN-routed `reqwest::Client` together with the MAM connection
@@ -28,22 +37,65 @@ pub struct MamClient {
     session: Arc<Mutex<String>>,
     seedbox_url: String,
     load_url: String,
+    last_request_at: Arc<Mutex<Option<std::time::Instant>>>,
+    debug_gate: DebugGate,
 }
 
 impl MamClient {
-    #[must_use]
+    /// # Errors
+    /// Returns an error if the reqwest client cannot be built (e.g. invalid proxy URL).
     pub fn new(
-        client: reqwest::Client,
+        proxy_url: Option<&str>,
         session: String,
         seedbox_url: String,
         load_url: String,
-    ) -> Self {
-        Self {
+        user_agent: &str,
+        debug_gate: DebugGate,
+    ) -> anyhow::Result<Self> {
+        let builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(user_agent);
+        let builder = if let Some(url) = proxy_url {
+            builder.proxy(reqwest::Proxy::all(url)?)
+        } else {
+            builder
+        };
+        let client = builder.build()?;
+        Ok(Self {
             client,
             session: Arc::new(Mutex::new(session)),
             seedbox_url,
             load_url,
+            last_request_at: Arc::new(Mutex::new(None)),
+            debug_gate,
+        })
+    }
+
+    /// Validates the `mam_id` session against MAM's checkCookie endpoint.
+    /// Returns `Ok(())` if valid, `Err` if the session is rejected or unreachable.
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP request fails or the response indicates an
+    /// invalid session.
+    ///
+    /// # Panics
+    /// Panics if the internal session mutex is poisoned.
+    pub async fn check_session(&self) -> anyhow::Result<()> {
+        let current = self.session.lock().unwrap().clone();
+        let resp = self
+            .client
+            .get("https://www.myanonamouse.net/json/checkCookie.php")
+            .header(reqwest::header::COOKIE, format!("mam_id={current}"))
+            .send()
+            .await?;
+        if resp.status().is_client_error() || resp.status().is_server_error() {
+            bail!("MAM session check failed: HTTP {}", resp.status());
         }
+        if let Some(rotated) = extract_mam_cookie(&resp) {
+            *self.session.lock().unwrap() = rotated;
+        }
+        info!("MAM session valid");
+        Ok(())
     }
 
     /// Registers the current VPN IP with MAM via the dynamic seedbox endpoint.
@@ -51,6 +103,9 @@ impl MamClient {
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn update_seedbox(&self) -> Event {
+        if !self.check_rate_limit() {
+            return Event::MamRateLimitViolation;
+        }
         let current = self.session.lock().unwrap().clone();
         let (event, new_session) = self.do_update_seedbox(&current).await;
         if let Some(rotated) = new_session {
@@ -64,12 +119,30 @@ impl MamClient {
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn check_connectability(&self) -> Event {
+        if !self.check_rate_limit() {
+            return Event::MamRateLimitViolation;
+        }
         let current = self.session.lock().unwrap().clone();
         let (event, new_session) = self.do_check_connectability(&current).await;
         if let Some(rotated) = new_session {
             *self.session.lock().unwrap() = rotated;
         }
         event
+    }
+
+    /// Returns `true` if the request can proceed (≥400ms since last request).
+    /// Returns `false` if the guard triggers — also freezes the debug gate.
+    fn check_rate_limit(&self) -> bool {
+        let mut last = self.last_request_at.lock().unwrap();
+        if let Some(t) = *last
+            && t.elapsed() < std::time::Duration::from_millis(400)
+        {
+            warn!("MAM rate limit guard triggered — freezing system");
+            self.debug_gate.freeze();
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+        true
     }
 
     async fn do_update_seedbox(&self, session: &str) -> (Event, Option<String>) {
@@ -147,6 +220,9 @@ impl MamClient {
                             .as_deref()
                             .is_some_and(|s| s.eq_ignore_ascii_case("yes"));
                         debug!("MAM connectable={connectable}");
+                        if let Some(ref unsat) = body.unsat {
+                            debug!("MAM unsat: {}/{}", unsat.count, unsat.limit);
+                        }
                         let status = if connectable {
                             MamStatus::Connectable
                         } else {
@@ -206,11 +282,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "my_session".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         let event = mam.update_seedbox().await;
         assert!(matches!(event, Event::MamUpdateSuccess));
     }
@@ -228,11 +307,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "my_session".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         let event = mam.update_seedbox().await;
         assert!(matches!(event, Event::MamAsnMismatch(ip) if ip.0.to_string() == "79.127.184.201"));
     }
@@ -254,11 +336,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "old_cookie".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         mam.update_seedbox().await;
         assert_eq!(mam.session_value(), "rotated_cookie");
     }
@@ -277,11 +362,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "my_session".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         let event = mam.update_seedbox().await;
         assert!(matches!(event, Event::MamUpdateSuccess));
     }
@@ -300,11 +388,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "my_session".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,
@@ -324,11 +415,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "my_session".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,
@@ -348,11 +442,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "my_session".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,
@@ -373,11 +470,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "old_cookie".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         mam.check_connectability().await;
         assert_eq!(mam.session_value(), "new_cookie");
     }
@@ -391,11 +491,14 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            reqwest::Client::new(),
+            None,
             "my_session".into(),
             server.uri(),
             server.uri(),
-        );
+            "windlass",
+            DebugGate::new(),
+        )
+        .unwrap();
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,

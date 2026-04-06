@@ -20,6 +20,7 @@ pub struct Config {
     /// Full URL for the MAM jsonLoad endpoint.
     /// Override via `MAM_LOAD_URL` to point at a mock in integration tests.
     pub mam_load_url: String,
+    pub mam_user_agent: String,
     /// Mount path to check for available disk space.
     pub data_path: String,
     pub dump_dir: String,
@@ -46,8 +47,10 @@ impl Config {
                 "https://t.myanonamouse.net/json/dynamicSeedbox.php".to_string()
             }),
             mam_load_url: var("MAM_LOAD_URL").unwrap_or_else(|_| {
-                "https://www.myanonamouse.net/jsonLoad.php?clientStats".to_string()
+                "https://www.myanonamouse.net/jsonLoad.php?snatch_summary=true&clientStats"
+                    .to_string()
             }),
+            mam_user_agent: var("MAM_USER_AGENT").unwrap_or_else(|_| "windlass".to_string()),
             data_path: var("DATA_PATH").unwrap_or_else(|_| "/mnt/Data".to_string()),
             dump_dir: var("DUMP_DIR").unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),
             vpn_ip_file: var("VPN_IP_FILE").unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),

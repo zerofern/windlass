@@ -46,4 +46,9 @@ pub enum Event {
     LogsDumped,
 
     Wakeup(WakeupId),
+
+    /// The MAM rate limit safety guard triggered — a request was attempted less
+    /// than 400ms after the previous one. The event loop handles this directly
+    /// (freeze + alert) before it reaches the core.
+    MamRateLimitViolation,
 }

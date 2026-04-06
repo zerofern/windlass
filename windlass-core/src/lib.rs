@@ -466,6 +466,11 @@ impl SystemState {
                 }
                 WakeupId::RetryPortRead => actions.push(Action::ReadPortFiles),
             },
+
+            Event::MamRateLimitViolation => {
+                // Handled by the shell event loop before reaching the core.
+                warn!("MamRateLimitViolation reached core — this should be intercepted by the shell");
+            }
         }
 
         (self, actions)

@@ -8,7 +8,7 @@ use anyhow::Result;
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 use uom::si::information::byte;
 
 use windlass_core::{actions::Action, events::Event, types::SystemState};
@@ -20,6 +20,7 @@ pub use config::Config;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
 /// fires the Init event, then runs the event loop forever.
+#[allow(clippy::too_many_lines)]
 pub async fn run() -> Result<()> {
     let config = Config::from_env()?;
 
@@ -31,19 +32,11 @@ pub async fn run() -> Result<()> {
 
     info!("Windlass started");
 
+    let debug_gate = windlass_types::DebugGate::new();
+
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-
-    let vpn = {
-        let builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
-        let builder = if let Some(ref proxy_url) = config.gluetun_proxy_url {
-            builder.proxy(reqwest::Proxy::all(proxy_url)?)
-        } else {
-            builder
-        };
-        builder.build()?
-    };
 
     let qbit = qbit::QbitClient::new(
         direct.clone(),
@@ -52,11 +45,13 @@ pub async fn run() -> Result<()> {
         config.qbit_pass.0.expose_secret().to_owned(),
     );
     let mam = mam::MamClient::new(
-        vpn,
+        config.gluetun_proxy_url.as_deref(),
         config.mam_session.clone(),
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
-    );
+        &config.mam_user_agent,
+        debug_gate.clone(),
+    )?;
     let gotify = gotify::GotifyClient::new(
         direct.clone(),
         config.gotify_url.clone(),
@@ -71,6 +66,7 @@ pub async fn run() -> Result<()> {
     let app_state = windlass_web::AppState {
         event_tx: tx.clone(),
         state: shared_state.clone(),
+        debug_gate: debug_gate.clone(),
     };
     let bind_addr = std::env::var("WINDLASS_BIND")
         .unwrap_or_else(|_| "0.0.0.0:5010".to_string());
@@ -84,6 +80,10 @@ pub async fn run() -> Result<()> {
 
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
     let mut state = SystemState::initial();
+
+    if let Err(e) = mam.check_session().await {
+        warn!("MAM session check failed at startup: {e} — continuing anyway");
+    }
 
     let (new_state, actions) = state.process_event(Event::Init {
         is_gluetun_healthy: boot.is_gluetun_healthy,
@@ -107,6 +107,24 @@ pub async fn run() -> Result<()> {
 
     while let Some(event) = rx.recv().await {
         debug!(?event, "←");
+
+        if debug_gate.is_frozen() {
+            debug!(?event, "system frozen: dropping event");
+            continue;
+        }
+
+        if matches!(event, Event::MamRateLimitViolation) {
+            error!("MAM rate limit guard triggered — system frozen. Restart Windlass to resume.");
+            let g = gotify.clone();
+            tokio::spawn(async move {
+                g.send_alert(
+                    windlass_types::AlertPriority::Critical,
+                    "🛑 MAM rate limit guard triggered — requests were too fast. System is frozen. Restart Windlass to resume.",
+                ).await;
+            });
+            continue;
+        }
+
         let (new_state, actions) = state.process_event(event);
         state = new_state;
         *shared_state.write().await = state.clone();
