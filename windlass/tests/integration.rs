@@ -109,47 +109,48 @@ async fn windlass_health_endpoint_returns_ok() {
 #[ignore = "requires dev stack"]
 async fn boot_sequence_authenticates_qbit() {
     let client = Client::new();
-    reset(&client).await;
-
-    // Give Windlass time to complete boot (it's already running)
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let n = count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await;
-    assert!(n >= 1, "qBit auth was not called (got {n})");
+    wait_for("qBit auth at boot", 30, || {
+        let client = client.clone();
+        async move { count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await >= 1 }
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
 async fn boot_sequence_syncs_port_to_51820() {
     let client = Client::new();
-    reset(&client).await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let n =
-        count_requests_with_body(&client, QBIT_ADMIN, "/api/v2/app/setPreferences", "51820").await;
-    assert!(n >= 1, "Port sync to 51820 not called (got {n})");
+    wait_for("port sync to 51820 at boot", 30, || {
+        let client = client.clone();
+        async move {
+            count_requests_with_body(&client, QBIT_ADMIN, "/api/v2/app/setPreferences", "51820")
+                .await
+                >= 1
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
 async fn boot_sequence_sends_gotify_alert() {
     let client = Client::new();
-    reset(&client).await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let n = count_requests(&client, GOTIFY_ADMIN, "/message").await;
-    assert!(n >= 1, "Gotify received no alerts (got {n})");
+    wait_for("Gotify alert at boot", 30, || {
+        let client = client.clone();
+        async move { count_requests(&client, GOTIFY_ADMIN, "/message").await >= 1 }
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
 async fn boot_sequence_updates_mam_seedbox() {
     let client = Client::new();
-    reset(&client).await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let n = count_requests(&client, MAM_ADMIN, "/json/dynamicSeedbox.php").await;
-    assert!(n >= 1, "MAM seedbox not called (got {n})");
+    wait_for("MAM seedbox update at boot", 30, || {
+        let client = client.clone();
+        async move { count_requests(&client, MAM_ADMIN, "/json/dynamicSeedbox.php").await >= 1 }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -191,9 +192,18 @@ async fn windlass_state_endpoint_returns_system_state() {
         .await
         .expect("state parse failed");
 
-    assert!(resp.get("vpn").is_some(), "state missing 'vpn' field");
-    assert!(resp.get("qbit").is_some(), "state missing 'qbit' field");
-    assert!(resp.get("mam").is_some(), "state missing 'mam' field");
+    assert!(
+        resp["state"].get("vpn").is_some(),
+        "state missing 'vpn' field"
+    );
+    assert!(
+        resp["state"].get("qbit").is_some(),
+        "state missing 'qbit' field"
+    );
+    assert!(
+        resp["state"].get("mam").is_some(),
+        "state missing 'mam' field"
+    );
 }
 
 #[tokio::test]
@@ -202,21 +212,30 @@ async fn qbit_auth_fail_scenario_causes_retry() {
     let client = Client::new();
     reset(&client).await;
 
-    // Apply qbit-auth-fail scenario
+    // Apply qbit-auth-fail scenario before triggering auth
     client
         .post(format!("{CHAOS}/scenario/qbit-auth-fail"))
         .send()
         .await
         .expect("scenario request failed");
 
-    // Wait for Windlass to attempt auth and fail/retry
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // ManualReset triggers re-authentication against the failing stub
+    client
+        .post(format!("{WINDLASS}/api/v1/operator/reset"))
+        .send()
+        .await
+        .expect("reset failed");
 
-    let n = count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await;
-    assert!(
-        n >= 2,
-        "Expected ≥2 auth attempts after auth-fail (got {n})"
-    );
+    // Windlass should attempt auth, fail, schedule retry (2s backoff), and try again
+    wait_for(
+        "≥2 qBit auth attempts with auth-fail scenario",
+        30,
+        || {
+            let client = client.clone();
+            async move { count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await >= 2 }
+        },
+    )
+    .await;
 }
 
 #[tokio::test]

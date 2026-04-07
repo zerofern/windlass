@@ -65,9 +65,37 @@ fn init_unhealthy_triggers_workflow_a() {
 
 #[test]
 fn manual_reset_in_active_mode_clears_recovery_counter() {
+    // vpn = Stopped — no re-auth triggered
     let mut state = SystemState::initial();
     state.hard_recoveries = RetryCount(2);
     let actions = state.process_event(Event::ManualReset);
     assert_eq!(state.hard_recoveries, RetryCount(0));
     assert!(actions.is_empty());
+}
+
+#[test]
+fn manual_reset_when_connected_re_authenticates_qbit() {
+    let mut state = SystemState::initial();
+    state.vpn = VpnState::Connected {
+        ip: ip(),
+        port: port(),
+    };
+    state.hard_recoveries = RetryCount(2);
+    let actions = state.process_event(Event::ManualReset);
+    assert_eq!(state.hard_recoveries, RetryCount(0));
+    assert!(
+        matches!(
+            state.qbit,
+            QbitState::Authenticating {
+                attempt: RetryCount(0)
+            }
+        ),
+        "qBit should be in Authenticating state after ManualReset"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::AuthenticateQbit)),
+        "ManualReset on connected VPN must schedule AuthenticateQbit"
+    );
 }

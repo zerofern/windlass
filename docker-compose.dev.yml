@@ -19,6 +19,8 @@ services:
       context: .
       dockerfile: windlass-testkit/Dockerfile
     container_name: gluetun
+    ports:
+      - "9001:9001"
     environment:
       TESTKIT_MODE: gluetun
       VPN_IP_FILE: /tmp/gluetun/ip
@@ -76,7 +78,6 @@ services:
       dockerfile: windlass-testkit/Dockerfile
     ports:
       - "9000:9000"
-      - "9001:9001"
     environment:
       TESTKIT_MODE: chaos
       QBIT_ADMIN_URL: http://mock-qbittorrent:8080/__admin

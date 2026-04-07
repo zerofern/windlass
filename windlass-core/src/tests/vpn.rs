@@ -109,6 +109,10 @@ fn gluetun_healthy_starts_containers() {
             .iter()
             .any(|a| matches!(a, Action::StartDependentContainers))
     );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::ReadPortFiles)),
+        "ReadPortFiles must be included so recovery completes on same-IP/port restart"
+    );
 }
 
 #[test]

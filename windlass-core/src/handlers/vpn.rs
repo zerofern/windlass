@@ -47,7 +47,14 @@ impl SystemState {
     pub(crate) fn on_manual_reset(&mut self) -> Vec<Action> {
         info!("manual reset: clearing recovery counter");
         self.hard_recoveries = RetryCount(0);
-        vec![]
+        if let VpnState::Connected { .. } = &self.vpn {
+            self.qbit = QbitState::Authenticating {
+                attempt: RetryCount(0),
+            };
+            vec![Action::AuthenticateQbit]
+        } else {
+            vec![]
+        }
     }
 
     pub(crate) fn on_docker_gluetun_died(&mut self) -> Vec<Action> {
@@ -87,7 +94,10 @@ impl SystemState {
     pub(crate) fn on_docker_gluetun_healthy(&mut self) -> Vec<Action> {
         info!("Gluetun healthy — starting dependent containers");
         self.vpn = VpnState::AwaitingTunnel;
-        vec![Action::StartDependentContainers]
+        // ReadPortFiles ensures recovery completes even when gluetun restarts
+        // with the same IP/port — the file watcher deduplicates same-value writes
+        // so an explicit read is needed to re-trigger Workflow B.
+        vec![Action::StartDependentContainers, Action::ReadPortFiles]
     }
 
     // No-op if content is identical to current state — the debounced
