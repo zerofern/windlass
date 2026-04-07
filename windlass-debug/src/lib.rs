@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Semaphore, broadcast, mpsc};
+use tracing::{info, warn};
 use windlass_core::Observation;
 use windlass_core::actions::Action;
 use windlass_core::events::Event;
@@ -15,9 +16,7 @@ use windlass_core::events::Event;
 /// Serialisable snapshot of the current debug state, served by `GET /api/v1/debug`.
 #[derive(Serialize)]
 pub struct DebugState {
-    pub frozen: bool,
     pub debug_mode: bool,
-    pub pending_event: Option<serde_json::Value>,
     pub pending_actions: Vec<serde_json::Value>,
     pub event_breakpoints: Vec<String>,
     pub action_breakpoints: Vec<String>,
@@ -30,30 +29,24 @@ pub struct DebugController(Arc<Inner>);
 
 #[derive(Debug)]
 struct Inner {
-    /// Emergency freeze flag (rate-limit guard). Drops all incoming events.
-    /// Absorbed from the old `DebugGate`.
-    frozen: AtomicBool,
-    /// Manually enabled/disabled from the UI. When enabled, each event/action
-    /// is queued and waits for an explicit step permit.
+    /// Manually enabled/disabled from the UI or by the MAM rate-limit guardrail.
+    /// When enabled, each event/action waits for an explicit step permit.
     debug_mode: AtomicBool,
-    event_queue: Mutex<VecDeque<Event>>,
     action_queue: Mutex<VecDeque<Action>>,
     event_breakpoints: Mutex<HashSet<String>>,
     action_breakpoints: Mutex<HashSet<String>>,
-    /// One permit = one event may be processed. POST /debug/step/event adds a permit.
+    /// One permit = one event may pass through. Released by `POST /debug/step/event`.
     step_event: Semaphore,
-    /// One permit = one action may be dispatched. POST /debug/step/action adds a permit.
+    /// One permit = one action may be dispatched. Released by `POST /debug/step/action`.
     step_action: Semaphore,
-    /// Present only when debug mode is active — lets clients emit `HttpExchange` observations.
+    /// Present only while debug mode is active — lets clients emit `HttpExchange` observations.
     obs_tx: Mutex<Option<broadcast::Sender<Observation>>>,
 }
 
 impl Default for Inner {
     fn default() -> Self {
         Self {
-            frozen: AtomicBool::new(false),
             debug_mode: AtomicBool::new(false),
-            event_queue: Mutex::new(VecDeque::new()),
             action_queue: Mutex::new(VecDeque::new()),
             event_breakpoints: Mutex::new(HashSet::new()),
             action_breakpoints: Mutex::new(HashSet::new()),
@@ -71,23 +64,6 @@ impl DebugController {
         Self::default()
     }
 
-    // ── Freeze (rate-limit emergency) ──────────────────────────────────────────
-
-    /// Freeze the event loop permanently (rate-limit guard). Idempotent.
-    pub fn freeze(&self) {
-        self.0.frozen.store(true, Ordering::SeqCst);
-    }
-
-    /// Unfreeze the event loop. Idempotent.
-    pub fn unfreeze(&self) {
-        self.0.frozen.store(false, Ordering::SeqCst);
-    }
-
-    #[must_use]
-    pub fn is_frozen(&self) -> bool {
-        self.0.frozen.load(Ordering::SeqCst)
-    }
-
     // ── Debug mode ────────────────────────────────────────────────────────────
 
     /// Enable debug mode. Wires up `obs_tx` so that clients can send `HttpExchange`
@@ -100,18 +76,16 @@ impl DebugController {
         *self.0.obs_tx.lock().unwrap() = Some(obs_tx);
     }
 
-    /// Disable debug mode. Clears the obs channel and discards any queued
-    /// events/actions so the system can resume normal operation.
+    /// Disable debug mode. Clears the obs channel and releases any blocked step
+    /// waiters so the system resumes normal operation.
     ///
     /// # Panics
     /// Panics if any internal mutex is poisoned.
     pub fn disable_debug(&self) {
         self.0.debug_mode.store(false, Ordering::SeqCst);
         *self.0.obs_tx.lock().unwrap() = None;
-        self.0.event_queue.lock().unwrap().clear();
         self.0.action_queue.lock().unwrap().clear();
-        // Release any tasks currently blocked on step permits so they can
-        // drain naturally once debug mode is disabled.
+        // Release any tasks currently blocked on step permits.
         self.0.step_event.add_permits(usize::MAX / 2);
         self.0.step_action.add_permits(usize::MAX / 2);
     }
@@ -156,7 +130,6 @@ impl DebugController {
     }
 
     /// Returns `true` if the event loop should pause before processing `variant`.
-    /// Pauses when debug mode is fully enabled, or the variant name is breakpointed.
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned.
@@ -174,22 +147,7 @@ impl DebugController {
         self.is_debug_mode() || self.0.action_breakpoints.lock().unwrap().contains(variant)
     }
 
-    // ── Event queue ───────────────────────────────────────────────────────────
-
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    pub fn enqueue_event(&self, event: Event) {
-        self.0.event_queue.lock().unwrap().push_back(event);
-    }
-
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    #[must_use]
-    pub fn dequeue_event(&self) -> Option<Event> {
-        self.0.event_queue.lock().unwrap().pop_front()
-    }
-
-    // ── Action queue ──────────────────────────────────────────────────────────
+    // ── Action queue (used by shell dispatch until DebuggableShell in step 2) ──
 
     /// # Panics
     /// Panics if the internal mutex is poisoned.
@@ -206,17 +164,12 @@ impl DebugController {
 
     // ── Step permits ──────────────────────────────────────────────────────────
 
-    /// Blocks until a step permit is available (released by `POST /debug/step/event`).
-    ///
-    /// # Panics
-    /// Panics if the semaphore has been closed, which never happens in normal operation.
-    pub async fn acquire_event_step(&self) {
-        // `acquire` is cancel-safe and returns a permit that auto-decrements on drop.
-        // We forget it immediately since we only need the counting behaviour.
+    /// Blocks until a step permit is available. Used by [`DebuggableEventStream`].
+    pub(crate) async fn acquire_event_step(&self) {
         self.0.step_event.acquire().await.unwrap().forget();
     }
 
-    /// Adds one step permit for an event, unblocking the event loop once.
+    /// Adds one step permit, unblocking [`DebuggableEventStream`] once.
     pub fn release_event_step(&self) {
         self.0.step_event.add_permits(1);
     }
@@ -237,7 +190,6 @@ impl DebugController {
     // ── HTTP observation channel ──────────────────────────────────────────────
 
     /// Returns the observation sender when debug mode is active.
-    /// Clients use this to emit `Observation::HttpExchange` messages.
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned.
@@ -254,14 +206,6 @@ impl DebugController {
     /// Panics if any internal mutex is poisoned.
     #[must_use]
     pub fn debug_state(&self) -> DebugState {
-        let pending_event = self
-            .0
-            .event_queue
-            .lock()
-            .unwrap()
-            .front()
-            .and_then(|e| serde_json::to_value(e).ok());
-
         let pending_actions = self
             .0
             .action_queue
@@ -290,12 +234,105 @@ impl DebugController {
             .collect();
 
         DebugState {
-            frozen: self.is_frozen(),
             debug_mode: self.is_debug_mode(),
-            pending_event,
             pending_actions,
             event_breakpoints,
             action_breakpoints,
         }
+    }
+}
+
+// ── DebuggableEventStream ─────────────────────────────────────────────────────
+
+/// Wraps the external mpsc receiver with debug-mode pause/step logic.
+///
+/// Two concurrent tasks are always running:
+/// - The **intake task** drains the external channel, broadcasting
+///   `Observation::EventArrived` for every event so the UI can see the full
+///   queue in real time, then forwards events to an internal channel.
+/// - The **main loop** calls [`recv`](DebuggableEventStream::recv) which pops
+///   from the internal channel and pauses when debug mode is active or a
+///   breakpoint is hit.
+pub struct DebuggableEventStream {
+    internal_rx: mpsc::Receiver<Event>,
+    debug_ctrl: DebugController,
+    obs_tx: broadcast::Sender<Observation>,
+}
+
+impl DebuggableEventStream {
+    /// Creates the stream, spawns the intake task, and enables debug mode
+    /// immediately if `DEBUG_MODE_ON_START=true`.
+    pub fn new(
+        external_rx: mpsc::Receiver<Event>,
+        debug_ctrl: DebugController,
+        obs_tx: broadcast::Sender<Observation>,
+    ) -> Self {
+        if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
+            debug_ctrl.enable_debug(obs_tx.clone());
+            info!("Debug mode enabled from DEBUG_MODE_ON_START");
+        }
+
+        let (internal_tx, internal_rx) = mpsc::channel(128);
+        let obs_tx_intake = obs_tx.clone();
+
+        tokio::spawn(async move {
+            let mut rx = external_rx;
+            while let Some(event) = rx.recv().await {
+                let _ = obs_tx_intake.send(Observation::EventArrived(event.clone()));
+                if internal_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            internal_rx,
+            debug_ctrl,
+            obs_tx,
+        }
+    }
+
+    /// Returns the next event, pausing if debug mode is active or a breakpoint
+    /// is set for this event's variant.
+    ///
+    /// `MamRateLimitViolation` automatically enters debug mode before pausing —
+    /// the event still reaches the core unchanged.
+    pub async fn recv(&mut self) -> Option<Event> {
+        let event = self.internal_rx.recv().await?;
+
+        if matches!(event, Event::MamRateLimitViolation) {
+            warn!("MAM rate-limit violation detected — entering debug mode");
+            self.debug_ctrl.enable_debug(self.obs_tx.clone());
+        }
+
+        if self.debug_ctrl.should_pause_on_event(event_variant(&event)) {
+            self.debug_ctrl.acquire_event_step().await;
+        }
+
+        Some(event)
+    }
+}
+
+const fn event_variant(event: &Event) -> &'static str {
+    match event {
+        Event::Init { .. } => "Init",
+        Event::ManualReset => "ManualReset",
+        Event::DockerGluetunDied => "DockerGluetunDied",
+        Event::DockerGluetunHealthy => "DockerGluetunHealthy",
+        Event::PortFileReadResult(_) => "PortFileReadResult",
+        Event::QbitAuthSuccess(_) => "QbitAuthSuccess",
+        Event::QbitAuthFailed => "QbitAuthFailed",
+        Event::QbitConnectionRefused => "QbitConnectionRefused",
+        Event::QbitApiError(_) => "QbitApiError",
+        Event::QbitPortSyncSuccess => "QbitPortSyncSuccess",
+        Event::QbitPortSyncFailed(_) => "QbitPortSyncFailed",
+        Event::MamUpdateSuccess => "MamUpdateSuccess",
+        Event::MamAsnMismatch(_) => "MamAsnMismatch",
+        Event::MamStatusObserved(_) => "MamStatusObserved",
+        Event::DiskSpaceObserved(_) => "DiskSpaceObserved",
+        Event::NewTorrentsObserved(_) => "NewTorrentsObserved",
+        Event::LogsDumped => "LogsDumped",
+        Event::Wakeup(_) => "Wakeup",
+        Event::MamRateLimitViolation => "MamRateLimitViolation",
     }
 }

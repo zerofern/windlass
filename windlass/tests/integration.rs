@@ -240,7 +240,7 @@ async fn qbit_auth_fail_scenario_causes_retry() {
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
-async fn state_endpoint_includes_frozen_field() {
+async fn state_endpoint_includes_debug_mode_field() {
     let client = Client::new();
     let resp: Value = client
         .get(format!("{WINDLASS}/api/v1/operator/state"))
@@ -251,8 +251,14 @@ async fn state_endpoint_includes_frozen_field() {
         .await
         .expect("state parse failed");
 
-    assert!(resp.get("frozen").is_some(), "state missing 'frozen' field");
-    assert_eq!(resp["frozen"], false, "'frozen' should be false at rest");
+    assert!(
+        resp.get("debug_mode").is_some(),
+        "state missing 'debug_mode' field"
+    );
+    assert_eq!(
+        resp["debug_mode"], false,
+        "'debug_mode' should be false at rest"
+    );
     assert!(
         resp.get("state").is_some(),
         "state missing nested 'state' field"

@@ -1,6 +1,6 @@
 # Windlass
 
-Windlass is a lightweight Rust operator for self-hosted torrent stacks running
+Windlass is a lightweight Rust \ for self-hosted torrent stacks running
 behind a Gluetun VPN. It watches the VPN tunnel and keeps everything in sync
 automatically, so a VPN reconnect or IP change requires no manual intervention.
 
@@ -58,14 +58,14 @@ just stack-up         # builds and starts all containers
 
 The stack includes:
 
-| Container | Role | Ports |
-|---|---|---|
-| `mock-gluetun` | Writes VPN IP/port files; control API | `:9001` |
-| `mock-qbittorrent` | WireMock stub for qBit API | `:18080` (admin) |
-| `mock-gotify` | WireMock stub for Gotify | `:18081` (admin) |
-| `mock-mam` | WireMock stub for MAM | `:18082` (admin) |
-| `chaos-controller` | Named scenario API | `:9000` |
-| `windlass` | Built from source | `:5010` |
+| Container          | Role                                  | Ports            |
+| ------------------ | ------------------------------------- | ---------------- |
+| `mock-gluetun`     | Writes VPN IP/port files; control API | `:9001`          |
+| `mock-qbittorrent` | WireMock stub for qBit API            | `:18080` (admin) |
+| `mock-gotify`      | WireMock stub for Gotify              | `:18081` (admin) |
+| `mock-mam`         | WireMock stub for MAM                 | `:18082` (admin) |
+| `chaos-controller` | Named scenario API                    | `:9000`          |
+| `windlass`         | Built from source                     | `:5010`          |
 
 ### Chaos scenarios
 
@@ -108,21 +108,21 @@ When adding new external API behaviour, add a corresponding scenario to
 
 Windlass is configured entirely via environment variables.
 
-| Variable            | Required | Default                        | Description                            |
-| ------------------- | -------- | ------------------------------ | -------------------------------------- |
-| `QBITTORRENT_URL`   | ✓        | —                              | qBittorrent WebUI base URL             |
-| `QBITTORRENT_USER`  | ✓        | —                              | qBittorrent WebUI username             |
-| `QBITTORRENT_PASS`  | ✓        | —                              | qBittorrent WebUI password             |
-| `MAM_SESSION`       | ✓        | —                              | MyAnonamouse session cookie value      |
-| `GOTIFY_URL`        | ✓        | —                              | Gotify server base URL                 |
-| `GOTIFY_TOKEN`      | ✓        | —                              | Gotify application token               |
-| `GLUETUN_PROXY_URL` |          | —                              | Gluetun HTTP proxy for MAM traffic     |
-| `MAM_USER_AGENT`    |          | `windlass`                     | User-Agent sent to MAM                 |
-| `DATA_PATH`         |          | `/mnt/Data`                    | Path to monitor for disk space         |
-| `DUMP_DIR`          |          | `/mnt/Data/windlass_dumps`     | Directory for crash log dumps          |
-| `VPN_IP_FILE`       |          | `/tmp/gluetun/ip`              | Gluetun IP file path                   |
-| `VPN_PORT_FILE`     |          | `/tmp/gluetun/forwarded_port`  | Gluetun forwarded port file path       |
-| `WINDLASS_BIND`     |          | `0.0.0.0:5010`                 | Address for the embedded web server    |
+| Variable            | Required | Default                       | Description                         |
+| ------------------- | -------- | ----------------------------- | ----------------------------------- |
+| `QBITTORRENT_URL`   | ✓        | —                             | qBittorrent WebUI base URL          |
+| `QBITTORRENT_USER`  | ✓        | —                             | qBittorrent WebUI username          |
+| `QBITTORRENT_PASS`  | ✓        | —                             | qBittorrent WebUI password          |
+| `MAM_SESSION`       | ✓        | —                             | MyAnonamouse session cookie value   |
+| `GOTIFY_URL`        | ✓        | —                             | Gotify server base URL              |
+| `GOTIFY_TOKEN`      | ✓        | —                             | Gotify application token            |
+| `GLUETUN_PROXY_URL` |          | —                             | Gluetun HTTP proxy for MAM traffic  |
+| `MAM_USER_AGENT`    |          | `windlass`                    | User-Agent sent to MAM              |
+| `DATA_PATH`         |          | `/mnt/Data`                   | Path to monitor for disk space      |
+| `DUMP_DIR`          |          | `/mnt/Data/windlass_dumps`    | Directory for crash log dumps       |
+| `VPN_IP_FILE`       |          | `/tmp/gluetun/ip`             | Gluetun IP file path                |
+| `VPN_PORT_FILE`     |          | `/tmp/gluetun/forwarded_port` | Gluetun forwarded port file path    |
+| `WINDLASS_BIND`     |          | `0.0.0.0:5010`                | Address for the embedded web server |
 
 ## Running with Docker Compose
 

@@ -89,7 +89,10 @@ pub fn on_disk_space_observed(space: Information) -> Vec<Action> {
 }
 
 pub fn on_mam_rate_limit_violation() -> Vec<Action> {
-    // Handled by the shell event loop before reaching the core.
-    warn!("MamRateLimitViolation reached core — this should be intercepted by the shell");
-    vec![]
+    warn!("MAM rate-limit violation — system entering debug mode");
+    vec![Action::SendGotifyAlert(
+        AlertPriority::Critical,
+        "🛑 MAM rate limit guard triggered — requests were too fast. System paused in debug mode."
+            .into(),
+    )]
 }

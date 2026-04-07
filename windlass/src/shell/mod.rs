@@ -8,24 +8,23 @@ use anyhow::Result;
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uom::si::information::byte;
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_debug::DebugController;
+use windlass_debug::{DebugController, DebuggableEventStream};
 use windlass_local::{docker, monitors, vpn_files};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 
 pub use config::Config;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
-/// fires the Init event, then runs the event loop forever.
-#[allow(clippy::too_many_lines)]
+/// then runs the event loop forever.
 pub async fn run() -> Result<()> {
     let config = Config::from_env()?;
 
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let (tx, rx) = mpsc::channel::<Event>(128);
 
     let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone(), tx.clone()).await?;
     let port_files =
@@ -34,11 +33,6 @@ pub async fn run() -> Result<()> {
     info!("Windlass started");
 
     let debug_ctrl = DebugController::new();
-
-    if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
-        // obs_tx isn't built yet — enable after the broadcast channel is created below.
-        info!("DEBUG_MODE_ON_START=true — debug mode will be enabled at startup");
-    }
 
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -73,10 +67,8 @@ pub async fn run() -> Result<()> {
     let shared_state = Arc::new(tokio::sync::RwLock::new(SystemState::initial()));
     let (obs_tx, _) = tokio::sync::broadcast::channel::<windlass_core::Observation>(256);
 
-    if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
-        debug_ctrl.enable_debug(obs_tx.clone());
-        info!("Debug mode enabled");
-    }
+    let mut debug_stream = DebuggableEventStream::new(rx, debug_ctrl.clone(), obs_tx.clone());
+
     let app_state = windlass_web::AppState {
         event_tx: tx.clone(),
         state: shared_state.clone(),
@@ -100,64 +92,18 @@ pub async fn run() -> Result<()> {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
     }
 
-    let actions = state.process_event(Event::Init {
+    // Send Init into the channel so it flows through DebuggableEventStream.
+    // If DEBUG_MODE_ON_START=true, the stream will pause on it before
+    // the main loop receives it.
+    tx.send(Event::Init {
         is_gluetun_healthy: boot.is_gluetun_healthy,
         port_files,
-    });
-    *shared_state.write().await = state.clone();
-    let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
-    ShellContext {
-        docker: &docker,
-        qbit: &qbit,
-        mam: &mam,
-        gotify: &gotify,
-        wakeups: &mut wakeups,
-        dependents: &boot.dependents,
-        tx: &tx,
-        vpn_ip_file: &vpn_ip_file,
-        vpn_port_file: &vpn_port_file,
-        data_path: &data_path,
-        debug_ctrl: &debug_ctrl,
-        obs_tx: &obs_tx,
-    }
-    .dispatch(actions)
-    .await;
+    })
+    .await
+    .expect("event channel open at startup");
 
-    while let Some(event) = rx.recv().await {
+    while let Some(event) = debug_stream.recv().await {
         debug!(?event, "←");
-
-        if debug_ctrl.is_frozen() {
-            debug!(?event, "system frozen: dropping event");
-            continue;
-        }
-
-        if matches!(event, Event::MamRateLimitViolation) {
-            error!("MAM rate limit guard triggered — system frozen. Restart Windlass to resume.");
-            let g = gotify.clone();
-            tokio::spawn(async move {
-                g.send_alert(
-                    windlass_types::AlertPriority::Critical,
-                    "🛑 MAM rate limit guard triggered — requests were too fast. System is frozen. Restart Windlass to resume.",
-                ).await;
-            });
-            continue;
-        }
-
-        // Pause if debug mode is on or the event variant has a breakpoint.
-        // The event is pushed to the queue (visible via GET /debug) then we wait
-        // for a step permit from POST /debug/step/event before continuing.
-        let event = if debug_ctrl.should_pause_on_event(event_variant(&event)) {
-            debug_ctrl.enqueue_event(event.clone());
-            let _ = obs_tx.send(windlass_core::Observation::EventReceived(event));
-            debug_ctrl.acquire_event_step().await;
-            match debug_ctrl.dequeue_event() {
-                Some(e) => e,
-                // Disabled while paused — discard and fetch the next event.
-                None => continue,
-            }
-        } else {
-            event
-        };
 
         let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
@@ -391,35 +337,11 @@ impl ShellContext<'_> {
     }
 }
 
-// ── Variant name helpers ──────────────────────────────────────────────────────
-
-/// Returns the variant name of an [`Event`] as a static string.
-/// Used to look up breakpoints without heap allocation.
-const fn event_variant(event: &Event) -> &'static str {
-    match event {
-        Event::Init { .. } => "Init",
-        Event::ManualReset => "ManualReset",
-        Event::DockerGluetunDied => "DockerGluetunDied",
-        Event::DockerGluetunHealthy => "DockerGluetunHealthy",
-        Event::PortFileReadResult(_) => "PortFileReadResult",
-        Event::QbitAuthSuccess(_) => "QbitAuthSuccess",
-        Event::QbitAuthFailed => "QbitAuthFailed",
-        Event::QbitConnectionRefused => "QbitConnectionRefused",
-        Event::QbitApiError(_) => "QbitApiError",
-        Event::QbitPortSyncSuccess => "QbitPortSyncSuccess",
-        Event::QbitPortSyncFailed(_) => "QbitPortSyncFailed",
-        Event::MamUpdateSuccess => "MamUpdateSuccess",
-        Event::MamAsnMismatch(_) => "MamAsnMismatch",
-        Event::MamStatusObserved(_) => "MamStatusObserved",
-        Event::DiskSpaceObserved(_) => "DiskSpaceObserved",
-        Event::NewTorrentsObserved(_) => "NewTorrentsObserved",
-        Event::LogsDumped => "LogsDumped",
-        Event::Wakeup(_) => "Wakeup",
-        Event::MamRateLimitViolation => "MamRateLimitViolation",
-    }
-}
+// ── Variant name helper ───────────────────────────────────────────────────────
 
 /// Returns the variant name of an [`Action`] as a static string.
+/// Used to look up breakpoints without heap allocation.
+/// (Event variant names live in `windlass-debug` alongside `DebuggableEventStream`.)
 const fn action_variant(action: &Action) -> &'static str {
     match action {
         Action::ScheduleWakeup(_, _) => "ScheduleWakeup",

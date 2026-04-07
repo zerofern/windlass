@@ -132,14 +132,14 @@ impl MamClient {
     }
 
     /// Returns `true` if the request can proceed (≥400ms since last request).
-    /// Returns `false` if the guard triggers — also freezes the debug gate.
+    /// Returns `false` if the guard triggers — a `MamRateLimitViolation` event
+    /// will be emitted by the caller.
     fn check_rate_limit(&self) -> bool {
         let mut last = self.last_request_at.lock().unwrap();
         if let Some(t) = *last
             && t.elapsed() < std::time::Duration::from_millis(400)
         {
-            warn!("MAM rate limit guard triggered — freezing system");
-            self.debug_ctrl.freeze();
+            warn!("MAM rate limit guard triggered");
             return false;
         }
         *last = Some(std::time::Instant::now());
