@@ -1,6 +1,6 @@
 # Windlass
 
-Windlass is a lightweight Rust \ for self-hosted torrent stacks running
+Windlass is a lightweight Rust operator for self-hosted torrent stacks running
 behind a Gluetun VPN. It watches the VPN tunnel and keeps everything in sync
 automatically, so a VPN reconnect or IP change requires no manual intervention.
 
