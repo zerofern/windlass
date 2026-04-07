@@ -1,179 +1,5 @@
 # Windlass Debug Mode
 
-## Implementation Plan
-
-Six sequential commits. Each leaves the system compiling, tested, and green.
-Steps 1–4 are pure infrastructure with no behaviour changes (except the MAM halt
-in step 1). Steps 5–6 add new capabilities.
-
----
-
-### Step 1 — `DebuggableEventStream`
-
-**Goal:** The shell's event loop has ~50 lines of inline queue/pause/step logic
-tangled with MAM rate-limit special-casing. After this commit the main loop is a
-clean 5-line while-let. The MAM guardrail no longer hard-freezes the system
-forever — it enters debug mode instead, which is recoverable.
-
-**What changes:**
-
-- Add `DebuggableEventStream` to `windlass-debug` with an intake task
-  (broadcasts `Observation::EventArrived` before forwarding to the internal
-  channel) and a `recv()` method that owns all pause/step logic.
-- `MamRateLimitViolation` in `recv()` calls `enable_debug()` then falls through
-  — event still reaches the core unchanged.
-- Shell `run()` replaces its 50-line event-loop body with a clean while-let over
-  `debug_stream.recv()`.
-- Remove `frozen`/`freeze()`/`unfreeze()`/`is_frozen()` from `DebugController`
-  — `is_debug_mode()` covers the same gate.
-- Remove `enqueue_event`/`dequeue_event` from `DebugController` — the stream
-  owns its internal channel exclusively.
-- `DEBUG_MODE_ON_START` check moves into the `DebuggableEventStream` constructor,
-  resolving the awkward two-phase init in the shell.
-
-**Files touched:** `windlass-debug/src/lib.rs`, `windlass/src/shell/mod.rs`,
-`windlass-web/src/routes/debug.rs` (remove freeze endpoints).
-
----
-
-### Step 2 — `DebuggableShell` + unified semaphore
-
-**Goal:** The action dispatch side gets the same treatment as step 1. Two
-separate semaphores become one. Skip works for both events and actions.
-
-**What changes:**
-
-- Add `ShellContext::execute(&mut self, action: Action)` that contains what the
-  existing `dispatch` match currently inlines — no logic change, just extraction.
-- Add `DebuggableShell` to `windlass-debug` wrapping a `ShellContext`. Its
-  `dispatch(actions)` stores the full batch upfront in debug mode (so the UI can
-  see all pending actions before any are dispatched), then pauses before each
-  action if debug mode is on or the variant is breakpointed.
-- Replace `step_event: Semaphore` + `step_action: Semaphore` in `DebugController`
-  with a single `step: Semaphore`. The loop is sequential and only ever blocked
-  at one point.
-- Add `skip: AtomicBool` to `DebugController`. `POST /debug/skip` sets it;
-  both `DebuggableEventStream::recv()` and `DebuggableShell::dispatch()` check
-  and clear it after waking.
-- Replace `/api/v1/debug/step/event` + `/api/v1/debug/step/action` with a
-  single `POST /api/v1/debug/step` that releases one permit regardless of what
-  is currently paused.
-- Remove `enqueue_action`/`dequeue_action`/`acquire_action_step`/
-  `release_action_step` from `DebugController`.
-
-**Files touched:** `windlass-debug/src/lib.rs`, `windlass/src/shell/mod.rs`,
-`windlass-web/src/routes/debug.rs`.
-
----
-
-### Step 3 — Rich debug state (`paused_on`, `pending_actions`, enable/disable)
-
-**Goal:** `GET /debug` currently returns the contents of queues. After this it
-returns what the system is paused on _right now_ and the full pending action
-batch — the two things the UI actually needs. Adds enable/disable endpoints.
-
-**What changes:**
-
-- Add `paused_on: ArcSwap<Option<PausedOn>>` to `DebugController`.
-  `DebuggableEventStream::recv()` and `DebuggableShell::dispatch()` store the
-  current pause point before blocking and clear it on wake.
-- Add `pending_actions: ArcSwap<Arc<Vec<Action>>>` to `DebugController`.
-  `DebuggableShell::dispatch()` stores the full batch on entry and clears it
-  when the batch is fully dispatched.
-- Update `DebugState` / `GET /api/v1/debug` to return `paused_on` and
-  `pending_actions` instead of the old queue snapshots.
-- Add `POST /api/v1/debug/enable` and `POST /api/v1/debug/disable` so the UI
-  can toggle debug mode at runtime without a restart.
-
-**Files touched:** `windlass-debug/src/lib.rs`, `windlass-web/src/routes/debug.rs`.
-
----
-
-### Step 4 — Lock-free `DebugController` + `ArcSwap` shared state + variant helpers
-
-**Goal:** `DebugController` uses `Mutex` throughout, violating the no-mutex
-rule. After this it is fully lock-free. Variant helpers move to `windlass-debug`.
-`SystemState` sharing drops the `RwLock`.
-
-**What changes:**
-
-- Replace `Mutex<HashSet<String>>` for `event_breakpoints` and
-  `action_breakpoints` with `ArcSwap<HashSet<String>>`.
-- Replace `Mutex<Option<broadcast::Sender<Observation>>>` for `obs_tx` with
-  `ArcSwap<Option<broadcast::Sender<Observation>>>`.
-- Move `event_variant()`, `action_variant()`, `EVENT_VARIANTS`, and
-  `ACTION_VARIANTS` from `windlass/src/shell/mod.rs` into `windlass-debug`.
-  Add `GET /api/v1/debug/events` and `GET /api/v1/debug/actions` endpoints.
-- Replace `Arc<RwLock<SystemState>>` in `windlass/src/shell/mod.rs` with
-  `Arc<ArcSwap<SystemState>>`. The main loop stores a new `Arc` after each
-  `process_event`; the SSE handler and `GET /state` load the current `Arc`
-  with a single atomic operation — no lock contention.
-
-**Files touched:** `windlass-debug/src/lib.rs`, `windlass/src/shell/mod.rs`,
-`windlass-web/src/routes/operator.rs`, `windlass-web/src/routes/debug.rs`,
-`windlass-web/src/app_state.rs`.
-
----
-
-### Step 5 — Remove `RunMode::Fatal`, `hard_recoveries`, and `ManualReset`
-
-**Goal:** The core has a permanent halting state (`RunMode::Fatal`) that requires a
-process restart to escape, plus a recovery counter (`hard_recoveries`) and a
-`ManualReset` event used to escape it. All three are removed. Death-loop prevention
-is handled entirely by the existing MAM rate-limit guardrail: if the stack keeps
-failing, MAM will be queried too frequently, `MamRateLimitViolation` will fire, and
-`DebuggableEventStream` will enter debug mode. The operator resumes via the debug UI.
-
-**What changes:**
-
-- Remove `RunMode` enum and `run_mode` field from `SystemState`.
-- Remove `hard_recoveries: RetryCount` from `SystemState`.
-- Remove `Event::ManualReset`.
-- `on_mam_not_connectable` hard-recovery path: remove the counter and limit check.
-  Emit `FetchAndDumpAllLogs` + `SendGotifyAlert` unconditionally (single hard
-  recovery attempt). The rate-limit guardrail is the only death-loop prevention.
-- Remove `on_manual_reset` handler.
-- Remove the `HARD_RECOVERY_LIMIT` constant.
-- Remove `POST /api/v1/operator/reset` endpoint — no longer meaningful.
-- Remove all unit and prop tests that assert on `Fatal`, `hard_recoveries`, or
-  `ManualReset` behaviour.
-
-**Files touched:** `windlass-core/src/types.rs`, `windlass-core/src/events.rs`,
-`windlass-core/src/handlers/mam.rs`, `windlass-core/src/handlers/vpn.rs`,
-`windlass-core/src/lib.rs`, `windlass-core/src/tests/mam.rs`,
-`windlass-core/src/tests/init.rs`, `windlass-core/src/prop_tests.rs`,
-`windlass-web/src/routes/operator.rs`, `windlass-web/src/routes/debug.rs`,
-`windlass-debug/src/stream.rs`, `windlass/src/shell/mod.rs`,
-`windlass/tests/integration.rs`.
-
----
-
-### Step 6 — HTTP Observation Callback
-
-**Goal:** In debug mode, every outbound HTTP call emits a full
-request/response observation on the SSE stream. Clients stay unaware of debug
-mode — they receive an optional callback at construction and call it if present.
-
-**What changes:**
-
-- Add `on_http: Option<Arc<dyn Fn(Observation) + Send + Sync>>` field to
-  `QbitClient`, `MamClient`, and `GotifyClient`. Each client calls it (if
-  `Some`) after every HTTP response, passing an `Observation::HttpExchange`
-  with module name, method, URL, optional request body, response status, and
-  response body.
-- Add `Observation::HttpExchange { module, method, url, request_body,
-status, response_body }` variant to `windlass-core/src/observation.rs`.
-- In `windlass/src/shell/mod.rs`, construct the closure from `obs_tx` and pass
-  it to each client constructor. When debug mode is off, pass `None`.
-  `windlass-debug` provides a helper to build the closure from an `obs_tx`.
-- Remove `obs_sender()` from `DebugController` — clients no longer poll for it.
-
-**Files touched:** `windlass-clients/src/qbit.rs`, `windlass-clients/src/mam.rs`,
-`windlass-clients/src/gotify.rs`, `windlass-core/src/observation.rs`,
-`windlass-debug/src/lib.rs`, `windlass/src/shell/mod.rs`.
-
----
-
 ## Purpose
 
 Debug mode gives the operator a **debugger-like experience** over the Windlass event loop
@@ -274,8 +100,6 @@ While debug mode is active the user has full visibility into:
   is dispatched through the shell. The UI determines which by reading `GET /api/v1/debug`
   — the user never needs to distinguish between "step event" and "step action."
 - **Skip** — discard the currently paused event or action without executing it.
-- **Step All** — release all pending actions in sequence without individual clicks.
-  Useful once you have inspected the current batch and are confident it is safe.
 - **Disable Debug Mode** — execute all remaining queued events and pending actions in
   order, then resume normal operation. No items are silently discarded.
 
@@ -342,7 +166,7 @@ Main loop
             │
             ShellContext.execute(action)
               └─ may make HTTP requests
-                   └─ on_http callback → broadcast HttpExchange  [debug mode only]
+                   └─ on_http callback → broadcast HttpExchange  (no-op when debug mode off)
 ```
 
 The main loop is paused at exactly one point at any time — either waiting to receive
@@ -355,9 +179,10 @@ blocked.
 ## HTTP Observation Detail
 
 Each HTTP client (`QbitClient`, `MamClient`, `GotifyClient`) receives an
-`on_http: Option<Arc<dyn Fn(Observation) + Send + Sync>>` callback at construction.
-When `Some`, it is called after every HTTP response. When `None`, the call is skipped —
-zero overhead in normal operation.
+`on_http: HttpObserver` (i.e. `Arc<dyn Fn(Observation) + Send + Sync>`) callback at
+construction. It is called unconditionally after every HTTP response. The callback
+implementation in `windlass-debug` routes the observation to the SSE channel when debug
+mode is active and is a no-op otherwise — zero overhead in normal operation.
 
 The callback broadcasts an `Observation::HttpExchange` containing module name, method,
 URL, optional request body, response status, and full response body. These appear in the
