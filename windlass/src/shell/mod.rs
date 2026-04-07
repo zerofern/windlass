@@ -13,7 +13,7 @@ use uom::si::information::byte;
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_debug::{DebugController, DebuggableEventStream};
+use windlass_debug::{DebugController, DebuggableEventStream, action_variant};
 use windlass_local::{docker, monitors, vpn_files};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 
@@ -110,7 +110,7 @@ pub async fn run() -> Result<()> {
         let actions = state.process_event(event);
         *shared_state.write().await = state.clone();
         let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
-        ShellContext {
+        DebuggableShell(ShellContext {
             docker: &docker,
             qbit: &qbit,
             mam: &mam,
@@ -123,7 +123,7 @@ pub async fn run() -> Result<()> {
             data_path: &data_path,
             debug_ctrl: &debug_ctrl,
             obs_tx: &obs_tx,
-        }
+        })
         .dispatch(actions)
         .await;
     }
@@ -149,54 +149,58 @@ struct ShellContext<'a> {
 }
 
 impl ShellContext<'_> {
-    /// Dispatches every action produced by the Core.
-    /// In debug mode (or when an action variant has a breakpoint) the action is
-    /// queued and waits for a step permit from `POST /debug/step/action`.
+    /// Executes a single action produced by the Core.
+    fn execute(&mut self, action: Action) {
+        match action {
+            Action::ScheduleWakeup(id, duration) => self.schedule_wakeup(id, duration),
+            Action::ReadPortFiles => self.read_port_files(),
+            Action::FetchAndDumpAllLogs => self.fetch_and_dump_all_logs(),
+            Action::StopDependentContainers => self.stop_dependent_containers(),
+            Action::StartDependentContainers => self.start_dependent_containers(),
+            Action::RestartGluetun => self.restart_gluetun(),
+            Action::AuthenticateQbit => self.authenticate_qbit(),
+            Action::SyncQbitPort(cookie, port) => self.sync_qbit_port(cookie, port),
+            Action::UpdateMam(ip) => self.update_mam(ip),
+            Action::CheckMamConnectability => self.check_mam_connectability(),
+            Action::CheckDiskSpace => self.check_disk_space(),
+            Action::CheckNewTorrents(cookie) => self.check_new_torrents(cookie),
+            Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
+        }
+    }
+}
+
+/// Wraps [`ShellContext`] with debug-mode pause/skip logic for action dispatch.
+///
+/// In debug mode (or when an action breakpoint is set), each action pauses
+/// before execution and waits for `POST /debug/step`. A `POST /debug/skip`
+/// discards the action instead.
+struct DebuggableShell<'a>(ShellContext<'a>);
+
+impl DebuggableShell<'_> {
     async fn dispatch(&mut self, actions: Vec<Action>) {
         for action in actions {
             debug!(?action, "→");
 
-            // Pause if debug mode is on or this action variant has a breakpoint.
-            let action = if self
-                .debug_ctrl
-                .should_pause_on_action(action_variant(&action))
-            {
-                self.debug_ctrl.enqueue_action(action.clone());
-                let _ = self
-                    .obs_tx
-                    .send(windlass_core::Observation::ActionDispatched(action));
-                self.debug_ctrl.acquire_action_step().await;
-                match self.debug_ctrl.dequeue_action() {
-                    Some(a) => a,
-                    // Debug disabled while paused — skip this action.
-                    None => continue,
-                }
-            } else {
-                action
-            };
-
             let _ = self
+                .0
                 .obs_tx
                 .send(windlass_core::Observation::ActionDispatched(action.clone()));
 
-            match action {
-                Action::ScheduleWakeup(id, duration) => self.schedule_wakeup(id, duration),
-                Action::ReadPortFiles => self.read_port_files(),
-                Action::FetchAndDumpAllLogs => self.fetch_and_dump_all_logs(),
-                Action::StopDependentContainers => self.stop_dependent_containers(),
-                Action::StartDependentContainers => self.start_dependent_containers(),
-                Action::RestartGluetun => self.restart_gluetun(),
-                Action::AuthenticateQbit => self.authenticate_qbit(),
-                Action::SyncQbitPort(cookie, port) => self.sync_qbit_port(cookie, port),
-                Action::UpdateMam(ip) => self.update_mam(ip),
-                Action::CheckMamConnectability => self.check_mam_connectability(),
-                Action::CheckDiskSpace => self.check_disk_space(),
-                Action::CheckNewTorrents(cookie) => self.check_new_torrents(cookie),
-                Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
+            if self
+                .0
+                .debug_ctrl
+                .should_pause_on_action(action_variant(&action))
+                && !self.0.debug_ctrl.acquire_step().await
+            {
+                continue; // skipped
             }
+
+            self.0.execute(action);
         }
     }
+}
 
+impl ShellContext<'_> {
     // ── Timers ────────────────────────────────────────────────────────────────
 
     fn schedule_wakeup(&mut self, id: WakeupId, duration: Duration) {
@@ -334,28 +338,5 @@ impl ShellContext<'_> {
         tokio::spawn(async move {
             gotify.send_alert(priority, &message).await;
         });
-    }
-}
-
-// ── Variant name helper ───────────────────────────────────────────────────────
-
-/// Returns the variant name of an [`Action`] as a static string.
-/// Used to look up breakpoints without heap allocation.
-/// (Event variant names live in `windlass-debug` alongside `DebuggableEventStream`.)
-const fn action_variant(action: &Action) -> &'static str {
-    match action {
-        Action::ScheduleWakeup(_, _) => "ScheduleWakeup",
-        Action::ReadPortFiles => "ReadPortFiles",
-        Action::FetchAndDumpAllLogs => "FetchAndDumpAllLogs",
-        Action::StopDependentContainers => "StopDependentContainers",
-        Action::StartDependentContainers => "StartDependentContainers",
-        Action::RestartGluetun => "RestartGluetun",
-        Action::AuthenticateQbit => "AuthenticateQbit",
-        Action::SyncQbitPort(_, _) => "SyncQbitPort",
-        Action::UpdateMam(_) => "UpdateMam",
-        Action::CheckMamConnectability => "CheckMamConnectability",
-        Action::CheckDiskSpace => "CheckDiskSpace",
-        Action::CheckNewTorrents(_) => "CheckNewTorrents",
-        Action::SendGotifyAlert(_, _) => "SendGotifyAlert",
     }
 }

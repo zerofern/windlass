@@ -63,8 +63,8 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/debug/breakpoints/action/{variant}",
             post(post_action_breakpoint).delete(delete_action_breakpoint),
         )
-        .route("/api/v1/debug/step/event", post(post_step_event))
-        .route("/api/v1/debug/step/action", post(post_step_action))
+        .route("/api/v1/debug/step", post(post_step))
+        .route("/api/v1/debug/skip", post(post_skip))
         .with_state(state)
 }
 
@@ -122,14 +122,14 @@ async fn delete_action_breakpoint(
     StatusCode::OK
 }
 
-/// Releases one step permit — the event loop will process the next queued event.
-async fn post_step_event(State(app): State<AppState>) -> StatusCode {
-    app.debug_ctrl.release_event_step();
+/// Releases one step permit — the currently-paused event or action will execute.
+async fn post_step(State(app): State<AppState>) -> StatusCode {
+    app.debug_ctrl.release_step();
     StatusCode::OK
 }
 
-/// Releases one step permit — the event loop will dispatch the next queued action.
-async fn post_step_action(State(app): State<AppState>) -> StatusCode {
-    app.debug_ctrl.release_action_step();
+/// Skips the currently-paused event or action without executing it.
+async fn post_skip(State(app): State<AppState>) -> StatusCode {
+    app.debug_ctrl.request_skip();
     StatusCode::OK
 }

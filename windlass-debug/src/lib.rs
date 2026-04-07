@@ -1,6 +1,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -32,13 +32,13 @@ struct Inner {
     /// Manually enabled/disabled from the UI or by the MAM rate-limit guardrail.
     /// When enabled, each event/action waits for an explicit step permit.
     debug_mode: AtomicBool,
-    action_queue: Mutex<VecDeque<Action>>,
     event_breakpoints: Mutex<HashSet<String>>,
     action_breakpoints: Mutex<HashSet<String>>,
-    /// One permit = one event may pass through. Released by `POST /debug/step/event`.
-    step_event: Semaphore,
-    /// One permit = one action may be dispatched. Released by `POST /debug/step/action`.
-    step_action: Semaphore,
+    /// One permit = one event or action may proceed.
+    /// Released by `POST /debug/step`; consumed by `acquire_step`.
+    step: Semaphore,
+    /// When set, the next `acquire_step` caller skips its item instead of executing it.
+    skip: AtomicBool,
     /// Present only while debug mode is active — lets clients emit `HttpExchange` observations.
     obs_tx: Mutex<Option<broadcast::Sender<Observation>>>,
 }
@@ -47,12 +47,11 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             debug_mode: AtomicBool::new(false),
-            action_queue: Mutex::new(VecDeque::new()),
             event_breakpoints: Mutex::new(HashSet::new()),
             action_breakpoints: Mutex::new(HashSet::new()),
             // Start with zero permits — nothing steps until explicitly requested.
-            step_event: Semaphore::new(0),
-            step_action: Semaphore::new(0),
+            step: Semaphore::new(0),
+            skip: AtomicBool::new(false),
             obs_tx: Mutex::new(None),
         }
     }
@@ -83,11 +82,10 @@ impl DebugController {
     /// Panics if any internal mutex is poisoned.
     pub fn disable_debug(&self) {
         self.0.debug_mode.store(false, Ordering::SeqCst);
+        self.0.skip.store(false, Ordering::SeqCst);
         *self.0.obs_tx.lock().unwrap() = None;
-        self.0.action_queue.lock().unwrap().clear();
-        // Release any tasks currently blocked on step permits.
-        self.0.step_event.add_permits(usize::MAX / 2);
-        self.0.step_action.add_permits(usize::MAX / 2);
+        // Release any task currently blocked on the step semaphore.
+        self.0.step.add_permits(usize::MAX / 2);
     }
 
     #[must_use]
@@ -147,44 +145,28 @@ impl DebugController {
         self.is_debug_mode() || self.0.action_breakpoints.lock().unwrap().contains(variant)
     }
 
-    // ── Action queue (used by shell dispatch until DebuggableShell in step 2) ──
-
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    pub fn enqueue_action(&self, action: Action) {
-        self.0.action_queue.lock().unwrap().push_back(action);
-    }
-
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    #[must_use]
-    pub fn dequeue_action(&self) -> Option<Action> {
-        self.0.action_queue.lock().unwrap().pop_front()
-    }
-
     // ── Step permits ──────────────────────────────────────────────────────────
 
-    /// Blocks until a step permit is available. Used by [`DebuggableEventStream`].
-    pub(crate) async fn acquire_event_step(&self) {
-        self.0.step_event.acquire().await.unwrap().forget();
-    }
-
-    /// Adds one step permit, unblocking [`DebuggableEventStream`] once.
-    pub fn release_event_step(&self) {
-        self.0.step_event.add_permits(1);
-    }
-
-    /// Blocks until a step permit is available (released by `POST /debug/step/action`).
+    /// Blocks until a step permit is available.
+    /// Returns `true` if the event or action should execute, `false` if it should be skipped.
     ///
     /// # Panics
     /// Panics if the semaphore has been closed, which never happens in normal operation.
-    pub async fn acquire_action_step(&self) {
-        self.0.step_action.acquire().await.unwrap().forget();
+    pub async fn acquire_step(&self) -> bool {
+        self.0.step.acquire().await.unwrap().forget();
+        !self.0.skip.swap(false, Ordering::SeqCst)
     }
 
-    /// Adds one step permit for an action, unblocking the dispatch loop once.
-    pub fn release_action_step(&self) {
-        self.0.step_action.add_permits(1);
+    /// Releases one step permit, allowing the currently-paused event or action to execute.
+    pub fn release_step(&self) {
+        self.0.step.add_permits(1);
+    }
+
+    /// Skips the currently-paused event or action without executing it.
+    /// Sets the skip flag then releases one permit so the waiter wakes up.
+    pub fn request_skip(&self) {
+        self.0.skip.store(true, Ordering::SeqCst);
+        self.0.step.add_permits(1);
     }
 
     // ── HTTP observation channel ──────────────────────────────────────────────
@@ -206,15 +188,6 @@ impl DebugController {
     /// Panics if any internal mutex is poisoned.
     #[must_use]
     pub fn debug_state(&self) -> DebugState {
-        let pending_actions = self
-            .0
-            .action_queue
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|a| serde_json::to_value(a).ok())
-            .collect();
-
         let event_breakpoints = self
             .0
             .event_breakpoints
@@ -235,7 +208,7 @@ impl DebugController {
 
         DebugState {
             debug_mode: self.is_debug_mode(),
-            pending_actions,
+            pending_actions: vec![], // populated in step 3 via ArcSwap
             event_breakpoints,
             action_breakpoints,
         }
@@ -293,23 +266,28 @@ impl DebuggableEventStream {
     }
 
     /// Returns the next event, pausing if debug mode is active or a breakpoint
-    /// is set for this event's variant.
+    /// is set for this event's variant. If the step is skipped the event is
+    /// discarded and the next one is returned instead.
     ///
     /// `MamRateLimitViolation` automatically enters debug mode before pausing —
     /// the event still reaches the core unchanged.
     pub async fn recv(&mut self) -> Option<Event> {
-        let event = self.internal_rx.recv().await?;
+        loop {
+            let event = self.internal_rx.recv().await?;
 
-        if matches!(event, Event::MamRateLimitViolation) {
-            warn!("MAM rate-limit violation detected — entering debug mode");
-            self.debug_ctrl.enable_debug(self.obs_tx.clone());
+            if matches!(event, Event::MamRateLimitViolation) {
+                warn!("MAM rate-limit violation detected — entering debug mode");
+                self.debug_ctrl.enable_debug(self.obs_tx.clone());
+            }
+
+            if self.debug_ctrl.should_pause_on_event(event_variant(&event))
+                && !self.debug_ctrl.acquire_step().await
+            {
+                continue; // skipped — fetch the next event
+            }
+
+            return Some(event);
         }
-
-        if self.debug_ctrl.should_pause_on_event(event_variant(&event)) {
-            self.debug_ctrl.acquire_event_step().await;
-        }
-
-        Some(event)
     }
 }
 
@@ -334,5 +312,26 @@ const fn event_variant(event: &Event) -> &'static str {
         Event::LogsDumped => "LogsDumped",
         Event::Wakeup(_) => "Wakeup",
         Event::MamRateLimitViolation => "MamRateLimitViolation",
+    }
+}
+
+/// Returns the variant name of an [`Action`] as a static string.
+/// Used to look up breakpoints without heap allocation.
+#[must_use]
+pub const fn action_variant(action: &Action) -> &'static str {
+    match action {
+        Action::ScheduleWakeup(_, _) => "ScheduleWakeup",
+        Action::ReadPortFiles => "ReadPortFiles",
+        Action::FetchAndDumpAllLogs => "FetchAndDumpAllLogs",
+        Action::StopDependentContainers => "StopDependentContainers",
+        Action::StartDependentContainers => "StartDependentContainers",
+        Action::RestartGluetun => "RestartGluetun",
+        Action::AuthenticateQbit => "AuthenticateQbit",
+        Action::SyncQbitPort(_, _) => "SyncQbitPort",
+        Action::UpdateMam(_) => "UpdateMam",
+        Action::CheckMamConnectability => "CheckMamConnectability",
+        Action::CheckDiskSpace => "CheckDiskSpace",
+        Action::CheckNewTorrents(_) => "CheckNewTorrents",
+        Action::SendGotifyAlert(_, _) => "SendGotifyAlert",
     }
 }
