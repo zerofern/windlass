@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use windlass_core::events::Event;
-use windlass_debug::DebugController;
+use windlass_core::{HttpObserver, Observation};
 use windlass_types::{MamStatus, VpnIp};
 
 #[derive(Deserialize)]
@@ -39,7 +39,7 @@ pub struct MamClient {
     seedbox_url: String,
     load_url: String,
     last_request_at: Arc<Mutex<Option<std::time::Instant>>>,
-    debug_ctrl: DebugController,
+    on_http: HttpObserver,
 }
 
 impl MamClient {
@@ -51,7 +51,7 @@ impl MamClient {
         seedbox_url: String,
         load_url: String,
         user_agent: &str,
-        debug_ctrl: DebugController,
+        on_http: HttpObserver,
     ) -> anyhow::Result<Self> {
         let builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -68,7 +68,7 @@ impl MamClient {
             seedbox_url,
             load_url,
             last_request_at: Arc::new(Mutex::new(None)),
-            debug_ctrl,
+            on_http,
         })
     }
 
@@ -147,16 +147,14 @@ impl MamClient {
     }
 
     fn emit_http(&self, url: &str, response_status: u16, response_body: &str) {
-        if let Some(tx) = self.debug_ctrl.obs_sender() {
-            let _ = tx.send(windlass_core::Observation::HttpExchange {
-                module: "mam".into(),
-                method: "GET".into(),
-                url: url.into(),
-                request_body: None,
-                response_status,
-                response_body: response_body.into(),
-            });
-        }
+        (self.on_http)(Observation::HttpExchange {
+            module: "mam".into(),
+            method: "GET".into(),
+            url: url.into(),
+            request_body: None,
+            response_status,
+            response_body: response_body.into(),
+        });
     }
 
     async fn do_update_seedbox(&self, session: &str) -> (Event, Option<String>) {
@@ -286,6 +284,8 @@ fn extract_mam_cookie(resp: &reqwest::Response) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use wiremock::matchers::{header_exists, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -310,7 +310,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -335,7 +335,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -364,7 +364,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         mam.update_seedbox().await;
@@ -390,7 +390,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -416,7 +416,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         let event = mam.check_connectability().await;
@@ -443,7 +443,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         let event = mam.check_connectability().await;
@@ -470,7 +470,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         let event = mam.check_connectability().await;
@@ -498,7 +498,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         mam.check_connectability().await;
@@ -519,7 +519,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            DebugController::new(),
+            Arc::new(|_| {}),
         )
         .unwrap();
         let event = mam.check_connectability().await;

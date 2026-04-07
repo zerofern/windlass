@@ -5,7 +5,7 @@ pub mod events;
 pub mod observation;
 pub mod types;
 
-pub use observation::Observation;
+pub use observation::{HttpObserver, Observation};
 
 #[cfg(test)]
 mod tests;

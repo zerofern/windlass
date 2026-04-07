@@ -1,9 +1,8 @@
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use windlass_core::Observation;
 use windlass_core::events::Event;
-use windlass_debug::DebugController;
+use windlass_core::{HttpObserver, Observation};
 use windlass_types::{AuthCookie, HttpStatusCode, TorrentName, VpnPort};
 
 #[derive(Deserialize)]
@@ -19,26 +18,24 @@ pub struct QbitClient {
     base_url: String,
     user: String,
     pass: String,
-    debug_ctrl: DebugController,
+    on_http: HttpObserver,
 }
 
 impl QbitClient {
     #[must_use]
-    // DebugController wraps an Arc — cannot be const.
-    #[allow(clippy::missing_const_for_fn)]
     pub fn new(
         client: reqwest::Client,
         base_url: String,
         user: String,
         pass: String,
-        debug_ctrl: DebugController,
+        on_http: HttpObserver,
     ) -> Self {
         Self {
             client,
             base_url,
             user,
             pass,
-            debug_ctrl,
+            on_http,
         }
     }
 
@@ -50,16 +47,14 @@ impl QbitClient {
         response_status: u16,
         response_body: &str,
     ) {
-        if let Some(tx) = self.debug_ctrl.obs_sender() {
-            let _ = tx.send(Observation::HttpExchange {
-                module: "qbit".into(),
-                method: method.into(),
-                url: url.into(),
-                request_body,
-                response_status,
-                response_body: response_body.into(),
-            });
-        }
+        (self.on_http)(Observation::HttpExchange {
+            module: "qbit".into(),
+            method: method.into(),
+            url: url.into(),
+            request_body,
+            response_status,
+            response_body: response_body.into(),
+        });
     }
 
     /// Authenticates with qBittorrent and returns the SID cookie on success.
@@ -178,8 +173,10 @@ fn extract_sid_cookie(resp: &reqwest::Response) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use windlass_debug::DebugController;
+
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -203,7 +200,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let event = qbit.authenticate().await;
         assert!(
@@ -226,7 +223,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let event = qbit.authenticate().await;
         assert!(matches!(event, Event::QbitAuthFailed));
@@ -246,7 +243,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "wrong_pass".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let event = qbit.authenticate().await;
         assert!(matches!(event, Event::QbitAuthFailed));
@@ -260,7 +257,7 @@ mod tests {
             "http://127.0.0.1:1".into(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let event = qbit.authenticate().await;
         assert!(matches!(event, Event::QbitConnectionRefused));
@@ -282,7 +279,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let cookie = AuthCookie("abc123".into());
         let port = VpnPort::try_new(51820).unwrap();
@@ -304,7 +301,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let cookie = AuthCookie("abc123".into());
         let port = VpnPort::try_new(51820).unwrap();
@@ -334,7 +331,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let cookie = AuthCookie("abc123".into());
         let names = qbit.list_torrents(&cookie).await;
@@ -358,7 +355,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let cookie = AuthCookie("abc123".into());
         let names = qbit.list_torrents(&cookie).await;
@@ -379,7 +376,7 @@ mod tests {
             server.uri(),
             "admin".into(),
             "password".into(),
-            DebugController::new(),
+            Arc::new(|_| {}),
         );
         let cookie = AuthCookie("abc123".into());
         let names = qbit.list_torrents(&cookie).await;

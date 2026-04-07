@@ -1,7 +1,14 @@
+use std::sync::Arc;
+
 use crate::actions::Action;
 use crate::events::Event;
 use crate::types::SystemState;
 use serde::Serialize;
+
+/// Type-erased callback for HTTP observation. Injected into clients at
+/// construction; the implementation in `windlass-debug` routes to the SSE
+/// channel when debug mode is active.
+pub type HttpObserver = Arc<dyn Fn(Observation) + Send + Sync>;
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
@@ -14,7 +21,7 @@ pub enum Observation {
     EventReceived(Event),
     StateSnapshot(SystemState),
     ActionDispatched(Action),
-    /// Emitted by HTTP clients when debug mode is active.
+    /// Emitted by HTTP clients on every response.
     /// Carries the full request/response detail for the SSE log view.
     HttpExchange {
         /// Which client emitted this: `"qbit"`, `"mam"`, or `"gotify"`.

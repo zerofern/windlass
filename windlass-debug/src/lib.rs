@@ -12,8 +12,8 @@ use arc_swap::ArcSwap;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Semaphore, broadcast};
-use windlass_core::Observation;
 use windlass_core::actions::Action;
+use windlass_core::{HttpObserver, Observation};
 
 // ── PausedOn ──────────────────────────────────────────────────────────────────
 
@@ -216,12 +216,18 @@ impl DebugController {
         self.pending_actions.store(Arc::new(vec![]));
     }
 
-    // ── HTTP observation channel ──────────────────────────────────────────────
+    // ── HTTP observation ──────────────────────────────────────────────────────
 
-    /// Returns the observation sender when debug mode is active.
+    /// Returns an [`HttpObserver`] that forwards observations to the SSE
+    /// channel when debug mode is active, and is a no-op when it is not.
     #[must_use]
-    pub fn obs_sender(&self) -> Option<broadcast::Sender<Observation>> {
-        self.obs_tx.load_full().as_ref().clone()
+    pub fn make_http_observer(&self) -> HttpObserver {
+        let obs_tx = Arc::clone(&self.obs_tx);
+        Arc::new(move |obs| {
+            if let Some(tx) = obs_tx.load_full().as_ref().as_ref() {
+                let _ = tx.send(obs);
+            }
+        })
     }
 
     // ── State snapshot ────────────────────────────────────────────────────────

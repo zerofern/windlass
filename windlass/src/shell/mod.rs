@@ -35,6 +35,7 @@ pub async fn run() -> Result<()> {
     info!("Windlass started");
 
     let debug_ctrl = DebugController::new();
+    let on_http = debug_ctrl.make_http_observer();
 
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -45,7 +46,7 @@ pub async fn run() -> Result<()> {
         config.qbit_url.clone(),
         config.qbit_user.clone(),
         config.qbit_pass.0.expose_secret().to_owned(),
-        debug_ctrl.clone(),
+        on_http.clone(),
     );
     let mam = mam::MamClient::new(
         config.gluetun_proxy_url.as_deref(),
@@ -53,13 +54,13 @@ pub async fn run() -> Result<()> {
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
         &config.mam_user_agent,
-        debug_ctrl.clone(),
+        on_http.clone(),
     )?;
     let gotify = gotify::GotifyClient::new(
         direct.clone(),
         config.gotify_url.clone(),
         config.gotify_token.clone(),
-        debug_ctrl.clone(),
+        on_http,
     );
 
     let vpn_ip_file = config.vpn_ip_file.clone();
