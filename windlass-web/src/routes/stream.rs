@@ -20,7 +20,7 @@ pub fn router(state: AppState) -> axum::Router {
 async fn stream_handler(
     State(app): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
-    let current_state = app.state.read().await.clone();
+    let current_state = (*app.state.load_full()).clone();
     let snapshot = Observation::StateSnapshot(current_state);
 
     let initial = stream::once(async move {

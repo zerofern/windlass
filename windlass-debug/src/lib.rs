@@ -5,8 +5,8 @@ mod stream;
 pub use stream::{DebuggableEventStream, action_variant};
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use serde::Serialize;
@@ -50,41 +50,38 @@ pub struct DebugState {
 
 // ── DebugController ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Default)]
-pub struct DebugController(Arc<Inner>);
-
-#[derive(Debug)]
-struct Inner {
+#[derive(Clone, Debug)]
+pub struct DebugController {
     /// Manually enabled/disabled from the UI or by the MAM rate-limit guardrail.
     /// When enabled, each event/action waits for an explicit step permit.
-    debug_mode: AtomicBool,
-    event_breakpoints: Mutex<HashSet<String>>,
-    action_breakpoints: Mutex<HashSet<String>>,
+    debug_mode: Arc<AtomicBool>,
+    event_breakpoints: Arc<ArcSwap<HashSet<String>>>,
+    action_breakpoints: Arc<ArcSwap<HashSet<String>>>,
     /// One permit = one event or action may proceed.
     /// Released by `POST /debug/step`; consumed by `acquire_step`.
-    step: Semaphore,
+    step: Arc<Semaphore>,
     /// When set, the next `acquire_step` caller skips its item instead of executing it.
-    skip: AtomicBool,
+    skip: Arc<AtomicBool>,
     /// Present only while debug mode is active — lets clients emit `HttpExchange` observations.
-    obs_tx: Mutex<Option<broadcast::Sender<Observation>>>,
+    obs_tx: Arc<ArcSwap<Option<broadcast::Sender<Observation>>>>,
     /// What the system is currently paused on; `None` when running freely.
-    paused_on: ArcSwap<Option<PausedOn>>,
+    paused_on: Arc<ArcSwap<Option<PausedOn>>>,
     /// The current action batch, pre-serialised; empty when not dispatching.
-    pending_actions: ArcSwap<Vec<Value>>,
+    pending_actions: Arc<ArcSwap<Vec<Value>>>,
 }
 
-impl Default for Inner {
+impl Default for DebugController {
     fn default() -> Self {
         Self {
-            debug_mode: AtomicBool::new(false),
-            event_breakpoints: Mutex::new(HashSet::new()),
-            action_breakpoints: Mutex::new(HashSet::new()),
+            debug_mode: Arc::new(AtomicBool::new(false)),
+            event_breakpoints: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+            action_breakpoints: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             // Start with zero permits — nothing steps until explicitly requested.
-            step: Semaphore::new(0),
-            skip: AtomicBool::new(false),
-            obs_tx: Mutex::new(None),
-            paused_on: ArcSwap::from_pointee(None),
-            pending_actions: ArcSwap::from_pointee(vec![]),
+            step: Arc::new(Semaphore::new(0)),
+            skip: Arc::new(AtomicBool::new(false)),
+            obs_tx: Arc::new(ArcSwap::from_pointee(None)),
+            paused_on: Arc::new(ArcSwap::from_pointee(None)),
+            pending_actions: Arc::new(ArcSwap::from_pointee(vec![])),
         }
     }
 }
@@ -99,84 +96,76 @@ impl DebugController {
 
     /// Enable debug mode. Wires up `obs_tx` so that clients can send `HttpExchange`
     /// observations while debug mode is active.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     pub fn enable_debug(&self, obs_tx: broadcast::Sender<Observation>) {
-        self.0.debug_mode.store(true, Ordering::SeqCst);
-        *self.0.obs_tx.lock().unwrap() = Some(obs_tx);
+        self.debug_mode.store(true, Ordering::SeqCst);
+        self.obs_tx.store(Arc::new(Some(obs_tx)));
     }
 
     /// Disable debug mode. Clears all debug state and releases any blocked
     /// step waiters so the system resumes normal operation.
-    ///
-    /// # Panics
-    /// Panics if any internal mutex is poisoned.
     pub fn disable_debug(&self) {
-        self.0.debug_mode.store(false, Ordering::SeqCst);
-        self.0.skip.store(false, Ordering::SeqCst);
-        self.0.paused_on.store(Arc::new(None));
-        self.0.pending_actions.store(Arc::new(vec![]));
-        *self.0.obs_tx.lock().unwrap() = None;
+        self.debug_mode.store(false, Ordering::SeqCst);
+        self.skip.store(false, Ordering::SeqCst);
+        self.obs_tx.store(Arc::new(None));
+        self.paused_on.store(Arc::new(None));
+        self.pending_actions.store(Arc::new(vec![]));
         // Release any task currently blocked on the step semaphore.
-        self.0.step.add_permits(usize::MAX / 2);
+        self.step.add_permits(usize::MAX / 2);
     }
 
     #[must_use]
     pub fn is_debug_mode(&self) -> bool {
-        self.0.debug_mode.load(Ordering::SeqCst)
+        self.debug_mode.load(Ordering::SeqCst)
     }
 
     // ── Breakpoints ───────────────────────────────────────────────────────────
 
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     pub fn add_event_breakpoint(&self, variant: impl Into<String>) {
-        self.0
-            .event_breakpoints
-            .lock()
-            .unwrap()
-            .insert(variant.into());
+        let v = variant.into();
+        self.event_breakpoints.rcu(|set| {
+            let mut new_set = (**set).clone();
+            new_set.insert(v.clone());
+            new_set
+        });
     }
 
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     pub fn remove_event_breakpoint(&self, variant: &str) {
-        self.0.event_breakpoints.lock().unwrap().remove(variant);
+        let v = variant.to_owned();
+        self.event_breakpoints.rcu(|set| {
+            let mut new_set = (**set).clone();
+            new_set.remove(&v);
+            new_set
+        });
     }
 
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     pub fn add_action_breakpoint(&self, variant: impl Into<String>) {
-        self.0
-            .action_breakpoints
-            .lock()
-            .unwrap()
-            .insert(variant.into());
+        let v = variant.into();
+        self.action_breakpoints.rcu(|set| {
+            let mut new_set = (**set).clone();
+            new_set.insert(v.clone());
+            new_set
+        });
     }
 
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     pub fn remove_action_breakpoint(&self, variant: &str) {
-        self.0.action_breakpoints.lock().unwrap().remove(variant);
+        let v = variant.to_owned();
+        self.action_breakpoints.rcu(|set| {
+            let mut new_set = (**set).clone();
+            new_set.remove(&v);
+            new_set
+        });
     }
 
     /// Returns `true` if the event loop should pause before processing `variant`.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn should_pause_on_event(&self, variant: &str) -> bool {
-        self.is_debug_mode() || self.0.event_breakpoints.lock().unwrap().contains(variant)
+        self.is_debug_mode() || self.event_breakpoints.load().contains(variant)
     }
 
     /// Returns `true` if the event loop should pause before dispatching `variant`.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn should_pause_on_action(&self, variant: &str) -> bool {
-        self.is_debug_mode() || self.0.action_breakpoints.lock().unwrap().contains(variant)
+        self.is_debug_mode() || self.action_breakpoints.load().contains(variant)
     }
 
     // ── Step permits ──────────────────────────────────────────────────────────
@@ -187,20 +176,20 @@ impl DebugController {
     /// # Panics
     /// Panics if the semaphore has been closed, which never happens in normal operation.
     pub async fn acquire_step(&self) -> bool {
-        self.0.step.acquire().await.unwrap().forget();
-        !self.0.skip.swap(false, Ordering::SeqCst)
+        self.step.acquire().await.unwrap().forget();
+        !self.skip.swap(false, Ordering::SeqCst)
     }
 
     /// Releases one step permit, allowing the currently-paused event or action to execute.
     pub fn release_step(&self) {
-        self.0.step.add_permits(1);
+        self.step.add_permits(1);
     }
 
     /// Skips the currently-paused event or action without executing it.
     /// Sets the skip flag then releases one permit so the waiter wakes up.
     pub fn request_skip(&self) {
-        self.0.skip.store(true, Ordering::SeqCst);
-        self.0.step.add_permits(1);
+        self.skip.store(true, Ordering::SeqCst);
+        self.step.add_permits(1);
     }
 
     // ── Pause state ───────────────────────────────────────────────────────────
@@ -208,7 +197,7 @@ impl DebugController {
     /// Sets or clears what the system is currently paused on.
     /// Called by [`DebuggableEventStream`] and [`DebuggableShell`] around step waits.
     pub fn set_paused_on(&self, p: Option<PausedOn>) {
-        self.0.paused_on.store(Arc::new(p));
+        self.paused_on.store(Arc::new(p));
     }
 
     /// Stores the current action batch as pre-serialised JSON.
@@ -218,57 +207,36 @@ impl DebugController {
             .iter()
             .filter_map(|a| serde_json::to_value(a).ok())
             .collect();
-        self.0.pending_actions.store(Arc::new(json));
+        self.pending_actions.store(Arc::new(json));
     }
 
     /// Clears the pending-actions batch.
     /// Called by `DebuggableShell` when the batch is fully dispatched.
     pub fn clear_pending_actions(&self) {
-        self.0.pending_actions.store(Arc::new(vec![]));
+        self.pending_actions.store(Arc::new(vec![]));
     }
 
     // ── HTTP observation channel ──────────────────────────────────────────────
 
     /// Returns the observation sender when debug mode is active.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn obs_sender(&self) -> Option<broadcast::Sender<Observation>> {
-        self.0.obs_tx.lock().unwrap().clone()
+        self.obs_tx.load_full().as_ref().clone()
     }
 
     // ── State snapshot ────────────────────────────────────────────────────────
 
     /// Returns a serialisable snapshot of the current debug state.
-    ///
-    /// # Panics
-    /// Panics if any internal mutex is poisoned.
     #[must_use]
     pub fn debug_state(&self) -> DebugState {
-        let paused_on = self.0.paused_on.load_full();
+        let paused_on = self.paused_on.load_full();
         let paused_on: Option<PausedOn> = paused_on.as_ref().clone();
 
-        let pending_actions = self.0.pending_actions.load_full();
+        let pending_actions = self.pending_actions.load_full();
         let pending_actions: Vec<Value> = pending_actions.as_ref().clone();
 
-        let event_breakpoints = self
-            .0
-            .event_breakpoints
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect();
-
-        let action_breakpoints = self
-            .0
-            .action_breakpoints
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect();
+        let event_breakpoints = self.event_breakpoints.load().iter().cloned().collect();
+        let action_breakpoints = self.action_breakpoints.load().iter().cloned().collect();
 
         DebugState {
             debug_mode: self.is_debug_mode(),

@@ -8,6 +8,7 @@ name = "windlass"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap         = { workspace = true }
 windlass-types   = { workspace = true }
 windlass-core    = { workspace = true }
 windlass-debug   = { workspace = true }

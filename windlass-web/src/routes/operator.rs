@@ -18,7 +18,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn get_state(State(app): State<AppState>) -> Json<Value> {
-    let state = app.state.read().await;
+    let state = app.state.load_full();
     Json(json!({
         "debug_mode": app.debug_ctrl.is_debug_mode(),
         "state": serde_json::to_value(&*state)
