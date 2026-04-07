@@ -111,27 +111,35 @@ rule. After this it is fully lock-free. Variant helpers move to `windlass-debug`
 
 ---
 
-### Step 5 — Remove `RunMode::Fatal`
+### Step 5 — Remove `RunMode::Fatal`, `hard_recoveries`, and `ManualReset`
 
-**Goal:** The core currently has a permanent halting state that requires a
-process restart to escape. After this, hitting the hard recovery limit enters
-debug mode instead. The operator sees exactly what triggered it, inspects state,
-and decides to step or restart. `ManualReset` becomes the universal resume.
+**Goal:** The core has a permanent halting state (`RunMode::Fatal`) that requires a
+process restart to escape, plus a recovery counter (`hard_recoveries`) and a
+`ManualReset` event used to escape it. All three are removed. Death-loop prevention
+is handled entirely by the existing MAM rate-limit guardrail: if the stack keeps
+failing, MAM will be queried too frequently, `MamRateLimitViolation` will fire, and
+`DebuggableEventStream` will enter debug mode. The operator resumes via the debug UI.
 
 **What changes:**
-- Remove `RunMode::Fatal` from `windlass-core/src/types.rs`.
-- `on_mam_not_connectable`: when the hard recovery limit is reached, return a
-  new `Action::EnterDebugMode` (or call the debug controller via a side-channel
-  — TBD during implementation) and a critical Gotify alert. No `Fatal` state.
-- `on_manual_reset`: always disables debug mode and resets `hard_recoveries`;
-  triggers `AuthenticateQbit` when VPN is connected (already done).
-- Remove the `RunMode::Fatal` early-return guard at the top of `process_event`.
-- Update all unit tests that assert on Fatal behaviour.
-- Update prop tests that generate `Fatal` state.
+- Remove `RunMode` enum and `run_mode` field from `SystemState`.
+- Remove `hard_recoveries: RetryCount` from `SystemState`.
+- Remove `Event::ManualReset`.
+- `on_mam_not_connectable` hard-recovery path: remove the counter and limit check.
+  Emit `FetchAndDumpAllLogs` + `SendGotifyAlert` unconditionally (single hard
+  recovery attempt). The rate-limit guardrail is the only death-loop prevention.
+- Remove `on_manual_reset` handler.
+- Remove the `HARD_RECOVERY_LIMIT` constant.
+- Remove `POST /api/v1/operator/reset` endpoint — no longer meaningful.
+- Remove all unit and prop tests that assert on `Fatal`, `hard_recoveries`, or
+  `ManualReset` behaviour.
 
-**Files touched:** `windlass-core/src/types.rs`, `windlass-core/src/handlers/mam.rs`,
-`windlass-core/src/handlers/vpn.rs`, `windlass-core/src/lib.rs`,
-`windlass-core/src/tests/mam.rs`, `windlass-core/src/prop_tests.rs`.
+**Files touched:** `windlass-core/src/types.rs`, `windlass-core/src/events.rs`,
+`windlass-core/src/handlers/mam.rs`, `windlass-core/src/handlers/vpn.rs`,
+`windlass-core/src/lib.rs`, `windlass-core/src/tests/mam.rs`,
+`windlass-core/src/tests/init.rs`, `windlass-core/src/prop_tests.rs`,
+`windlass-web/src/routes/operator.rs`, `windlass-web/src/routes/debug.rs`,
+`windlass-debug/src/stream.rs`, `windlass/src/shell/mod.rs`,
+`windlass/tests/integration.rs`.
 
 ---
 

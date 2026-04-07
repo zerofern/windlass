@@ -27,7 +27,6 @@ pub enum Event {
         /// `Err` means the files were absent or unparseable (Gluetun not yet up).
         port_files: Result<(VpnIp, VpnPort), String>,
     },
-    ManualReset,
 
     DockerGluetunDied,
     DockerGluetunHealthy,

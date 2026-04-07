@@ -91,7 +91,6 @@ impl DebuggableEventStream {
 const fn event_variant(event: &Event) -> &'static str {
     match event {
         Event::Init { .. } => "Init",
-        Event::ManualReset => "ManualReset",
         Event::DockerGluetunDied => "DockerGluetunDied",
         Event::DockerGluetunHealthy => "DockerGluetunHealthy",
         Event::PortFileReadResult(_) => "PortFileReadResult",

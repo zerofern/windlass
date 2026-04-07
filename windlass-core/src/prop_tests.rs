@@ -5,9 +5,8 @@ use uom::si::f64::Information;
 use uom::si::information::gigabyte;
 
 use crate::{
-    HARD_RECOVERY_LIMIT,
     events::Event,
-    types::{MamState, QbitState, RunMode, SystemState, VpnState},
+    types::{MamState, QbitState, SystemState, VpnState},
 };
 use windlass_types::{
     AuthCookie, HttpStatusCode, MamStatus, RetryCount, TorrentName, VpnIp, VpnPort, WakeupId,
@@ -91,115 +90,38 @@ fn any_mam_state() -> impl Strategy<Value = MamState> {
     ]
 }
 
-fn any_run_mode() -> impl Strategy<Value = RunMode> {
-    prop_oneof![
-        Just(RunMode::Active),
-        proptest::string::string_regex("[a-zA-Z ]{0,50}")
-            .unwrap()
-            .prop_map(|r| RunMode::Fatal { reason: r }),
-    ]
-}
-
 fn any_system_state() -> impl Strategy<Value = SystemState> {
-    (
-        any_run_mode(),
-        any_retry_count(),
-        any_vpn_state(),
-        any_qbit_state(),
-        any_mam_state(),
-    )
-        .prop_map(|(run_mode, hard_recoveries, vpn, qbit, mam)| SystemState {
-            run_mode,
-            hard_recoveries,
-            vpn,
-            qbit,
-            mam,
-            known_torrents: std::collections::HashSet::new(),
-        })
+    (any_vpn_state(), any_qbit_state(), any_mam_state()).prop_map(|(vpn, qbit, mam)| SystemState {
+        vpn,
+        qbit,
+        mam,
+        known_torrents: std::collections::HashSet::new(),
+    })
 }
 
 fn any_active_state() -> impl Strategy<Value = SystemState> {
-    (
-        any_retry_count(),
-        any_vpn_state(),
-        any_qbit_state(),
-        any_mam_state(),
-    )
-        .prop_map(|(hard_recoveries, vpn, qbit, mam)| SystemState {
-            run_mode: RunMode::Active,
-            hard_recoveries,
-            vpn,
-            qbit,
-            mam,
-            known_torrents: std::collections::HashSet::new(),
-        })
-}
-
-/// Active state where hard_recoveries is strictly below the fatal limit —
-/// the only valid region for asserting the counter stays bounded.
-fn any_active_state_with_valid_recoveries() -> impl Strategy<Value = SystemState> {
-    (
-        0u8..HARD_RECOVERY_LIMIT.0,
-        any_vpn_state(),
-        any_qbit_state(),
-        any_mam_state(),
-    )
-        .prop_map(|(recoveries, vpn, qbit, mam)| SystemState {
-            run_mode: RunMode::Active,
-            hard_recoveries: RetryCount(recoveries),
-            vpn,
-            qbit,
-            mam,
-            known_torrents: std::collections::HashSet::new(),
-        })
-}
-
-fn any_fatal_state() -> impl Strategy<Value = SystemState> {
-    (
-        any_retry_count(),
-        any_vpn_state(),
-        any_qbit_state(),
-        any_mam_state(),
-        proptest::string::string_regex("[a-zA-Z ]{0,50}").unwrap(),
-    )
-        .prop_map(|(hard_recoveries, vpn, qbit, mam, reason)| SystemState {
-            run_mode: RunMode::Fatal { reason },
-            hard_recoveries,
-            vpn,
-            qbit,
-            mam,
-            known_torrents: std::collections::HashSet::new(),
-        })
+    any_system_state()
 }
 
 /// A fully healthy, synced state: VPN connected, qBit ready, MAM synced.
 fn any_synced_state() -> impl Strategy<Value = SystemState> {
-    (
-        any_vpn_ip(),
-        any_vpn_port(),
-        any_vpn_port(),
-        any_vpn_ip(),
-        0u8..HARD_RECOVERY_LIMIT.0,
-    )
-        .prop_map(
-            |(vpn_ip, vpn_port, q_port, mam_ip, recoveries)| SystemState {
-                run_mode: RunMode::Active,
-                hard_recoveries: RetryCount(recoveries),
-                vpn: VpnState::Connected {
-                    ip: vpn_ip,
-                    port: vpn_port,
-                },
-                qbit: QbitState::Ready {
-                    port: q_port,
-                    cookie: AuthCookie("prop".into()),
-                },
-                mam: MamState::Synced {
-                    ip: mam_ip,
-                    port: q_port,
-                },
-                known_torrents: std::collections::HashSet::new(),
+    (any_vpn_ip(), any_vpn_port(), any_vpn_port(), any_vpn_ip()).prop_map(
+        |(vpn_ip, vpn_port, q_port, mam_ip)| SystemState {
+            vpn: VpnState::Connected {
+                ip: vpn_ip,
+                port: vpn_port,
             },
-        )
+            qbit: QbitState::Ready {
+                port: q_port,
+                cookie: AuthCookie("prop".into()),
+            },
+            mam: MamState::Synced {
+                ip: mam_ip,
+                port: q_port,
+            },
+            known_torrents: std::collections::HashSet::new(),
+        },
+    )
 }
 
 // ── Event strategies ──────────────────────────────────────────────────────────
@@ -214,7 +136,6 @@ fn any_event() -> impl Strategy<Value = Event> {
             is_gluetun_healthy: healthy,
             port_files: Err("not ready".into()),
         }),
-        Just(Event::ManualReset),
         Just(Event::DockerGluetunDied),
         Just(Event::DockerGluetunHealthy),
         (any_vpn_ip(), any_vpn_port())
@@ -245,10 +166,6 @@ fn any_event() -> impl Strategy<Value = Event> {
         any_wakeup_id().prop_map(Event::Wakeup),
         Just(Event::MamRateLimitViolation),
     ]
-}
-
-fn any_non_reset_event() -> impl Strategy<Value = Event> {
-    any_event().prop_filter("exclude ManualReset", |e| !matches!(e, Event::ManualReset))
 }
 
 // ── Properties ────────────────────────────────────────────────────────────────
@@ -299,21 +216,7 @@ proptest! {
         prop_assert!(elapsed < deadline, "50-event sequence took {:?}", elapsed);
     }
 
-    // 4. Fatal mode is a black hole — all non-reset events produce no actions
-    //    and leave the state completely unchanged.
-    #[test]
-    fn fatal_mode_ignores_all_non_reset_events(
-        state in any_fatal_state(),
-        event in any_non_reset_event(),
-    ) {
-        let mut new_state = state.clone();
-        let actions = new_state.process_event(event);
-        prop_assert!(matches!(new_state.run_mode, RunMode::Fatal { .. }), "run_mode should remain Fatal");
-        prop_assert!(actions.is_empty(), "actions should be empty in Fatal mode");
-        prop_assert_eq!(new_state, state);
-    }
-
-    // 5. DockerGluetunDied always clears qbit and mam — regardless of prior
+    // 4. DockerGluetunDied always clears qbit and mam — regardless of prior
     //    active state. Prevents stale state from surviving a VPN death.
     #[test]
     fn gluetun_death_always_clears_qbit_and_mam(mut state in any_active_state()) {
@@ -334,54 +237,7 @@ proptest! {
         prop_assert!(actions.is_empty());
     }
 
-    // 7. hard_recoveries bounded — when starting below the limit in Active
-    //    mode, any event either stays below the limit or transitions to Fatal.
-    //    The counter must never exceed the limit while remaining Active.
-    #[test]
-    fn hard_recovery_limit_always_triggers_fatal(
-        mut state in any_active_state_with_valid_recoveries(),
-        event in any_event(),
-    ) {
-        state.process_event(event);
-        if matches!(state.run_mode, RunMode::Active) {
-            prop_assert!(
-                state.hard_recoveries < HARD_RECOVERY_LIMIT,
-                "hard_recoveries {:?} reached limit without transitioning to Fatal",
-                state.hard_recoveries,
-            );
-        }
-    }
-
-    // 8. Sequential invariants — no sequence of arbitrary events violates the
-    //    two core safety rules: Fatal emits nothing, counter stays bounded.
-    #[test]
-    fn sequential_events_never_violate_invariants(
-        events in prop::collection::vec(any_event(), 1..50),
-    ) {
-        let mut state = SystemState::initial();
-        for event in &events {
-            let prior = state.clone();
-            let actions = state.process_event(event.clone());
-
-            // Fatal mode must never emit actions on non-reset events.
-            if matches!(prior.run_mode, RunMode::Fatal { .. })
-                && !matches!(event, Event::ManualReset)
-            {
-                prop_assert!(
-                    actions.is_empty(),
-                    "Fatal mode emitted {} action(s) on {:?}", actions.len(), event
-                );
-            }
-
-            // hard_recoveries must never exceed the limit.
-            prop_assert!(
-                state.hard_recoveries.0 <= HARD_RECOVERY_LIMIT.0,
-                "hard_recoveries {:?} exceeded limit", state.hard_recoveries,
-            );
-        }
-    }
-
-    // 9. Monitoring wakeups never mutate state — they only emit Check actions.
+    // 7. Monitoring wakeups never mutate state — they only emit Check actions.
     //    Routing a wakeup must be a pure dispatch with zero side effects on state.
     #[test]
     fn monitoring_wakeups_do_not_mutate_state(state in any_active_state()) {
@@ -411,10 +267,6 @@ proptest! {
         for event in observations {
             let mut new_state = state.clone();
             new_state.process_event(event.clone());
-            prop_assert!(
-                matches!(new_state.run_mode, RunMode::Active),
-                "{:?} disrupted RunMode", event
-            );
             prop_assert!(
                 matches!(new_state.vpn, VpnState::Connected { .. }),
                 "{:?} disrupted VpnState", event

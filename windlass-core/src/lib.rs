@@ -17,36 +17,19 @@ mod handlers;
 
 use actions::Action;
 use events::Event;
-use tracing::{debug, info};
-use types::{RunMode, SystemState, VpnState};
-use windlass_types::{MamStatus, RetryCount};
-
-pub(crate) const HARD_RECOVERY_LIMIT: RetryCount = RetryCount(3);
+use types::SystemState;
+use windlass_types::MamStatus;
 
 /// The pure functional core. No I/O, no async, no side effects.
 /// All state transitions and action scheduling happen here.
 impl SystemState {
     pub fn process_event(&mut self, event: Event) -> Vec<Action> {
-        // Fatal mode: only ManualReset can escape it.
-        if matches!(self.run_mode, RunMode::Fatal { .. }) {
-            if matches!(event, Event::ManualReset) {
-                info!("manual reset: clearing fatal state and restarting Gluetun");
-                self.run_mode = RunMode::Active;
-                self.hard_recoveries = RetryCount(0);
-                self.vpn = VpnState::Starting;
-                return vec![Action::RestartGluetun];
-            }
-            debug!(?event, "fatal mode: ignoring event");
-            return vec![];
-        }
-
         match event {
             // ── Initialisation ────────────────────────────────────────────────
             Event::Init {
                 is_gluetun_healthy,
                 port_files,
             } => self.on_init(is_gluetun_healthy, port_files),
-            Event::ManualReset => self.on_manual_reset(),
 
             // ── Workflow A: VPN Drop Recovery ─────────────────────────────────
             Event::DockerGluetunDied => self.on_docker_gluetun_died(),

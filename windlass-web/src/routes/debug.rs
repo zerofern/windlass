@@ -10,7 +10,6 @@ use crate::AppState;
 
 const EVENT_VARIANTS: &[&str] = &[
     "Init",
-    "ManualReset",
     "DockerGluetunDied",
     "DockerGluetunHealthy",
     "PortFileReadResult",

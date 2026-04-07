@@ -12,12 +12,6 @@ mod redact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum RunMode {
-    Active,
-    Fatal { reason: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum VpnState {
     Stopped,
     DumpingLogs,
@@ -104,8 +98,6 @@ impl fmt::Display for MamState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SystemState {
-    pub run_mode: RunMode,
-    pub hard_recoveries: RetryCount,
     pub vpn: VpnState,
     pub qbit: QbitState,
     pub mam: MamState,
@@ -118,8 +110,6 @@ impl SystemState {
     #[must_use]
     pub fn initial() -> Self {
         Self {
-            run_mode: RunMode::Active,
-            hard_recoveries: RetryCount(0),
             vpn: VpnState::Stopped,
             qbit: QbitState::Offline,
             mam: MamState::Unknown,

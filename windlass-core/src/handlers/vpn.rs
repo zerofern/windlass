@@ -44,19 +44,6 @@ impl SystemState {
         actions
     }
 
-    pub(crate) fn on_manual_reset(&mut self) -> Vec<Action> {
-        info!("manual reset: clearing recovery counter");
-        self.hard_recoveries = RetryCount(0);
-        if let VpnState::Connected { .. } = &self.vpn {
-            self.qbit = QbitState::Authenticating {
-                attempt: RetryCount(0),
-            };
-            vec![Action::AuthenticateQbit]
-        } else {
-            vec![]
-        }
-    }
-
     pub(crate) fn on_docker_gluetun_died(&mut self) -> Vec<Action> {
         let mut actions = vec![];
         match &self.vpn {

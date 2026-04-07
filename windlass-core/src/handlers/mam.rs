@@ -1,9 +1,8 @@
 use crate::actions::Action;
-use crate::types::{MamState, QbitState, RunMode, SystemState, VpnState};
-use tracing::{debug, error, info, warn};
+use crate::types::{MamState, QbitState, SystemState, VpnState};
+use tracing::{debug, info, warn};
 use windlass_types::{AlertPriority, RetryCount, VpnIp, WakeupId};
 
-use super::super::HARD_RECOVERY_LIMIT;
 use super::HEARTBEAT_INTERVAL;
 
 impl SystemState {
@@ -34,7 +33,6 @@ impl SystemState {
 
     pub(crate) fn on_mam_connectable(&mut self) -> Vec<Action> {
         debug!(mam = %self.mam, "MAM reports connectable — heartbeat OK");
-        self.hard_recoveries = RetryCount(0);
         vec![Action::ScheduleWakeup(
             WakeupId::Heartbeat,
             HEARTBEAT_INTERVAL.into(),
@@ -61,42 +59,18 @@ impl SystemState {
                     Action::ScheduleWakeup(WakeupId::Heartbeat, HEARTBEAT_INTERVAL.into()),
                 ]
             }
-            // Soft recovery already in flight or qBit offline — escalate.
+            // Hard recovery: NAT is frozen, restart the stack.
+            // Death-loop prevention is the MAM rate-limit guardrail in the shell.
             _ => {
-                let recoveries = self.hard_recoveries.increment();
-                self.hard_recoveries = recoveries;
-
-                if recoveries >= HARD_RECOVERY_LIMIT {
-                    error!(
-                        recoveries = recoveries.0,
-                        limit = HARD_RECOVERY_LIMIT.0,
-                        "FATAL: hard recovery limit reached — manual intervention required"
-                    );
-                    self.run_mode = RunMode::Fatal {
-                        reason: "Hard recovery limit reached".into(),
-                    };
-                    vec![Action::SendGotifyAlert(
+                warn!("hard recovery: NAT frozen — restarting stack");
+                self.vpn = VpnState::DumpingLogs;
+                vec![
+                    Action::FetchAndDumpAllLogs,
+                    Action::SendGotifyAlert(
                         AlertPriority::Critical,
-                        "💀 Windlass: hard recovery limit reached. Halting. Manual intervention required.".into(),
-                    )]
-                } else {
-                    warn!(
-                        attempt = recoveries.0,
-                        limit = HARD_RECOVERY_LIMIT.0,
-                        "hard recovery: NAT frozen — restarting stack"
-                    );
-                    self.vpn = VpnState::DumpingLogs;
-                    vec![
-                        Action::FetchAndDumpAllLogs,
-                        Action::SendGotifyAlert(
-                            AlertPriority::Critical,
-                            format!(
-                                "⚠️ NAT Frozen. Initiating Hard Recovery ({}/{}).",
-                                recoveries.0, HARD_RECOVERY_LIMIT.0,
-                            ),
-                        ),
-                    ]
-                }
+                        "⚠️ NAT Frozen. Initiating Hard Recovery.".into(),
+                    ),
+                ]
             }
         }
     }

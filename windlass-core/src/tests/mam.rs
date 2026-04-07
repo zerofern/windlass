@@ -43,15 +43,7 @@ fn mam_asn_mismatch_blocks_and_alerts_with_ip() {
 }
 
 #[test]
-fn connectable_resets_hard_recoveries() {
-    let mut state = connected_state();
-    state.hard_recoveries = RetryCount(2);
-    state.process_event(Event::MamStatusObserved(MamStatus::Connectable));
-    assert_eq!(state.hard_recoveries, RetryCount(0));
-}
-
-#[test]
-fn connectable_rearms_heartbeat() {
+fn connectable_schedules_heartbeat() {
     let mut state = connected_state();
     let actions = state.process_event(Event::MamStatusObserved(MamStatus::Connectable));
     assert!(
@@ -62,21 +54,97 @@ fn connectable_rearms_heartbeat() {
 }
 
 #[test]
-fn soft_recovery_from_ready_re_auths_qbit() {
-    let state = connected_state(); // qbit is Ready
-    let mut state = state;
-    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert!(matches!(
-        state.qbit,
-        QbitState::Authenticating {
-            attempt: RetryCount(0)
-        }
-    ));
+fn soft_recovery_re_triggers_qbit_auth() {
+    let mut state = connected_state();
+    let actions = state.process_event(Event::MamStatusObserved(MamStatus::NotConnectable));
+    assert!(
+        matches!(
+            state.qbit,
+            QbitState::Authenticating {
+                attempt: RetryCount(0)
+            }
+        ),
+        "qBit should be Authenticating after soft recovery"
+    );
     assert!(
         actions
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
+}
+
+#[test]
+fn soft_recovery_rearms_heartbeat() {
+    let state = connected_state();
+    let mut state = state;
+    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::Heartbeat, _)))
+    );
+}
+
+#[test]
+fn hard_recovery_dumps_logs_and_restarts_stack() {
+    let mut state = SystemState::initial();
+    state.vpn = VpnState::Connected {
+        ip: ip(),
+        port: port(),
+    };
+    state.qbit = QbitState::Offline;
+    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
+    assert_eq!(state.vpn, VpnState::DumpingLogs);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Critical, _)))
+    );
+}
+
+#[test]
+fn hard_recovery_escalates_from_authenticating_in_flight() {
+    let mut state = SystemState::initial();
+    state.qbit = QbitState::Authenticating {
+        attempt: RetryCount(1),
+    };
+    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
+    );
+}
+
+#[test]
+fn hard_recovery_escalates_from_syncing_in_flight() {
+    let mut state = SystemState::initial();
+    state.qbit = QbitState::SyncingPort {
+        attempt: RetryCount(0),
+        cookie: cookie(),
+        target: port(),
+    };
+    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
+    );
+}
+
+#[test]
+fn asn_blocked_suppresses_recovery() {
+    let mut state = connected_state();
+    state.mam = MamState::AsnBlocked { ip: ip() };
+    let mut new_state = state.clone();
+    let actions = new_state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
+    assert_eq!(new_state.qbit, state.qbit);
+    assert!(actions.is_empty());
 }
 
 #[test]
@@ -99,127 +167,4 @@ fn soft_recovery_from_authenticated_re_auths_qbit() {
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
-}
-
-#[test]
-fn soft_recovery_rearms_heartbeat() {
-    let state = connected_state();
-    let mut state = state;
-    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::Heartbeat, _)))
-    );
-}
-
-#[test]
-fn hard_recovery_increments_counter_and_dumps_logs() {
-    let mut state = SystemState::initial();
-    state.vpn = VpnState::Connected {
-        ip: ip(),
-        port: port(),
-    };
-    state.qbit = QbitState::Offline;
-    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert_eq!(state.hard_recoveries, RetryCount(1));
-    assert_eq!(state.vpn, VpnState::DumpingLogs);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
-    );
-}
-
-#[test]
-fn hard_recovery_escalates_from_authenticating_in_flight() {
-    // If auth is already in flight, soft recovery is considered attempted.
-    let mut state = SystemState::initial();
-    state.qbit = QbitState::Authenticating {
-        attempt: RetryCount(1),
-    };
-    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert_eq!(state.hard_recoveries, RetryCount(1));
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
-    );
-}
-
-#[test]
-fn hard_recovery_escalates_from_syncing_in_flight() {
-    let mut state = SystemState::initial();
-    state.qbit = QbitState::SyncingPort {
-        attempt: RetryCount(0),
-        cookie: cookie(),
-        target: port(),
-    };
-    state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert_eq!(state.hard_recoveries, RetryCount(1));
-}
-
-#[test]
-fn death_loop_prevention_transitions_to_fatal() {
-    let mut state = SystemState::initial();
-    state.hard_recoveries = RetryCount(2);
-    state.qbit = QbitState::Offline;
-    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert!(matches!(state.run_mode, RunMode::Fatal { .. }));
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Critical, _)))
-    );
-}
-
-#[test]
-fn death_loop_does_not_dump_logs_on_fatal_transition() {
-    // When we hit the limit, we halt — no further recovery actions.
-    let mut state = SystemState::initial();
-    state.hard_recoveries = RetryCount(2);
-    state.qbit = QbitState::Offline;
-    let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
-    );
-    assert!(!actions.iter().any(|a| matches!(a, Action::RestartGluetun)));
-}
-
-#[test]
-fn asn_blocked_suppresses_recovery() {
-    let mut state = connected_state();
-    state.mam = MamState::AsnBlocked { ip: ip() };
-    let mut new_state = state.clone();
-    let actions = new_state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
-    assert_eq!(new_state.qbit, state.qbit);
-    assert!(actions.is_empty());
-}
-
-#[test]
-fn fatal_mode_ignores_all_events_except_reset() {
-    let mut state = SystemState::initial();
-    state.run_mode = RunMode::Fatal {
-        reason: "test".into(),
-    };
-    let mut new_state = state.clone();
-    let actions = new_state.process_event(Event::DockerGluetunDied);
-    assert!(matches!(new_state.run_mode, RunMode::Fatal { .. }));
-    assert!(actions.is_empty());
-}
-
-#[test]
-fn manual_reset_clears_fatal_mode_and_restarts_gluetun() {
-    let mut state = SystemState::initial();
-    state.run_mode = RunMode::Fatal {
-        reason: "test".into(),
-    };
-    state.hard_recoveries = RetryCount(3);
-    let actions = state.process_event(Event::ManualReset);
-    assert_eq!(state.run_mode, RunMode::Active);
-    assert_eq!(state.hard_recoveries, RetryCount(0));
-    assert_eq!(state.vpn, VpnState::Starting);
-    assert!(actions.iter().any(|a| matches!(a, Action::RestartGluetun)));
 }

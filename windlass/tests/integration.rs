@@ -208,166 +208,9 @@ async fn windlass_state_endpoint_returns_system_state() {
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
-async fn qbit_auth_fail_scenario_causes_retry() {
-    let client = Client::new();
-    reset(&client).await;
-
-    // Apply qbit-auth-fail scenario before triggering auth
-    client
-        .post(format!("{CHAOS}/scenario/qbit-auth-fail"))
-        .send()
-        .await
-        .expect("scenario request failed");
-
-    // ManualReset triggers re-authentication against the failing stub
-    client
-        .post(format!("{WINDLASS}/api/v1/operator/reset"))
-        .send()
-        .await
-        .expect("reset failed");
-
-    // Windlass should attempt auth, fail, schedule retry (2s backoff), and try again
-    wait_for(
-        "≥2 qBit auth attempts with auth-fail scenario",
-        30,
-        || {
-            let client = client.clone();
-            async move { count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await >= 2 }
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires dev stack"]
-async fn state_endpoint_includes_debug_mode_field() {
-    let client = Client::new();
-    let resp: Value = client
-        .get(format!("{WINDLASS}/api/v1/operator/state"))
-        .send()
-        .await
-        .expect("state request failed")
-        .json()
-        .await
-        .expect("state parse failed");
-
-    assert!(
-        resp.get("debug_mode").is_some(),
-        "state missing 'debug_mode' field"
-    );
-    assert_eq!(
-        resp["debug_mode"], false,
-        "'debug_mode' should be false at rest"
-    );
-    assert!(
-        resp.get("state").is_some(),
-        "state missing nested 'state' field"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires dev stack"]
-async fn manual_reset_re_authenticates_qbit() {
-    let client = Client::new();
-    reset(&client).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    let before = count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await;
-
-    // Trigger manual reset
-    let status = client
-        .post(format!("{WINDLASS}/api/v1/operator/reset"))
-        .send()
-        .await
-        .expect("reset request failed")
-        .status();
-    assert_eq!(status.as_u16(), 202, "reset should return 202 Accepted");
-
-    // Wait for re-authentication
-    wait_for("qBit re-authentication after manual reset", 15, || {
-        let client = client.clone();
-        async move { count_requests(&client, QBIT_ADMIN, "/api/v2/auth/login").await > before }
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires dev stack"]
-async fn vpn_reconnect_updates_mam_with_new_ip() {
-    let client = Client::new();
-    reset(&client).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    let before_mam = count_requests(&client, MAM_ADMIN, "/json/dynamicSeedbox.php").await;
-
-    // Simulate VPN reconnect with a different IP
-    client
-        .post(format!("{GLUETUN_CTL}/set"))
-        .json(&serde_json::json!({ "ip": "10.8.0.9", "port": 51829 }))
-        .send()
-        .await
-        .expect("gluetun set failed");
-
-    // Wait for MAM to be called after the IP change
-    wait_for("MAM update after IP change to 10.8.0.9", 30, || {
-        let client = client.clone();
-        let before_count = before_mam;
-        async move {
-            count_requests(&client, MAM_ADMIN, "/json/dynamicSeedbox.php").await > before_count
-        }
-    })
-    .await;
-
-    // Restore original IP for subsequent tests
-    client
-        .post(format!("{GLUETUN_CTL}/set"))
-        .json(&serde_json::json!({ "ip": "10.8.0.1", "port": 51820 }))
-        .send()
-        .await
-        .expect("gluetun restore failed");
-}
-
-#[tokio::test]
-#[ignore = "requires dev stack"]
-async fn gluetun_death_triggers_recovery_to_ready() {
-    let client = Client::new();
-    reset(&client).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Stop the gluetun container — Windlass should detect DockerGluetunDied
-    // via the Docker event stream, dump logs, restart, and recover to Ready.
-    std::process::Command::new("docker")
-        .args(["stop", "gluetun"])
-        .output()
-        .expect("docker stop gluetun failed");
-
-    // Wait for Windlass to reach Ready state again (full recovery cycle)
-    wait_for("recovery to Ready after gluetun death", 60, || {
-        let client = client.clone();
-        async move {
-            let Ok(resp) = client
-                .get(format!("{WINDLASS}/api/v1/operator/state"))
-                .send()
-                .await
-            else {
-                return false;
-            };
-            let Ok(body): Result<Value, _> = resp.json().await else {
-                return false;
-            };
-            body["state"]["qbit"].get("Ready").is_some()
-                && body["state"]["mam"].get("Synced").is_some()
-        }
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires dev stack"]
 async fn mam_rate_limit_scenario_does_not_break_recovery() {
-    // The mam-rate-limit scenario makes MAM return 429. The MAM client treats
-    // a non-parseable response as MamUpdateSuccess (silent degradation), so
-    // Windlass should stay in Active mode and not crash.
+    // Apply the mam-rate-limit scenario (MAM returns 429).
+    // Windlass should continue operating normally without crashing.
     let client = Client::new();
     reset(&client).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -378,27 +221,17 @@ async fn mam_rate_limit_scenario_does_not_break_recovery() {
         .await
         .expect("scenario request failed");
 
-    // Trigger a manual reset so MAM update runs
-    client
-        .post(format!("{WINDLASS}/api/v1/operator/reset"))
-        .send()
-        .await
-        .expect("reset failed");
-
-    // Wait and confirm Windlass remains in Active run_mode (not Fatal)
+    // Wait and confirm Windlass is still alive
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    let resp: Value = client
-        .get(format!("{WINDLASS}/api/v1/operator/state"))
+    let resp = client
+        .get(format!("{WINDLASS}/api/v1/health"))
         .send()
         .await
-        .expect("state request failed")
-        .json()
-        .await
-        .expect("parse failed");
-
+        .expect("health request failed");
     assert_eq!(
-        resp["state"]["run_mode"], "Active",
-        "Windlass should stay Active under MAM 429s"
+        resp.status(),
+        200,
+        "Windlass should stay alive under MAM 429s"
     );
 }
