@@ -50,6 +50,10 @@ This applies even when the current requirements are explicit. The owner's
 answer may well be "yes, do it." Never silently skip an improvement you
 have spotted — surface it as a question.
 
+## mutexes
+
+Avoid introducing mutexes. These are a code smell that indicate bad design.
+
 ## File size
 
 Keep source files small. LLMs and humans both work better with focused,
@@ -144,6 +148,7 @@ pub struct AppState {
 ```
 
 **Inbound (browser → core):**
+
 ```
 POST /api/v1/operator/reset
   → axum handler clones event_tx
@@ -152,6 +157,7 @@ POST /api/v1/operator/reset
 ```
 
 **Outbound (core → browser):**
+
 ```
 process_event() runs in the main loop
   → broadcasts EventReceived, StateSnapshot, ActionDispatched

@@ -37,7 +37,7 @@ impl SystemState {
     // process_event is a top-level state machine handler. Its length reflects the number
     // of distinct events in the system, not incidental complexity.
     #[allow(clippy::too_many_lines)]
-    pub fn process_event(mut self, event: Event) -> (Self, Vec<Action>) {
+    pub fn process_event(&mut self, event: Event) -> Vec<Action> {
         // Fatal mode: only ManualReset can escape it.
         if matches!(self.run_mode, RunMode::Fatal { .. }) {
             if matches!(event, Event::ManualReset) {
@@ -45,10 +45,10 @@ impl SystemState {
                 self.run_mode = RunMode::Active;
                 self.hard_recoveries = RetryCount(0);
                 self.vpn = VpnState::Starting;
-                return (self, vec![Action::RestartGluetun]);
+                return vec![Action::RestartGluetun];
             }
             debug!(?event, "fatal mode: ignoring event");
-            return (self, vec![]);
+            return vec![];
         }
 
         let mut actions: Vec<Action> = vec![];
@@ -151,7 +151,7 @@ impl SystemState {
                 {
                     if *cur_ip == ip && *cur_port == port {
                         debug!(ip = %ip.0, port = port.into_inner(), "VPN files read: no change");
-                        return (self, actions);
+                        return actions;
                     }
                     info!(
                         ip = %ip.0, port = port.into_inner(),
@@ -344,7 +344,7 @@ impl SystemState {
                 // If ASN is blocked, a human must intervene. Don't attempt recovery.
                 if let MamState::AsnBlocked { .. } = &self.mam {
                     debug!("ASN blocked — suppressing recovery");
-                    return (self, actions);
+                    return actions;
                 }
 
                 match &self.qbit {
@@ -478,6 +478,6 @@ impl SystemState {
             }
         }
 
-        (self, actions)
+        actions
     }
 }

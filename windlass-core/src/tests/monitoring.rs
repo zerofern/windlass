@@ -6,7 +6,8 @@ use windlass_types::{AlertPriority, TorrentName, WakeupId};
 #[test]
 fn low_disk_space_sends_alert() {
     let space = Information::new::<gigabyte>(20.0);
-    let (_, actions) = SystemState::initial().process_event(Event::DiskSpaceObserved(space));
+    let mut state = SystemState::initial();
+    let actions = state.process_event(Event::DiskSpaceObserved(space));
     assert!(
         actions
             .iter()
@@ -17,7 +18,8 @@ fn low_disk_space_sends_alert() {
 #[test]
 fn sufficient_disk_space_sends_no_alert() {
     let space = Information::new::<gigabyte>(200.0);
-    let (_, actions) = SystemState::initial().process_event(Event::DiskSpaceObserved(space));
+    let mut state = SystemState::initial();
+    let actions = state.process_event(Event::DiskSpaceObserved(space));
     assert!(
         !actions
             .iter()
@@ -29,7 +31,8 @@ fn sufficient_disk_space_sends_no_alert() {
 fn disk_check_always_reschedules() {
     for gb in [20.0_f64, 200.0] {
         let space = Information::new::<gigabyte>(gb);
-        let (_, actions) = SystemState::initial().process_event(Event::DiskSpaceObserved(space));
+        let mut state = SystemState::initial();
+        let actions = state.process_event(Event::DiskSpaceObserved(space));
         assert!(
             actions
                 .iter()
@@ -45,8 +48,8 @@ fn new_torrents_sends_alert_for_unseen_names() {
         TorrentName("Ubuntu.iso".into()),
         TorrentName("Fedora.iso".into()),
     ];
-    let (new_state, actions) =
-        SystemState::initial().process_event(Event::NewTorrentsObserved(names));
+    let mut state = SystemState::initial();
+    let actions = state.process_event(Event::NewTorrentsObserved(names));
     assert!(
         actions
             .iter()
@@ -59,12 +62,12 @@ fn new_torrents_sends_alert_for_unseen_names() {
     );
     // Core remembers them for next time.
     assert!(
-        new_state
+        state
             .known_torrents
             .contains(&TorrentName("Ubuntu.iso".into()))
     );
     assert!(
-        new_state
+        state
             .known_torrents
             .contains(&TorrentName("Fedora.iso".into()))
     );
@@ -83,7 +86,7 @@ fn already_known_torrents_send_no_alert() {
         TorrentName("Ubuntu.iso".into()),
         TorrentName("Fedora.iso".into()),
     ];
-    let (_, actions) = state.process_event(Event::NewTorrentsObserved(names));
+    let actions = state.process_event(Event::NewTorrentsObserved(names));
     assert!(
         !actions
             .iter()
@@ -106,7 +109,7 @@ fn mixed_known_and_new_torrents_alerts_only_for_new() {
         TorrentName("Ubuntu.iso".into()),
         TorrentName("Debian.iso".into()),
     ];
-    let (new_state, actions) = state.process_event(Event::NewTorrentsObserved(names));
+    let actions = state.process_event(Event::NewTorrentsObserved(names));
     let alert = actions.iter().find_map(|a| match a {
         Action::SendGotifyAlert(AlertPriority::Info, msg) => Some(msg.clone()),
         _ => None,
@@ -114,12 +117,12 @@ fn mixed_known_and_new_torrents_alerts_only_for_new() {
     assert!(alert.is_some(), "Expected an alert for the new torrent");
     assert!(alert.unwrap().contains("Debian.iso"));
     assert!(
-        new_state
+        state
             .known_torrents
             .contains(&TorrentName("Ubuntu.iso".into()))
     );
     assert!(
-        new_state
+        state
             .known_torrents
             .contains(&TorrentName("Debian.iso".into()))
     );
@@ -127,7 +130,8 @@ fn mixed_known_and_new_torrents_alerts_only_for_new() {
 
 #[test]
 fn empty_torrent_list_sends_no_alert_but_reschedules() {
-    let (_, actions) = SystemState::initial().process_event(Event::NewTorrentsObserved(vec![]));
+    let mut state = SystemState::initial();
+    let actions = state.process_event(Event::NewTorrentsObserved(vec![]));
     assert!(
         !actions
             .iter()

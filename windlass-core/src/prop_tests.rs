@@ -257,7 +257,7 @@ proptest! {
     // 1. No panic — any combination of (state, event) must never panic.
     #[test]
     fn process_event_never_panics(
-        state in any_system_state(),
+        mut state in any_system_state(),
         event in any_event(),
     ) {
         let _ = state.process_event(event);
@@ -267,7 +267,7 @@ proptest! {
     //    Catches accidental blocking calls, sleeps, or heavy allocations.
     #[test]
     fn process_event_returns_within_deadline(
-        state in any_system_state(),
+        mut state in any_system_state(),
         event in any_event(),
     ) {
         // 100ms per event is generous for any instrumentation overhead while
@@ -293,8 +293,7 @@ proptest! {
         let start = Instant::now();
         let mut state = SystemState::initial();
         for event in events {
-            let (new_state, _) = state.process_event(event);
-            state = new_state;
+            state.process_event(event);
         }
         let elapsed = start.elapsed();
         prop_assert!(elapsed < deadline, "50-event sequence took {:?}", elapsed);
@@ -307,7 +306,8 @@ proptest! {
         state in any_fatal_state(),
         event in any_non_reset_event(),
     ) {
-        let (new_state, actions) = state.clone().process_event(event);
+        let mut new_state = state.clone();
+        let actions = new_state.process_event(event);
         prop_assert!(matches!(new_state.run_mode, RunMode::Fatal { .. }), "run_mode should remain Fatal");
         prop_assert!(actions.is_empty(), "actions should be empty in Fatal mode");
         prop_assert_eq!(new_state, state);
@@ -316,10 +316,10 @@ proptest! {
     // 5. DockerGluetunDied always clears qbit and mam — regardless of prior
     //    active state. Prevents stale state from surviving a VPN death.
     #[test]
-    fn gluetun_death_always_clears_qbit_and_mam(state in any_active_state()) {
-        let (new_state, _) = state.process_event(Event::DockerGluetunDied);
-        prop_assert_eq!(new_state.qbit, QbitState::Offline);
-        prop_assert_eq!(new_state.mam, MamState::Unknown);
+    fn gluetun_death_always_clears_qbit_and_mam(mut state in any_active_state()) {
+        state.process_event(Event::DockerGluetunDied);
+        prop_assert_eq!(state.qbit, QbitState::Offline);
+        prop_assert_eq!(state.mam, MamState::Unknown);
     }
 
     // 6. ASN blocked always suppresses recovery — no actions emitted
@@ -330,7 +330,7 @@ proptest! {
         ip in any_vpn_ip(),
     ) {
         state.mam = MamState::AsnBlocked { ip };
-        let (_, actions) = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
+        let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
         prop_assert!(actions.is_empty());
     }
 
@@ -339,15 +339,15 @@ proptest! {
     //    The counter must never exceed the limit while remaining Active.
     #[test]
     fn hard_recovery_limit_always_triggers_fatal(
-        state in any_active_state_with_valid_recoveries(),
+        mut state in any_active_state_with_valid_recoveries(),
         event in any_event(),
     ) {
-        let (new_state, _) = state.process_event(event);
-        if matches!(new_state.run_mode, RunMode::Active) {
+        state.process_event(event);
+        if matches!(state.run_mode, RunMode::Active) {
             prop_assert!(
-                new_state.hard_recoveries < HARD_RECOVERY_LIMIT,
+                state.hard_recoveries < HARD_RECOVERY_LIMIT,
                 "hard_recoveries {:?} reached limit without transitioning to Fatal",
-                new_state.hard_recoveries,
+                state.hard_recoveries,
             );
         }
     }
@@ -361,7 +361,7 @@ proptest! {
         let mut state = SystemState::initial();
         for event in &events {
             let prior = state.clone();
-            let (new_state, actions) = state.process_event(event.clone());
+            let actions = state.process_event(event.clone());
 
             // Fatal mode must never emit actions on non-reset events.
             if matches!(prior.run_mode, RunMode::Fatal { .. })
@@ -375,11 +375,9 @@ proptest! {
 
             // hard_recoveries must never exceed the limit.
             prop_assert!(
-                new_state.hard_recoveries.0 <= HARD_RECOVERY_LIMIT.0,
-                "hard_recoveries {:?} exceeded limit", new_state.hard_recoveries,
+                state.hard_recoveries.0 <= HARD_RECOVERY_LIMIT.0,
+                "hard_recoveries {:?} exceeded limit", state.hard_recoveries,
             );
-
-            state = new_state;
         }
     }
 
@@ -388,7 +386,8 @@ proptest! {
     #[test]
     fn monitoring_wakeups_do_not_mutate_state(state in any_active_state()) {
         for wakeup in [WakeupId::Heartbeat, WakeupId::DiskCheck, WakeupId::TorrentCheck] {
-            let (new_state, _) = state.clone().process_event(Event::Wakeup(wakeup));
+            let mut new_state = state.clone();
+            new_state.process_event(Event::Wakeup(wakeup));
             prop_assert_eq!(
                 new_state, state.clone(),
                 "Wakeup({:?}) must not mutate state", wakeup
@@ -410,7 +409,8 @@ proptest! {
         ];
 
         for event in observations {
-            let (new_state, _) = state.clone().process_event(event.clone());
+            let mut new_state = state.clone();
+            new_state.process_event(event.clone());
             prop_assert!(
                 matches!(new_state.run_mode, RunMode::Active),
                 "{:?} disrupted RunMode", event

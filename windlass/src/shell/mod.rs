@@ -35,7 +35,6 @@ pub async fn run() -> Result<()> {
 
     let debug_ctrl = DebugController::new();
 
-    // Enable debug mode at startup if the env var is set.
     if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
         // obs_tx isn't built yet — enable after the broadcast channel is created below.
         info!("DEBUG_MODE_ON_START=true — debug mode will be enabled at startup");
@@ -101,11 +100,10 @@ pub async fn run() -> Result<()> {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
     }
 
-    let (new_state, actions) = state.process_event(Event::Init {
+    let actions = state.process_event(Event::Init {
         is_gluetun_healthy: boot.is_gluetun_healthy,
         port_files,
     });
-    state = new_state;
     *shared_state.write().await = state.clone();
     let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
     ShellContext {
@@ -163,8 +161,7 @@ pub async fn run() -> Result<()> {
 
         let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
-        let (new_state, actions) = state.process_event(event);
-        state = new_state;
+        let actions = state.process_event(event);
         *shared_state.write().await = state.clone();
         let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
         ShellContext {

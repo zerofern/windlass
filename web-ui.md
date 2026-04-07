@@ -85,6 +85,7 @@ embedded in the `windlass-web` crate at compile time via `rust-embed` and served
 under `/`. API calls go to `/api/v1/`.
 
 **Hard requirements:**
+
 - Fully functional on **mobile** (touch-first interactions, responsive layout)
 - Fully functional on **desktop** (keyboard-friendly, dense information layout where appropriate)
 
@@ -92,6 +93,7 @@ shadcn/ui + Tailwind CSS handles responsive layout; `@dnd-kit/core` handles touc
 drag-and-drop for the queue page.
 
 **Stack rationale:**
+
 - **Vite** — fast builds, HMR during development, outputs a static bundle suitable for embedding
 - **shadcn/ui** — components copied into the codebase (not a dependency), built on Radix UI primitives (accessible, mobile-first) + Tailwind CSS; fully customizable, no version lock-in
 - **React Router v7** — client-side routing; the route table maps directly to the planned pages
@@ -104,18 +106,18 @@ In development, Vite proxies `/api/` to the running Rust backend.
 
 **Planned routes:**
 
-| Route | Feature |
-|-------|---------|
-| `/` | Dashboard — operator state, reset button |
-| `/log` | Live event/action stream |
-| `/debug` | Stepper, breakpoints |
-| `/queue` | Download queue, drag-and-drop prioritisation |
-| `/library` | Ratings, series, ABS sync status |
-| `/alerts` | Alert history |
-| `/alerts/:id` | Alert detail page (Gotify deep link target) |
-| `/ai` | AI recommendations, approve/reject |
-| `/calendar` | Upcoming series releases |
-| `/settings` | Configuration, custom format rules |
+| Route         | Feature                                      |
+| ------------- | -------------------------------------------- |
+| `/`           | Dashboard — operator state, reset button     |
+| `/log`        | Live event/action stream                     |
+| `/debug`      | Stepper, breakpoints                         |
+| `/queue`      | Download queue, drag-and-drop prioritisation |
+| `/library`    | Ratings, series, ABS sync status             |
+| `/alerts`     | Alert history                                |
+| `/alerts/:id` | Alert detail page (Gotify deep link target)  |
+| `/ai`         | AI recommendations, approve/reject           |
+| `/calendar`   | Upcoming series releases                     |
+| `/settings`   | Configuration, custom format rules           |
 
 ---
 
@@ -159,15 +161,16 @@ pub struct AppState {
 
 Endpoints:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET`  | `/api/v1/operator/state` | Current `SystemState` as JSON |
-| `POST` | `/api/v1/operator/reset` | Injects `Event::ManualReset` |
-| `GET`  | `/api/v1/alerts` | Paginated alert history from DB |
-| `GET`  | `/api/v1/alerts/{id}` | Alert detail — message, event context, state snapshot |
-| `GET`  | `/api/v1/health` | Liveness probe |
+| Method | Path                     | Description                                           |
+| ------ | ------------------------ | ----------------------------------------------------- |
+| `GET`  | `/api/v1/operator/state` | Current `SystemState` as JSON                         |
+| `POST` | `/api/v1/operator/reset` | Injects `Event::ManualReset`                          |
+| `GET`  | `/api/v1/alerts`         | Paginated alert history from DB                       |
+| `GET`  | `/api/v1/alerts/{id}`    | Alert detail — message, event context, state snapshot |
+| `GET`  | `/api/v1/health`         | Liveness probe                                        |
 
 **Rust changes:**
+
 - Extract project to workspace.
 - Add `axum` and `rust-embed` dependencies.
 - Spawn axum server task in the binary's `main`.
@@ -181,8 +184,8 @@ Endpoints:
 
 Endpoint:
 
-| Method | Path | Description |
-|--------|------|-------------|
+| Method | Path             | Description                          |
+| ------ | ---------------- | ------------------------------------ |
 | `GET`  | `/api/v1/stream` | SSE stream of `Observation` messages |
 
 ```rust
@@ -200,6 +203,7 @@ Multiple clients can subscribe simultaneously. Slow clients are dropped on buffe
 overflow and reconnect to receive a fresh snapshot.
 
 **Rust changes:**
+
 - `tokio::sync::broadcast::Sender<Observation>` (capacity 256) in `AppState`.
 - Main event loop taps it at three points:
   - Before `process_event` → `EventReceived`
@@ -217,19 +221,19 @@ enables it at startup.
 
 **Endpoints:**
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET`  | `/api/v1/debug` | Current debug state (enabled, queue, pending actions, breakpoints) |
-| `POST` | `/api/v1/debug/enable` | Enable debug mode |
-| `POST` | `/api/v1/debug/disable` | Disable debug mode; flush queue normally |
-| `GET`  | `/api/v1/debug/events` | All `Event` variant names (for breakpoint UI) |
-| `GET`  | `/api/v1/debug/actions` | All `Action` variant names (for breakpoint UI) |
-| `POST` | `/api/v1/debug/breakpoints/event/{variant}` | Add event breakpoint |
-| `DELETE` | `/api/v1/debug/breakpoints/event/{variant}` | Remove event breakpoint |
-| `POST` | `/api/v1/debug/breakpoints/action/{variant}` | Add action breakpoint |
-| `DELETE` | `/api/v1/debug/breakpoints/action/{variant}` | Remove action breakpoint |
-| `POST` | `/api/v1/debug/step/event` | Process next queued event through the Core |
-| `POST` | `/api/v1/debug/step/action` | Dispatch next pending action through the Shell |
+| Method   | Path                                         | Description                                                        |
+| -------- | -------------------------------------------- | ------------------------------------------------------------------ |
+| `GET`    | `/api/v1/debug`                              | Current debug state (enabled, queue, pending actions, breakpoints) |
+| `POST`   | `/api/v1/debug/enable`                       | Enable debug mode                                                  |
+| `POST`   | `/api/v1/debug/disable`                      | Disable debug mode; flush queue normally                           |
+| `GET`    | `/api/v1/debug/events`                       | All `Event` variant names (for breakpoint UI)                      |
+| `GET`    | `/api/v1/debug/actions`                      | All `Action` variant names (for breakpoint UI)                     |
+| `POST`   | `/api/v1/debug/breakpoints/event/{variant}`  | Add event breakpoint                                               |
+| `DELETE` | `/api/v1/debug/breakpoints/event/{variant}`  | Remove event breakpoint                                            |
+| `POST`   | `/api/v1/debug/breakpoints/action/{variant}` | Add action breakpoint                                              |
+| `DELETE` | `/api/v1/debug/breakpoints/action/{variant}` | Remove action breakpoint                                           |
+| `POST`   | `/api/v1/debug/step/event`                   | Process next queued event through the Core                         |
+| `POST`   | `/api/v1/debug/step/action`                  | Dispatch next pending action through the Shell                     |
 
 The loop pauses on an event if: debug mode is enabled, **or** the event's variant name
 is in the breakpoints set. Same logic for actions. This means breakpoints work
