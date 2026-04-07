@@ -1,15 +1,38 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+mod stream;
+
+pub use stream::{DebuggableEventStream, action_variant};
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use serde::Serialize;
-use tokio::sync::{Semaphore, broadcast, mpsc};
-use tracing::{info, warn};
+use serde_json::Value;
+use tokio::sync::{Semaphore, broadcast};
 use windlass_core::Observation;
 use windlass_core::actions::Action;
-use windlass_core::events::Event;
+
+// ── PausedOn ──────────────────────────────────────────────────────────────────
+
+/// Describes what the debug loop is currently paused on.
+/// Serialised into `DebugState` and returned by `GET /api/v1/debug`.
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "kind")]
+pub enum PausedOn {
+    /// Paused before processing an event.
+    Event { variant: &'static str },
+    /// Paused before dispatching an action within a batch.
+    Action {
+        variant: &'static str,
+        /// 1-based position within the current batch.
+        index: usize,
+        /// Total number of actions in the batch.
+        of: usize,
+    },
+}
 
 // ── DebugState ────────────────────────────────────────────────────────────────
 
@@ -17,7 +40,10 @@ use windlass_core::events::Event;
 #[derive(Serialize)]
 pub struct DebugState {
     pub debug_mode: bool,
-    pub pending_actions: Vec<serde_json::Value>,
+    /// What the system is currently paused on, or `null` when running freely.
+    pub paused_on: Option<PausedOn>,
+    /// The current action batch, pre-serialised; empty when not dispatching.
+    pub pending_actions: Vec<Value>,
     pub event_breakpoints: Vec<String>,
     pub action_breakpoints: Vec<String>,
 }
@@ -41,6 +67,10 @@ struct Inner {
     skip: AtomicBool,
     /// Present only while debug mode is active — lets clients emit `HttpExchange` observations.
     obs_tx: Mutex<Option<broadcast::Sender<Observation>>>,
+    /// What the system is currently paused on; `None` when running freely.
+    paused_on: ArcSwap<Option<PausedOn>>,
+    /// The current action batch, pre-serialised; empty when not dispatching.
+    pending_actions: ArcSwap<Vec<Value>>,
 }
 
 impl Default for Inner {
@@ -53,6 +83,8 @@ impl Default for Inner {
             step: Semaphore::new(0),
             skip: AtomicBool::new(false),
             obs_tx: Mutex::new(None),
+            paused_on: ArcSwap::from_pointee(None),
+            pending_actions: ArcSwap::from_pointee(vec![]),
         }
     }
 }
@@ -75,14 +107,16 @@ impl DebugController {
         *self.0.obs_tx.lock().unwrap() = Some(obs_tx);
     }
 
-    /// Disable debug mode. Clears the obs channel and releases any blocked step
-    /// waiters so the system resumes normal operation.
+    /// Disable debug mode. Clears all debug state and releases any blocked
+    /// step waiters so the system resumes normal operation.
     ///
     /// # Panics
     /// Panics if any internal mutex is poisoned.
     pub fn disable_debug(&self) {
         self.0.debug_mode.store(false, Ordering::SeqCst);
         self.0.skip.store(false, Ordering::SeqCst);
+        self.0.paused_on.store(Arc::new(None));
+        self.0.pending_actions.store(Arc::new(vec![]));
         *self.0.obs_tx.lock().unwrap() = None;
         // Release any task currently blocked on the step semaphore.
         self.0.step.add_permits(usize::MAX / 2);
@@ -169,6 +203,30 @@ impl DebugController {
         self.0.step.add_permits(1);
     }
 
+    // ── Pause state ───────────────────────────────────────────────────────────
+
+    /// Sets or clears what the system is currently paused on.
+    /// Called by [`DebuggableEventStream`] and [`DebuggableShell`] around step waits.
+    pub fn set_paused_on(&self, p: Option<PausedOn>) {
+        self.0.paused_on.store(Arc::new(p));
+    }
+
+    /// Stores the current action batch as pre-serialised JSON.
+    /// Called by `DebuggableShell` at the start of each dispatch cycle.
+    pub fn set_pending_actions(&self, actions: &[Action]) {
+        let json: Vec<Value> = actions
+            .iter()
+            .filter_map(|a| serde_json::to_value(a).ok())
+            .collect();
+        self.0.pending_actions.store(Arc::new(json));
+    }
+
+    /// Clears the pending-actions batch.
+    /// Called by `DebuggableShell` when the batch is fully dispatched.
+    pub fn clear_pending_actions(&self) {
+        self.0.pending_actions.store(Arc::new(vec![]));
+    }
+
     // ── HTTP observation channel ──────────────────────────────────────────────
 
     /// Returns the observation sender when debug mode is active.
@@ -188,6 +246,12 @@ impl DebugController {
     /// Panics if any internal mutex is poisoned.
     #[must_use]
     pub fn debug_state(&self) -> DebugState {
+        let paused_on = self.0.paused_on.load_full();
+        let paused_on: Option<PausedOn> = paused_on.as_ref().clone();
+
+        let pending_actions = self.0.pending_actions.load_full();
+        let pending_actions: Vec<Value> = pending_actions.as_ref().clone();
+
         let event_breakpoints = self
             .0
             .event_breakpoints
@@ -208,130 +272,10 @@ impl DebugController {
 
         DebugState {
             debug_mode: self.is_debug_mode(),
-            pending_actions: vec![], // populated in step 3 via ArcSwap
+            paused_on,
+            pending_actions,
             event_breakpoints,
             action_breakpoints,
         }
-    }
-}
-
-// ── DebuggableEventStream ─────────────────────────────────────────────────────
-
-/// Wraps the external mpsc receiver with debug-mode pause/step logic.
-///
-/// Two concurrent tasks are always running:
-/// - The **intake task** drains the external channel, broadcasting
-///   `Observation::EventArrived` for every event so the UI can see the full
-///   queue in real time, then forwards events to an internal channel.
-/// - The **main loop** calls [`recv`](DebuggableEventStream::recv) which pops
-///   from the internal channel and pauses when debug mode is active or a
-///   breakpoint is hit.
-pub struct DebuggableEventStream {
-    internal_rx: mpsc::Receiver<Event>,
-    debug_ctrl: DebugController,
-    obs_tx: broadcast::Sender<Observation>,
-}
-
-impl DebuggableEventStream {
-    /// Creates the stream, spawns the intake task, and enables debug mode
-    /// immediately if `DEBUG_MODE_ON_START=true`.
-    pub fn new(
-        external_rx: mpsc::Receiver<Event>,
-        debug_ctrl: DebugController,
-        obs_tx: broadcast::Sender<Observation>,
-    ) -> Self {
-        if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
-            debug_ctrl.enable_debug(obs_tx.clone());
-            info!("Debug mode enabled from DEBUG_MODE_ON_START");
-        }
-
-        let (internal_tx, internal_rx) = mpsc::channel(128);
-        let obs_tx_intake = obs_tx.clone();
-
-        tokio::spawn(async move {
-            let mut rx = external_rx;
-            while let Some(event) = rx.recv().await {
-                let _ = obs_tx_intake.send(Observation::EventArrived(event.clone()));
-                if internal_tx.send(event).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Self {
-            internal_rx,
-            debug_ctrl,
-            obs_tx,
-        }
-    }
-
-    /// Returns the next event, pausing if debug mode is active or a breakpoint
-    /// is set for this event's variant. If the step is skipped the event is
-    /// discarded and the next one is returned instead.
-    ///
-    /// `MamRateLimitViolation` automatically enters debug mode before pausing —
-    /// the event still reaches the core unchanged.
-    pub async fn recv(&mut self) -> Option<Event> {
-        loop {
-            let event = self.internal_rx.recv().await?;
-
-            if matches!(event, Event::MamRateLimitViolation) {
-                warn!("MAM rate-limit violation detected — entering debug mode");
-                self.debug_ctrl.enable_debug(self.obs_tx.clone());
-            }
-
-            if self.debug_ctrl.should_pause_on_event(event_variant(&event))
-                && !self.debug_ctrl.acquire_step().await
-            {
-                continue; // skipped — fetch the next event
-            }
-
-            return Some(event);
-        }
-    }
-}
-
-const fn event_variant(event: &Event) -> &'static str {
-    match event {
-        Event::Init { .. } => "Init",
-        Event::ManualReset => "ManualReset",
-        Event::DockerGluetunDied => "DockerGluetunDied",
-        Event::DockerGluetunHealthy => "DockerGluetunHealthy",
-        Event::PortFileReadResult(_) => "PortFileReadResult",
-        Event::QbitAuthSuccess(_) => "QbitAuthSuccess",
-        Event::QbitAuthFailed => "QbitAuthFailed",
-        Event::QbitConnectionRefused => "QbitConnectionRefused",
-        Event::QbitApiError(_) => "QbitApiError",
-        Event::QbitPortSyncSuccess => "QbitPortSyncSuccess",
-        Event::QbitPortSyncFailed(_) => "QbitPortSyncFailed",
-        Event::MamUpdateSuccess => "MamUpdateSuccess",
-        Event::MamAsnMismatch(_) => "MamAsnMismatch",
-        Event::MamStatusObserved(_) => "MamStatusObserved",
-        Event::DiskSpaceObserved(_) => "DiskSpaceObserved",
-        Event::NewTorrentsObserved(_) => "NewTorrentsObserved",
-        Event::LogsDumped => "LogsDumped",
-        Event::Wakeup(_) => "Wakeup",
-        Event::MamRateLimitViolation => "MamRateLimitViolation",
-    }
-}
-
-/// Returns the variant name of an [`Action`] as a static string.
-/// Used to look up breakpoints without heap allocation.
-#[must_use]
-pub const fn action_variant(action: &Action) -> &'static str {
-    match action {
-        Action::ScheduleWakeup(_, _) => "ScheduleWakeup",
-        Action::ReadPortFiles => "ReadPortFiles",
-        Action::FetchAndDumpAllLogs => "FetchAndDumpAllLogs",
-        Action::StopDependentContainers => "StopDependentContainers",
-        Action::StartDependentContainers => "StartDependentContainers",
-        Action::RestartGluetun => "RestartGluetun",
-        Action::AuthenticateQbit => "AuthenticateQbit",
-        Action::SyncQbitPort(_, _) => "SyncQbitPort",
-        Action::UpdateMam(_) => "UpdateMam",
-        Action::CheckMamConnectability => "CheckMamConnectability",
-        Action::CheckDiskSpace => "CheckDiskSpace",
-        Action::CheckNewTorrents(_) => "CheckNewTorrents",
-        Action::SendGotifyAlert(_, _) => "SendGotifyAlert",
     }
 }

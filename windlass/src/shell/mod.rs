@@ -1,3 +1,4 @@
+mod actions;
 mod config;
 
 use std::collections::HashMap;
@@ -9,13 +10,12 @@ use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
-use uom::si::information::byte;
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_debug::{DebugController, DebuggableEventStream, action_variant};
-use windlass_local::{docker, monitors, vpn_files};
-use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
+use windlass_debug::{DebugController, DebuggableEventStream, PausedOn, action_variant};
+use windlass_local::{docker, vpn_files};
+use windlass_types::WakeupId;
 
 pub use config::Config;
 
@@ -178,7 +178,10 @@ struct DebuggableShell<'a>(ShellContext<'a>);
 
 impl DebuggableShell<'_> {
     async fn dispatch(&mut self, actions: Vec<Action>) {
-        for action in actions {
+        let total = actions.len();
+        self.0.debug_ctrl.set_pending_actions(&actions);
+
+        for (idx, action) in actions.into_iter().enumerate() {
             debug!(?action, "→");
 
             let _ = self
@@ -186,157 +189,23 @@ impl DebuggableShell<'_> {
                 .obs_tx
                 .send(windlass_core::Observation::ActionDispatched(action.clone()));
 
-            if self
-                .0
-                .debug_ctrl
-                .should_pause_on_action(action_variant(&action))
-                && !self.0.debug_ctrl.acquire_step().await
-            {
-                continue; // skipped
+            let variant = action_variant(&action);
+            if self.0.debug_ctrl.should_pause_on_action(variant) {
+                self.0.debug_ctrl.set_paused_on(Some(PausedOn::Action {
+                    variant,
+                    index: idx + 1,
+                    of: total,
+                }));
+                let execute = self.0.debug_ctrl.acquire_step().await;
+                self.0.debug_ctrl.set_paused_on(None);
+                if !execute {
+                    continue; // skipped
+                }
             }
 
             self.0.execute(action);
         }
-    }
-}
 
-impl ShellContext<'_> {
-    // ── Timers ────────────────────────────────────────────────────────────────
-
-    fn schedule_wakeup(&mut self, id: WakeupId, duration: Duration) {
-        // Cancel any existing timer for this id to prevent duplicate wakeup loops.
-        if let Some(handle) = self.wakeups.remove(&id) {
-            handle.abort();
-        }
-        let tx = self.tx.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            let _ = tx.send(Event::Wakeup(id)).await;
-        });
-        self.wakeups.insert(id, handle);
-    }
-
-    // ── Port files ────────────────────────────────────────────────────────────
-
-    /// Retry path only — the debounced file watcher handles normal reads.
-    fn read_port_files(&self) {
-        let ip_file = self.vpn_ip_file.to_owned();
-        let port_file = self.vpn_port_file.to_owned();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                vpn_files::read_port_files(&ip_file, &port_file)
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = tx.send(Event::PortFileReadResult(result)).await;
-        });
-    }
-
-    // ── Docker ────────────────────────────────────────────────────────────────
-
-    fn fetch_and_dump_all_logs(&self) {
-        let docker = self.docker.clone();
-        let deps = self.dependents.to_vec();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            docker.fetch_and_dump_logs(&deps).await;
-            let _ = tx.send(Event::LogsDumped).await;
-        });
-    }
-
-    fn stop_dependent_containers(&self) {
-        let docker = self.docker.clone();
-        let deps = self.dependents.to_vec();
-        tokio::spawn(async move {
-            docker.stop_dependents(&deps).await;
-        });
-    }
-
-    fn start_dependent_containers(&self) {
-        let docker = self.docker.clone();
-        let deps = self.dependents.to_vec();
-        tokio::spawn(async move {
-            docker.start_dependents(&deps).await;
-        });
-    }
-
-    fn restart_gluetun(&self) {
-        let docker = self.docker.clone();
-        tokio::spawn(async move {
-            docker.restart_gluetun().await;
-        });
-    }
-
-    // ── qBittorrent ───────────────────────────────────────────────────────────
-
-    fn authenticate_qbit(&self) {
-        let qbit = self.qbit.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let event = qbit.authenticate().await;
-            let _ = tx.send(event).await;
-        });
-    }
-
-    fn sync_qbit_port(&self, cookie: AuthCookie, port: VpnPort) {
-        let qbit = self.qbit.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let event = qbit.sync_port(&cookie, port).await;
-            let _ = tx.send(event).await;
-        });
-    }
-
-    // ── MAM ───────────────────────────────────────────────────────────────────
-
-    fn update_mam(&self, _ip: VpnIp) {
-        let mam = self.mam.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let event = mam.update_seedbox().await;
-            let _ = tx.send(event).await;
-        });
-    }
-
-    fn check_mam_connectability(&self) {
-        let mam = self.mam.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let event = mam.check_connectability().await;
-            let _ = tx.send(event).await;
-        });
-    }
-
-    // ── Monitoring ────────────────────────────────────────────────────────────
-
-    fn check_disk_space(&self) {
-        let path = self.data_path.to_owned();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let space = tokio::task::spawn_blocking(move || monitors::check_disk_space(&path))
-                .await
-                .unwrap_or_else(|_| uom::si::f64::Information::new::<byte>(f64::MAX));
-            let _ = tx.send(Event::DiskSpaceObserved(space)).await;
-        });
-    }
-
-    fn check_new_torrents(&self, cookie: AuthCookie) {
-        let tx = self.tx.clone();
-        let qbit = self.qbit.clone();
-        tokio::spawn(async move {
-            // Shell sends the raw full list — Core owns the deduplication logic.
-            let current = qbit.list_torrents(&cookie).await;
-            let _ = tx.send(Event::NewTorrentsObserved(current)).await;
-        });
-    }
-
-    // ── Alerts ────────────────────────────────────────────────────────────────
-
-    fn send_gotify_alert(&self, priority: AlertPriority, message: String) {
-        let gotify = self.gotify.clone();
-        tokio::spawn(async move {
-            gotify.send_alert(priority, &message).await;
-        });
+        self.0.debug_ctrl.clear_pending_actions();
     }
 }
