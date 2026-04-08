@@ -7,6 +7,7 @@ interface ObservationsValue {
   state: SystemState | null
   log: Observation[]
   connected: boolean
+  debugMode: boolean
   clearLog: () => void
 }
 
@@ -14,6 +15,7 @@ const ObservationsContext = createContext<ObservationsValue>({
   state: null,
   log: [],
   connected: false,
+  debugMode: false,
   clearLog: () => {},
 })
 
@@ -21,6 +23,7 @@ export function ObservationsProvider({ children }: { children: React.ReactNode }
   const [state, setState] = useState<SystemState | null>(null)
   const [log, setLog] = useState<Observation[]>([])
   const [connected, setConnected] = useState(false)
+  const [debugMode, setDebugMode] = useState(false)
   const clearLog = useCallback(() => setLog([]), [])
 
   // Keep a ref so the SSE handler always sees the latest log length without re-subscribing
@@ -32,7 +35,12 @@ export function ObservationsProvider({ children }: { children: React.ReactNode }
 
     es.addEventListener('observation', (e: MessageEvent) => {
       const obs = JSON.parse(e.data as string) as Observation
-      if (obs.type === 'StateSnapshot') setState(obs.data)
+      if (obs.type === 'StateSnapshot') {
+        setState(obs.data)
+      } else if (obs.type === 'DebugModeChanged') {
+        setDebugMode(obs.data)
+        return // don't add debug mode changes to the log
+      }
       setLog(prev => [...prev.slice(-(MAX_LOG - 1)), obs])
     })
 
@@ -43,7 +51,7 @@ export function ObservationsProvider({ children }: { children: React.ReactNode }
   }, [])
 
   return (
-    <ObservationsContext.Provider value={{ state, log, connected, clearLog }}>
+    <ObservationsContext.Provider value={{ state, log, connected, debugMode, clearLog }}>
       {children}
     </ObservationsContext.Provider>
   )

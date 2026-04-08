@@ -116,7 +116,7 @@ function tryParse(s: string): unknown {
 // ── main component ────────────────────────────────────────────────────────────
 
 export function Debug() {
-  const { log, connected } = useObservations()
+  const { log, connected, debugMode } = useObservations()
 
   const [debugState, setDebugState] = useState<DebugState | null>(null)
   const [eventVariants,  setEventVariants]  = useState<string[]>([])
@@ -139,22 +139,13 @@ export function Debug() {
     void fetch('/api/v1/debug/actions').then(r => r.json()).then(d => setActionVariants(d as string[]))
   }, [refreshDebugState])
 
-  // Refresh debug state on every StateSnapshot so pending queues stay current
+  // Refresh debug state on every event/action so pending queues stay current
   useEffect(() => {
     const last = log[log.length - 1]
-    if (last?.type === 'StateSnapshot' || last?.type === 'EventReceived' || last?.type === 'ActionDispatched') {
+    if (last?.type === 'EventReceived' || last?.type === 'ActionDispatched') {
       void refreshDebugState()
     }
   }, [log, refreshDebugState])
-
-  const frozen     = debugState?.frozen     ?? false
-  const debugMode  = debugState?.debug_mode ?? false
-
-  async function toggleFreeze() {
-    const path = frozen ? '/api/v1/operator/unfreeze' : '/api/v1/operator/freeze'
-    await fetch(path, { method: 'POST' })
-    await refreshDebugState()
-  }
 
   async function toggleDebugMode() {
     await api(debugMode ? '/disable' : '/enable')
@@ -189,7 +180,6 @@ export function Debug() {
           <Badge variant={connected ? 'success' : 'destructive'}>
             {connected ? 'Live' : 'Disconnected'}
           </Badge>
-          {frozen    && <Badge variant="warning">Frozen</Badge>}
           {debugMode && <Badge variant="secondary">Debug Mode</Badge>}
         </div>
         <div className="flex gap-2">
@@ -199,9 +189,6 @@ export function Debug() {
             onClick={toggleDebugMode}
           >
             {debugMode ? 'Disable Debug' : 'Enable Debug'}
-          </Button>
-          <Button variant="outline" size="sm" onClick={toggleFreeze}>
-            {frozen ? 'Unfreeze' : 'Freeze'}
           </Button>
         </div>
       </div>

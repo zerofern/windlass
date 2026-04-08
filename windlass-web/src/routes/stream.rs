@@ -20,11 +20,11 @@ pub fn router(state: AppState) -> axum::Router {
 async fn stream_handler(
     State(app): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
-    let current_state = (*app.state.load_full()).clone();
-    let snapshot = Observation::StateSnapshot(current_state);
+    let initial_debug_mode = app.debug_ctrl.is_debug_mode();
+    let initial = Observation::DebugModeChanged(initial_debug_mode);
 
     let initial = stream::once(async move {
-        let json = serde_json::to_string(&snapshot).unwrap_or_default();
+        let json = serde_json::to_string(&initial).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(SseEvent::default().event("observation").data(json))
     });
 

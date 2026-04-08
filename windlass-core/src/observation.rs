@@ -21,6 +21,9 @@ pub enum Observation {
     EventReceived(Event),
     StateSnapshot(SystemState),
     ActionDispatched(Action),
+    /// Emitted when debug mode is enabled or disabled, including automatic
+    /// entry triggered by the MAM rate-limit guardrail.
+    DebugModeChanged(bool),
     /// Emitted by HTTP clients on every response.
     /// Carries the full request/response detail for the SSE log view.
     HttpExchange {

@@ -68,6 +68,7 @@ impl DebuggableEventStream {
             if matches!(event, Event::MamRateLimitViolation) {
                 warn!("MAM rate-limit violation detected — entering debug mode");
                 self.debug_ctrl.enable_debug(self.obs_tx.clone());
+                let _ = self.obs_tx.send(Observation::DebugModeChanged(true));
             }
 
             if self.debug_ctrl.should_pause_on_event(event_variant(&event)) {

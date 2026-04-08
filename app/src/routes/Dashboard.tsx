@@ -6,8 +6,7 @@ import { Button } from '@/components/ui/button'
 import type { Observation } from '@/types/api'
 
 function obsLabel(obs: Observation): string {
-  if (obs.type === 'StateSnapshot') return 'State'
-  if (obs.type === 'EventReceived') {
+  if (obs.type === 'EventArrived' || obs.type === 'EventReceived') {
     const d = obs.data
     if (typeof d === 'string') return d
     if (typeof d === 'object' && d !== null) return Object.keys(d as Record<string, unknown>)[0] ?? '?'
@@ -17,13 +16,23 @@ function obsLabel(obs: Observation): string {
     if (typeof d === 'string') return d
     if (typeof d === 'object' && d !== null) return Object.keys(d as Record<string, unknown>)[0] ?? '?'
   }
+  if (obs.type === 'HttpExchange') return `${obs.data.method} ${obs.data.module}`
   return obs.type
 }
 
 function obsBadgeVariant(obs: Observation): 'secondary' | 'warning' | 'default' {
-  if (obs.type === 'StateSnapshot') return 'secondary'
-  if (obs.type === 'EventReceived') return 'warning'
-  return 'default'
+  if (obs.type === 'EventArrived' || obs.type === 'EventReceived') return 'warning'
+  if (obs.type === 'ActionDispatched') return 'default'
+  return 'secondary'
+}
+
+function obsBadgeLabel(obs: Observation): string {
+  if (obs.type === 'EventArrived') return 'arrived'
+  if (obs.type === 'EventReceived') return 'event'
+  if (obs.type === 'ActionDispatched') return 'action'
+  if (obs.type === 'HttpExchange') return 'http'
+  if (obs.type === 'StateSnapshot') return 'state'
+  return obs.type.toLowerCase()
 }
 
 export function Dashboard() {
@@ -37,22 +46,15 @@ export function Dashboard() {
   return (
     <div className="flex flex-col gap-6">
       {/* Status */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-bold">Dashboard</h1>
-          <Badge variant={connected ? 'success' : 'destructive'}>
-            {connected ? 'Live' : 'Disconnected'}
-          </Badge>
-        </div>
-        <Button variant="destructive" size="sm" onClick={() =>
-          fetch('/api/v1/operator/reset', { method: 'POST' })
-        }>
-          Reset
-        </Button>
+      <div className="flex items-center gap-3">
+        <h1 className="text-2xl font-bold">Dashboard</h1>
+        <Badge variant={connected ? 'success' : 'destructive'}>
+          {connected ? 'Live' : 'Disconnected'}
+        </Badge>
       </div>
 
       {state ? <StateDisplay state={state} /> : (
-        <p className="text-muted-foreground text-sm">Connecting to Windlass…</p>
+        <p className="text-muted-foreground text-sm">Waiting for first state update…</p>
       )}
 
       {/* Live Log */}
@@ -71,7 +73,7 @@ export function Dashboard() {
         {log.map((obs, i) => (
           <div key={i} className="flex gap-2 py-0.5 hover:bg-muted/30 rounded px-1">
             <Badge variant={obsBadgeVariant(obs)} className="shrink-0 text-[10px]">
-              {obs.type === 'StateSnapshot' ? 'state' : obs.type === 'EventReceived' ? 'event' : 'action'}
+              {obsBadgeLabel(obs)}
             </Badge>
             <span className="truncate text-muted-foreground">{obsLabel(obs)}</span>
           </div>

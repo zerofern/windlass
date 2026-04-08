@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use windlass_core::Observation;
 use windlass_debug::DebugState;
 
 use crate::AppState;
@@ -73,11 +74,13 @@ async fn get_debug_state(State(app): State<AppState>) -> Json<DebugState> {
 
 async fn post_enable(State(app): State<AppState>) -> StatusCode {
     app.debug_ctrl.enable_debug(app.observations.clone());
+    let _ = app.observations.send(Observation::DebugModeChanged(true));
     StatusCode::OK
 }
 
 async fn post_disable(State(app): State<AppState>) -> StatusCode {
     app.debug_ctrl.disable_debug();
+    let _ = app.observations.send(Observation::DebugModeChanged(false));
     StatusCode::OK
 }
 

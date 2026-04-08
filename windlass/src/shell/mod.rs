@@ -2,7 +2,6 @@ mod actions;
 mod config;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,8 +15,6 @@ use windlass_core::{actions::Action, events::Event, types::SystemState};
 use windlass_debug::{DebugController, DebuggableEventStream, PausedOn, action_variant};
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
-
-use arc_swap::ArcSwap;
 
 pub use config::Config;
 
@@ -67,14 +64,12 @@ pub async fn run() -> Result<()> {
     let vpn_port_file = config.vpn_port_file.clone();
     let data_path = config.data_path.clone();
 
-    let shared_state = Arc::new(ArcSwap::from_pointee(SystemState::initial()));
     let (obs_tx, _) = tokio::sync::broadcast::channel::<windlass_core::Observation>(256);
 
     let mut debug_stream = DebuggableEventStream::new(rx, debug_ctrl.clone(), obs_tx.clone());
 
     let app_state = windlass_web::AppState {
         event_tx: tx.clone(),
-        state: shared_state.clone(),
         debug_ctrl: debug_ctrl.clone(),
         observations: obs_tx.clone(),
         chaos_url: std::env::var("CHAOS_URL").ok(),
@@ -111,7 +106,6 @@ pub async fn run() -> Result<()> {
         let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
         let actions = state.process_event(event);
-        shared_state.store(Arc::new(state.clone()));
         let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
         DebuggableShell(ShellContext {
             docker: &docker,

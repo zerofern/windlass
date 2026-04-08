@@ -1,9 +1,6 @@
-use arc_swap::ArcSwap;
-use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use windlass_core::Observation;
 use windlass_core::events::Event;
-use windlass_core::types::SystemState;
 use windlass_debug::DebugController;
 
 /// Shared state threaded through every axum handler via [`axum::extract::State`].
@@ -11,8 +8,6 @@ use windlass_debug::DebugController;
 pub struct AppState {
     /// Channel for injecting events into the core event loop.
     pub event_tx: mpsc::Sender<Event>,
-    /// Latest [`SystemState`] written by the event loop after each transition.
-    pub state: Arc<ArcSwap<SystemState>>,
     /// Debug controller — breakpoints, step permits, pause state.
     pub debug_ctrl: DebugController,
     /// Broadcast channel for live observations streamed to SSE clients.

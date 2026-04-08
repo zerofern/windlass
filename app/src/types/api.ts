@@ -7,10 +7,6 @@ export type AuthCookie = "[redacted]"
 
 // ── Enums ─────────────────────────────────────────────────────────────────
 
-export type RunMode =
-  | "Active"
-  | { Fatal: { reason: string } }
-
 export type VpnState =
   | "Stopped"
   | "DumpingLogs"
@@ -36,8 +32,6 @@ export type MamState =
 // ── SystemState ───────────────────────────────────────────────────────────
 
 export interface SystemState {
-  run_mode: RunMode
-  hard_recoveries: RetryCount
   vpn: VpnState
   qbit: QbitState
   mam: MamState
@@ -61,8 +55,10 @@ export interface HttpExchange {
 
 export type Observation =
   | { type: "StateSnapshot"; data: SystemState }
+  | { type: "EventArrived"; data: RustEvent }
   | { type: "EventReceived"; data: RustEvent }
   | { type: "ActionDispatched"; data: RustAction }
+  | { type: "DebugModeChanged"; data: boolean }
   | { type: "HttpExchange"; data: HttpExchange }
 
 // ── Debug ─────────────────────────────────────────────────────────────────

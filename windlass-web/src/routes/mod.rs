@@ -3,7 +3,6 @@ use axum::Router;
 
 mod debug;
 mod health;
-mod operator;
 mod stream;
 
 /// Combines all sub-routers into a single [`Router`].
@@ -11,7 +10,6 @@ mod stream;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(health::router(state.clone()))
-        .merge(operator::router(state.clone()))
         .merge(stream::router(state.clone()))
         .merge(debug::router(state))
 }
