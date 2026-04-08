@@ -7,6 +7,15 @@ pub mod types;
 
 pub use observation::{HttpObserver, Observation};
 
+/// Returned by [`SystemState::process_event`].
+pub struct EventOutcome {
+    pub actions: Vec<Action>,
+    /// `true` if the state changed as a result of this event.
+    /// The shell uses this to avoid cloning and broadcasting a `StateSnapshot`
+    /// when nothing has actually changed (e.g. no-op wakeups).
+    pub state_changed: bool,
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -24,9 +33,14 @@ use windlass_types::MamStatus;
 /// The pure functional core. No I/O, no async, no side effects.
 /// All state transitions and action scheduling happen here.
 impl SystemState {
-    pub fn process_event(&mut self, event: Event, now: DateTime<Utc>) -> Vec<Action> {
+    pub fn process_event(&mut self, event: Event, now: DateTime<Utc>) -> EventOutcome {
         let _ = now;
-        match event {
+        let before_version = self.version;
+
+        #[cfg(debug_assertions)]
+        let before_state = self.clone();
+
+        let actions = match event {
             // ── Initialisation ────────────────────────────────────────────────
             Event::Init {
                 is_gluetun_healthy,
@@ -71,6 +85,19 @@ impl SystemState {
             Event::NewTorrentsObserved { torrents, .. } => self.on_new_torrents_observed(torrents),
             Event::Wakeup { id, .. } => self.on_wakeup(id),
             Event::MamRateLimitViolation { .. } => handlers::on_mam_rate_limit_violation(),
+        };
+
+        let state_changed = self.version != before_version;
+
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            *self == before_state || state_changed,
+            "state changed but mark_changed() was not called"
+        );
+
+        EventOutcome {
+            actions,
+            state_changed,
         }
     }
 }

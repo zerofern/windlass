@@ -41,6 +41,7 @@ impl SystemState {
             actions.push(Action::FetchAndDumpAllLogs);
         }
 
+        self.mark_changed();
         actions
     }
 
@@ -67,6 +68,7 @@ impl SystemState {
         // qBit and MAM are unreachable until VPN is back.
         self.qbit = QbitState::Offline;
         self.mam = MamState::Unknown;
+        self.mark_changed();
         actions
     }
 
@@ -75,12 +77,14 @@ impl SystemState {
         // Always stop dependents and restart Gluetun — the double-dump guard
         // in DockerGluetunDied ensures we don't loop.
         self.vpn = VpnState::Starting;
+        self.mark_changed();
         vec![Action::StopDependentContainers, Action::RestartGluetun]
     }
 
     pub(crate) fn on_docker_gluetun_healthy(&mut self) -> Vec<Action> {
         info!("Gluetun healthy — starting dependent containers");
         self.vpn = VpnState::AwaitingTunnel;
+        self.mark_changed();
         // ReadPortFiles ensures recovery completes even when gluetun restarts
         // with the same IP/port — the file watcher deduplicates same-value writes
         // so an explicit read is needed to re-trigger Workflow B.
@@ -111,6 +115,7 @@ impl SystemState {
         self.qbit = QbitState::Authenticating {
             attempt: RetryCount(0),
         };
+        self.mark_changed();
         vec![Action::AuthenticateQbit]
     }
 }

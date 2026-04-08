@@ -108,8 +108,10 @@ pub async fn run() -> Result<()> {
 
         let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
-        let actions = state.process_event(event, chrono::Utc::now());
-        let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
+        let outcome = state.process_event(event, chrono::Utc::now());
+        if outcome.state_changed {
+            let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
+        }
 
         let mut ctx = ShellContext {
             docker: &docker,
@@ -124,7 +126,7 @@ pub async fn run() -> Result<()> {
             data_path: &data_path,
         };
         debug_dispatcher
-            .dispatch(actions, |action| ctx.execute(action))
+            .dispatch(outcome.actions, |action| ctx.execute(action))
             .await;
     }
 

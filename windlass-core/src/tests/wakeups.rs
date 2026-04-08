@@ -10,13 +10,15 @@ fn now() -> chrono::DateTime<Utc> {
 #[test]
 fn wakeup_heartbeat_checks_mam_connectability() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::Heartbeat,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -27,26 +29,30 @@ fn wakeup_heartbeat_checks_mam_connectability() {
 #[test]
 fn wakeup_disk_check_checks_disk_space() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::DiskCheck,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(actions.iter().any(|a| matches!(a, Action::CheckDiskSpace)));
 }
 
 #[test]
 fn wakeup_torrent_check_checks_new_torrents() {
     let mut state = connected_state();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::TorrentCheck,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -58,13 +64,15 @@ fn wakeup_torrent_check_checks_new_torrents() {
 fn wakeup_torrent_check_is_noop_when_qbit_not_ready() {
     // Core must not emit CheckNewTorrents if we have no valid cookie.
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::TorrentCheck,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         !actions
             .iter()
@@ -78,13 +86,15 @@ fn wakeup_qbit_auth_retry_authenticates() {
     state.qbit = QbitState::Authenticating {
         attempt: RetryCount(0),
     };
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::QbitAuthRetry,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -100,13 +110,15 @@ fn wakeup_qbit_sync_retry_syncs_when_in_syncing_state() {
         cookie: cookie(),
         target: port(),
     };
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::QbitSyncRetry,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -118,25 +130,29 @@ fn wakeup_qbit_sync_retry_syncs_when_in_syncing_state() {
 fn wakeup_qbit_sync_retry_is_noop_when_not_syncing() {
     let mut state = SystemState::initial();
     state.qbit = QbitState::Offline;
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::QbitSyncRetry,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(actions.is_empty());
 }
 
 #[test]
 fn wakeup_retry_port_read_reads_port_files() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Wakeup {
             at: now(),
             id: WakeupId::RetryPortRead,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(actions.iter().any(|a| matches!(a, Action::ReadPortFiles)));
 }

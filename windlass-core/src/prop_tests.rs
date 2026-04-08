@@ -97,6 +97,7 @@ fn any_system_state() -> impl Strategy<Value = SystemState> {
         qbit,
         mam,
         known_torrents: std::collections::HashSet::new(),
+        ..SystemState::initial()
     })
 }
 
@@ -121,6 +122,7 @@ fn any_synced_state() -> impl Strategy<Value = SystemState> {
                 port: q_port,
             },
             known_torrents: std::collections::HashSet::new(),
+            ..SystemState::initial()
         },
     )
 }
@@ -287,11 +289,11 @@ proptest! {
         ip in any_vpn_ip(),
     ) {
         state.mam = MamState::AsnBlocked { ip };
-        let actions = state.process_event(
+        let outcome = state.process_event(
             Event::MamStatusObserved { at: DateTime::UNIX_EPOCH, status: MamStatus::Unreachable },
             Utc::now(),
         );
-        prop_assert!(actions.is_empty());
+        prop_assert!(outcome.actions.is_empty());
     }
 
     // 7. Monitoring wakeups never mutate state — they only emit Check actions.
@@ -337,5 +339,22 @@ proptest! {
                 "{:?} disrupted MamState", event
             );
         }
+    }
+
+    // 11. Version counter integrity — state_changed must be true whenever
+    //     the observable state actually changed.
+    #[test]
+    fn version_counter_matches_partial_eq(
+        mut state in any_system_state(),
+        event in any_event(),
+    ) {
+        let before = state.clone();
+        let outcome = state.process_event(event, Utc::now());
+        let actually_changed = state != before;
+        prop_assert!(
+            !actually_changed || outcome.state_changed,
+            "state changed but state_changed was false: actually_changed={actually_changed}, state_changed={}",
+            outcome.state_changed
+        );
     }
 }

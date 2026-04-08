@@ -12,7 +12,9 @@ fn now() -> chrono::DateTime<Utc> {
 fn low_disk_space_sends_alert() {
     let space = Information::new::<gigabyte>(20.0);
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::DiskSpaceObserved { at: now(), space }, now());
+    let outcome = state.process_event(Event::DiskSpaceObserved { at: now(), space }, now());
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -24,7 +26,9 @@ fn low_disk_space_sends_alert() {
 fn sufficient_disk_space_sends_no_alert() {
     let space = Information::new::<gigabyte>(200.0);
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::DiskSpaceObserved { at: now(), space }, now());
+    let outcome = state.process_event(Event::DiskSpaceObserved { at: now(), space }, now());
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         !actions
             .iter()
@@ -37,7 +41,9 @@ fn disk_check_always_reschedules() {
     for gb in [20.0_f64, 200.0] {
         let space = Information::new::<gigabyte>(gb);
         let mut state = SystemState::initial();
-        let actions = state.process_event(Event::DiskSpaceObserved { at: now(), space }, now());
+        let outcome = state.process_event(Event::DiskSpaceObserved { at: now(), space }, now());
+        let actions = outcome.actions;
+        assert!(!outcome.state_changed);
         assert!(
             actions
                 .iter()
@@ -54,13 +60,15 @@ fn new_torrents_sends_alert_for_unseen_names() {
         TorrentName("Fedora.iso".into()),
     ];
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::NewTorrentsObserved {
             at: now(),
             torrents: names,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -97,13 +105,15 @@ fn already_known_torrents_send_no_alert() {
         TorrentName("Ubuntu.iso".into()),
         TorrentName("Fedora.iso".into()),
     ];
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::NewTorrentsObserved {
             at: now(),
             torrents: names,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         !actions
             .iter()
@@ -126,13 +136,15 @@ fn mixed_known_and_new_torrents_alerts_only_for_new() {
         TorrentName("Ubuntu.iso".into()),
         TorrentName("Debian.iso".into()),
     ];
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::NewTorrentsObserved {
             at: now(),
             torrents: names,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     let alert = actions.iter().find_map(|a| match a {
         Action::SendGotifyAlert(AlertPriority::Info, msg) => Some(msg.clone()),
         _ => None,
@@ -154,13 +166,15 @@ fn mixed_known_and_new_torrents_alerts_only_for_new() {
 #[test]
 fn empty_torrent_list_sends_no_alert_but_reschedules() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::NewTorrentsObserved {
             at: now(),
             torrents: vec![],
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         !actions
             .iter()

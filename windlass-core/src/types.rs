@@ -96,17 +96,32 @@ impl fmt::Display for MamState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SystemState {
     pub vpn: VpnState,
     pub qbit: QbitState,
     pub mam: MamState,
-    /// Full list of torrent names seen so far. Used by the Core to diff
-    /// against the raw list from `NewTorrentsObserved` and only alert on new ones.
     pub known_torrents: HashSet<TorrentName>,
+    #[serde(skip)]
+    pub(crate) version: u64,
 }
 
+impl PartialEq for SystemState {
+    fn eq(&self, other: &Self) -> bool {
+        self.vpn == other.vpn
+            && self.qbit == other.qbit
+            && self.mam == other.mam
+            && self.known_torrents == other.known_torrents
+    }
+}
+
+impl Eq for SystemState {}
+
 impl SystemState {
+    pub(crate) const fn mark_changed(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
     #[must_use]
     pub fn initial() -> Self {
         Self {
@@ -114,6 +129,7 @@ impl SystemState {
             qbit: QbitState::Offline,
             mam: MamState::Unknown,
             known_torrents: HashSet::new(),
+            version: 0,
         }
     }
 }

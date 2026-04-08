@@ -17,9 +17,11 @@ impl SystemState {
                 cookie: cookie.clone(),
                 target,
             };
+            self.mark_changed();
             vec![Action::SyncQbitPort(cookie, target)]
         } else {
             self.qbit = QbitState::Authenticated { cookie };
+            self.mark_changed();
             vec![]
         }
     }
@@ -47,6 +49,7 @@ impl SystemState {
         self.qbit = QbitState::Authenticating {
             attempt: RetryCount(0),
         };
+        self.mark_changed();
         vec![
             Action::SendGotifyAlert(
                 AlertPriority::Critical,
@@ -66,6 +69,7 @@ impl SystemState {
         self.qbit = QbitState::Authenticating {
             attempt: attempt.increment(),
         };
+        self.mark_changed();
         vec![Action::ScheduleWakeup(WakeupId::QbitAuthRetry, backoff)]
     }
 
@@ -81,6 +85,7 @@ impl SystemState {
                     target_ip: ip,
                     target_port: port,
                 };
+                self.mark_changed();
                 return vec![Action::UpdateMam(ip)];
             }
         }
@@ -108,6 +113,7 @@ impl SystemState {
                     cookie,
                     target,
                 };
+                self.mark_changed();
                 return vec![Action::ScheduleWakeup(
                     WakeupId::QbitSyncRetry,
                     QBIT_SYNC_BACKOFF.into(),
@@ -122,6 +128,7 @@ impl SystemState {
             self.qbit = QbitState::Authenticating {
                 attempt: RetryCount(0),
             };
+            self.mark_changed();
             return vec![
                 Action::SendGotifyAlert(
                     AlertPriority::Warning,

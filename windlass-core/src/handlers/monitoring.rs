@@ -21,6 +21,7 @@ impl SystemState {
             debug!("torrent check: no new torrents");
         } else {
             info!(names = ?new_names, "new torrent(s) detected");
+            self.mark_changed();
             let list = new_names
                 .iter()
                 .map(|n| n.0.as_str())

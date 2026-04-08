@@ -10,7 +10,7 @@ fn now() -> chrono::DateTime<Utc> {
 #[test]
 fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Init {
             at: now(),
             is_gluetun_healthy: true,
@@ -18,6 +18,8 @@ fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(matches!(state.vpn, VpnState::Connected { .. }));
     assert!(matches!(
         state.qbit,
@@ -45,7 +47,7 @@ fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
 #[test]
 fn init_healthy_without_files_waits_for_watcher() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Init {
             at: now(),
             is_gluetun_healthy: true,
@@ -53,6 +55,8 @@ fn init_healthy_without_files_waits_for_watcher() {
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert_eq!(state.vpn, VpnState::AwaitingTunnel);
     assert!(
         !actions
@@ -64,7 +68,7 @@ fn init_healthy_without_files_waits_for_watcher() {
 #[test]
 fn init_unhealthy_triggers_workflow_a() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::Init {
             at: now(),
             is_gluetun_healthy: false,
@@ -72,6 +76,8 @@ fn init_unhealthy_triggers_workflow_a() {
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert_eq!(state.vpn, VpnState::DumpingLogs);
     assert!(
         actions

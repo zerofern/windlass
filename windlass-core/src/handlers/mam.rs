@@ -11,6 +11,7 @@ impl SystemState {
             let (ip, port) = (*ip, *port);
             info!(ip = %ip.0, port = port.into_inner(), "MAM seedbox registered — VPN recovery complete");
             self.mam = MamState::Synced { port, ip };
+            self.mark_changed();
             return vec![Action::SendGotifyAlert(
                 AlertPriority::Info,
                 "✅ VPN Recovered. Port synced.".into(),
@@ -22,6 +23,7 @@ impl SystemState {
     pub(crate) fn on_mam_asn_mismatch(&mut self, ip: VpnIp) -> Vec<Action> {
         warn!(ip = %ip.0, "MAM ASN mismatch — manual IP whitelist required");
         self.mam = MamState::AsnBlocked { ip };
+        self.mark_changed();
         vec![Action::SendGotifyAlert(
             AlertPriority::Critical,
             format!(
@@ -54,6 +56,7 @@ impl SystemState {
                 self.qbit = QbitState::Authenticating {
                     attempt: RetryCount(0),
                 };
+                self.mark_changed();
                 vec![
                     Action::AuthenticateQbit,
                     Action::ScheduleWakeup(WakeupId::Heartbeat, HEARTBEAT_INTERVAL.into()),
@@ -64,6 +67,7 @@ impl SystemState {
             _ => {
                 warn!("hard recovery: NAT frozen — restarting stack");
                 self.vpn = VpnState::DumpingLogs;
+                self.mark_changed();
                 vec![
                     Action::FetchAndDumpAllLogs,
                     Action::SendGotifyAlert(

@@ -14,7 +14,9 @@ fn mam_update_success_sends_ok_alert() {
         ip: ip(),
         port: port(),
     };
-    let actions = state.process_event(Event::MamUpdateSuccess { at: now() }, now());
+    let outcome = state.process_event(Event::MamUpdateSuccess { at: now() }, now());
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(matches!(state.mam, MamState::Synced { .. }));
     assert!(
         actions
@@ -26,7 +28,9 @@ fn mam_update_success_sends_ok_alert() {
 #[test]
 fn mam_update_success_is_noop_when_vpn_not_connected() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::MamUpdateSuccess { at: now() }, now());
+    let outcome = state.process_event(Event::MamUpdateSuccess { at: now() }, now());
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert_eq!(state.mam, MamState::Unknown);
     assert!(actions.is_empty());
 }
@@ -34,13 +38,15 @@ fn mam_update_success_is_noop_when_vpn_not_connected() {
 #[test]
 fn mam_asn_mismatch_blocks_and_alerts_with_ip() {
     let mut state = connected_state();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamAsnMismatch {
             at: now(),
             ip: ip(),
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(matches!(state.mam, MamState::AsnBlocked { .. }));
     let alert = actions.iter().find_map(|a| match a {
         Action::SendGotifyAlert(AlertPriority::Critical, msg) => Some(msg.clone()),
@@ -56,13 +62,15 @@ fn mam_asn_mismatch_blocks_and_alerts_with_ip() {
 #[test]
 fn connectable_schedules_heartbeat() {
     let mut state = connected_state();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::Connectable,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(!outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -73,13 +81,15 @@ fn connectable_schedules_heartbeat() {
 #[test]
 fn soft_recovery_re_triggers_qbit_auth() {
     let mut state = connected_state();
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::NotConnectable,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(
         matches!(
             state.qbit,
@@ -100,13 +110,15 @@ fn soft_recovery_re_triggers_qbit_auth() {
 fn soft_recovery_rearms_heartbeat() {
     let state = connected_state();
     let mut state = state;
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::Unreachable,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -122,13 +134,15 @@ fn hard_recovery_dumps_logs_and_restarts_stack() {
         port: port(),
     };
     state.qbit = QbitState::Offline;
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::Unreachable,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert_eq!(state.vpn, VpnState::DumpingLogs);
     assert!(
         actions
@@ -148,13 +162,15 @@ fn hard_recovery_escalates_from_authenticating_in_flight() {
     state.qbit = QbitState::Authenticating {
         attempt: RetryCount(1),
     };
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::Unreachable,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -170,13 +186,15 @@ fn hard_recovery_escalates_from_syncing_in_flight() {
         cookie: cookie(),
         target: port(),
     };
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::Unreachable,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(
         actions
             .iter()
@@ -189,15 +207,16 @@ fn asn_blocked_suppresses_recovery() {
     let mut state = connected_state();
     state.mam = MamState::AsnBlocked { ip: ip() };
     let mut new_state = state.clone();
-    let actions = new_state.process_event(
+    let outcome = new_state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::Unreachable,
         },
         now(),
     );
+    assert!(!outcome.state_changed);
     assert_eq!(new_state.qbit, state.qbit);
-    assert!(actions.is_empty());
+    assert!(outcome.actions.is_empty());
 }
 
 #[test]
@@ -208,13 +227,15 @@ fn soft_recovery_from_authenticated_re_auths_qbit() {
         port: port(),
     };
     state.qbit = QbitState::Authenticated { cookie: cookie() };
-    let actions = state.process_event(
+    let outcome = state.process_event(
         Event::MamStatusObserved {
             at: now(),
             status: MamStatus::Unreachable,
         },
         now(),
     );
+    let actions = outcome.actions;
+    assert!(outcome.state_changed);
     assert!(matches!(
         state.qbit,
         QbitState::Authenticating {
