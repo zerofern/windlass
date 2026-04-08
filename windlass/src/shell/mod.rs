@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_debug::{DebugController, DebuggableEventStream, PausedOn, action_variant};
+use windlass_debug::{DebugController, DebugDispatcher, DebuggableEventStream};
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
@@ -101,6 +101,8 @@ pub async fn run() -> Result<()> {
     .await
     .expect("event channel open at startup");
 
+    let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone(), obs_tx.clone());
+
     while let Some(event) = debug_stream.recv().await {
         debug!(?event, "←");
 
@@ -108,7 +110,8 @@ pub async fn run() -> Result<()> {
 
         let actions = state.process_event(event, chrono::Utc::now());
         let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
-        DebuggableShell(ShellContext {
+
+        let mut ctx = ShellContext {
             docker: &docker,
             qbit: &qbit,
             mam: &mam,
@@ -119,11 +122,10 @@ pub async fn run() -> Result<()> {
             vpn_ip_file: &vpn_ip_file,
             vpn_port_file: &vpn_port_file,
             data_path: &data_path,
-            debug_ctrl: &debug_ctrl,
-            obs_tx: &obs_tx,
-        })
-        .dispatch(actions)
-        .await;
+        };
+        debug_dispatcher
+            .dispatch(actions, |action| ctx.execute(action))
+            .await;
     }
 
     Ok(())
@@ -142,8 +144,6 @@ struct ShellContext<'a> {
     vpn_ip_file: &'a str,
     vpn_port_file: &'a str,
     data_path: &'a str,
-    debug_ctrl: &'a DebugController,
-    obs_tx: &'a tokio::sync::broadcast::Sender<windlass_core::Observation>,
 }
 
 impl ShellContext<'_> {
@@ -164,46 +164,5 @@ impl ShellContext<'_> {
             Action::CheckNewTorrents(cookie) => self.check_new_torrents(cookie),
             Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
         }
-    }
-}
-
-/// Wraps [`ShellContext`] with debug-mode pause/skip logic for action dispatch.
-///
-/// In debug mode (or when an action breakpoint is set), each action pauses
-/// before execution and waits for `POST /debug/step`. A `POST /debug/skip`
-/// discards the action instead.
-struct DebuggableShell<'a>(ShellContext<'a>);
-
-impl DebuggableShell<'_> {
-    async fn dispatch(&mut self, actions: Vec<Action>) {
-        let total = actions.len();
-        self.0.debug_ctrl.set_pending_actions(&actions);
-
-        for (idx, action) in actions.into_iter().enumerate() {
-            debug!(?action, "→");
-
-            let _ = self
-                .0
-                .obs_tx
-                .send(windlass_core::Observation::ActionDispatched(action.clone()));
-
-            let variant = action_variant(&action);
-            if self.0.debug_ctrl.should_pause_on_action(variant) {
-                self.0.debug_ctrl.set_paused_on(Some(PausedOn::Action {
-                    variant,
-                    index: idx + 1,
-                    of: total,
-                }));
-                let execute = self.0.debug_ctrl.acquire_step().await;
-                self.0.debug_ctrl.set_paused_on(None);
-                if !execute {
-                    continue; // skipped
-                }
-            }
-
-            self.0.execute(action);
-        }
-
-        self.0.debug_ctrl.clear_pending_actions();
     }
 }

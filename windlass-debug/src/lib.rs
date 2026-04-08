@@ -1,8 +1,10 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+mod dispatcher;
 mod stream;
 
-pub use stream::{DebuggableEventStream, action_variant};
+pub use dispatcher::DebugDispatcher;
+pub use stream::DebuggableEventStream;
 
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -31,7 +31,7 @@ impl SystemState {
         )]
     }
 
-    pub(crate) fn on_mam_connectable(&mut self) -> Vec<Action> {
+    pub(crate) fn on_mam_connectable(&self) -> Vec<Action> {
         debug!(mam = %self.mam, "MAM reports connectable — heartbeat OK");
         vec![Action::ScheduleWakeup(
             WakeupId::Heartbeat,
