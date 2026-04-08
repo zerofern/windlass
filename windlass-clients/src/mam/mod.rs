@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::bail;
+use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -105,7 +106,7 @@ impl MamClient {
     /// Panics if the internal session mutex is poisoned.
     pub async fn update_seedbox(&self) -> Event {
         if !self.check_rate_limit() {
-            return Event::MamRateLimitViolation;
+            return Event::MamRateLimitViolation { at: Utc::now() };
         }
         let current = self.session.lock().unwrap().clone();
         let (event, new_session) = self.do_update_seedbox(&current).await;
@@ -121,7 +122,7 @@ impl MamClient {
     /// Panics if the internal session mutex is poisoned.
     pub async fn check_connectability(&self) -> Event {
         if !self.check_rate_limit() {
-            return Event::MamRateLimitViolation;
+            return Event::MamRateLimitViolation { at: Utc::now() };
         }
         let current = self.session.lock().unwrap().clone();
         let (event, new_session) = self.do_check_connectability(&current).await;
@@ -170,7 +171,7 @@ impl MamClient {
         match result {
             Err(e) => {
                 warn!("MAM seedbox update request failed: {e}");
-                (Event::MamUpdateSuccess, new_session)
+                (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -179,7 +180,7 @@ impl MamClient {
                 match serde_json::from_str::<DynamicSeedboxResponse>(&raw) {
                     Ok(body) if body.success => {
                         info!("MAM seedbox: {}", body.msg);
-                        (Event::MamUpdateSuccess, new_session)
+                        (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
                     }
                     Ok(body) if body.msg.contains("ASN mismatch") => {
                         let ip = body
@@ -189,15 +190,15 @@ impl MamClient {
                             .map(VpnIp)
                             .unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
                         warn!("MAM ASN mismatch: ip={}", ip.0);
-                        (Event::MamAsnMismatch(ip), new_session)
+                        (Event::MamAsnMismatch { at: Utc::now(), ip }, new_session)
                     }
                     Ok(body) => {
                         warn!("MAM seedbox non-success: {}", body.msg);
-                        (Event::MamUpdateSuccess, new_session)
+                        (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
                     }
                     Err(e) => {
                         warn!("MAM seedbox response parse failed: {e}");
-                        (Event::MamUpdateSuccess, new_session)
+                        (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
                     }
                 }
             }
@@ -218,7 +219,10 @@ impl MamClient {
             Err(e) => {
                 warn!("MAM connectivity check request failed: {e}");
                 (
-                    Event::MamStatusObserved(MamStatus::Unreachable),
+                    Event::MamStatusObserved {
+                        at: Utc::now(),
+                        status: MamStatus::Unreachable,
+                    },
                     new_session,
                 )
             }
@@ -228,7 +232,10 @@ impl MamClient {
                     warn!("MAM connectivity check HTTP {}", status);
                     self.emit_http(&self.load_url, status.as_u16(), "");
                     return (
-                        Event::MamStatusObserved(MamStatus::Unreachable),
+                        Event::MamStatusObserved {
+                            at: Utc::now(),
+                            status: MamStatus::Unreachable,
+                        },
                         new_session,
                     );
                 }
@@ -249,12 +256,21 @@ impl MamClient {
                         } else {
                             MamStatus::NotConnectable
                         };
-                        (Event::MamStatusObserved(mam_status), new_session)
+                        (
+                            Event::MamStatusObserved {
+                                at: Utc::now(),
+                                status: mam_status,
+                            },
+                            new_session,
+                        )
                     }
                     Err(e) => {
                         warn!("MAM connectivity parse failed: {e}");
                         (
-                            Event::MamStatusObserved(MamStatus::Unreachable),
+                            Event::MamStatusObserved {
+                                at: Utc::now(),
+                                status: MamStatus::Unreachable,
+                            },
                             new_session,
                         )
                     }
@@ -314,7 +330,7 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUpdateSuccess));
+        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
     }
 
     #[tokio::test]
@@ -339,7 +355,9 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamAsnMismatch(ip) if ip.0.to_string() == "79.127.184.201"));
+        assert!(
+            matches!(event, Event::MamAsnMismatch { ip, .. } if ip.0.to_string() == "79.127.184.201")
+        );
     }
 
     #[tokio::test]
@@ -394,7 +412,7 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUpdateSuccess));
+        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
     }
 
     // ── check_connectability ──────────────────────────────────────────────────
@@ -422,7 +440,10 @@ mod tests {
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,
-            Event::MamStatusObserved(MamStatus::Connectable)
+            Event::MamStatusObserved {
+                status: MamStatus::Connectable,
+                ..
+            }
         ));
     }
 
@@ -449,7 +470,10 @@ mod tests {
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,
-            Event::MamStatusObserved(MamStatus::NotConnectable)
+            Event::MamStatusObserved {
+                status: MamStatus::NotConnectable,
+                ..
+            }
         ));
     }
 
@@ -476,7 +500,10 @@ mod tests {
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,
-            Event::MamStatusObserved(MamStatus::NotConnectable)
+            Event::MamStatusObserved {
+                status: MamStatus::NotConnectable,
+                ..
+            }
         ));
     }
 
@@ -525,7 +552,10 @@ mod tests {
         let event = mam.check_connectability().await;
         assert!(matches!(
             event,
-            Event::MamStatusObserved(MamStatus::Unreachable)
+            Event::MamStatusObserved {
+                status: MamStatus::Unreachable,
+                ..
+            }
         ));
     }
 }

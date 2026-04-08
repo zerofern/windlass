@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::Utc;
 use uom::si::information::byte;
 use windlass_core::events::Event;
 use windlass_local::{monitors, vpn_files};
@@ -18,7 +19,7 @@ impl ShellContext<'_> {
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(duration).await;
-            let _ = tx.send(Event::Wakeup(id)).await;
+            let _ = tx.send(Event::Wakeup { at: Utc::now(), id }).await;
         });
         self.wakeups.insert(id, handle);
     }
@@ -36,7 +37,12 @@ impl ShellContext<'_> {
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()));
-            let _ = tx.send(Event::PortFileReadResult(result)).await;
+            let _ = tx
+                .send(Event::PortFileReadResult {
+                    at: Utc::now(),
+                    result,
+                })
+                .await;
         });
     }
 
@@ -48,7 +54,7 @@ impl ShellContext<'_> {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             docker.fetch_and_dump_logs(&deps).await;
-            let _ = tx.send(Event::LogsDumped).await;
+            let _ = tx.send(Event::LogsDumped { at: Utc::now() }).await;
         });
     }
 
@@ -124,7 +130,12 @@ impl ShellContext<'_> {
             let space = tokio::task::spawn_blocking(move || monitors::check_disk_space(&path))
                 .await
                 .unwrap_or_else(|_| uom::si::f64::Information::new::<byte>(f64::MAX));
-            let _ = tx.send(Event::DiskSpaceObserved(space)).await;
+            let _ = tx
+                .send(Event::DiskSpaceObserved {
+                    at: Utc::now(),
+                    space,
+                })
+                .await;
         });
     }
 
@@ -134,7 +145,12 @@ impl ShellContext<'_> {
         tokio::spawn(async move {
             // Shell sends the raw full list — Core owns the deduplication logic.
             let current = qbit.list_torrents(&cookie).await;
-            let _ = tx.send(Event::NewTorrentsObserved(current)).await;
+            let _ = tx
+                .send(Event::NewTorrentsObserved {
+                    at: Utc::now(),
+                    torrents: current,
+                })
+                .await;
         });
     }
 

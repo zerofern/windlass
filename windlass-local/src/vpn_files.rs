@@ -1,3 +1,4 @@
+use chrono::Utc;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -132,7 +133,14 @@ pub fn spawn_file_watcher_inner(
                 last_sent = Some(*val);
             }
 
-            if tx.send(Event::PortFileReadResult(result)).await.is_err() {
+            if tx
+                .send(Event::PortFileReadResult {
+                    at: Utc::now(),
+                    result,
+                })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -242,7 +250,7 @@ mod tests {
             .expect("channel closed unexpectedly");
         let expected_port = VpnPort::try_new(51821).unwrap();
         assert!(
-            matches!(event, Event::PortFileReadResult(Ok((_, p))) if p == expected_port),
+            matches!(event, Event::PortFileReadResult { result: Ok((_, p)), .. } if p == expected_port),
             "expected PortFileReadResult(Ok(_, 51821)), got {event:?}"
         );
     }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 windlass-types = { workspace = true }
+chrono         = { workspace = true }
 tracing        = { workspace = true }
 uom            = { workspace = true }
 serde          = { workspace = true }

@@ -94,6 +94,7 @@ pub async fn run() -> Result<()> {
     // If DEBUG_MODE_ON_START=true, the stream will pause on it before
     // the main loop receives it.
     tx.send(Event::Init {
+        at: chrono::Utc::now(),
         is_gluetun_healthy: boot.is_gluetun_healthy,
         port_files,
     })
@@ -105,7 +106,7 @@ pub async fn run() -> Result<()> {
 
         let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
-        let actions = state.process_event(event);
+        let actions = state.process_event(event, chrono::Utc::now());
         let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(state.clone()));
         DebuggableShell(ShellContext {
             docker: &docker,

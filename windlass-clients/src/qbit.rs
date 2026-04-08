@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -74,7 +75,7 @@ impl QbitClient {
                 // Connection refused is normal during container startup — report as
                 // ConnectionRefused so the Core can retry silently without alerting.
                 debug!("qBit auth request failed (connection): {e}");
-                Event::QbitConnectionRefused
+                Event::QbitConnectionRefused { at: Utc::now() }
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -85,17 +86,23 @@ impl QbitClient {
                 if status.is_success() && body.trim() == "Ok." {
                     let Some(cookie) = sid else {
                         warn!("qBit auth: ok status but no SID cookie in response");
-                        return Event::QbitAuthFailed;
+                        return Event::QbitAuthFailed { at: Utc::now() };
                     };
                     debug!("qBit auth success");
-                    return Event::QbitAuthSuccess(AuthCookie(cookie));
+                    return Event::QbitAuthSuccess {
+                        at: Utc::now(),
+                        cookie: AuthCookie(cookie),
+                    };
                 }
                 if body.trim() == "Fails." {
                     warn!("qBit auth: credentials rejected (Fails.)");
-                    return Event::QbitAuthFailed;
+                    return Event::QbitAuthFailed { at: Utc::now() };
                 }
                 warn!("qBit auth unexpected response: status={status}, body={body:?}");
-                Event::QbitApiError(HttpStatusCode(status.as_u16()))
+                Event::QbitApiError {
+                    at: Utc::now(),
+                    code: HttpStatusCode(status.as_u16()),
+                }
             }
         }
     }
@@ -114,7 +121,10 @@ impl QbitClient {
         {
             Err(e) => {
                 warn!("qBit port sync request failed: {e}");
-                Event::QbitPortSyncFailed(HttpStatusCode(0))
+                Event::QbitPortSyncFailed {
+                    at: Utc::now(),
+                    code: HttpStatusCode(0),
+                }
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -122,10 +132,13 @@ impl QbitClient {
                 self.emit_http("POST", &url, Some(req_body), status.as_u16(), &body);
                 if status.is_success() {
                     debug!("qBit port sync success");
-                    Event::QbitPortSyncSuccess
+                    Event::QbitPortSyncSuccess { at: Utc::now() }
                 } else {
                     warn!("qBit port sync failed: status={status}");
-                    Event::QbitPortSyncFailed(HttpStatusCode(status.as_u16()))
+                    Event::QbitPortSyncFailed {
+                        at: Utc::now(),
+                        code: HttpStatusCode(status.as_u16()),
+                    }
                 }
             }
         }
@@ -204,7 +217,7 @@ mod tests {
         );
         let event = qbit.authenticate().await;
         assert!(
-            matches!(&event, Event::QbitAuthSuccess(AuthCookie(s)) if s == "abc123"),
+            matches!(&event, Event::QbitAuthSuccess { cookie: AuthCookie(s), .. } if s == "abc123"),
             "Expected QbitAuthSuccess(abc123), got {event:?}"
         );
     }
@@ -226,7 +239,7 @@ mod tests {
             Arc::new(|_| {}),
         );
         let event = qbit.authenticate().await;
-        assert!(matches!(event, Event::QbitAuthFailed));
+        assert!(matches!(event, Event::QbitAuthFailed { .. }));
     }
 
     #[tokio::test]
@@ -246,7 +259,7 @@ mod tests {
             Arc::new(|_| {}),
         );
         let event = qbit.authenticate().await;
-        assert!(matches!(event, Event::QbitAuthFailed));
+        assert!(matches!(event, Event::QbitAuthFailed { .. }));
     }
 
     #[tokio::test]
@@ -260,7 +273,7 @@ mod tests {
             Arc::new(|_| {}),
         );
         let event = qbit.authenticate().await;
-        assert!(matches!(event, Event::QbitConnectionRefused));
+        assert!(matches!(event, Event::QbitConnectionRefused { .. }));
     }
 
     // ── sync_port ─────────────────────────────────────────────────────────────
@@ -284,7 +297,7 @@ mod tests {
         let cookie = AuthCookie("abc123".into());
         let port = VpnPort::try_new(51820).unwrap();
         let event = qbit.sync_port(&cookie, port).await;
-        assert!(matches!(event, Event::QbitPortSyncSuccess));
+        assert!(matches!(event, Event::QbitPortSyncSuccess { .. }));
     }
 
     #[tokio::test]
@@ -308,7 +321,10 @@ mod tests {
         let event = qbit.sync_port(&cookie, port).await;
         assert!(matches!(
             event,
-            Event::QbitPortSyncFailed(HttpStatusCode(403))
+            Event::QbitPortSyncFailed {
+                code: HttpStatusCode(403),
+                ..
+            }
         ));
     }
 

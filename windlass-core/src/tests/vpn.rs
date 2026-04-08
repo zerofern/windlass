@@ -1,12 +1,17 @@
 use super::helpers::*;
 use crate::{actions::Action, events::Event, types::*};
+use chrono::Utc;
 use windlass_types::RetryCount;
+
+fn now() -> chrono::DateTime<Utc> {
+    Utc::now()
+}
 
 #[test]
 fn unexpected_vpn_death_dumps_logs() {
     let state = connected_state();
     let mut state = state;
-    let actions = state.process_event(Event::DockerGluetunDied);
+    let actions = state.process_event(Event::DockerGluetunDied { at: now() }, now());
     assert_eq!(state.vpn, VpnState::DumpingLogs);
     assert!(
         actions
@@ -19,7 +24,7 @@ fn unexpected_vpn_death_dumps_logs() {
 fn death_from_awaiting_tunnel_dumps_logs() {
     let mut state = SystemState::initial();
     state.vpn = VpnState::AwaitingTunnel;
-    let actions = state.process_event(Event::DockerGluetunDied);
+    let actions = state.process_event(Event::DockerGluetunDied { at: now() }, now());
     assert_eq!(state.vpn, VpnState::DumpingLogs);
     assert!(
         actions
@@ -32,7 +37,7 @@ fn death_from_awaiting_tunnel_dumps_logs() {
 fn death_from_stopped_is_noop_for_vpn() {
     let mut state = SystemState::initial();
     state.vpn = VpnState::Stopped;
-    let actions = state.process_event(Event::DockerGluetunDied);
+    let actions = state.process_event(Event::DockerGluetunDied { at: now() }, now());
     assert_eq!(state.vpn, VpnState::Stopped);
     assert!(
         !actions
@@ -50,7 +55,7 @@ fn death_from_stopped_is_noop_for_vpn() {
 fn unexpected_death_resets_qbit_and_mam() {
     let state = connected_state();
     let mut state = state;
-    state.process_event(Event::DockerGluetunDied);
+    state.process_event(Event::DockerGluetunDied { at: now() }, now());
     assert_eq!(state.qbit, QbitState::Offline);
     assert_eq!(state.mam, MamState::Unknown);
 }
@@ -59,7 +64,7 @@ fn unexpected_death_resets_qbit_and_mam() {
 fn logs_dumped_stops_containers_and_restarts_gluetun() {
     let mut state = SystemState::initial();
     state.vpn = VpnState::DumpingLogs;
-    let actions = state.process_event(Event::LogsDumped);
+    let actions = state.process_event(Event::LogsDumped { at: now() }, now());
     assert_eq!(state.vpn, VpnState::Starting);
     assert!(
         actions
@@ -73,7 +78,7 @@ fn logs_dumped_stops_containers_and_restarts_gluetun() {
 fn double_dump_guard_skips_dump_when_starting() {
     let mut state = SystemState::initial();
     state.vpn = VpnState::Starting;
-    let actions = state.process_event(Event::DockerGluetunDied);
+    let actions = state.process_event(Event::DockerGluetunDied { at: now() }, now());
     assert!(
         !actions
             .iter()
@@ -90,7 +95,7 @@ fn double_dump_guard_skips_dump_when_starting() {
 fn double_dump_guard_skips_dump_when_dumping_logs() {
     let mut state = SystemState::initial();
     state.vpn = VpnState::DumpingLogs;
-    let actions = state.process_event(Event::DockerGluetunDied);
+    let actions = state.process_event(Event::DockerGluetunDied { at: now() }, now());
     assert!(
         !actions
             .iter()
@@ -102,7 +107,7 @@ fn double_dump_guard_skips_dump_when_dumping_logs() {
 fn gluetun_healthy_starts_containers() {
     let mut state = SystemState::initial();
     state.vpn = VpnState::Starting;
-    let actions = state.process_event(Event::DockerGluetunHealthy);
+    let actions = state.process_event(Event::DockerGluetunHealthy { at: now() }, now());
     assert_eq!(state.vpn, VpnState::AwaitingTunnel);
     assert!(
         actions
@@ -118,7 +123,13 @@ fn gluetun_healthy_starts_containers() {
 #[test]
 fn port_file_read_ok_authenticates_qbit() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::PortFileReadResult(Ok((ip(), port()))));
+    let actions = state.process_event(
+        Event::PortFileReadResult {
+            at: now(),
+            result: Ok((ip(), port())),
+        },
+        now(),
+    );
     assert!(matches!(
         state.qbit,
         QbitState::Authenticating {
@@ -136,7 +147,13 @@ fn port_file_read_ok_authenticates_qbit() {
 fn port_file_read_same_values_is_noop() {
     // Core ignores no-change reads — debouncer may fire even when content is unchanged.
     let mut state = connected_state();
-    let actions = state.process_event(Event::PortFileReadResult(Ok((ip(), port()))));
+    let actions = state.process_event(
+        Event::PortFileReadResult {
+            at: now(),
+            result: Ok((ip(), port())),
+        },
+        now(),
+    );
     assert!(
         actions.is_empty(),
         "identical ip+port must produce no actions"
@@ -148,7 +165,13 @@ fn port_file_read_new_port_triggers_reauth() {
     use windlass_types::VpnPort;
     let new_port = VpnPort::try_new(51821).unwrap();
     let mut state = connected_state();
-    let actions = state.process_event(Event::PortFileReadResult(Ok((ip(), new_port))));
+    let actions = state.process_event(
+        Event::PortFileReadResult {
+            at: now(),
+            result: Ok((ip(), new_port)),
+        },
+        now(),
+    );
     assert!(matches!(state.qbit, QbitState::Authenticating { .. }));
     assert!(
         actions
@@ -161,7 +184,13 @@ fn port_file_read_new_port_triggers_reauth() {
 fn port_file_read_err_schedules_retry() {
     use windlass_types::WakeupId;
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::PortFileReadResult(Err("partial".into())));
+    let actions = state.process_event(
+        Event::PortFileReadResult {
+            at: now(),
+            result: Err("partial".into()),
+        },
+        now(),
+    );
     assert!(
         actions
             .iter()

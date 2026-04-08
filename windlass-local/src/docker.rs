@@ -2,6 +2,7 @@ use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::container::{LogsOptions, RestartContainerOptions};
 use bollard::models::{EventMessageTypeEnum, HealthStatusEnum};
+use chrono::Utc;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -153,9 +154,9 @@ impl DockerClient {
 
                             let action = msg.action.as_deref().unwrap_or("");
                             let event = if action.starts_with("health_status: healthy") {
-                                Event::DockerGluetunHealthy
+                                Event::DockerGluetunHealthy { at: Utc::now() }
                             } else if action == "die" {
-                                Event::DockerGluetunDied
+                                Event::DockerGluetunDied { at: Utc::now() }
                             } else {
                                 continue;
                             };

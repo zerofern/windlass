@@ -1,14 +1,23 @@
 use super::helpers::*;
 use crate::{actions::Action, events::Event, types::*};
+use chrono::Utc;
 use windlass_types::{RetryCount, WakeupId};
+
+fn now() -> chrono::DateTime<Utc> {
+    Utc::now()
+}
 
 #[test]
 fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::Init {
-        is_gluetun_healthy: true,
-        port_files: Ok((ip(), port())),
-    });
+    let actions = state.process_event(
+        Event::Init {
+            at: now(),
+            is_gluetun_healthy: true,
+            port_files: Ok((ip(), port())),
+        },
+        now(),
+    );
     assert!(matches!(state.vpn, VpnState::Connected { .. }));
     assert!(matches!(
         state.qbit,
@@ -36,10 +45,14 @@ fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
 #[test]
 fn init_healthy_without_files_waits_for_watcher() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::Init {
-        is_gluetun_healthy: true,
-        port_files: Err("not ready".into()),
-    });
+    let actions = state.process_event(
+        Event::Init {
+            at: now(),
+            is_gluetun_healthy: true,
+            port_files: Err("not ready".into()),
+        },
+        now(),
+    );
     assert_eq!(state.vpn, VpnState::AwaitingTunnel);
     assert!(
         !actions
@@ -51,10 +64,14 @@ fn init_healthy_without_files_waits_for_watcher() {
 #[test]
 fn init_unhealthy_triggers_workflow_a() {
     let mut state = SystemState::initial();
-    let actions = state.process_event(Event::Init {
-        is_gluetun_healthy: false,
-        port_files: Err("n/a".into()),
-    });
+    let actions = state.process_event(
+        Event::Init {
+            at: now(),
+            is_gluetun_healthy: false,
+            port_files: Err("n/a".into()),
+        },
+        now(),
+    );
     assert_eq!(state.vpn, VpnState::DumpingLogs);
     assert!(
         actions

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -129,42 +130,95 @@ fn any_synced_state() -> impl Strategy<Value = SystemState> {
 fn any_event() -> impl Strategy<Value = Event> {
     prop_oneof![
         (any::<bool>(), any_vpn_ip(), any_vpn_port()).prop_map(|(healthy, ip, port)| Event::Init {
+            at: DateTime::UNIX_EPOCH,
             is_gluetun_healthy: healthy,
             port_files: Ok((ip, port)),
         }),
         any::<bool>().prop_map(|healthy| Event::Init {
+            at: DateTime::UNIX_EPOCH,
             is_gluetun_healthy: healthy,
             port_files: Err("not ready".into()),
         }),
-        Just(Event::DockerGluetunDied),
-        Just(Event::DockerGluetunHealthy),
-        (any_vpn_ip(), any_vpn_port())
-            .prop_map(|(ip, port)| Event::PortFileReadResult(Ok((ip, port)))),
+        Just(Event::DockerGluetunDied {
+            at: DateTime::UNIX_EPOCH
+        }),
+        Just(Event::DockerGluetunHealthy {
+            at: DateTime::UNIX_EPOCH
+        }),
+        (any_vpn_ip(), any_vpn_port()).prop_map(|(ip, port)| Event::PortFileReadResult {
+            at: DateTime::UNIX_EPOCH,
+            result: Ok((ip, port))
+        }),
         proptest::string::string_regex("[a-z]{1,20}")
             .unwrap()
-            .prop_map(|s| Event::PortFileReadResult(Err(s))),
-        any_auth_cookie().prop_map(Event::QbitAuthSuccess),
-        Just(Event::QbitAuthFailed),
-        Just(Event::QbitConnectionRefused),
-        any::<u16>().prop_map(|c| Event::QbitApiError(HttpStatusCode(c))),
-        Just(Event::QbitPortSyncSuccess),
-        any::<u16>().prop_map(|c| Event::QbitPortSyncFailed(HttpStatusCode(c))),
-        Just(Event::MamUpdateSuccess),
-        any_vpn_ip().prop_map(Event::MamAsnMismatch),
+            .prop_map(|s| Event::PortFileReadResult {
+                at: DateTime::UNIX_EPOCH,
+                result: Err(s)
+            }),
+        any_auth_cookie().prop_map(|cookie| Event::QbitAuthSuccess {
+            at: DateTime::UNIX_EPOCH,
+            cookie
+        }),
+        Just(Event::QbitAuthFailed {
+            at: DateTime::UNIX_EPOCH
+        }),
+        Just(Event::QbitConnectionRefused {
+            at: DateTime::UNIX_EPOCH
+        }),
+        any::<u16>().prop_map(|c| Event::QbitApiError {
+            at: DateTime::UNIX_EPOCH,
+            code: HttpStatusCode(c)
+        }),
+        Just(Event::QbitPortSyncSuccess {
+            at: DateTime::UNIX_EPOCH
+        }),
+        any::<u16>().prop_map(|c| Event::QbitPortSyncFailed {
+            at: DateTime::UNIX_EPOCH,
+            code: HttpStatusCode(c)
+        }),
+        Just(Event::MamUpdateSuccess {
+            at: DateTime::UNIX_EPOCH
+        }),
+        any_vpn_ip().prop_map(|ip| Event::MamAsnMismatch {
+            at: DateTime::UNIX_EPOCH,
+            ip
+        }),
         prop_oneof![
-            Just(Event::MamStatusObserved(MamStatus::Connectable)),
-            Just(Event::MamStatusObserved(MamStatus::NotConnectable)),
-            Just(Event::MamStatusObserved(MamStatus::Unreachable)),
+            Just(Event::MamStatusObserved {
+                at: DateTime::UNIX_EPOCH,
+                status: MamStatus::Connectable
+            }),
+            Just(Event::MamStatusObserved {
+                at: DateTime::UNIX_EPOCH,
+                status: MamStatus::NotConnectable
+            }),
+            Just(Event::MamStatusObserved {
+                at: DateTime::UNIX_EPOCH,
+                status: MamStatus::Unreachable
+            }),
         ],
-        any_information().prop_map(Event::DiskSpaceObserved),
+        any_information().prop_map(|space| Event::DiskSpaceObserved {
+            at: DateTime::UNIX_EPOCH,
+            space
+        }),
         prop::collection::vec(
             proptest::string::string_regex("[a-zA-Z0-9. ]{1,30}").unwrap(),
             0..5
         )
-        .prop_map(|v| Event::NewTorrentsObserved(v.into_iter().map(TorrentName).collect())),
-        Just(Event::LogsDumped),
-        any_wakeup_id().prop_map(Event::Wakeup),
-        Just(Event::MamRateLimitViolation),
+        .prop_map(|v| Event::NewTorrentsObserved {
+            at: DateTime::UNIX_EPOCH,
+            torrents: v.into_iter().map(TorrentName).collect()
+        }),
+        Just(Event::LogsDumped {
+            at: DateTime::UNIX_EPOCH
+        }),
+        any_wakeup_id().prop_map(|id| Event::Wakeup {
+            at: DateTime::UNIX_EPOCH,
+            id
+        }),
+        Just(Event::MamRateLimitViolation {
+            at: DateTime::UNIX_EPOCH
+        }),
     ]
 }
 
@@ -177,7 +231,7 @@ proptest! {
         mut state in any_system_state(),
         event in any_event(),
     ) {
-        let _ = state.process_event(event);
+        let _ = state.process_event(event, Utc::now());
     }
 
     // 2. Timing — single call must return within 1ms on any input.
@@ -191,7 +245,7 @@ proptest! {
         // still catching accidental blocking I/O or sleep calls.
         let deadline = Duration::from_millis(100);
         let start = Instant::now();
-        let _ = state.process_event(event);
+        let _ = state.process_event(event, Utc::now());
         let elapsed = start.elapsed();
         prop_assert!(
             elapsed < deadline,
@@ -210,7 +264,7 @@ proptest! {
         let start = Instant::now();
         let mut state = SystemState::initial();
         for event in events {
-            state.process_event(event);
+            state.process_event(event, Utc::now());
         }
         let elapsed = start.elapsed();
         prop_assert!(elapsed < deadline, "50-event sequence took {:?}", elapsed);
@@ -220,7 +274,7 @@ proptest! {
     //    active state. Prevents stale state from surviving a VPN death.
     #[test]
     fn gluetun_death_always_clears_qbit_and_mam(mut state in any_active_state()) {
-        state.process_event(Event::DockerGluetunDied);
+        state.process_event(Event::DockerGluetunDied { at: DateTime::UNIX_EPOCH }, Utc::now());
         prop_assert_eq!(state.qbit, QbitState::Offline);
         prop_assert_eq!(state.mam, MamState::Unknown);
     }
@@ -233,7 +287,10 @@ proptest! {
         ip in any_vpn_ip(),
     ) {
         state.mam = MamState::AsnBlocked { ip };
-        let actions = state.process_event(Event::MamStatusObserved(MamStatus::Unreachable));
+        let actions = state.process_event(
+            Event::MamStatusObserved { at: DateTime::UNIX_EPOCH, status: MamStatus::Unreachable },
+            Utc::now(),
+        );
         prop_assert!(actions.is_empty());
     }
 
@@ -243,7 +300,7 @@ proptest! {
     fn monitoring_wakeups_do_not_mutate_state(state in any_active_state()) {
         for wakeup in [WakeupId::Heartbeat, WakeupId::DiskCheck, WakeupId::TorrentCheck] {
             let mut new_state = state.clone();
-            new_state.process_event(Event::Wakeup(wakeup));
+            new_state.process_event(Event::Wakeup { at: DateTime::UNIX_EPOCH, id: wakeup }, Utc::now());
             prop_assert_eq!(
                 new_state, state.clone(),
                 "Wakeup({:?}) must not mutate state", wakeup
@@ -259,14 +316,14 @@ proptest! {
         free_gb in 51.0f64..1000.0f64,
     ) {
         let observations = [
-            Event::MamStatusObserved(MamStatus::Connectable),
-            Event::DiskSpaceObserved(Information::new::<gigabyte>(free_gb)),
-            Event::NewTorrentsObserved(vec![]),
+            Event::MamStatusObserved { at: DateTime::UNIX_EPOCH, status: MamStatus::Connectable },
+            Event::DiskSpaceObserved { at: DateTime::UNIX_EPOCH, space: Information::new::<gigabyte>(free_gb) },
+            Event::NewTorrentsObserved { at: DateTime::UNIX_EPOCH, torrents: vec![] },
         ];
 
         for event in observations {
             let mut new_state = state.clone();
-            new_state.process_event(event.clone());
+            new_state.process_event(event.clone(), Utc::now());
             prop_assert!(
                 matches!(new_state.vpn, VpnState::Connected { .. }),
                 "{:?} disrupted VpnState", event

@@ -65,7 +65,7 @@ impl DebuggableEventStream {
         loop {
             let event = self.internal_rx.recv().await?;
 
-            if matches!(event, Event::MamRateLimitViolation) {
+            if matches!(event, Event::MamRateLimitViolation { .. }) {
                 warn!("MAM rate-limit violation detected — entering debug mode");
                 self.debug_ctrl.enable_debug(self.obs_tx.clone());
                 let _ = self.obs_tx.send(Observation::DebugModeChanged(true));
@@ -92,23 +92,23 @@ impl DebuggableEventStream {
 const fn event_variant(event: &Event) -> &'static str {
     match event {
         Event::Init { .. } => "Init",
-        Event::DockerGluetunDied => "DockerGluetunDied",
-        Event::DockerGluetunHealthy => "DockerGluetunHealthy",
-        Event::PortFileReadResult(_) => "PortFileReadResult",
-        Event::QbitAuthSuccess(_) => "QbitAuthSuccess",
-        Event::QbitAuthFailed => "QbitAuthFailed",
-        Event::QbitConnectionRefused => "QbitConnectionRefused",
-        Event::QbitApiError(_) => "QbitApiError",
-        Event::QbitPortSyncSuccess => "QbitPortSyncSuccess",
-        Event::QbitPortSyncFailed(_) => "QbitPortSyncFailed",
-        Event::MamUpdateSuccess => "MamUpdateSuccess",
-        Event::MamAsnMismatch(_) => "MamAsnMismatch",
-        Event::MamStatusObserved(_) => "MamStatusObserved",
-        Event::DiskSpaceObserved(_) => "DiskSpaceObserved",
-        Event::NewTorrentsObserved(_) => "NewTorrentsObserved",
-        Event::LogsDumped => "LogsDumped",
-        Event::Wakeup(_) => "Wakeup",
-        Event::MamRateLimitViolation => "MamRateLimitViolation",
+        Event::DockerGluetunDied { .. } => "DockerGluetunDied",
+        Event::DockerGluetunHealthy { .. } => "DockerGluetunHealthy",
+        Event::PortFileReadResult { .. } => "PortFileReadResult",
+        Event::QbitAuthSuccess { .. } => "QbitAuthSuccess",
+        Event::QbitAuthFailed { .. } => "QbitAuthFailed",
+        Event::QbitConnectionRefused { .. } => "QbitConnectionRefused",
+        Event::QbitApiError { .. } => "QbitApiError",
+        Event::QbitPortSyncSuccess { .. } => "QbitPortSyncSuccess",
+        Event::QbitPortSyncFailed { .. } => "QbitPortSyncFailed",
+        Event::MamUpdateSuccess { .. } => "MamUpdateSuccess",
+        Event::MamAsnMismatch { .. } => "MamAsnMismatch",
+        Event::MamStatusObserved { .. } => "MamStatusObserved",
+        Event::DiskSpaceObserved { .. } => "DiskSpaceObserved",
+        Event::NewTorrentsObserved { .. } => "NewTorrentsObserved",
+        Event::LogsDumped { .. } => "LogsDumped",
+        Event::Wakeup { .. } => "Wakeup",
+        Event::MamRateLimitViolation { .. } => "MamRateLimitViolation",
     }
 }
 
