@@ -1,4 +1,4 @@
-import type { VpnState, QbitState, MamState, RunMode, SystemState } from '@/types/api'
+import type { VpnState, QbitState, MamState, SystemState } from '@/types/api'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 
@@ -53,16 +53,6 @@ function mamVariant(s: MamState): 'success' | 'warning' | 'destructive' | 'secon
   return 'secondary'
 }
 
-function runModeVariant(m: RunMode): 'success' | 'destructive' {
-  return m === 'Active' ? 'success' : 'destructive'
-}
-
-function runModeLabel(m: RunMode): string {
-  if (m === 'Active') return 'Active'
-  if (typeof m === 'object' && 'Fatal' in m) return `Fatal: ${m.Fatal.reason}`
-  return 'Unknown'
-}
-
 interface Props { state: SystemState; compact?: boolean }
 
 export function StateDisplay({ state, compact }: Props) {
@@ -74,14 +64,6 @@ export function StateDisplay({ state, compact }: Props) {
       <Card>
         <CardHeader><CardTitle>System</CardTitle></CardHeader>
         <CardContent className="space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-muted-foreground">Mode</span>
-            <Badge variant={runModeVariant(state.run_mode)}>{runModeLabel(state.run_mode)}</Badge>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-muted-foreground">Hard recoveries</span>
-            <span className="text-sm font-mono">{state.hard_recoveries}</span>
-          </div>
           <div className="flex items-center justify-between">
             <span className="text-sm text-muted-foreground">Known torrents</span>
             <span className="text-sm font-mono">{state.known_torrents.length}</span>

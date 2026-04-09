@@ -67,6 +67,9 @@ evaluating a series. Everything else hangs off `books`.
 | `profile_preferences` | Stable identity layer: flexible tag-style rows (e.g. `narrator:Ray Porter = love`, `genre:LitRPG = avoid`). |
 | `profile_signals` | Dynamic LLM-updated weights per dimension. Updated after each listening session. |
 | `alerts` | All fired alerts. UUID primary key for Gotify deep-links. Severity, timestamp, triggering event, system state snapshot. |
+| `playback_sessions` | One row per play/pause event per book. `start_time`, `start_position_sec`, `end_time`, `end_position_sec`, `device_id`. Used for Sleep Recovery bounded search and slog detection refinement. |
+| `sync_artifacts` | Forced-alignment JSON map for a book (epub paragraph ↔ audio timestamp). One row per book, FK to `books`. State: `pending_alignment → aligned`. Only present when an epub counterpart exists. |
+| `context_chunks` | Hierarchical Act summaries per book generated JIT as the user progresses. FK to `books`. Stores `act_index`, `plot_advancements`, `character_roster`, and `world_lore` as structured JSON. |
 
 ### JIT (Just-In-Time) Context Injection
 
@@ -297,9 +300,11 @@ palate cleanser under 10 hours."* The LLM parses the prompt, scans the existing 
 > An on-demand, spoiler-free cheat sheet for dense sci-fi/fantasy world-building.
 
 **Execution:** When a user is confused by factions or physics (e.g., in *Blindsight*), they
-click "Generate Glossary." The LLM is strictly prompted with the user's current chapter
-progress and generates a structured Dramatis Personae and term glossary — barring any plot
-points beyond the user's current timestamp.
+click "Generate Glossary." The LLM generates a structured Dramatis Personae and term
+glossary barring any plot points beyond the user's current position. When a sync artifact
+exists (§8.2), the text payload is truncated at the user's exact audio timestamp for a
+precise, paragraph-level spoiler boundary. Without a sync artifact, truncation falls back
+to chapter-level granularity.
 
 #### "Previously On…" Series Recaps
 
@@ -401,7 +406,105 @@ Both options guarantee zero data training.
 
 ---
 
-## 8. The Control Plane (Web UI)
+## 8. Advanced AI Pipeline
+
+> These features are unlocked progressively when an `.epub` counterpart is available for a
+> given title. All standard features continue to operate normally when no epub is present.
+
+### 8.1 The Asynchronous Worker Node
+
+> Off-loads compute-heavy alignment processing to local high-performance hardware without
+> impacting the lightweight server.
+
+**Rationale:** Forced audio-to-text alignment is CPU/GPU intensive and unsuitable for a
+low-power home server. Windlass offloads this work to a separate worker process designed to
+run on local high-compute hardware (e.g., a workstation or gaming laptop).
+
+**Execution:**
+
+- The worker is governed by a `systemd` timer with a `ConditionACPower=true` guard,
+  ensuring it only activates when the device is on wall power and never drains battery.
+- On wake, the worker polls the Windlass REST API for books in a `Pending_Alignment` state.
+  If the queue is empty, it exits silently.
+- For each queued book, the worker pulls the `.m4b` and `.epub` files (via direct network
+  mount or temporary API download), runs the alignment process using local hardware, and
+  pushes the resulting sync artifact back to the Windlass API.
+- On completion, the book's state advances to `Aligned` and a Gotify notification is fired.
+  The worker scrubs all local temporary files after each job.
+
+### 8.2 Forced Synchronization Engine (Audio-to-Text Mapping)
+
+> Bridges Audiobookshelf's time-based tracking and the LLM's text-based context by
+> generating a precise map between audio timestamps and epub paragraphs.
+
+**Execution:** The worker node runs a forced-alignment tool (e.g., WhisperX) against the
+`.m4b` audio and `.epub` text. The output is a structured JSON map stored in `sync_artifacts`,
+linking every audio timecode (e.g., `04:12:35`) to the corresponding paragraph and chapter
+in the epub.
+
+**Impact on existing features:**
+
+- **Glossary Generator & "Previously On…":** The LLM text payload is truncated at the
+  user's exact audio timestamp rather than chapter-level granularity, hardening the
+  spoiler-free guarantee.
+- **Hierarchical Summarization:** The sync map is the prerequisite that enables JIT
+  summary generation tied to precise reading progress milestones (§8.3).
+
+### 8.3 Hierarchical Context Summarization
+
+> Compresses a full novel into a structured, cost-efficient LLM memory without exhausting
+> token limits.
+
+**Execution:** Once a sync artifact exists, Windlass segments the epub into logical "Acts"
+(roughly 20% milestones). Summarization is **Just-In-Time** — triggered when ABS reports
+the user has completed each Act, not pre-processed in bulk. Each Act is summarised via a
+single LLM call using a strict JSON Schema:
+
+- `plot_advancements`: Key events that occurred in the Act
+- `character_roster`: New characters introduced; status updates on existing ones
+- `world_lore`: New rules, locations, or mechanics explained in the text
+
+**The Super-Summary:** When any feature requiring book-wide context fires (Bailout Protocol,
+Series Recap, Slog Detector analysis), Windlass concatenates all completed Act summaries
+into a single dense payload — giving the LLM full memory of everything the user has read so
+far at a fraction of the token cost.
+
+### 8.4 The "Sleep Recovery" Protocol
+
+> A natural-language rewinding tool that rescues users who fall asleep during playback and
+> wake up having lost their place.
+
+**Session Boundary Tracking:** Windlass continuously monitors ABS for playback state
+changes, logging a row to `playback_sessions` every time playback starts or stops
+(`start_time`, `start_position_sec`, `end_time`, `end_position_sec`). This bounds the
+search window to the exact block of audio that played during the suspected sleep session,
+preventing the LLM from finding a false match elsewhere in the book.
+
+**Execution:**
+
+1. The user opens the Action Center and selects **"I fell asleep."**
+2. Windlass prompts: *"What is the last thing you remember happening?"*
+3. Windlass identifies the last significant listening session (e.g., 4 hours from 11 PM to
+   3 AM) and extracts only the epub text corresponding to that time window via the sync map.
+4. The LLM searches strictly within this bounded text block, returning the exact matching
+   paragraph.
+5. Windlass translates that paragraph back to an audio timestamp, uses the ABS API to rewind
+   the user's progress to that exact second, and logs the correction in `reading_ledger`.
+
+**Offline / Partial Sync Fallback:** When playing on a mobile client without a live server
+connection (e.g., the "Still" iOS app in airplane mode), real-time session boundaries are
+unavailable. Windlass falls back to a **progress-bounded search**: it restricts the LLM's
+search window to the epub text between the last known synced position before the offline
+session and the newly synced position on reconnect. The result is identical — the user is
+rewound to the correct sentence.
+
+**Degraded Mode (No Epub):** If no sync artifact exists, Sleep Recovery cannot perform
+text localisation. Windlass instead presents the user with the raw session log (*"You
+listened for 3h 42m, from 06:14:22 to 10:01:44"*) to assist with manual rewinding.
+
+---
+
+## 9. The Control Plane (Web UI)
 
 - **Embedded Web UI:** A responsive dashboard (mobile + desktop) served directly from the
   Rust binary via axum and rust-embed. Built with React + Vite + shadcn/ui.
@@ -514,7 +617,7 @@ tables.
 
 ---
 
-## 9. Deferred Features
+## 10. Deferred Features
 
 Features confirmed for the roadmap but not yet scheduled for implementation.
 
