@@ -23,8 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arc_swap::ArcSwap;
 use serde::Serialize;
 use tokio::sync::{Semaphore, broadcast, mpsc};
+use uuid::Uuid;
 use windlass_core::events::Event;
-use windlass_core::{HttpObserver, Observation};
+use windlass_core::HttpObserver;
+use windlass_types::HttpExchange;
 
 pub(crate) use stream::QueueSink;
 
@@ -108,8 +110,6 @@ pub struct DebugController {
     step: Arc<Semaphore>,
     /// When set, the next `acquire_step` caller skips its item instead of executing it.
     skip: Arc<AtomicBool>,
-    /// Present only while debug mode is active — lets clients emit `HttpExchange` observations.
-    obs_tx: Arc<ArcSwap<Option<broadcast::Sender<Observation>>>>,
     /// What the system is currently paused on; `None` when running freely.
     paused_on: Arc<ArcSwap<Option<PausedOn>>>,
     // ── Queue routing ─────────────────────────────────────────────────────────
@@ -125,8 +125,10 @@ pub struct DebugController {
     pub snapshot: Arc<ArcSwap<DebugState>>,
     /// HTTP handlers send queue-manipulation commands here; main loop drains `cmd_rx`.
     pub cmd_tx: mpsc::Sender<DebugCommand>,
-    /// `DebugLogLayer` sends captured log lines here (Phase 5+); main loop drains `log_rx`.
+    /// `DebugLogLayer` sends captured log lines here; main loop drains `log_rx`.
     pub log_tx: mpsc::Sender<LogEntry>,
+    /// `make_http_observer` sends `(action_id, exchange)` here in debug mode.
+    exchange_tx: mpsc::Sender<(Uuid, HttpExchange)>,
     /// Broadcasts the new `seq` on every snapshot update; SSE handler subscribes.
     pub notify_tx: broadcast::Sender<u64>,
 }
@@ -140,6 +142,9 @@ pub struct DebugOwnedPart {
     pub queue_rx: mpsc::Receiver<StoredEvent>,
     pub cmd_rx: mpsc::Receiver<DebugCommand>,
     pub log_rx: mpsc::Receiver<LogEntry>,
+    /// Receives `(action_id, HttpExchange)` pairs from `make_http_observer`
+    /// when debug mode is active.
+    pub exchange_rx: mpsc::Receiver<(Uuid, HttpExchange)>,
 }
 
 impl DebugController {
@@ -150,6 +155,7 @@ impl DebugController {
         let (stored_tx, queue_rx) = mpsc::channel::<StoredEvent>(128);
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (log_tx, log_rx) = mpsc::channel(1024);
+        let (exchange_tx, exchange_rx) = mpsc::channel(1024);
         let (notify_tx, _) = broadcast::channel(256);
 
         // Start in non-debug mode: intake task routes to internal_tx.
@@ -161,7 +167,6 @@ impl DebugController {
             action_breakpoints: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             step: Arc::new(Semaphore::new(0)),
             skip: Arc::new(AtomicBool::new(false)),
-            obs_tx: Arc::new(ArcSwap::from_pointee(None)),
             paused_on: Arc::new(ArcSwap::from_pointee(None)),
             queue_sink,
             internal_tx,
@@ -169,6 +174,7 @@ impl DebugController {
             snapshot: Arc::new(ArcSwap::from_pointee(DebugState::initial())),
             cmd_tx,
             log_tx,
+            exchange_tx,
             notify_tx,
         };
         let owned = DebugOwnedPart {
@@ -176,6 +182,7 @@ impl DebugController {
             queue_rx,
             cmd_rx,
             log_rx,
+            exchange_rx,
         };
         (ctrl, owned)
     }
@@ -189,9 +196,8 @@ impl DebugController {
 
     // ── Debug mode ────────────────────────────────────────────────────────────
 
-    pub fn enable_debug(&self, obs_tx: broadcast::Sender<Observation>) {
+    pub fn enable_debug(&self) {
         self.debug_mode.store(true, Ordering::SeqCst);
-        self.obs_tx.store(Arc::new(Some(obs_tx)));
         // Swap intake routing to the VecDeque path.
         self.queue_sink
             .store(Arc::new(QueueSink::Queue(self.stored_tx.clone())));
@@ -200,7 +206,6 @@ impl DebugController {
     pub fn disable_debug(&self) {
         self.debug_mode.store(false, Ordering::SeqCst);
         self.skip.store(false, Ordering::SeqCst);
-        self.obs_tx.store(Arc::new(None));
         self.paused_on.store(Arc::new(None));
         self.step.add_permits(usize::MAX / 2);
         // Restore intake routing to the direct mpsc path.
@@ -323,14 +328,24 @@ impl DebugController {
 
     // ── HTTP observation ──────────────────────────────────────────────────────
 
-    /// Returns an [`HttpObserver`] that forwards observations to the SSE
-    /// channel when debug mode is active, and is a no-op when it is not.
+    /// Returns an [`HttpObserver`] that, when debug mode is active, reads
+    /// `CURRENT_ACTION_ID` from the task-local set by `CausalTx::run` and
+    /// routes the exchange to the main loop via `exchange_tx`. No-op when
+    /// debug mode is off (single atomic load, no allocation).
     #[must_use]
     pub fn make_http_observer(&self) -> HttpObserver {
-        let obs_tx = Arc::clone(&self.obs_tx);
-        Arc::new(move |obs| {
-            if let Some(tx) = obs_tx.load_full().as_ref().as_ref() {
-                let _ = tx.send(obs);
+        let exchange_tx = self.exchange_tx.clone();
+        let debug_mode = self.debug_mode.clone();
+        Arc::new(move |exchange: HttpExchange| {
+            if !debug_mode.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Some(action_id) = causal_tx::CURRENT_ACTION_ID
+                .try_with(|id| *id)
+                .ok()
+                .flatten()
+            {
+                let _ = exchange_tx.try_send((action_id, exchange));
             }
         })
     }

@@ -26,6 +26,20 @@ pub struct VpnPort(u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpStatusCode(pub u16);
 
+/// A single HTTP request/response pair captured from a client call.
+/// Stored per-action in `ActionEntry.http_exchanges` when debug mode is on.
+#[derive(Debug, Clone, Serialize)]
+pub struct HttpExchange {
+    /// Which client emitted this: `"qbit"`, `"mam"`, or `"gotify"`.
+    pub module: String,
+    pub method: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    pub response_status: u16,
+    pub response_body: String,
+}
+
 // ── Torrents ─────────────────────────────────────────────────────────────────
 
 /// The display name of a torrent as reported by qBittorrent.

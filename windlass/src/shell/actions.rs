@@ -31,7 +31,7 @@ impl ShellContext<'_> {
     pub(super) fn read_port_files(&self, causal_tx: CausalTx) {
         let ip_file = self.vpn_ip_file.to_owned();
         let port_file = self.vpn_port_file.to_owned();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
             let result = tokio::task::spawn_blocking(move || {
                 vpn_files::read_port_files(&ip_file, &port_file)
             })
@@ -43,7 +43,7 @@ impl ShellContext<'_> {
                     result,
                 })
                 .await;
-        });
+        }));
     }
 
     // ── Docker ────────────────────────────────────────────────────────────────
@@ -51,10 +51,10 @@ impl ShellContext<'_> {
     pub(super) fn fetch_and_dump_all_logs(&self, causal_tx: CausalTx) {
         let docker = self.docker.clone();
         let deps = self.dependents.to_vec();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
             docker.fetch_and_dump_logs(&deps).await;
             causal_tx.send(Event::LogsDumped { at: Utc::now() }).await;
-        });
+        }));
     }
 
     pub(super) fn stop_dependent_containers(&self) {
@@ -84,43 +84,43 @@ impl ShellContext<'_> {
 
     pub(super) fn authenticate_qbit(&self, causal_tx: CausalTx) {
         let qbit = self.qbit.clone();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
             let event = qbit.authenticate().await;
             causal_tx.send(event).await;
-        });
+        }));
     }
 
     pub(super) fn sync_qbit_port(&self, cookie: AuthCookie, port: VpnPort, causal_tx: CausalTx) {
         let qbit = self.qbit.clone();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(move |causal_tx| async move {
             let event = qbit.sync_port(&cookie, port).await;
             causal_tx.send(event).await;
-        });
+        }));
     }
 
     // ── MAM ───────────────────────────────────────────────────────────────────
 
     pub(super) fn update_mam(&self, _ip: VpnIp, causal_tx: CausalTx) {
         let mam = self.mam.clone();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
             let event = mam.update_seedbox().await;
             causal_tx.send(event).await;
-        });
+        }));
     }
 
     pub(super) fn check_mam_connectability(&self, causal_tx: CausalTx) {
         let mam = self.mam.clone();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
             let event = mam.check_connectability().await;
             causal_tx.send(event).await;
-        });
+        }));
     }
 
     // ── Monitoring ────────────────────────────────────────────────────────────
 
     pub(super) fn check_disk_space(&self, causal_tx: CausalTx) {
         let path = self.data_path.to_owned();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
             let space = tokio::task::spawn_blocking(move || monitors::check_disk_space(&path))
                 .await
                 .unwrap_or_else(|_| uom::si::f64::Information::new::<byte>(f64::MAX));
@@ -130,12 +130,12 @@ impl ShellContext<'_> {
                     space,
                 })
                 .await;
-        });
+        }));
     }
 
     pub(super) fn check_new_torrents(&self, cookie: AuthCookie, causal_tx: CausalTx) {
         let qbit = self.qbit.clone();
-        tokio::spawn(async move {
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
             // Shell sends the raw full list — Core owns the deduplication logic.
             let current = qbit.list_torrents(&cookie).await;
             causal_tx
@@ -144,7 +144,7 @@ impl ShellContext<'_> {
                     torrents: current,
                 })
                 .await;
-        });
+        }));
     }
 
     // ── Alerts ────────────────────────────────────────────────────────────────

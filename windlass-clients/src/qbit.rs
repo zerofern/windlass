@@ -3,8 +3,8 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use windlass_core::events::Event;
-use windlass_core::{HttpObserver, Observation};
-use windlass_types::{AuthCookie, HttpStatusCode, TorrentName, VpnPort};
+use windlass_core::HttpObserver;
+use windlass_types::{AuthCookie, HttpExchange, HttpStatusCode, TorrentName, VpnPort};
 
 #[derive(Deserialize)]
 struct TorrentInfo {
@@ -48,7 +48,7 @@ impl QbitClient {
         response_status: u16,
         response_body: &str,
     ) {
-        (self.on_http)(Observation::HttpExchange {
+        (self.on_http)(HttpExchange {
             module: "qbit".into(),
             method: method.into(),
             url: url.into(),

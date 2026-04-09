@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use windlass_core::events::Event;
 use windlass_core::types::SystemState;
+use windlass_types::HttpExchange;
 
 // ── Event lifecycle ───────────────────────────────────────────────────────────
 
@@ -45,6 +46,8 @@ pub struct ActionEntry {
     pub completed_at: Option<DateTime<Utc>>,
     /// Set when this action produced a result event (Phase 4+).
     pub caused_event_id: Option<Uuid>,
+    /// HTTP exchanges captured while this action was running (Phase 6+).
+    pub http_exchanges: Vec<HttpExchange>,
 }
 
 /// The event currently being processed, including the actions it has produced so far.

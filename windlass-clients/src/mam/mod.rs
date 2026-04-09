@@ -6,8 +6,8 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use windlass_core::events::Event;
-use windlass_core::{HttpObserver, Observation};
-use windlass_types::{MamStatus, VpnIp};
+use windlass_core::HttpObserver;
+use windlass_types::{HttpExchange, MamStatus, VpnIp};
 
 #[derive(Deserialize)]
 struct DynamicSeedboxResponse {
@@ -148,7 +148,7 @@ impl MamClient {
     }
 
     fn emit_http(&self, url: &str, response_status: u16, response_body: &str) {
-        (self.on_http)(Observation::HttpExchange {
+        (self.on_http)(HttpExchange {
             module: "mam".into(),
             method: "GET".into(),
             url: url.into(),

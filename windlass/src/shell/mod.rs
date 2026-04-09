@@ -98,6 +98,7 @@ pub async fn run(debug_ctrl: DebugController, debug_owned: windlass_debug::Debug
     let mut cmd_rx = debug_owned.cmd_rx;
     let mut log_rx = debug_owned.log_rx;
     let mut queue_rx = debug_owned.queue_rx;
+    let mut exchange_rx = debug_owned.exchange_rx;
 
     // Causation channel: action handlers send (event, action_id) here in debug mode
     // so the loop can record caused_by_action on the resulting event.
@@ -126,6 +127,10 @@ pub async fn run(debug_ctrl: DebugController, debug_owned: windlass_debug::Debug
         }
         while let Ok(log) = log_rx.try_recv() {
             history.append_log(log);
+            debug_ctrl.publish(&history);
+        }
+        while let Ok((action_id, exchange)) = exchange_rx.try_recv() {
+            history.action_http_exchange(action_id, exchange);
             debug_ctrl.publish(&history);
         }
 

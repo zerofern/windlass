@@ -48,6 +48,8 @@ impl std::fmt::Debug for QueueSink {
 pub struct DebuggableEventStream {
     internal_rx: mpsc::Receiver<Event>,
     debug_ctrl: DebugController,
+    /// Kept solely for the `MamRateLimitViolation` auto-enable path,
+    /// which needs to broadcast `DebugModeChanged(true)` to SSE subscribers.
     obs_tx: broadcast::Sender<Observation>,
 }
 
@@ -64,7 +66,7 @@ impl DebuggableEventStream {
         obs_tx: broadcast::Sender<Observation>,
     ) -> Self {
         if std::env::var("DEBUG_MODE_ON_START").is_ok_and(|v| v == "true") {
-            debug_ctrl.enable_debug(obs_tx.clone());
+            debug_ctrl.enable_debug();
             info!("Debug mode enabled from DEBUG_MODE_ON_START");
         }
 
@@ -122,7 +124,7 @@ impl DebuggableEventStream {
 
             if matches!(event, Event::MamRateLimitViolation { .. }) {
                 warn!("MAM rate-limit violation detected — entering debug mode");
-                self.debug_ctrl.enable_debug(self.obs_tx.clone());
+                self.debug_ctrl.enable_debug();
                 let _ = self.obs_tx.send(Observation::DebugModeChanged(true));
             }
 

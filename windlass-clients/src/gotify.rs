@@ -1,8 +1,8 @@
 use serde_json::json;
 use tracing::warn;
 
-use windlass_core::{HttpObserver, Observation};
-use windlass_types::AlertPriority;
+use windlass_core::HttpObserver;
+use windlass_types::{AlertPriority, HttpExchange};
 
 /// Wraps a `reqwest::Client` together with the Gotify connection details.
 /// All Gotify operations are methods so call sites only pass `&self`.
@@ -61,7 +61,7 @@ impl GotifyClient {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                (self.on_http)(Observation::HttpExchange {
+                (self.on_http)(HttpExchange {
                     module: "gotify".into(),
                     method: "POST".into(),
                     url: url.clone(),

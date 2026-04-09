@@ -5,6 +5,7 @@ use uuid::Uuid;
 use windlass_core::actions::Action;
 use windlass_core::events::Event;
 use windlass_core::types::SystemState;
+use windlass_types::HttpExchange;
 
 use crate::stream::{action_variant, event_variant};
 use crate::types::{
@@ -125,6 +126,7 @@ impl DebugHistory {
                 started_at: Utc::now(),
                 completed_at: None,
                 caused_event_id: None,
+                http_exchanges: Vec::new(),
             });
         }
         self.running_actions.push(RunningAction {
@@ -182,6 +184,27 @@ impl DebugHistory {
         });
         self.seq += 1;
         id
+    }
+
+    /// Attaches an HTTP exchange to the action that made the call.
+    ///
+    /// Searches `current_event.actions` first, then walks the trace backwards,
+    /// since the action may have completed before its exchange is processed.
+    pub fn action_http_exchange(&mut self, action_id: Uuid, exchange: HttpExchange) {
+        if let Some(current) = &mut self.current_event {
+            if let Some(entry) = current.actions.iter_mut().find(|a| a.id == action_id) {
+                entry.http_exchanges.push(exchange);
+                self.seq += 1;
+                return;
+            }
+        }
+        for trace_entry in self.trace.iter_mut().rev() {
+            if let Some(entry) = trace_entry.actions.iter_mut().find(|a| a.id == action_id) {
+                entry.http_exchanges.push(exchange);
+                self.seq += 1;
+                return;
+            }
+        }
     }
 
     /// Finalises the current event: updates `latest_state` and appends to trace.

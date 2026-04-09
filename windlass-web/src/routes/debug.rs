@@ -91,7 +91,7 @@ async fn get_debug_state(State(app): State<AppState>) -> Json<DebugState> {
 }
 
 async fn post_enable(State(app): State<AppState>) -> StatusCode {
-    app.debug_ctrl.enable_debug(app.observations.clone());
+    app.debug_ctrl.enable_debug();
     let _ = app.observations.send(Observation::DebugModeChanged(true));
     StatusCode::OK
 }
