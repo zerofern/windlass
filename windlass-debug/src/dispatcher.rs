@@ -24,7 +24,6 @@ impl DebugDispatcher {
     /// active breakpoint. `execute` is called (or skipped) for each action.
     pub async fn dispatch(&self, actions: Vec<Action>, mut execute: impl FnMut(Action)) {
         let total = actions.len();
-        self.debug_ctrl.set_pending_actions(&actions);
 
         for (idx, action) in actions.into_iter().enumerate() {
             debug!(?action, "→");
@@ -49,7 +48,5 @@ impl DebugDispatcher {
 
             execute(action);
         }
-
-        self.debug_ctrl.clear_pending_actions();
     }
 }

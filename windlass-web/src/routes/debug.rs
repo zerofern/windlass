@@ -69,7 +69,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn get_debug_state(State(app): State<AppState>) -> Json<DebugState> {
-    Json(app.debug_ctrl.debug_state())
+    Json((*app.debug_ctrl.snapshot.load_full()).clone())
 }
 
 async fn post_enable(State(app): State<AppState>) -> StatusCode {

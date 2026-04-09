@@ -12,7 +12,6 @@
 #   docker compose -f docker-compose.dev.yml down -v
 
 services:
-
   # ── Gluetun mock ─────────────────────────────────────────────────────────────
   mock-gluetun:
     build:
@@ -42,7 +41,11 @@ services:
       - "18080:8080"
     command: ["--port", "8080"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health | grep -q healthy"]
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8080/__admin/health | grep -q healthy",
+        ]
       interval: 3s
       timeout: 2s
       retries: 10
@@ -54,7 +57,11 @@ services:
       - "18081:8080"
     command: ["--port", "8080"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health | grep -q healthy"]
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8080/__admin/health | grep -q healthy",
+        ]
       interval: 3s
       timeout: 2s
       retries: 10
@@ -66,7 +73,11 @@ services:
       - "18082:8080"
     command: ["--port", "8080"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health | grep -q healthy"]
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8080/__admin/health | grep -q healthy",
+        ]
       interval: 3s
       timeout: 2s
       retries: 10
@@ -92,7 +103,11 @@ services:
       mock-mam:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'echo -e \"GET /health HTTP/1.0\\r\\n\\r\\n\" > /dev/tcp/localhost/9000' 2>/dev/null || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'echo -e \"GET /health HTTP/1.0\\r\\n\\r\\n\" > /dev/tcp/localhost/9000' 2>/dev/null || exit 1",
+        ]
       interval: 3s
       timeout: 2s
       retries: 10
@@ -120,21 +135,21 @@ services:
       - vpn-files:/tmp/gluetun:ro
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      QBITTORRENT_URL:  http://mock-qbittorrent:8080
+      QBITTORRENT_URL: http://mock-qbittorrent:8080
       QBITTORRENT_USER: admin
       QBITTORRENT_PASS: adminadmin
-      MAM_SESSION:      test_session
-      GOTIFY_URL:       http://mock-gotify:8080
-      GOTIFY_TOKEN:     test_token
-      MAM_SEEDBOX_URL:  http://mock-mam:8080/json/dynamicSeedbox.php
-      MAM_LOAD_URL:     "http://mock-mam:8080/jsonLoad.php?snatch_summary=true&clientStats"
-      DATA_PATH:        /tmp
-      DUMP_DIR:         /tmp/windlass_dumps
-      VPN_IP_FILE:      /tmp/gluetun/ip
-      VPN_PORT_FILE:    /tmp/gluetun/forwarded_port
-      WINDLASS_BIND:    0.0.0.0:5010
-      CHAOS_URL:        http://localhost:9000
-      RUST_LOG:         windlass=debug,info
-
+      MAM_SESSION: test_session
+      GOTIFY_URL: http://mock-gotify:8080
+      GOTIFY_TOKEN: test_token
+      MAM_SEEDBOX_URL: http://mock-mam:8080/json/dynamicSeedbox.php
+      MAM_LOAD_URL: "http://mock-mam:8080/jsonLoad.php?snatch_summary=true&clientStats"
+      DATA_PATH: /tmp
+      DUMP_DIR: /tmp/windlass_dumps
+      VPN_IP_FILE: /tmp/gluetun/ip
+      VPN_PORT_FILE: /tmp/gluetun/forwarded_port
+      WINDLASS_BIND: 0.0.0.0:5010
+      CHAOS_URL: http://localhost:9000
+      DEBUG_MODE_ON_START: "true"
+      RUST_LOG: windlass=debug,info
 volumes:
   vpn-files:

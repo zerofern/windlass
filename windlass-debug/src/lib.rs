@@ -1,10 +1,16 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 mod dispatcher;
+pub mod history;
 mod stream;
+pub mod types;
 
 pub use dispatcher::DebugDispatcher;
+pub use history::DebugHistory;
 pub use stream::DebuggableEventStream;
+pub use types::{
+    ActionEntry, ActiveEvent, DebugCommand, LogEntry, RunningAction, StoredEvent, TraceEntry,
+};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -12,9 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use serde::Serialize;
-use serde_json::Value;
-use tokio::sync::{Semaphore, broadcast};
-use windlass_core::actions::Action;
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use windlass_core::{HttpObserver, Observation};
 
 // ── PausedOn ──────────────────────────────────────────────────────────────────
@@ -38,20 +42,53 @@ pub enum PausedOn {
 
 // ── DebugState ────────────────────────────────────────────────────────────────
 
-/// Serialisable snapshot of the current debug state, served by `GET /api/v1/debug`.
-#[derive(Serialize)]
+/// Serialisable snapshot of the current debug state, served by `GET /api/v1/debug`
+/// and pushed on every change over `/api/v1/debug/stream` (Phase 2+).
+#[derive(Serialize, Clone, Debug)]
 pub struct DebugState {
+    /// Monotonic counter incremented on every mutation. Used by the frontend
+    /// to discard stale SSE events that arrived before the initial GET snapshot.
+    pub seq: u64,
     pub debug_mode: bool,
     /// What the system is currently paused on, or `null` when running freely.
     pub paused_on: Option<PausedOn>,
-    /// The current action batch, pre-serialised; empty when not dispatching.
-    pub pending_actions: Vec<Value>,
     pub event_breakpoints: Vec<String>,
     pub action_breakpoints: Vec<String>,
+    // ── History fields (populated when debug mode is active) ──────────────────
+    pub event_queue: Vec<StoredEvent>,
+    pub current_event: Option<ActiveEvent>,
+    pub running_actions: Vec<RunningAction>,
+    /// Last 200 completed events with full before/after state and actions.
+    pub trace: Vec<TraceEntry>,
+    /// Last 500 log lines (populated from Phase 5 onwards).
+    pub logs: Vec<LogEntry>,
+}
+
+impl DebugState {
+    fn initial() -> Self {
+        Self {
+            seq: 0,
+            debug_mode: false,
+            paused_on: None,
+            event_breakpoints: Vec::new(),
+            action_breakpoints: Vec::new(),
+            event_queue: Vec::new(),
+            current_event: None,
+            running_actions: Vec::new(),
+            trace: Vec::new(),
+            logs: Vec::new(),
+        }
+    }
 }
 
 // ── DebugController ───────────────────────────────────────────────────────────
 
+/// The debug controller, cloned freely into HTTP handlers and SSE tasks.
+/// All fields are `Arc`-wrapped so cloning is cheap.
+///
+/// The `DebugHistory` (the mutable history half) lives separately in the main
+/// event loop as `&mut DebugHistory`. HTTP handlers communicate with it via
+/// `cmd_tx`; the main loop drains `cmd_rx` between events.
 #[derive(Clone, Debug)]
 pub struct DebugController {
     /// Manually enabled/disabled from the UI or by the MAM rate-limit guardrail.
@@ -68,50 +105,68 @@ pub struct DebugController {
     obs_tx: Arc<ArcSwap<Option<broadcast::Sender<Observation>>>>,
     /// What the system is currently paused on; `None` when running freely.
     paused_on: Arc<ArcSwap<Option<PausedOn>>>,
-    /// The current action batch, pre-serialised; empty when not dispatching.
-    pending_actions: Arc<ArcSwap<Vec<Value>>>,
+    // ── Shared handles for history / snapshot ─────────────────────────────────
+    /// Latest published snapshot of `DebugState`. Read by GET /api/v1/debug.
+    pub snapshot: Arc<ArcSwap<DebugState>>,
+    /// HTTP handlers send queue-manipulation commands here; main loop drains `cmd_rx`.
+    pub cmd_tx: mpsc::Sender<DebugCommand>,
+    /// `DebugLogLayer` sends captured log lines here (Phase 5+); main loop drains `log_rx`.
+    pub log_tx: mpsc::Sender<LogEntry>,
+    /// Broadcasts the new `seq` on every snapshot update; SSE handler subscribes.
+    pub notify_tx: broadcast::Sender<u64>,
 }
 
-impl Default for DebugController {
-    fn default() -> Self {
-        Self {
+/// The receiver halves of the history channels, owned exclusively by the main
+/// event loop. Returned alongside `DebugController` from `new_with_owned`.
+pub struct DebugOwnedPart {
+    pub cmd_rx: mpsc::Receiver<DebugCommand>,
+    pub log_rx: mpsc::Receiver<LogEntry>,
+}
+
+impl DebugController {
+    /// Creates a `DebugController` alongside the receiver halves that the main
+    /// event loop must own. Pass the returned `DebugOwnedPart` to `shell::run`.
+    pub fn new_with_owned() -> (Self, DebugOwnedPart) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(128);
+        let (log_tx, log_rx) = mpsc::channel(1024);
+        let (notify_tx, _) = broadcast::channel(256);
+
+        let ctrl = Self {
             debug_mode: Arc::new(AtomicBool::new(false)),
             event_breakpoints: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             action_breakpoints: Arc::new(ArcSwap::from_pointee(HashSet::new())),
-            // Start with zero permits — nothing steps until explicitly requested.
             step: Arc::new(Semaphore::new(0)),
             skip: Arc::new(AtomicBool::new(false)),
             obs_tx: Arc::new(ArcSwap::from_pointee(None)),
             paused_on: Arc::new(ArcSwap::from_pointee(None)),
-            pending_actions: Arc::new(ArcSwap::from_pointee(vec![])),
-        }
+            snapshot: Arc::new(ArcSwap::from_pointee(DebugState::initial())),
+            cmd_tx,
+            log_tx,
+            notify_tx,
+        };
+        let owned = DebugOwnedPart { cmd_rx, log_rx };
+        (ctrl, owned)
     }
-}
 
-impl DebugController {
+    /// Convenience constructor that discards the owned channels.
+    /// Suitable for test code or contexts where history is not needed.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with_owned().0
     }
 
     // ── Debug mode ────────────────────────────────────────────────────────────
 
-    /// Enable debug mode. Wires up `obs_tx` so that clients can send `HttpExchange`
-    /// observations while debug mode is active.
     pub fn enable_debug(&self, obs_tx: broadcast::Sender<Observation>) {
         self.debug_mode.store(true, Ordering::SeqCst);
         self.obs_tx.store(Arc::new(Some(obs_tx)));
     }
 
-    /// Disable debug mode. Clears all debug state and releases any blocked
-    /// step waiters so the system resumes normal operation.
     pub fn disable_debug(&self) {
         self.debug_mode.store(false, Ordering::SeqCst);
         self.skip.store(false, Ordering::SeqCst);
         self.obs_tx.store(Arc::new(None));
         self.paused_on.store(Arc::new(None));
-        self.pending_actions.store(Arc::new(vec![]));
-        // Release any task currently blocked on the step semaphore.
         self.step.add_permits(usize::MAX / 2);
     }
 
@@ -158,13 +213,11 @@ impl DebugController {
         });
     }
 
-    /// Returns `true` if the event loop should pause before processing `variant`.
     #[must_use]
     pub fn should_pause_on_event(&self, variant: &str) -> bool {
         self.is_debug_mode() || self.event_breakpoints.load().contains(variant)
     }
 
-    /// Returns `true` if the event loop should pause before dispatching `variant`.
     #[must_use]
     pub fn should_pause_on_action(&self, variant: &str) -> bool {
         self.is_debug_mode() || self.action_breakpoints.load().contains(variant)
@@ -182,13 +235,10 @@ impl DebugController {
         !self.skip.swap(false, Ordering::SeqCst)
     }
 
-    /// Releases one step permit, allowing the currently-paused event or action to execute.
     pub fn release_step(&self) {
         self.step.add_permits(1);
     }
 
-    /// Skips the currently-paused event or action without executing it.
-    /// Sets the skip flag then releases one permit so the waiter wakes up.
     pub fn request_skip(&self) {
         self.skip.store(true, Ordering::SeqCst);
         self.step.add_permits(1);
@@ -197,25 +247,33 @@ impl DebugController {
     // ── Pause state ───────────────────────────────────────────────────────────
 
     /// Sets or clears what the system is currently paused on.
-    /// Called by [`DebuggableEventStream`] and [`DebuggableShell`] around step waits.
     pub fn set_paused_on(&self, p: Option<PausedOn>) {
         self.paused_on.store(Arc::new(p));
     }
 
-    /// Stores the current action batch as pre-serialised JSON.
-    /// Called by `DebuggableShell` at the start of each dispatch cycle.
-    pub fn set_pending_actions(&self, actions: &[Action]) {
-        let json: Vec<Value> = actions
-            .iter()
-            .filter_map(|a| serde_json::to_value(a).ok())
-            .collect();
-        self.pending_actions.store(Arc::new(json));
-    }
+    // ── Snapshot / publish ────────────────────────────────────────────────────
 
-    /// Clears the pending-actions batch.
-    /// Called by `DebuggableShell` when the batch is fully dispatched.
-    pub fn clear_pending_actions(&self) {
-        self.pending_actions.store(Arc::new(vec![]));
+    /// Serialises the current history into a new `DebugState` snapshot,
+    /// stores it in `self.snapshot`, and broadcasts the new `seq` so SSE
+    /// subscribers know to refresh. No-op when debug mode is off.
+    pub fn publish(&self, history: &DebugHistory) {
+        if !self.is_debug_mode() {
+            return;
+        }
+        let state = Arc::new(DebugState {
+            seq: history.seq,
+            debug_mode: true,
+            paused_on: self.paused_on.load_full().as_ref().clone(),
+            event_queue: history.event_queue.iter().cloned().collect(),
+            current_event: history.current_event.clone(),
+            running_actions: history.running_actions.clone(),
+            trace: history.trace.iter().cloned().collect(),
+            logs: history.logs.iter().cloned().collect(),
+            event_breakpoints: self.event_breakpoints.load().iter().cloned().collect(),
+            action_breakpoints: self.action_breakpoints.load().iter().cloned().collect(),
+        });
+        self.snapshot.store(state);
+        let _ = self.notify_tx.send(history.seq);
     }
 
     // ── HTTP observation ──────────────────────────────────────────────────────
@@ -230,28 +288,5 @@ impl DebugController {
                 let _ = tx.send(obs);
             }
         })
-    }
-
-    // ── State snapshot ────────────────────────────────────────────────────────
-
-    /// Returns a serialisable snapshot of the current debug state.
-    #[must_use]
-    pub fn debug_state(&self) -> DebugState {
-        let paused_on = self.paused_on.load_full();
-        let paused_on: Option<PausedOn> = paused_on.as_ref().clone();
-
-        let pending_actions = self.pending_actions.load_full();
-        let pending_actions: Vec<Value> = pending_actions.as_ref().clone();
-
-        let event_breakpoints = self.event_breakpoints.load().iter().cloned().collect();
-        let action_breakpoints = self.action_breakpoints.load().iter().cloned().collect();
-
-        DebugState {
-            debug_mode: self.is_debug_mode(),
-            paused_on,
-            pending_actions,
-            event_breakpoints,
-            action_breakpoints,
-        }
     }
 }

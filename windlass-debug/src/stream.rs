@@ -89,7 +89,7 @@ impl DebuggableEventStream {
 
 // ── Variant name helpers ──────────────────────────────────────────────────────
 
-const fn event_variant(event: &Event) -> &'static str {
+pub(crate) const fn event_variant(event: &Event) -> &'static str {
     match event {
         Event::Init { .. } => "Init",
         Event::DockerGluetunDied { .. } => "DockerGluetunDied",
@@ -115,7 +115,7 @@ const fn event_variant(event: &Event) -> &'static str {
 /// Returns the variant name of an [`Action`] as a static string.
 /// Used to look up breakpoints and populate [`PausedOn`] without heap allocation.
 #[must_use]
-pub const fn action_variant(action: &Action) -> &'static str {
+pub(crate) const fn action_variant(action: &Action) -> &'static str {
     match action {
         Action::ScheduleWakeup(_, _) => "ScheduleWakeup",
         Action::ReadPortFiles => "ReadPortFiles",

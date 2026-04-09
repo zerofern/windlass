@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_debug::{DebugController, DebugDispatcher, DebuggableEventStream};
+use windlass_debug::{DebugController, DebugDispatcher, DebugHistory, DebuggableEventStream};
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
@@ -31,7 +31,7 @@ pub async fn run() -> Result<()> {
 
     info!("Windlass started");
 
-    let debug_ctrl = DebugController::new();
+    let (debug_ctrl, debug_owned) = DebugController::new_with_owned();
     let on_http = debug_ctrl.make_http_observer();
 
     let direct = reqwest::Client::builder()
@@ -85,6 +85,9 @@ pub async fn run() -> Result<()> {
 
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
     let mut state = SystemState::initial();
+    let mut history = DebugHistory::new(SystemState::initial());
+    let mut cmd_rx = debug_owned.cmd_rx;
+    let mut log_rx = debug_owned.log_rx;
 
     if let Err(e) = mam.check_session().await {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
@@ -106,6 +109,30 @@ pub async fn run() -> Result<()> {
     while let Some(event) = debug_stream.recv().await {
         debug!(?event, "←");
 
+        // Drain any pending history commands and log lines accumulated while
+        // we were waiting for the previous event or processing it.
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            history.apply_cmd(cmd);
+            debug_ctrl.publish(&history);
+        }
+        while let Ok(log) = log_rx.try_recv() {
+            history.append_log(log);
+            debug_ctrl.publish(&history);
+        }
+
+        let debug = debug_ctrl.is_debug_mode();
+
+        // Record the event in history and publish so the debug page shows
+        // what is currently being processed.
+        let event_id = if debug {
+            let id = history.event_arrived(&event, None);
+            history.event_started(id, state.clone());
+            debug_ctrl.publish(&history);
+            Some(id)
+        } else {
+            None
+        };
+
         let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
         let outcome = state.process_event(event, chrono::Utc::now());
@@ -125,9 +152,21 @@ pub async fn run() -> Result<()> {
             vpn_port_file: &vpn_port_file,
             data_path: &data_path,
         };
-        debug_dispatcher
-            .dispatch(outcome.actions, |action| ctx.execute(action))
-            .await;
+
+        if let Some(eid) = event_id {
+            debug_dispatcher
+                .dispatch(outcome.actions, |action| {
+                    history.action_started(&action, eid);
+                    ctx.execute(action);
+                })
+                .await;
+            history.event_completed(eid, state.clone());
+            debug_ctrl.publish(&history);
+        } else {
+            debug_dispatcher
+                .dispatch(outcome.actions, |action| ctx.execute(action))
+                .await;
+        }
     }
 
     Ok(())
