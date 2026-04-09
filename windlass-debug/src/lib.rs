@@ -25,6 +25,7 @@ use serde::Serialize;
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use uuid::Uuid;
 use windlass_core::events::Event;
+use windlass_core::types::SystemState;
 use windlass_core::HttpObserver;
 use windlass_types::HttpExchange;
 
@@ -71,6 +72,9 @@ pub struct DebugState {
     pub trace: Vec<TraceEntry>,
     /// Last 500 log lines (populated from Phase 5 onwards).
     pub logs: Vec<LogEntry>,
+    /// The system state after the most-recently completed event. Always valid —
+    /// initialised to `SystemState::initial()`. Used by the dryrun endpoint.
+    pub latest_state: SystemState,
 }
 
 impl DebugState {
@@ -86,6 +90,7 @@ impl DebugState {
             running_actions: Vec::new(),
             trace: Vec::new(),
             logs: Vec::new(),
+            latest_state: SystemState::initial(),
         }
     }
 }
@@ -321,6 +326,7 @@ impl DebugController {
             logs: history.logs.iter().cloned().collect(),
             event_breakpoints: self.event_breakpoints.load().iter().cloned().collect(),
             action_breakpoints: self.action_breakpoints.load().iter().cloned().collect(),
+            latest_state: history.latest_state.clone(),
         });
         self.snapshot.store(state);
         let _ = self.notify_tx.send(history.seq);

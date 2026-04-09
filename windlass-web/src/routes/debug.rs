@@ -15,6 +15,7 @@ use serde_json::Value;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 use windlass_core::Observation;
+use windlass_core::events::Event;
 use windlass_debug::DebugState;
 
 use crate::AppState;
@@ -76,6 +77,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/debug/step", post(post_step))
         .route("/api/v1/debug/skip", post(post_skip))
+        .route("/api/v1/debug/dryrun", post(post_dryrun))
         // Queue manipulation
         .route("/api/v1/debug/queue", post(post_inject))
         .route("/api/v1/debug/queue/order", put(put_queue_order))
@@ -152,6 +154,49 @@ async fn post_step(State(app): State<AppState>) -> StatusCode {
 async fn post_skip(State(app): State<AppState>) -> StatusCode {
     app.debug_ctrl.request_skip();
     StatusCode::OK
+}
+
+// ── Dryrun ────────────────────────────────────────────────────────────────────
+
+/// Runs an event against the latest known state without dispatching any actions.
+///
+/// Returns 409 if debug mode is off (no valid state snapshot is available).
+/// The body must be a JSON-serialised `Event`.
+async fn post_dryrun(
+    State(app): State<AppState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let snapshot = app.debug_ctrl.snapshot.load_full();
+    if !snapshot.debug_mode {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "debug mode is not enabled"})),
+        );
+    }
+
+    let event = match serde_json::from_value::<Event>(body) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid event: {e}")})),
+            );
+        }
+    };
+
+    let state_before = snapshot.latest_state.clone();
+    let mut state_after = state_before.clone();
+    let outcome = state_after.process_event(event, Utc::now());
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "state_before": state_before,
+            "state_after": state_after,
+            "state_changed": outcome.state_changed,
+            "actions": outcome.actions,
+        })),
+    )
 }
 
 // ── Queue manipulation ────────────────────────────────────────────────────────
