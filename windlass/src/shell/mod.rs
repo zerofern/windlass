@@ -104,7 +104,7 @@ pub async fn run() -> Result<()> {
     .await
     .expect("event channel open at startup");
 
-    let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone(), obs_tx.clone());
+    let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
 
     while let Some(event) = debug_stream.recv().await {
         debug!(?event, "←");
@@ -132,8 +132,6 @@ pub async fn run() -> Result<()> {
         } else {
             None
         };
-
-        let _ = obs_tx.send(windlass_core::Observation::EventReceived(event.clone()));
 
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {

@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use crate::actions::Action;
-use crate::events::Event;
 use crate::types::SystemState;
 use serde::Serialize;
 
@@ -13,14 +11,7 @@ pub type HttpObserver = Arc<dyn Fn(Observation) + Send + Sync>;
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum Observation {
-    /// Emitted by the intake task the moment an event enters the system,
-    /// before the main loop has had a chance to process it.
-    EventArrived(Event),
-    /// Emitted by the main loop when an event is about to be processed
-    /// (after any debug-mode pause has been released).
-    EventReceived(Event),
     StateSnapshot(SystemState),
-    ActionDispatched(Action),
     /// Emitted when debug mode is enabled or disabled, including automatic
     /// entry triggered by the MAM rate-limit guardrail.
     DebugModeChanged(bool),

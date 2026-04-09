@@ -10,12 +10,10 @@ use super::{DebugController, PausedOn};
 
 /// Wraps the external mpsc receiver with debug-mode pause/step logic.
 ///
-/// An intake task drains the external channel, broadcasting
-/// `Observation::EventArrived` for every event so the UI can see what's
-/// queued in real time, then forwards events to an internal channel.
-/// The main loop calls [`recv`](DebuggableEventStream::recv) which pops from
-/// the internal channel and pauses when debug mode is active or a breakpoint
-/// is hit.
+/// An intake task drains the external channel and forwards events to an
+/// internal channel. The main loop calls [`recv`](DebuggableEventStream::recv)
+/// which pops from the internal channel and pauses when debug mode is active
+/// or a breakpoint is hit.
 pub struct DebuggableEventStream {
     internal_rx: mpsc::Receiver<Event>,
     debug_ctrl: DebugController,
@@ -36,12 +34,10 @@ impl DebuggableEventStream {
         }
 
         let (internal_tx, internal_rx) = mpsc::channel(128);
-        let obs_tx_intake = obs_tx.clone();
 
         tokio::spawn(async move {
             let mut rx = external_rx;
             while let Some(event) = rx.recv().await {
-                let _ = obs_tx_intake.send(Observation::EventArrived(event.clone()));
                 if internal_tx.send(event).await.is_err() {
                     break;
                 }
