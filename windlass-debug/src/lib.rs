@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arc_swap::ArcSwap;
 use serde::Serialize;
 use tokio::sync::{Semaphore, broadcast, mpsc};
+use windlass_core::events::Event;
 use windlass_core::{HttpObserver, Observation};
+
+pub(crate) use stream::QueueSink;
 
 // ── PausedOn ──────────────────────────────────────────────────────────────────
 
@@ -105,6 +108,14 @@ pub struct DebugController {
     obs_tx: Arc<ArcSwap<Option<broadcast::Sender<Observation>>>>,
     /// What the system is currently paused on; `None` when running freely.
     paused_on: Arc<ArcSwap<Option<PausedOn>>>,
+    // ── Queue routing ─────────────────────────────────────────────────────────
+    /// Controls where the intake task routes incoming events.
+    /// Swapped atomically on enable/disable debug.
+    pub(crate) queue_sink: Arc<ArcSwap<QueueSink>>,
+    /// Sender for the non-debug (mpsc) path — restored on `disable_debug()`.
+    internal_tx: mpsc::Sender<Event>,
+    /// Sender for the debug (VecDeque) path — activated on `enable_debug()`.
+    stored_tx: mpsc::Sender<StoredEvent>,
     // ── Shared handles for history / snapshot ─────────────────────────────────
     /// Latest published snapshot of `DebugState`. Read by GET /api/v1/debug.
     pub snapshot: Arc<ArcSwap<DebugState>>,
@@ -119,6 +130,10 @@ pub struct DebugController {
 /// The receiver halves of the history channels, owned exclusively by the main
 /// event loop. Returned alongside `DebugController` from `new_with_owned`.
 pub struct DebugOwnedPart {
+    /// Receives events from the intake task in non-debug mode.
+    pub internal_rx: mpsc::Receiver<Event>,
+    /// Receives `StoredEvent`s from the intake task in debug mode.
+    pub queue_rx: mpsc::Receiver<StoredEvent>,
     pub cmd_rx: mpsc::Receiver<DebugCommand>,
     pub log_rx: mpsc::Receiver<LogEntry>,
 }
@@ -127,9 +142,14 @@ impl DebugController {
     /// Creates a `DebugController` alongside the receiver halves that the main
     /// event loop must own. Pass the returned `DebugOwnedPart` to `shell::run`.
     pub fn new_with_owned() -> (Self, DebugOwnedPart) {
+        let (internal_tx, internal_rx) = mpsc::channel::<Event>(128);
+        let (stored_tx, queue_rx) = mpsc::channel::<StoredEvent>(128);
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (log_tx, log_rx) = mpsc::channel(1024);
         let (notify_tx, _) = broadcast::channel(256);
+
+        // Start in non-debug mode: intake task routes to internal_tx.
+        let queue_sink = Arc::new(ArcSwap::from_pointee(QueueSink::Mpsc(internal_tx.clone())));
 
         let ctrl = Self {
             debug_mode: Arc::new(AtomicBool::new(false)),
@@ -139,12 +159,20 @@ impl DebugController {
             skip: Arc::new(AtomicBool::new(false)),
             obs_tx: Arc::new(ArcSwap::from_pointee(None)),
             paused_on: Arc::new(ArcSwap::from_pointee(None)),
+            queue_sink,
+            internal_tx,
+            stored_tx,
             snapshot: Arc::new(ArcSwap::from_pointee(DebugState::initial())),
             cmd_tx,
             log_tx,
             notify_tx,
         };
-        let owned = DebugOwnedPart { cmd_rx, log_rx };
+        let owned = DebugOwnedPart {
+            internal_rx,
+            queue_rx,
+            cmd_rx,
+            log_rx,
+        };
         (ctrl, owned)
     }
 
@@ -160,6 +188,9 @@ impl DebugController {
     pub fn enable_debug(&self, obs_tx: broadcast::Sender<Observation>) {
         self.debug_mode.store(true, Ordering::SeqCst);
         self.obs_tx.store(Arc::new(Some(obs_tx)));
+        // Swap intake routing to the VecDeque path.
+        self.queue_sink
+            .store(Arc::new(QueueSink::Queue(self.stored_tx.clone())));
     }
 
     pub fn disable_debug(&self) {
@@ -168,6 +199,9 @@ impl DebugController {
         self.obs_tx.store(Arc::new(None));
         self.paused_on.store(Arc::new(None));
         self.step.add_permits(usize::MAX / 2);
+        // Restore intake routing to the direct mpsc path.
+        self.queue_sink
+            .store(Arc::new(QueueSink::Mpsc(self.internal_tx.clone())));
     }
 
     #[must_use]

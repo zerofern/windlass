@@ -56,6 +56,13 @@ impl DebugHistory {
 
     // ── Event lifecycle ───────────────────────────────────────────────────────
 
+    /// Pushes an already-constructed `StoredEvent` into the queue.
+    /// Called by the main loop when draining `queue_rx` in debug mode.
+    pub fn push_stored_event(&mut self, stored: StoredEvent) {
+        self.event_queue.push_back(stored);
+        self.seq += 1;
+    }
+
     /// Records that an event has arrived in the intake queue. Returns its ID.
     pub fn event_arrived(&mut self, event: &Event, caused_by: Option<Uuid>) -> Uuid {
         let id = Uuid::new_v4();
@@ -66,6 +73,7 @@ impl DebugHistory {
             variant: event_variant(event),
             payload: serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
             caused_by_action: caused_by,
+            event: event.clone(),
         });
         self.seq += 1;
         id
@@ -85,6 +93,19 @@ impl DebugHistory {
             });
             self.seq += 1;
         }
+    }
+
+    /// Sets `current_event` from an already-removed `StoredEvent`.
+    /// Used by the Phase 3+ queue path where the shell loop pops the event
+    /// from the front of `event_queue` before calling this.
+    pub fn event_started_stored(&mut self, stored: StoredEvent, state_before: SystemState) {
+        self.current_event = Some(ActiveEvent {
+            stored,
+            state_before,
+            started_at: Utc::now(),
+            actions: Vec::new(),
+        });
+        self.seq += 1;
     }
 
     // ── Action lifecycle ──────────────────────────────────────────────────────
@@ -162,19 +183,58 @@ impl DebugHistory {
     // ── Queue commands ────────────────────────────────────────────────────────
 
     /// Applies a queue-manipulation command from an HTTP handler.
-    /// Full Event injection/editing requires `Event: Deserialize` (Phase 3).
     pub fn apply_cmd(&mut self, cmd: DebugCommand) {
         match cmd {
             DebugCommand::RemoveQueuedEvent(id) => {
                 self.event_queue.retain(|e| e.id != id);
                 self.seq += 1;
             }
-            DebugCommand::EditQueuedEvent(_id, _payload, reply) => {
-                let _ = reply.send(Err("EditQueuedEvent available from Phase 3".to_string()));
+            DebugCommand::EditQueuedEvent(id, payload, reply) => {
+                match self.event_queue.iter_mut().find(|e| e.id == id) {
+                    None => {
+                        let _ = reply.send(Err(format!("Event {id} not found in queue")));
+                    }
+                    Some(stored) => match serde_json::from_value::<Event>(payload.clone()) {
+                        Err(e) => {
+                            let _ = reply.send(Err(format!("Invalid payload: {e}")));
+                        }
+                        Ok(event) => {
+                            stored.variant = event_variant(&event);
+                            stored.payload = payload;
+                            stored.event = event;
+                            self.seq += 1;
+                            let _ = reply.send(Ok(()));
+                        }
+                    },
+                }
             }
-            DebugCommand::InjectEvent { reply, .. } => {
-                let _ = reply.send(Err("InjectEvent available from Phase 3".to_string()));
-            }
+            DebugCommand::InjectEvent {
+                payload,
+                position,
+                at,
+                reply,
+            } => match serde_json::from_value::<Event>(payload.clone()) {
+                Err(e) => {
+                    let _ = reply.send(Err(format!("Invalid payload: {e}")));
+                }
+                Ok(event) => {
+                    let id = uuid::Uuid::new_v4();
+                    let stored = StoredEvent {
+                        id,
+                        at,
+                        arrived_at: Utc::now(),
+                        variant: event_variant(&event),
+                        payload,
+                        caused_by_action: None,
+                        event,
+                    };
+                    let pos = position.unwrap_or(self.event_queue.len());
+                    let pos = pos.min(self.event_queue.len());
+                    self.event_queue.insert(pos, stored);
+                    self.seq += 1;
+                    let _ = reply.send(Ok(id));
+                }
+            },
             DebugCommand::ReorderQueue(ids, reply) => {
                 if ids.len() != self.event_queue.len() {
                     let _ = reply.send(Err(format!(
@@ -199,6 +259,25 @@ impl DebugHistory {
                 let _ = reply.send(Ok(()));
             }
         }
+    }
+
+    // ── Queue accessors (for the shell's debug loop) ──────────────────────────
+
+    /// Returns `true` when no events are waiting in the queue.
+    #[must_use]
+    pub fn queue_is_empty(&self) -> bool {
+        self.event_queue.is_empty()
+    }
+
+    /// Returns the variant name of the front queued event, or `None` if empty.
+    #[must_use]
+    pub fn queue_front_variant(&self) -> Option<&'static str> {
+        self.event_queue.front().map(|e| e.variant)
+    }
+
+    /// Removes and returns the front queued event, or `None` if empty.
+    pub fn pop_queue_front(&mut self) -> Option<StoredEvent> {
+        self.event_queue.pop_front()
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────

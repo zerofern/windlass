@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::oneshot;
 use uuid::Uuid;
+use windlass_core::events::Event;
 use windlass_core::types::SystemState;
 
 // ── Event lifecycle ───────────────────────────────────────────────────────────
@@ -16,10 +17,21 @@ pub struct StoredEvent {
     /// When the event entered the intake queue.
     pub arrived_at: DateTime<Utc>,
     pub variant: &'static str,
-    /// Full serialised form of the event.
+    /// Full serialised form of the event (sent to frontend; editable via REST).
     pub payload: Value,
     /// Set when the event was produced by an action (Phase 4+).
     pub caused_by_action: Option<Uuid>,
+    /// The original event kept for dispatch. Not sent to the frontend.
+    #[serde(skip)]
+    pub(crate) event: Event,
+}
+
+impl StoredEvent {
+    /// Returns a reference to the original event (used for dispatch).
+    #[must_use]
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
 }
 
 /// An action that was dispatched but whose result has not yet been recorded.

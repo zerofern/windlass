@@ -2,34 +2,34 @@
 
 use nutype::nutype;
 use secrecy::SecretString;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 pub use uom::si::f64::Information;
 
 // ── IPs ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnIp(pub Ipv4Addr);
 
 // ── Ports ────────────────────────────────────────────────────────────────────
 
 #[nutype(
     validate(greater = 0, less_or_equal = 65535),
-    derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)
+    derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)
 )]
 pub struct VpnPort(u16);
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────
 
 /// An HTTP status code returned by an external service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpStatusCode(pub u16);
 
 // ── Torrents ─────────────────────────────────────────────────────────────────
 
 /// The display name of a torrent as reported by qBittorrent.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TorrentName(pub String);
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
@@ -42,6 +42,12 @@ pub struct AuthCookie(pub String);
 impl serde::Serialize for AuthCookie {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str("[redacted]")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AuthCookie {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(AuthCookie(String::deserialize(d)?))
     }
 }
 
@@ -61,7 +67,7 @@ pub struct QbitPassword(pub SecretString);
 // ── Retry / recovery counts ───────────────────────────────────────────────────
 
 /// A count of retry attempts or recovery cycles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RetryCount(pub u8);
 
 impl RetryCount {
@@ -103,7 +109,7 @@ impl From<Backoff> for Duration {
 
 // ── Wakeup IDs ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WakeupId {
     Heartbeat,
     DiskCheck,
@@ -115,7 +121,7 @@ pub enum WakeupId {
 
 // ── Alert priority ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlertPriority {
     Info,
     Warning,
@@ -125,7 +131,7 @@ pub enum AlertPriority {
 // ── MAM connectivity ─────────────────────────────────────────────────────────
 
 /// The result of a MAM connectivity heartbeat check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MamStatus {
     /// MAM reached and qBit is listed as connectable (accepts incoming connections).
     Connectable,

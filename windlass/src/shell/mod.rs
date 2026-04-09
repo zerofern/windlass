@@ -66,7 +66,12 @@ pub async fn run() -> Result<()> {
 
     let (obs_tx, _) = tokio::sync::broadcast::channel::<windlass_core::Observation>(256);
 
-    let mut debug_stream = DebuggableEventStream::new(rx, debug_ctrl.clone(), obs_tx.clone());
+    let mut debug_stream = DebuggableEventStream::new(
+        rx,
+        debug_owned.internal_rx,
+        debug_ctrl.clone(),
+        obs_tx.clone(),
+    );
 
     let app_state = windlass_web::AppState {
         event_tx: tx.clone(),
@@ -88,14 +93,13 @@ pub async fn run() -> Result<()> {
     let mut history = DebugHistory::new(SystemState::initial());
     let mut cmd_rx = debug_owned.cmd_rx;
     let mut log_rx = debug_owned.log_rx;
+    let mut queue_rx = debug_owned.queue_rx;
 
     if let Err(e) = mam.check_session().await {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
     }
 
     // Send Init into the channel so it flows through DebuggableEventStream.
-    // If DEBUG_MODE_ON_START=true, the stream will pause on it before
-    // the main loop receives it.
     tx.send(Event::Init {
         at: chrono::Utc::now(),
         is_gluetun_healthy: boot.is_gluetun_healthy,
@@ -106,11 +110,8 @@ pub async fn run() -> Result<()> {
 
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
 
-    while let Some(event) = debug_stream.recv().await {
-        debug!(?event, "←");
-
-        // Drain any pending history commands and log lines accumulated while
-        // we were waiting for the previous event or processing it.
+    'main: loop {
+        // ── Drain pending channels ────────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             history.apply_cmd(cmd);
             debug_ctrl.publish(&history);
@@ -120,18 +121,32 @@ pub async fn run() -> Result<()> {
             debug_ctrl.publish(&history);
         }
 
-        let debug = debug_ctrl.is_debug_mode();
-
-        // Record the event in history and publish so the debug page shows
-        // what is currently being processed.
-        let event_id = if debug {
-            let id = history.event_arrived(&event, None);
-            history.event_started(id, state.clone());
-            debug_ctrl.publish(&history);
-            Some(id)
+        // ── Obtain next event ─────────────────────────────────────────────────
+        let (event, event_id) = if debug_ctrl.is_debug_mode() {
+            // Debug mode: drain incoming StoredEvents into the queue, then pop
+            // the front event (pausing for step if needed).
+            match dequeue_debug(
+                &mut history,
+                &mut queue_rx,
+                &mut cmd_rx,
+                &mut log_rx,
+                &state,
+                &debug_ctrl,
+            )
+            .await
+            {
+                None => break 'main,
+                Some(v) => v,
+            }
         } else {
-            None
+            // Non-debug mode: receive directly, pause only on breakpoints.
+            match debug_stream.recv().await {
+                None => break 'main,
+                Some(e) => (e, None),
+            }
         };
+
+        debug!(?event, "←");
 
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {
@@ -168,6 +183,103 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Waits for the next event in debug mode by draining the queue channel and
+/// history, pausing on the front event for a step permit.
+///
+/// Returns `None` if all input channels have closed (shutdown). Otherwise
+/// returns `(Event, Some(event_id))` after recording the event as started.
+async fn dequeue_debug(
+    history: &mut DebugHistory,
+    queue_rx: &mut tokio::sync::mpsc::Receiver<windlass_debug::StoredEvent>,
+    cmd_rx: &mut tokio::sync::mpsc::Receiver<windlass_debug::DebugCommand>,
+    log_rx: &mut tokio::sync::mpsc::Receiver<windlass_debug::LogEntry>,
+    state: &SystemState,
+    debug_ctrl: &DebugController,
+) -> Option<(windlass_core::events::Event, Option<uuid::Uuid>)> {
+    loop {
+        // Drain any newly-arrived stored events into the queue.
+        while let Ok(stored) = queue_rx.try_recv() {
+            history.push_stored_event(stored);
+            debug_ctrl.publish(history);
+        }
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            history.apply_cmd(cmd);
+            debug_ctrl.publish(history);
+        }
+        while let Ok(log) = log_rx.try_recv() {
+            history.append_log(log);
+            debug_ctrl.publish(history);
+        }
+
+        if history.queue_is_empty() {
+            // Nothing to process — wait for an event, command, or log.
+            tokio::select! {
+                stored = queue_rx.recv() => match stored {
+                    Some(s) => { history.push_stored_event(s); debug_ctrl.publish(history); }
+                    None => return None,
+                },
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(c) => { history.apply_cmd(c); debug_ctrl.publish(history); }
+                    None => return None,
+                },
+                log = log_rx.recv() => {
+                    if let Some(l) = log { history.append_log(l); debug_ctrl.publish(history); }
+                },
+            }
+            continue;
+        }
+
+        // Pause on the front event before processing it.
+        let front_variant = history.queue_front_variant().unwrap();
+        if debug_ctrl.should_pause_on_event(front_variant) {
+            debug_ctrl.set_paused_on(Some(windlass_debug::PausedOn::Event {
+                variant: front_variant,
+            }));
+            debug_ctrl.publish(history);
+
+            let execute = loop {
+                tokio::select! {
+                    execute = debug_ctrl.acquire_step() => break execute,
+                    stored = queue_rx.recv() => match stored {
+                        Some(s) => { history.push_stored_event(s); debug_ctrl.publish(history); }
+                        None => { debug_ctrl.set_paused_on(None); return None; }
+                    },
+                    cmd = cmd_rx.recv() => match cmd {
+                        Some(c) => { history.apply_cmd(c); debug_ctrl.publish(history); }
+                        None => { debug_ctrl.set_paused_on(None); return None; }
+                    },
+                    log = log_rx.recv() => {
+                        if let Some(l) = log { history.append_log(l); debug_ctrl.publish(history); }
+                    },
+                }
+            };
+
+            debug_ctrl.set_paused_on(None);
+
+            if !execute {
+                // Skip: pop the front event without processing.
+                history.pop_queue_front();
+                debug_ctrl.publish(history);
+                continue;
+            }
+
+            // Re-check: the queue may have changed while we waited.
+            if history.queue_is_empty() {
+                continue;
+            }
+        }
+
+        // Pop the front event and record it as started.
+        let stored = history.pop_queue_front().unwrap();
+        let id = stored.id;
+        let event = stored.event().clone();
+        history.event_started_stored(stored, state.clone());
+        debug_ctrl.publish(history);
+
+        return Some((event, Some(id)));
+    }
 }
 
 /// All shared shell state bundled together so action handlers don't need

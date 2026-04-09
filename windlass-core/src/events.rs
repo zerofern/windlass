@@ -1,23 +1,32 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windlass_types::{
     AuthCookie, HttpStatusCode, Information, MamStatus, TorrentName, VpnIp, VpnPort, WakeupId,
 };
 
 mod serde_information {
+    use uom::si::f64::Information;
     use uom::si::information::byte;
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
     pub(super) fn serialize<S: serde::Serializer>(
-        v: &uom::si::f64::Information,
+        v: &Information,
         s: S,
     ) -> Result<S::Ok, S::Error> {
         s.serialize_f64(v.get::<byte>())
     }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<Information, D::Error> {
+        use serde::Deserialize as _;
+        let bytes = f64::deserialize(d)?;
+        Ok(Information::new::<byte>(bytes))
+    }
 }
 
 /// Everything the outside world (via the Shell) can tell the Core.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     /// Boot reconciliation. The Shell inspects Gluetun's actual health and
     /// reads the VPN files before emitting this, so the Core can fast-forward
@@ -86,7 +95,7 @@ pub enum Event {
 
     DiskSpaceObserved {
         at: DateTime<Utc>,
-        #[serde(serialize_with = "serde_information::serialize")]
+        #[serde(with = "serde_information")]
         space: Information,
     },
     NewTorrentsObserved {

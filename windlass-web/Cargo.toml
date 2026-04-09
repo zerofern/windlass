@@ -9,6 +9,7 @@ windlass-core  = { workspace = true }
 windlass-debug = { workspace = true }
 arc-swap       = { workspace = true }
 axum           = { workspace = true }
+chrono         = { workspace = true }
 tokio          = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
@@ -17,3 +18,4 @@ futures-util   = { workspace = true }
 tokio-stream   = { workspace = true, features = ["sync"] }
 rust-embed     = { workspace = true }
 mime_guess     = { workspace = true }
+uuid           = { workspace = true }

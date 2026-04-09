@@ -6,10 +6,14 @@ use axum::{
         Sse,
         sse::{Event as SseEvent, KeepAlive},
     },
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
+use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
+use serde::Deserialize;
+use serde_json::Value;
 use tokio_stream::wrappers::BroadcastStream;
+use uuid::Uuid;
 use windlass_core::Observation;
 use windlass_debug::DebugState;
 
@@ -72,6 +76,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/debug/step", post(post_step))
         .route("/api/v1/debug/skip", post(post_skip))
+        // Queue manipulation
+        .route("/api/v1/debug/queue", post(post_inject))
+        .route("/api/v1/debug/queue/order", put(put_queue_order))
+        .route(
+            "/api/v1/debug/queue/{id}",
+            delete(delete_queue_event).put(put_queue_event),
+        )
         .with_state(state)
 }
 
@@ -141,6 +152,122 @@ async fn post_step(State(app): State<AppState>) -> StatusCode {
 async fn post_skip(State(app): State<AppState>) -> StatusCode {
     app.debug_ctrl.request_skip();
     StatusCode::OK
+}
+
+// ── Queue manipulation ────────────────────────────────────────────────────────
+
+/// Removes a queued event by ID. No-op if the ID is not in the queue.
+async fn delete_queue_event(State(app): State<AppState>, Path(id): Path<Uuid>) -> StatusCode {
+    let _ = app
+        .debug_ctrl
+        .cmd_tx
+        .send(windlass_debug::DebugCommand::RemoveQueuedEvent(id))
+        .await;
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct EditPayload {
+    payload: Value,
+}
+
+/// Replaces the payload of a queued event. Returns 400 if the payload does not
+/// deserialise to a valid `Event`.
+async fn put_queue_event(
+    State(app): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<EditPayload>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = app
+        .debug_ctrl
+        .cmd_tx
+        .send(windlass_debug::DebugCommand::EditQueuedEvent(
+            id,
+            body.payload,
+            reply_tx,
+        ))
+        .await;
+    match reply_rx.await {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "channel closed"})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct InjectBody {
+    payload: Value,
+    position: Option<usize>,
+    at: Option<chrono::DateTime<Utc>>,
+}
+
+/// Injects a new event into the queue. `payload` must be a valid serialised
+/// `Event`. `position` defaults to the end of the queue. `at` defaults to now.
+async fn post_inject(
+    State(app): State<AppState>,
+    Json(body): Json<InjectBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let at = body.at.unwrap_or_else(Utc::now);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = app
+        .debug_ctrl
+        .cmd_tx
+        .send(windlass_debug::DebugCommand::InjectEvent {
+            payload: body.payload,
+            position: body.position,
+            at,
+            reply: reply_tx,
+        })
+        .await;
+    match reply_rx.await {
+        Ok(Ok(id)) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "channel closed"})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct OrderBody {
+    ids: Vec<Uuid>,
+}
+
+/// Reorders the queue. `ids` must list every queued event ID in the desired order.
+async fn put_queue_order(
+    State(app): State<AppState>,
+    Json(body): Json<OrderBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = app
+        .debug_ctrl
+        .cmd_tx
+        .send(windlass_debug::DebugCommand::ReorderQueue(
+            body.ids, reply_tx,
+        ))
+        .await;
+    match reply_rx.await {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "channel closed"})),
+        ),
+    }
 }
 
 /// SSE stream for the debug page.

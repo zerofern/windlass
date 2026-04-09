@@ -2616,6 +2616,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uom",
+ "uuid",
  "windlass-clients",
  "windlass-core",
  "windlass-debug",
@@ -2717,6 +2718,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "chrono",
  "futures-util",
  "mime_guess",
  "rust-embed",
@@ -2725,6 +2727,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid",
  "windlass-core",
  "windlass-debug",
  "windlass-types",
