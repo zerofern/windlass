@@ -93,16 +93,44 @@ the account from automated bans.
   connectable on MAM (i.e., the tracker can reach qBit for incoming connections). Alerts if
   `NotConnectable`; distinguishes network failure (`Unreachable`) from a genuine
   connectivity problem.
-- **Unsatisfied Quota Manager (Rule 2.8):** The core tracks the user's Class Limit (e.g.,
-  50 for User, 100 for Power User). Windlass continuously polls qBittorrent for torrents
-  that have *not yet* reached 72 hours of seed time. If the active unsatisfied count
-  approaches the limit, all new automated downloads are paused until slots free up.
+- **Unsatisfied Quota & Queue Limits Manager (Rule 2.8):** The core tracks the user's
+  Class Limit for unsatisfied torrents (e.g., 50 for User, 100 for Power User). It
+  continuously polls qBittorrent for torrents that have *not yet* reached 72 hours of seed
+  time. If the active unsatisfied count approaches the limit, all new automated downloads
+  are paused. Furthermore, Windlass monitors qBittorrent's global maximum active,
+  downloading, and seeding limits. To prevent H&R violations caused by qBittorrent parking
+  torrents when limits are reached, Windlass actively orchestrates the queue, temporarily
+  pausing fully satisfied torrents to guarantee unsatisfied torrents remain actively seeding.
 - **MAM HnR Compliance Monitor (Rules 2.5 & 2.7):**
   - *No Partials:* Forces qBittorrent to download 100% of torrent contents.
   - *HnR Lock:* Auto-eviction is mathematically prohibited from deleting any torrent that
     has downloaded data until `seed_time ≥ 72 hours`.
   - *Safe Deletion:* Stalled or dead torrents are only automatically deleted and
     blacklisted if they have downloaded exactly 0 bytes.
+- **The Vault Guardian:** Windlass monitors the MAM Millionaires Vault. When a new vault
+  cycle reaches 20,000,000 BP, Windlass checks if the user's global ratio is ≥ 1.05. If
+  eligible, it fires a Gotify notification: *"The Millionaires Vault is open. Click here to
+  donate 2,000 BP and secure your Freeleech Wedges."* To strictly comply with MAM's rules
+  against automated scripts, the system will never execute the donation via headless
+  background scripts; it requires the user's explicit click via the notification deep-link.
+- **qBittorrent Configuration Validator & Auto-Tuner:** Windlass does not just send
+  torrents to the client; it actively manages the client's internal configuration via the
+  WebAPI to ensure optimal throughput and strict tracker compliance. Enforcement is tiered
+  by risk level:
+  - *Port Forwarding:* Always silently auto-updated as part of the core VPN sync loop. No
+    notification required.
+  - *Privacy Settings — DHT, PeX, Local Peer Discovery (Rule 6.1):* These carry an
+    immediate ban risk on private trackers. If any are detected as enabled, Windlass
+    auto-reverts them immediately and fires a Gotify notification: *"DHT was re-enabled in
+    qBittorrent — I've corrected it."* The intervention is logged. This does not wait for
+    user confirmation.
+  - *Queue Limits — `max_active_downloads`, `max_active_uploads`, `max_active_torrents`:*
+    Windlass first attempts to work around restrictive limits via queue orchestration
+    (pausing satisfied torrents, reordering priorities) without touching qBittorrent's
+    config. If the limits are so low that orchestration cannot prevent an H&R violation,
+    Windlass escalates: it auto-corrects the setting and fires a high-priority Gotify alert
+    explaining exactly what was changed and why — *"Your max active torrents was set to 5.
+    With 12 unsatisfied torrents, H&R violations were unavoidable. I've raised it to 25."*
 - **Upload Health Math (Rule 1.4):** Enforced before queueing new downloads:
   - Global Ratio must remain ≥ 2.0 (well above the 1.0 minimum).
   - Upload credit buffer must remain ≥ 25 GB.
@@ -299,25 +327,23 @@ searches the library/tracker for a highly-rated, sub-12-hour, fast-paced standal
 you bounced off that epic. I've queued up a fast-paced palate cleanser to get your momentum
 back."*
 
-#### The DNF "Autopsy" Interview
+#### The Universal Review Component
 
-> Self-updating profile weights through conversational feedback.
+> A standardized, single-interface review system used across all interactions to ensure a
+> consistent user experience and clean data ingestion.
 
-**Execution:** After a DNF, Windlass sends a Gotify notification with a deep-link to a
-feedback card in the UI: *"What went wrong with [Book Title]?"* The user opens the card and
-types a short response (e.g., *"Just a pacing slog, no real plot."*). The LLM parses this,
-updates the negative/positive weights in `user_profile`, and refines future search parameters.
+**Execution:** Whether a user finishes a book, triggers a DNF, completes the onboarding
+wizard, or marks a suggested book as "Already Read," they are presented with the exact same
+UI card.
 
-#### The Post-Book Debrief
-
-> Captures immediate user sentiment upon finishing a book — combined with the "what's next" handoff.
-
-**Execution:** The ABS "Completed" webhook fires a single Gotify notification that handles
-both the debrief and the next-book handoff (see §6 Finish-Book Notification). The LLM
-parses any note the user adds, logs the rating into `reading_ledger`, and extracts specific
-feedback to tweak `user_profile` weights for future RAG prompts. If pipeline depth is below
-the healthy threshold after this book is marked complete, acquisition aggressiveness
-increases immediately.
+- **The Interface:** A standard 1 to 5 star rating scale, accompanied by a single free-text
+  box prompted with *"What did you think?"* (or *"What went wrong?"* during a Bailout).
+- **The Pipeline:** The raw text and rating are saved permanently to the `reviews` and
+  `reading_ledger` tables. The LLM ingests this payload, extracts the underlying sentiment,
+  and automatically adjusts the dynamic weights in the `profile_signals` table. For finished
+  or DNF'd books, submitting the review seamlessly transitions the user to the "what's next"
+  suggestion or Bailout protocol. If pipeline depth is below the healthy threshold after a
+  book is marked complete, acquisition aggressiveness increases immediately.
 
 #### The Listening Velocity Monitor (The "Slog Detector")
 
@@ -379,8 +405,6 @@ Both options guarantee zero data training.
 
 - **Embedded Web UI:** A responsive dashboard (mobile + desktop) served directly from the
   Rust binary via axum and rust-embed. Built with React + Vite + shadcn/ui.
-- **Client Validation (MAM Rule 2.3):** Checks the qBittorrent version against the approved
-  client list and displays a warning in the UI if an unsupported/beta version is detected.
 - **Gotify Integration:** Delivers push notifications for critical NAT errors, series
   check-ins, and prompts to review finished media. Each notification deep-links to the
   relevant UI card. All alerts are persisted to the database with a unique ID, severity,
@@ -389,16 +413,18 @@ Both options guarantee zero data training.
   state updates and event/action history. Commands (manual reset, queue actions) are sent
   via REST POST.
 
-### Onboarding
+### Onboarding: The Librarian Interview
 
-On first boot, Windlass performs two-step profile initialisation:
+On first boot, Windlass performs a guided profile initialisation:
 
-1. **ABS Library Analysis:** Scans the existing Audiobookshelf library to infer genre
-   preferences, preferred lengths, and narrator affinities from what is already present.
-2. **Short Questionnaire (5 questions max):** Displayed on first open of the UI to capture
-   dealbreakers, preferred genres, and tone preferences that the library scan cannot infer.
-
-Subsequent DNF Autopsies and Post-Book Debriefs continuously refine the profile over time.
+1. **Library Import & Rating Wizard:** Windlass scans the existing Audiobookshelf library.
+   It presents the user with a UI to quickly process their existing books. The user can
+   assign a star rating and leave a free-text review (using the Universal Review Component)
+   for any title they wish.
+2. **Dealbreakers & Preferences:** The wizard explicitly asks the user for hard boundaries,
+   dealbreakers, and core preferences (e.g., "No LitRPG", "Must have a single narrator").
+3. **LLM Profile Generation:** The LLM ingests all the free-text comments, ratings, and
+   dealbreakers to generate the initial `profile_signals` database weights.
 
 ### Action Center
 
@@ -407,7 +433,7 @@ Most users will interact with Windlass primarily through Gotify notifications an
 to open it. It exists for users who want to inspect the current state of their pipeline,
 adjust priorities, or add something manually.
 
-It is organised into five panels.
+It is organised into seven panels.
 
 #### 1. Suggested Next Listens
 
@@ -418,7 +444,15 @@ duration, format badge, and series health badge (if applicable). **"Sell It To M
 are not shown in the list** — they are generated fresh when the user opens a specific card
 or receives a notification, ensuring the pitch reflects current context.
 
-Actions per card: **Approve** (sends to Download Queue) · **Reject** · **Snooze**
+- **The "Already Read" Workflow:** To easily build history without downloading known books,
+  every AI-curated card features an **"Already Read"** action button alongside *Approve*,
+  *Reject*, and *Snooze*. Users can also paste an external URL (e.g., Audible) into the
+  Universal Input Box and tag it as "Already Read".
+- **Immediate Capture:** Clicking "Already Read" instantly opens the Universal Review
+  Component. The rating and text are injected directly into the `reading_ledger`, and the
+  LLM uses it to immediately refine the user's profile.
+
+Actions per card: **Approve** (sends to Download Queue) · **Reject** · **Snooze** · **Already Read**
 
 The universal input box sits at the top of this panel:
 
@@ -458,6 +492,25 @@ collection in ABS.
 Books already present in ABS but not yet started. Ensures there is always something ready
 to listen to next. Cards use the same format as Suggested Next Listens. Windlass alerts if
 this panel is empty and the Download Queue is also empty.
+
+#### 6. User Profile Dashboard
+
+A dedicated control panel exposing the user's LLM profile exactly as it exists in the
+database. It displays the core `profile_preferences` (tag-style rows) and `profile_signals`
+(dynamic weights per dimension). Users can manually edit these raw key-value pairs or
+sliders directly. This ensures the user is always in total control of the AI's logic,
+without relying exclusively on inferred data.
+
+#### 7. Reading Ledger & Reviews
+
+A historical, searchable catalog displaying all data from the `reading_ledger` and `reviews`
+tables.
+
+- Users can revisit old books, read their past free-text reviews, and retroactively adjust
+  ratings.
+- **Optional Re-calibration:** When a user edits a past review or rating, Windlass does
+  *not* automatically overwrite the profile. Instead, it presents a prompt: *"Do you want
+  to re-calibrate your AI profile based on these changes?"*
 
 ---
 

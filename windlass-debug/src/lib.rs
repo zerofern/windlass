@@ -3,12 +3,14 @@
 pub mod causal_tx;
 mod dispatcher;
 pub mod history;
+pub mod log_layer;
 mod stream;
 pub mod types;
 
 pub use causal_tx::CausalTx;
 pub use dispatcher::DebugDispatcher;
 pub use history::DebugHistory;
+pub use log_layer::DebugLogLayer;
 pub use stream::DebuggableEventStream;
 pub use types::{
     ActionEntry, ActiveEvent, DebugCommand, LogEntry, RunningAction, StoredEvent, TraceEntry,
@@ -209,6 +211,13 @@ impl DebugController {
     #[must_use]
     pub fn is_debug_mode(&self) -> bool {
         self.debug_mode.load(Ordering::SeqCst)
+    }
+
+    /// Returns a clone of the `Arc<AtomicBool>` flag so external components
+    /// (e.g. `DebugLogLayer`) can check debug mode with a single atomic load.
+    #[must_use]
+    pub fn debug_mode_flag(&self) -> Arc<AtomicBool> {
+        self.debug_mode.clone()
     }
 
     // ── Breakpoints ───────────────────────────────────────────────────────────

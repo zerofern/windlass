@@ -20,7 +20,12 @@ pub use config::Config;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
 /// then runs the event loop forever.
-pub async fn run() -> Result<()> {
+/// Entry point for the imperative shell. Bootstraps all infrastructure,
+/// then runs the event loop forever.
+///
+/// `debug_ctrl` and `debug_owned` are created in `main` so the log layer
+/// can be registered on the tracing subscriber before the shell starts.
+pub async fn run(debug_ctrl: DebugController, debug_owned: windlass_debug::DebugOwnedPart) -> Result<()> {
     let config = Config::from_env()?;
 
     let (tx, rx) = mpsc::channel::<Event>(128);
@@ -31,7 +36,6 @@ pub async fn run() -> Result<()> {
 
     info!("Windlass started");
 
-    let (debug_ctrl, debug_owned) = DebugController::new_with_owned();
     let on_http = debug_ctrl.make_http_observer();
 
     let direct = reqwest::Client::builder()

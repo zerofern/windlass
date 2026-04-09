@@ -2664,6 +2664,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "windlass-core",
 ]
