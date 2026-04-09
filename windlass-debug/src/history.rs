@@ -138,16 +138,50 @@ impl DebugHistory {
         id
     }
 
-    /// Records that an async action has completed (wired fully in Phase 4).
+    /// Records that an async action has completed and links the causal result
+    /// event to its `ActionEntry`.
+    ///
+    /// The action may have completed after its parent event was already moved
+    /// to the trace (the typical case for causal actions), so this searches
+    /// `current_event` first and then walks the trace backwards.
     pub fn action_completed(&mut self, action_id: Uuid, caused_event_id: Option<Uuid>) {
         self.running_actions.retain(|a| a.id != action_id);
         if let Some(current) = &mut self.current_event {
             if let Some(entry) = current.actions.iter_mut().find(|a| a.id == action_id) {
                 entry.completed_at = Some(Utc::now());
                 entry.caused_event_id = caused_event_id;
+                self.seq += 1;
+                return;
+            }
+        }
+        // Action completed after its parent event was finalised — update in trace.
+        for trace_entry in self.trace.iter_mut().rev() {
+            if let Some(entry) = trace_entry.actions.iter_mut().find(|a| a.id == action_id) {
+                entry.completed_at = Some(Utc::now());
+                entry.caused_event_id = caused_event_id;
+                break;
             }
         }
         self.seq += 1;
+    }
+
+    /// Records a causal event — produced by a running action — into the queue.
+    ///
+    /// Returns the assigned event ID so the caller can immediately invoke
+    /// `action_completed(action_id, Some(event_id))` to link them.
+    pub fn push_causal_event(&mut self, event: Event, caused_by: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        self.event_queue.push_back(StoredEvent {
+            id,
+            at: event.at(),
+            arrived_at: Utc::now(),
+            variant: event_variant(&event),
+            payload: serde_json::to_value(&event).unwrap_or(serde_json::Value::Null),
+            caused_by_action: Some(caused_by),
+            event,
+        });
+        self.seq += 1;
+        id
     }
 
     /// Finalises the current event: updates `latest_state` and appends to trace.

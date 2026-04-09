@@ -1,10 +1,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+pub mod causal_tx;
 mod dispatcher;
 pub mod history;
 mod stream;
 pub mod types;
 
+pub use causal_tx::CausalTx;
 pub use dispatcher::DebugDispatcher;
 pub use history::DebugHistory;
 pub use stream::DebuggableEventStream;

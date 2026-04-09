@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_debug::{DebugController, DebugDispatcher, DebugHistory, DebuggableEventStream};
+use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory, DebuggableEventStream};
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
@@ -95,6 +95,10 @@ pub async fn run() -> Result<()> {
     let mut log_rx = debug_owned.log_rx;
     let mut queue_rx = debug_owned.queue_rx;
 
+    // Causation channel: action handlers send (event, action_id) here in debug mode
+    // so the loop can record caused_by_action on the resulting event.
+    let (causal_debug_tx, mut causal_rx) = mpsc::channel::<(Event, uuid::Uuid)>(128);
+
     if let Err(e) = mam.check_session().await {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
     }
@@ -128,6 +132,7 @@ pub async fn run() -> Result<()> {
             match dequeue_debug(
                 &mut history,
                 &mut queue_rx,
+                &mut causal_rx,
                 &mut cmd_rx,
                 &mut log_rx,
                 &state,
@@ -167,17 +172,24 @@ pub async fn run() -> Result<()> {
         };
 
         if let Some(eid) = event_id {
+            let plain_tx = tx.clone();
             debug_dispatcher
                 .dispatch(outcome.actions, |action| {
-                    history.action_started(&action, eid);
-                    ctx.execute(action);
+                    let action_id = history.action_started(&action, eid);
+                    let causal = CausalTx::debug(action_id, causal_debug_tx.clone());
+                    ctx.execute(action, causal);
                 })
                 .await;
             history.event_completed(eid, state.clone());
             debug_ctrl.publish(&history);
+            drop(plain_tx);
         } else {
+            let plain_tx = tx.clone();
             debug_dispatcher
-                .dispatch(outcome.actions, |action| ctx.execute(action))
+                .dispatch(outcome.actions, |action| {
+                    let causal = CausalTx::plain(uuid::Uuid::new_v4(), plain_tx.clone());
+                    ctx.execute(action, causal);
+                })
                 .await;
         }
     }
@@ -193,15 +205,21 @@ pub async fn run() -> Result<()> {
 async fn dequeue_debug(
     history: &mut DebugHistory,
     queue_rx: &mut tokio::sync::mpsc::Receiver<windlass_debug::StoredEvent>,
+    causal_rx: &mut tokio::sync::mpsc::Receiver<(windlass_core::events::Event, uuid::Uuid)>,
     cmd_rx: &mut tokio::sync::mpsc::Receiver<windlass_debug::DebugCommand>,
     log_rx: &mut tokio::sync::mpsc::Receiver<windlass_debug::LogEntry>,
     state: &SystemState,
     debug_ctrl: &DebugController,
 ) -> Option<(windlass_core::events::Event, Option<uuid::Uuid>)> {
     loop {
-        // Drain any newly-arrived stored events into the queue.
+        // Drain all pending channels before checking the queue.
         while let Ok(stored) = queue_rx.try_recv() {
             history.push_stored_event(stored);
+            debug_ctrl.publish(history);
+        }
+        while let Ok((event, action_id)) = causal_rx.try_recv() {
+            let event_id = history.push_causal_event(event, action_id);
+            history.action_completed(action_id, Some(event_id));
             debug_ctrl.publish(history);
         }
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -219,6 +237,13 @@ async fn dequeue_debug(
                 stored = queue_rx.recv() => match stored {
                     Some(s) => { history.push_stored_event(s); debug_ctrl.publish(history); }
                     None => return None,
+                },
+                causal = causal_rx.recv() => {
+                    if let Some((event, action_id)) = causal {
+                        let event_id = history.push_causal_event(event, action_id);
+                        history.action_completed(action_id, Some(event_id));
+                        debug_ctrl.publish(history);
+                    }
                 },
                 cmd = cmd_rx.recv() => match cmd {
                     Some(c) => { history.apply_cmd(c); debug_ctrl.publish(history); }
@@ -245,6 +270,13 @@ async fn dequeue_debug(
                     stored = queue_rx.recv() => match stored {
                         Some(s) => { history.push_stored_event(s); debug_ctrl.publish(history); }
                         None => { debug_ctrl.set_paused_on(None); return None; }
+                    },
+                    causal = causal_rx.recv() => {
+                        if let Some((event, action_id)) = causal {
+                            let event_id = history.push_causal_event(event, action_id);
+                            history.action_completed(action_id, Some(event_id));
+                            debug_ctrl.publish(history);
+                        }
                     },
                     cmd = cmd_rx.recv() => match cmd {
                         Some(c) => { history.apply_cmd(c); debug_ctrl.publish(history); }
@@ -299,20 +331,20 @@ struct ShellContext<'a> {
 
 impl ShellContext<'_> {
     /// Executes a single action produced by the Core.
-    fn execute(&mut self, action: Action) {
+    fn execute(&mut self, action: Action, causal_tx: CausalTx) {
         match action {
             Action::ScheduleWakeup(id, duration) => self.schedule_wakeup(id, duration),
-            Action::ReadPortFiles => self.read_port_files(),
-            Action::FetchAndDumpAllLogs => self.fetch_and_dump_all_logs(),
+            Action::ReadPortFiles => self.read_port_files(causal_tx),
+            Action::FetchAndDumpAllLogs => self.fetch_and_dump_all_logs(causal_tx),
             Action::StopDependentContainers => self.stop_dependent_containers(),
             Action::StartDependentContainers => self.start_dependent_containers(),
             Action::RestartGluetun => self.restart_gluetun(),
-            Action::AuthenticateQbit => self.authenticate_qbit(),
-            Action::SyncQbitPort(cookie, port) => self.sync_qbit_port(cookie, port),
-            Action::UpdateMam(ip) => self.update_mam(ip),
-            Action::CheckMamConnectability => self.check_mam_connectability(),
-            Action::CheckDiskSpace => self.check_disk_space(),
-            Action::CheckNewTorrents(cookie) => self.check_new_torrents(cookie),
+            Action::AuthenticateQbit => self.authenticate_qbit(causal_tx),
+            Action::SyncQbitPort(cookie, port) => self.sync_qbit_port(cookie, port, causal_tx),
+            Action::UpdateMam(ip) => self.update_mam(ip, causal_tx),
+            Action::CheckMamConnectability => self.check_mam_connectability(causal_tx),
+            Action::CheckDiskSpace => self.check_disk_space(causal_tx),
+            Action::CheckNewTorrents(cookie) => self.check_new_torrents(cookie, causal_tx),
             Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
         }
     }
