@@ -93,6 +93,8 @@ export interface ActiveEvent {
   state_before: SystemState
   started_at: string
   actions: ActionEntry[]
+  /** Actions waiting to be dispatched — populated before dispatch begins. */
+  pending_actions: unknown[]
 }
 
 export interface RunningAction {

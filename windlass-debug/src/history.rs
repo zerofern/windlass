@@ -91,6 +91,7 @@ impl DebugHistory {
                 state_before,
                 started_at: Utc::now(),
                 actions: Vec::new(),
+                pending_actions: Vec::new(),
             });
             self.seq += 1;
         }
@@ -105,11 +106,25 @@ impl DebugHistory {
             state_before,
             started_at: Utc::now(),
             actions: Vec::new(),
+            pending_actions: Vec::new(),
         });
         self.seq += 1;
     }
 
     // ── Action lifecycle ──────────────────────────────────────────────────────
+
+    /// Records the full action list before dispatch begins, so the frontend
+    /// can show all upcoming actions even before they are stepped through.
+    /// Each call to `action_started` will pop the front entry from this list.
+    pub fn actions_ready(&mut self, actions: &[Action]) {
+        if let Some(current) = &mut self.current_event {
+            current.pending_actions = actions
+                .iter()
+                .map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null))
+                .collect();
+        }
+        self.seq += 1;
+    }
 
     /// Records that an action has been dispatched. Returns the action's ID.
     pub fn action_started(&mut self, action: &Action, parent_event_id: Uuid) -> Uuid {
@@ -118,6 +133,10 @@ impl DebugHistory {
         let payload = serde_json::to_value(action).unwrap_or(serde_json::Value::Null);
 
         if let Some(current) = &mut self.current_event {
+            // Remove the front pending entry now that this action has started.
+            if !current.pending_actions.is_empty() {
+                current.pending_actions.remove(0);
+            }
             current.actions.push(ActionEntry {
                 id,
                 variant,

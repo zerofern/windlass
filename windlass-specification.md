@@ -101,13 +101,15 @@ SQLite blobs, keeping the database lean and making per-book deletion trivial:
 
 ### Table Overview
 
-`books` is the canonical library record for every title Windlass knows about — whether it
-downloaded the file, discovered it in ABS from a manual add, or just fetched metadata while
-evaluating a series. Everything else hangs off `books`.
+`books` is the canonical library record for every title Windlass knows about. **One row
+per work (title) — not per edition.** Multiple MAM torrents may exist for the same work
+(different narrators, re-releases, languages); the §5 scoring engine selects the single
+best torrent to download. Everything else hangs off `books`.
 
 | Table                 | Contents                                                                                                                                                                                                                                                                     |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `books`               | Every title Windlass knows about. Library status lifecycle (`known → queued → downloading → seeding → completed`), source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`), Audnexus ASIN, Hardcover ID, ABS item ID, `epub_status` (`searching` / `found` / `not_found`), `tag_scores_json` (tag intensity scores -100→+100; top 20–30 tags also denormalised as real columns for indexed dot-product queries), `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`), `enrichment_summary_path` (path to file-backed enrichment summary, null until Stage 2), `reason` (LLM-generated blurb for why this book suits the user; overwritten on re-evaluation). A book record survives disk deletion. |
+| `metadata_cache`      | Read-through cache for external API responses. Keyed by `(source, external_id)` where `source` is `audnexus` or `hardcover` and `external_id` is the ASIN or Hardcover ID. Stores the raw `response_json` and `fetched_at` timestamp. TTL: Audnexus 30 days (stable data), Hardcover 7 days (community reviews change frequently). Eliminates redundant API calls across Stage 1, Stage 2, and all LLM context assembly. |
 | `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
 | `series`              | Series identity and health (Audnexus data, user started/following flags). `engagement_trend_json`: array of `{book_number, rating, completion_ratio, slog_events}` appended after each series book review. Used for series drop-off detection. |
 | `torrents`            | File data once a download starts: qBittorrent hash, seed time, HnR status, ratio, disk path. |
@@ -242,10 +244,17 @@ Windlass evaluates raw tracker search results to automatically select the optima
   | Format: `mp3` | `−100` | Excluded by default |
   | Format: `m4a`, `ogg`, other audio | `−100` | Excluded by default |
   | Title contains `Abridged` | `−100` | MAM rule compliance |
+  | Language: `English` | `+50` | Prefer English editions by default |
+  | Language: not `English` | `−50` | Deprioritise non-English editions |
 
-  Scores are integers on the same **-100 → +100 scale** used throughout Windlass.
-  A candidate scoring below **0** (after all rules are combined) is not auto-grabbed.
-  A user who explicitly wants mp3 downloads can remove or reduce the `−100` rule.
+  Narrator preference is not pre-installed — users add their own rules (e.g. `+80` for
+  "Ray Porter", `+60` for "Kate Reading"). This is the primary mechanism for resolving
+  between multiple editions of the same work.
+
+  Scores are integers on the same **-100 → +100 scale** used throughout Windlass. A
+  candidate scoring below **0** after all rules are combined is not auto-grabbed. When
+  multiple torrents match the same work, the highest-scoring one is selected — only one
+  torrent is ever downloaded per work.
 
 - **MAM New Additions Monitor:** Windlass polls MAM's audiobook catalogue sorted by date
   added at regular intervals. New entries are cross-referenced against `books` (skip

@@ -56,7 +56,12 @@ pub struct ActiveEvent {
     pub stored: StoredEvent,
     pub state_before: SystemState,
     pub started_at: DateTime<Utc>,
+    /// Actions that have already been dispatched (started).
     pub actions: Vec<ActionEntry>,
+    /// Actions still waiting to be dispatched (serialised payloads only).
+    /// Populated before dispatch begins; each entry is removed when the
+    /// corresponding action transitions to `actions`.
+    pub pending_actions: Vec<Value>,
 }
 
 /// An async action that has been dispatched but not yet completed.

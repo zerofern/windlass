@@ -102,11 +102,12 @@ function HttpExchangeEntry({ x }: { x: HttpExchange }) {
   )
 }
 
-function ActionTimeline({ actions }: { actions: ActionEntry[] }) {
-  if (actions.length === 0) return null
+function ActionTimeline({ actions, pendingActions }: { actions: ActionEntry[]; pendingActions: unknown[] }) {
+  const total = actions.length + pendingActions.length
+  if (total === 0) return null
   return (
     <div>
-      <p className="text-xs font-semibold text-muted-foreground mb-2">Actions ({actions.length})</p>
+      <p className="text-xs font-semibold text-muted-foreground mb-2">Actions ({total})</p>
       <div className="flex flex-col gap-4">
         {actions.map(action => (
           <div key={action.id} className="border-l-2 border-muted/30 pl-3">
@@ -133,9 +134,28 @@ function ActionTimeline({ actions }: { actions: ActionEntry[] }) {
             )}
           </div>
         ))}
+        {pendingActions.map((p, i) => (
+          <div key={`pending-${i}`} className="border-l-2 border-muted/20 pl-3 opacity-50">
+            <div className="flex items-center gap-2 mb-2">
+              <Badge variant="outline" className="text-[10px] shrink-0 text-muted-foreground">
+                {variantFromPayload(p)}
+              </Badge>
+              <span className="text-[10px] text-muted-foreground">pending</span>
+            </div>
+            <JsonBlock value={p} />
+          </div>
+        ))}
       </div>
     </div>
   )
+}
+
+function variantFromPayload(p: unknown): string {
+  if (p && typeof p === 'object') {
+    const keys = Object.keys(p as Record<string, unknown>)
+    if (keys.length === 1) return keys[0]
+  }
+  return '?'
 }
 
 function LogLevel({ level }: { level: string }) {
@@ -326,6 +346,7 @@ function DetailPane({
   const stateBefore = selected.kind === 'trace' ? selected.entry.state_before : selected.active.state_before
   const stateAfter = selected.kind === 'trace' ? selected.entry.state_after : null
   const actions = selected.kind === 'trace' ? selected.entry.actions : selected.active.actions
+  const pendingActions = selected.kind === 'current' ? (selected.active.pending_actions ?? []) : []
 
   return (
     <div className="flex flex-col gap-4">
@@ -355,7 +376,9 @@ function DetailPane({
         </div>
       )}
 
-      {actions.length > 0 && <ActionTimeline actions={actions} />}
+      {(actions.length > 0 || pendingActions.length > 0) && (
+        <ActionTimeline actions={actions} pendingActions={pendingActions} />
+      )}
     </div>
   )
 }

@@ -187,6 +187,8 @@ pub async fn run(
 
         if let Some(eid) = event_id {
             let plain_tx = tx.clone();
+            history.actions_ready(&outcome.actions);
+            debug_ctrl.publish(&history);
             debug_dispatcher
                 .dispatch(outcome.actions, |action| {
                     let action_id = history.action_started(&action, eid);
