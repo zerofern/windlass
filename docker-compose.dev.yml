@@ -94,6 +94,7 @@ services:
       QBIT_ADMIN_URL: http://mock-qbittorrent:8080/__admin
       MAM_ADMIN_URL: http://mock-mam:8080/__admin
       GOTIFY_ADMIN_URL: http://mock-gotify:8080/__admin
+      GLUETUN_CONTROL_URL: http://mock-gluetun:9001
       RUST_LOG: info
     depends_on:
       mock-qbittorrent:
