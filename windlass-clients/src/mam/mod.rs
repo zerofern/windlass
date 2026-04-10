@@ -37,6 +37,7 @@ struct UnsatSummary {
 pub struct MamClient {
     client: reqwest::Client,
     session: Arc<Mutex<String>>,
+    check_session_url: String,
     seedbox_url: String,
     load_url: String,
     last_request_at: Arc<Mutex<Option<std::time::Instant>>>,
@@ -66,6 +67,7 @@ impl MamClient {
         Ok(Self {
             client,
             session: Arc::new(Mutex::new(session)),
+            check_session_url: "https://www.myanonamouse.net/json/checkCookie.php".into(),
             seedbox_url,
             load_url,
             last_request_at: Arc::new(Mutex::new(None)),
@@ -86,7 +88,7 @@ impl MamClient {
         let current = self.session.lock().unwrap().clone();
         let resp = self
             .client
-            .get("https://www.myanonamouse.net/json/checkCookie.php")
+            .get(&self.check_session_url)
             .header(reqwest::header::COOKIE, format!("mam_id={current}"))
             .send()
             .await?;
@@ -282,6 +284,12 @@ impl MamClient {
     #[cfg(test)]
     pub fn session_value(&self) -> String {
         self.session.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub fn with_check_session_url(mut self, url: String) -> Self {
+        self.check_session_url = url;
+        self
     }
 }
 
@@ -557,5 +565,287 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── check_session ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn check_session_ok_returns_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap()
+        .with_check_session_url(server.uri());
+        assert!(mam.check_session().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_session_error_status_returns_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap()
+        .with_check_session_url(server.uri());
+        assert!(mam.check_session().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_session_rotates_cookie() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("Set-Cookie", "mam_id=rotated; Path=/; HttpOnly"),
+            )
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "old_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap()
+        .with_check_session_url(server.uri());
+        mam.check_session().await.unwrap();
+        assert_eq!(mam.session_value(), "rotated");
+    }
+
+    // ── rate limiting ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_seedbox_rate_limit_returns_violation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Success": true, "msg": "ok", "ip": "1.2.3.4"
+            })))
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        // First call consumes the rate limit slot.
+        mam.update_seedbox().await;
+        // Second call immediately after should be rate-limited.
+        let event = mam.update_seedbox().await;
+        assert!(matches!(event, Event::MamRateLimitViolation { .. }));
+    }
+
+    #[tokio::test]
+    async fn check_connectability_rate_limit_returns_violation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "connectable": "yes" })),
+            )
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        mam.check_connectability().await;
+        let event = mam.check_connectability().await;
+        assert!(matches!(event, Event::MamRateLimitViolation { .. }));
+    }
+
+    // ── do_update_seedbox error paths ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_seedbox_network_error_returns_success() {
+        // Network failure is treated as "no-op success" — the Core retries on a wakeup.
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let event = mam.update_seedbox().await;
+        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_seedbox_non_success_non_asn_returns_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Success": false,
+                "msg": "Some other error",
+                "ip": "1.2.3.4"
+            })))
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let event = mam.update_seedbox().await;
+        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_seedbox_unparseable_body_returns_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let event = mam.update_seedbox().await;
+        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
+    }
+
+    // ── do_check_connectability error paths ───────────────────────────────────
+
+    #[tokio::test]
+    async fn check_connectability_network_error_returns_unreachable() {
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let event = mam.check_connectability().await;
+        assert!(matches!(
+            event,
+            Event::MamStatusObserved {
+                status: MamStatus::Unreachable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_connectability_unparseable_body_returns_unreachable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let event = mam.check_connectability().await;
+        assert!(matches!(
+            event,
+            Event::MamStatusObserved {
+                status: MamStatus::Unreachable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_connectability_with_unsat_field_returns_connectable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "connectable": "yes",
+                "unsat": { "count": 2, "limit": 10 }
+            })))
+            .mount(&server)
+            .await;
+
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            server.uri(),
+            server.uri(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let event = mam.check_connectability().await;
+        assert!(matches!(
+            event,
+            Event::MamStatusObserved {
+                status: MamStatus::Connectable,
+                ..
+            }
+        ));
+    }
+
+    // ── constructor ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_with_proxy_url_builds_client() {
+        // A local socks5 proxy address — client builds without error.
+        let result = MamClient::new(
+            Some("socks5://127.0.0.1:1080"),
+            "session".into(),
+            "http://example.com".into(),
+            "http://example.com".into(),
+            "windlass",
+            Arc::new(|_| {}),
+        );
+        assert!(result.is_ok());
     }
 }

@@ -398,4 +398,71 @@ mod tests {
         let names = qbit.list_torrents(&cookie).await;
         assert!(names.is_empty());
     }
+
+    #[tokio::test]
+    async fn authenticate_unexpected_response_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .mount(&server)
+            .await;
+
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            "admin".into(),
+            "password".into(),
+            Arc::new(|_| {}),
+        );
+        let event = qbit.authenticate().await;
+        assert!(
+            matches!(
+                event,
+                Event::QbitApiError {
+                    code: HttpStatusCode(503),
+                    ..
+                }
+            ),
+            "Expected QbitApiError(503), got {event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_port_network_error_returns_failed_with_code_zero() {
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            "admin".into(),
+            "password".into(),
+            Arc::new(|_| {}),
+        );
+        let cookie = AuthCookie("abc123".into());
+        let port = VpnPort::try_new(51820).unwrap();
+        let event = qbit.sync_port(&cookie, port).await;
+        assert!(
+            matches!(
+                event,
+                Event::QbitPortSyncFailed {
+                    code: HttpStatusCode(0),
+                    ..
+                }
+            ),
+            "Expected QbitPortSyncFailed(0), got {event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_torrents_network_error_returns_empty() {
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            "admin".into(),
+            "password".into(),
+            Arc::new(|_| {}),
+        );
+        let cookie = AuthCookie("abc123".into());
+        let names = qbit.list_torrents(&cookie).await;
+        assert!(names.is_empty());
+    }
 }
