@@ -593,15 +593,22 @@ export function Debug() {
   }, [])
 
   // Keep selected item pointing at the latest version of the same object.
+  // Also auto-select the current event when nothing is selected, or when
+  // a selected queue item is promoted to current.
   useEffect(() => {
-    if (!selected || !debugState) return
+    if (!debugState) return
+    if (!selected) {
+      if (debugState.current_event) setSelected({ kind: 'current', active: debugState.current_event })
+      return
+    }
     if (selected.kind === 'trace') {
       const updated = debugState.trace.find(e => e.event.id === selected.entry.event.id)
       if (updated) setSelected({ kind: 'trace', entry: updated })
     } else if (selected.kind === 'queue') {
       const updated = debugState.event_queue.find(e => e.id === selected.event.id)
       if (updated) setSelected({ kind: 'queue', event: updated })
-      else setSelected(null) // deleted or moved to current
+      else if (debugState.current_event) setSelected({ kind: 'current', active: debugState.current_event })
+      else setSelected(null)
     } else if (selected.kind === 'current') {
       if (debugState.current_event) setSelected({ kind: 'current', active: debugState.current_event })
       else setSelected(null)
