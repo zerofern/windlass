@@ -332,6 +332,24 @@ impl DebugController {
         let _ = self.notify_tx.send(history.seq);
     }
 
+    /// Patches only the `paused_on` field of the current snapshot and
+    /// rebroadcasts. Used by [`DebugDispatcher`] which has no access to
+    /// `DebugHistory` but must notify the frontend when it pauses on an action.
+    pub fn publish_paused(&self) {
+        if !self.is_debug_mode() {
+            return;
+        }
+        let current = self.snapshot.load_full();
+        let seq = current.seq + 1;
+        let updated = Arc::new(DebugState {
+            seq,
+            paused_on: self.paused_on.load_full().as_ref().clone(),
+            ..(*current).clone()
+        });
+        self.snapshot.store(updated);
+        let _ = self.notify_tx.send(seq);
+    }
+
     // ── HTTP observation ──────────────────────────────────────────────────────
 
     /// Returns an [`HttpObserver`] that, when debug mode is active, reads

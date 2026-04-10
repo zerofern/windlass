@@ -1,3 +1,5 @@
+copilot --resume=b7c59de2-a45f-4dee-b671-833558330801
+
 # Debug Redesign — Full Observability & Control
 
 ## Problem

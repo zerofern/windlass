@@ -33,8 +33,10 @@ impl DebugDispatcher {
                     index: idx + 1,
                     of: total,
                 }));
+                self.debug_ctrl.publish_paused();
                 let execute_it = self.debug_ctrl.acquire_step().await;
                 self.debug_ctrl.set_paused_on(None);
+                self.debug_ctrl.publish_paused();
                 if !execute_it {
                     continue;
                 }
