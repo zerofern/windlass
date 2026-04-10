@@ -119,6 +119,7 @@ evaluating a series. Everything else hangs off `books`.
 | `series_check_ins`    | Records of the 60–75% series check-in: what was offered, what the user chose. |
 | `profile_signals`     | One row per scored dimension. `dimension_type` (`tag` / `author` / `narrator`), `dimension_id` (canonical tag slug or name), `score` (integer -100→+100). Updated after every review via Learn call delta. |
 | `mood_state`          | Single-row table (replaced on each update). `inferred_modifiers_json` (tag score deltas from inference), `explicit_override_json` (user-set modifiers with per-pick decay multiplier at 0.65×, dropped when `\|score\| < 5`), `inferred_context` (human-readable explanation shown in Queue View and Panel 6), `computed_at` timestamp. |
+| `events`              | Internal audit log. One row per significant system action. `source` (which rule or feature triggered it — e.g. `freeleech_scavenger`, `mood_inference`, `series_continuation`, `stage2_enrichment`), `action` (e.g. `book_grabbed`, `slot_replaced`, `epub_found`), `book_id` (nullable FK), `detail_json` (structured context). Read-only — never modified after insert. **Retention: 90 days rolling.** Visible in the desktop UI Event Log panel. Distinct from `alerts` (which are user-facing and actionable). |
 | `alerts`              | Fired alerts. UUID primary key for notification deep-links. Severity, timestamp, triggering event, system state snapshot. **Retention: 30 days rolling.** |
 | `playback_sessions`   | One row per play/pause event (or scheduled ABS position poll) per book. `start_time`, `start_position_sec`, `end_time`, `end_position_sec`, `device_id`, `time_of_day_bucket` (`morning` / `afternoon` / `evening` / `night`), `day_of_week`, `source` (`webhook` / `poll`). Used for Sleep Recovery, slog detection, and mood inference. Retained permanently (required for seasonal pattern queries). |
 | `sync_artifacts`      | Metadata row for a book's forced-alignment file. `book_id` FK, `alignment_path` (path to `windlass_data/sync/{book_id}.json`), `state` (`pending_alignment → aligned`). Only present when an epub counterpart exists. The file is deleted with the book; this row is deleted at the same time. |
@@ -223,7 +224,10 @@ the account from automated bans.
 
 Windlass evaluates raw tracker search results to automatically select the optimal release.
 
-- **Base Rules:** Evaluates seeders, Freeleech status, and file format (preferring M4B).
+- **Base Rules:** Evaluates seeders and Freeleech status. **Audio format is a hard gate:
+  only `.m4b` torrents are eligible for automated download.** Other formats (mp3, m4a,
+  ogg, etc.) are unconditionally skipped — this ensures every book in the library works
+  with the Worker Node, forced alignment, and the full feature set.
 - **Custom Format Weights (Radarr-Style):** Users define custom score adjustments in the
   Action Center using Regex or plain keyword rules matched against the torrent title,
   uploader, and format fields (e.g., `+50` for "Ray Porter", `−100` for "Abridged",
@@ -448,9 +452,11 @@ threshold is automatically raised so that more candidates surface in Panel 1 rat
 auto-grabbing — profile confidence is too low to trust silent auto-approval.*
 
 **Epub acquisition:** whenever a book is approved for download, Windlass simultaneously
-searches MAM for the matching epub. Epubs are small (2–5 MB) and unlock significant
-features. If found, the epub is queued at `priority: high` alongside the audiobook.
-`books.epub_status` is updated to `found` or `not_found` accordingly.
+searches MAM for the matching epub. If found, the epub is queued at `priority: high`
+alongside the audiobook — epubs are 2–5 MB and unlock Stage 2 full enrichment, forced
+alignment, Glossary, Sleep Recovery, and series recaps. `books.epub_status` is updated to
+`found` or `not_found`. If no epub is found the m4b is downloaded regardless and Stage 2
+runs Path B (lite enrichment from reviews and metadata). Epub absence is never a blocker.
 
 #### The Monitoring Queue
 
@@ -1221,6 +1227,14 @@ is already playing — the review is asynchronous and can always be completed la
 
 Condensed pipeline view: Download Queue, Upcoming in Series, Free Discoveries. Supports
 card approvals and queue reordering without opening the desktop UI.
+
+#### Event Log (Desktop)
+
+A chronological, searchable log of every significant action Windlass has taken, drawn from
+the `events` table. Each row shows timestamp, source rule/feature, action, and the
+affected book (linked to its card). Filterable by source and action type. Read-only — the
+event log is an audit trail, not an inbox. Useful for understanding why a book was grabbed,
+why a slot was replaced, or tracing the enrichment pipeline for a specific title.
 
 ### 10.4 Notification Behaviour
 

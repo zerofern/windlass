@@ -77,69 +77,63 @@ function StateDiff({ before, after }: { before: SystemState; after: SystemState 
   )
 }
 
-function HttpExchangeRow({ x }: { x: HttpExchange }) {
-  const [open, setOpen] = useState(false)
+function HttpExchangeEntry({ x }: { x: HttpExchange }) {
   return (
-    <div className="text-[10px] border border-muted/30 rounded p-1 mb-1">
-      <div className="flex items-center gap-2 cursor-pointer" onClick={() => setOpen(o => !o)}>
+    <div className="text-[10px] font-mono space-y-1 border border-muted/20 rounded p-2 bg-muted/5">
+      <div className="flex items-center gap-2">
         <Badge variant="secondary" className="text-[10px] shrink-0">{x.module}</Badge>
-        <span className="font-bold text-primary">{x.method}</span>
+        <span className="font-bold text-primary shrink-0">{x.method}</span>
         <span className="truncate text-muted-foreground flex-1">{x.url}</span>
         <Badge variant={x.response_status < 400 ? 'success' : 'destructive'} className="text-[10px] shrink-0">
           {x.response_status}
         </Badge>
-        <span className="text-muted-foreground">{open ? '▲' : '▼'}</span>
       </div>
-      {open && (
-        <div className="mt-1 space-y-1">
-          {x.request_body && (
-            <div>
-              <p className="text-muted-foreground">Request:</p>
-              <pre className="whitespace-pre-wrap break-all bg-muted/20 rounded p-1">{displayValue(x.request_body)}</pre>
-            </div>
-          )}
-          <div>
-            <p className="text-muted-foreground">Response:</p>
-            <pre className="whitespace-pre-wrap break-all bg-muted/20 rounded p-1">{displayValue(x.response_body)}</pre>
-          </div>
+      {x.request_body != null && (
+        <div>
+          <p className="text-muted-foreground text-[9px] uppercase tracking-wider mb-0.5">Request</p>
+          <pre className="whitespace-pre-wrap break-all bg-muted/20 rounded p-1">{displayValue(x.request_body)}</pre>
         </div>
       )}
+      <div>
+        <p className="text-muted-foreground text-[9px] uppercase tracking-wider mb-0.5">Response</p>
+        <pre className="whitespace-pre-wrap break-all bg-muted/20 rounded p-1">{displayValue(x.response_body)}</pre>
+      </div>
     </div>
   )
 }
 
-function ActionRow({ action }: { action: ActionEntry }) {
-  const [open, setOpen] = useState(false)
-  const done = action.completed_at != null
+function ActionTimeline({ actions }: { actions: ActionEntry[] }) {
+  if (actions.length === 0) return null
   return (
-    <div className="border border-muted/30 rounded p-2 mb-1">
-      <div className="flex items-center gap-2 cursor-pointer" onClick={() => setOpen(o => !o)}>
-        <Badge variant={done ? 'secondary' : 'default'} className="text-[10px] shrink-0">
-          {action.variant}
-        </Badge>
-        {done
-          ? <span className="text-xs text-muted-foreground">done {fmt(action.completed_at!)}</span>
-          : <span className="text-xs text-yellow-500">running…</span>
-        }
-        {action.caused_event_id && (
-          <span className="text-[10px] text-blue-400 ml-auto">→ causal event</span>
-        )}
-        {action.http_exchanges.length > 0 && (
-          <span className="text-[10px] text-muted-foreground ml-auto">{action.http_exchanges.length} HTTP</span>
-        )}
-        <span className="text-muted-foreground ml-1">{open ? '▲' : '▼'}</span>
-      </div>
-      {open && (
-        <div className="mt-2 space-y-2">
-          <JsonBlock value={action.payload} />
-          {action.http_exchanges.length > 0 && (
-            <div>
-              <p className="text-[10px] font-semibold text-muted-foreground mb-1">HTTP Exchanges</p>
-              {action.http_exchanges.map((x, i) => <HttpExchangeRow key={i} x={x} />)}
+    <div>
+      <p className="text-xs font-semibold text-muted-foreground mb-2">Actions ({actions.length})</p>
+      <div className="flex flex-col gap-4">
+        {actions.map(action => (
+          <div key={action.id} className="border-l-2 border-muted/30 pl-3">
+            <div className="flex items-center gap-2 mb-2">
+              <Badge variant={action.completed_at ? 'secondary' : 'default'} className="text-[10px] shrink-0">
+                {action.variant}
+              </Badge>
+              {action.completed_at
+                ? <span className="text-[10px] text-muted-foreground">{fmt(action.completed_at)}</span>
+                : <span className="text-[10px] text-yellow-500">running…</span>
+              }
+              {action.caused_event_id && (
+                <Badge variant="outline" className="text-[10px] text-blue-400 border-blue-400/30">→ caused event</Badge>
+              )}
+              {action.http_exchanges.length > 0 && (
+                <span className="text-[10px] text-muted-foreground ml-auto">{action.http_exchanges.length} HTTP</span>
+              )}
             </div>
-          )}
-        </div>
-      )}
+            <JsonBlock value={action.payload} />
+            {action.http_exchanges.length > 0 && (
+              <div className="mt-2 space-y-2 pl-2 border-l border-muted/20">
+                {action.http_exchanges.map((x, i) => <HttpExchangeEntry key={i} x={x} />)}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
@@ -361,12 +355,7 @@ function DetailPane({
         </div>
       )}
 
-      {actions.length > 0 && (
-        <div>
-          <p className="text-xs font-semibold text-muted-foreground mb-1">Actions ({actions.length})</p>
-          {actions.map(a => <ActionRow key={a.id} action={a} />)}
-        </div>
-      )}
+      {actions.length > 0 && <ActionTimeline actions={actions} />}
     </div>
   )
 }
@@ -374,10 +363,13 @@ function DetailPane({
 // ── Log panel ─────────────────────────────────────────────────────────────────
 
 function LogPanel({ logs }: { logs: LogEntry[] }) {
-  const bottomRef = useRef<HTMLDivElement>(null)
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [logs.length])
+  const containerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = containerRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [logs.length])
   return (
-    <div className="h-40 overflow-auto rounded-lg border bg-muted/10 font-mono text-[10px] p-2">
+    <div ref={containerRef} className="h-40 overflow-auto rounded-lg border bg-muted/10 font-mono text-[10px] p-2">
       {logs.length === 0 && (
         <p className="text-muted-foreground">No logs captured — enable debug mode to see log output.</p>
       )}
@@ -389,7 +381,6 @@ function LogPanel({ logs }: { logs: LogEntry[] }) {
           <span>{l.message}</span>
         </div>
       ))}
-      <div ref={bottomRef} />
     </div>
   )
 }
@@ -511,10 +502,20 @@ function BreakpointList({ title, variants, active, onToggle }: {
   active: string[]
   onToggle: (v: string, on: boolean) => void
 }) {
+  const [open, setOpen] = useState(false)
   return (
     <div className="flex flex-col gap-1">
-      <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">{title}</p>
-      {variants.map(v => {
+      <button
+        className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground mb-1 text-left"
+        onClick={() => setOpen(o => !o)}
+      >
+        <span>{open ? '▼' : '▶'}</span>
+        <span>{title}</span>
+        {active.length > 0 && (
+          <Badge variant="destructive" className="text-[10px] ml-1">{active.length}</Badge>
+        )}
+      </button>
+      {open && variants.map(v => {
         const on = active.includes(v)
         return (
           <label key={v} className="flex items-center gap-2 cursor-pointer select-none">
