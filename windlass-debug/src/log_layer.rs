@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::Level;
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 use crate::types::LogEntry;
 

@@ -224,10 +224,8 @@ the account from automated bans.
 
 Windlass evaluates raw tracker search results to automatically select the optimal release.
 
-- **Base Rules:** Evaluates seeders and Freeleech status. **Audio format is a hard gate:
-  only `.m4b` torrents are eligible for automated download.** Other formats (mp3, m4a,
-  ogg, etc.) are unconditionally skipped — this ensures every book in the library works
-  with the Worker Node, forced alignment, and the full feature set.
+- **Base Rules:** Evaluates seeders and Freeleech status. The base score for each
+  candidate starts at 0 and is adjusted by Custom Format Weight rules.
 - **Custom Format Weights (Radarr-Style):** Users define custom score adjustments in the
   Action Center using Regex or plain keyword rules matched against the torrent title,
   uploader, and format fields (e.g., `+50` for "Ray Porter", `−100` for "Abridged",
@@ -235,6 +233,20 @@ Windlass evaluates raw tracker search results to automatically select the optima
   with the base score. These weights are the primary mechanism by which the auto-grabber
   selects the correct release without user approval — a narrator preference or format
   rejection defined here directly controls which torrents are snatched automatically.
+
+  **Default rules (pre-installed, user-editable):**
+
+  | Rule | Score | Rationale |
+  |---|---|---|
+  | Format: `m4b` | `+0` | Baseline — preferred format |
+  | Format: `mp3` | `−100` | Excluded by default |
+  | Format: `m4a`, `ogg`, other audio | `−100` | Excluded by default |
+  | Title contains `Abridged` | `−100` | MAM rule compliance |
+
+  Scores are integers on the same **-100 → +100 scale** used throughout Windlass.
+  A candidate scoring below **0** (after all rules are combined) is not auto-grabbed.
+  A user who explicitly wants mp3 downloads can remove or reduce the `−100` rule.
+
 - **MAM New Additions Monitor:** Windlass polls MAM's audiobook catalogue sorted by date
   added at regular intervals. New entries are cross-referenced against `books` (skip
   already-known titles) and passed through Stage 1 enrichment (§7.1). Strong profile

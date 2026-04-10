@@ -331,7 +331,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, Event::PortFileReadResult { result: Err(_), .. }))
             .count();
-        assert_eq!(err_count, 1, "only the first error should be forwarded, got {err_count}");
+        assert_eq!(
+            err_count, 1,
+            "only the first error should be forwarded, got {err_count}"
+        );
 
         // Verify recovery: write a valid port — should always be forwarded
         std::fs::write(&port_path, "51820").unwrap();

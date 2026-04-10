@@ -12,7 +12,9 @@ use tracing::{debug, info, warn};
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
-use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory, DebuggableEventStream};
+use windlass_debug::{
+    CausalTx, DebugController, DebugDispatcher, DebugHistory, DebuggableEventStream,
+};
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
@@ -25,7 +27,10 @@ pub use config::Config;
 ///
 /// `debug_ctrl` and `debug_owned` are created in `main` so the log layer
 /// can be registered on the tracing subscriber before the shell starts.
-pub async fn run(debug_ctrl: DebugController, debug_owned: windlass_debug::DebugOwnedPart) -> Result<()> {
+pub async fn run(
+    debug_ctrl: DebugController,
+    debug_owned: windlass_debug::DebugOwnedPart,
+) -> Result<()> {
     let config = Config::from_env()?;
 
     let (tx, rx) = mpsc::channel::<Event>(128);

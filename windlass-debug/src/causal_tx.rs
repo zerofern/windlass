@@ -34,11 +34,17 @@ enum CausalTxInner {
 
 impl CausalTx {
     pub fn debug(action_id: Uuid, tx: mpsc::Sender<(Event, Uuid)>) -> Self {
-        Self { action_id, inner: CausalTxInner::Debug(tx) }
+        Self {
+            action_id,
+            inner: CausalTxInner::Debug(tx),
+        }
     }
 
     pub fn plain(action_id: Uuid, tx: mpsc::Sender<Event>) -> Self {
-        Self { action_id, inner: CausalTxInner::Plain(tx) }
+        Self {
+            action_id,
+            inner: CausalTxInner::Plain(tx),
+        }
     }
 
     /// Wraps `f` in a `CURRENT_ACTION_ID` scope so that any HTTP calls made

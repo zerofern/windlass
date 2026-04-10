@@ -2,8 +2,8 @@ use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use windlass_core::events::Event;
 use windlass_core::HttpObserver;
+use windlass_core::events::Event;
 use windlass_types::{AuthCookie, HttpExchange, HttpStatusCode, TorrentName, VpnPort};
 
 #[derive(Deserialize)]

@@ -108,7 +108,10 @@ async fn chaos_gluetun_state_endpoint_returns_fields() {
 
     assert!(resp["ip"].as_str().is_some(), "missing 'ip' field");
     assert!(resp["port"].as_u64().is_some(), "missing 'port' field");
-    assert!(resp["healthy"].as_bool().is_some(), "missing 'healthy' field");
+    assert!(
+        resp["healthy"].as_bool().is_some(),
+        "missing 'healthy' field"
+    );
 }
 
 #[tokio::test]
@@ -230,7 +233,11 @@ async fn qbit_connection_refused_windlass_stays_alive() {
         .send()
         .await
         .expect("health request failed");
-    assert_eq!(resp.status(), 200, "Windlass should stay alive with qBit refusing connections");
+    assert_eq!(
+        resp.status(),
+        200,
+        "Windlass should stay alive with qBit refusing connections"
+    );
 }
 
 #[tokio::test]
@@ -252,7 +259,11 @@ async fn mam_not_connectable_windlass_stays_alive() {
         .send()
         .await
         .expect("health request failed");
-    assert_eq!(resp.status(), 200, "Windlass should stay alive when MAM reports not connectable");
+    assert_eq!(
+        resp.status(),
+        200,
+        "Windlass should stay alive when MAM reports not connectable"
+    );
 }
 
 #[tokio::test]
@@ -274,7 +285,11 @@ async fn mam_asn_mismatch_windlass_stays_alive() {
         .send()
         .await
         .expect("health request failed");
-    assert_eq!(resp.status(), 200, "Windlass should stay alive on MAM ASN mismatch");
+    assert_eq!(
+        resp.status(),
+        200,
+        "Windlass should stay alive on MAM ASN mismatch"
+    );
 }
 
 #[tokio::test]
@@ -296,7 +311,11 @@ async fn gotify_down_windlass_stays_alive() {
         .send()
         .await
         .expect("health request failed");
-    assert_eq!(resp.status(), 200, "Windlass should stay alive when Gotify is down");
+    assert_eq!(
+        resp.status(),
+        200,
+        "Windlass should stay alive when Gotify is down"
+    );
 }
 
 // ── State helpers ─────────────────────────────────────────────────────────────

@@ -23,7 +23,10 @@ pub struct GluetunClient {
 
 impl GluetunClient {
     pub fn new(base: &str) -> Self {
-        Self { client: reqwest::Client::new(), base: base.to_owned() }
+        Self {
+            client: reqwest::Client::new(),
+            base: base.to_owned(),
+        }
     }
 
     pub async fn set(&self, ip: &str, port: u16) -> anyhow::Result<()> {
@@ -57,7 +60,11 @@ pub struct VpnFileState {
 
 impl Default for VpnFileState {
     fn default() -> Self {
-        Self { ip: "10.8.0.1".to_owned(), port: 51820, healthy: true }
+        Self {
+            ip: "10.8.0.1".to_owned(),
+            port: 51820,
+            healthy: true,
+        }
     }
 }
 
@@ -115,9 +122,15 @@ pub async fn run(
 }
 
 async fn apply_happy_path(state: &ChaosState) -> anyhow::Result<()> {
-    state.qbit.set_mappings(scenarios::happy_path_qbit()).await?;
+    state
+        .qbit
+        .set_mappings(scenarios::happy_path_qbit())
+        .await?;
     state.mam.set_mappings(scenarios::happy_path_mam()).await?;
-    state.gotify.set_mappings(scenarios::happy_path_gotify()).await?;
+    state
+        .gotify
+        .set_mappings(scenarios::happy_path_gotify())
+        .await?;
     state.qbit.reset_requests().await?;
     state.mam.reset_requests().await?;
     state.gotify.reset_requests().await?;
@@ -150,14 +163,21 @@ async fn scenario_handler(
     Path(name): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     let result = match name.as_str() {
-        "qbit-auth-fail"          => s.qbit.set_mappings(scenarios::qbit_auth_fail()).await,
-        "qbit-connection-refused" => s.qbit.set_mappings(scenarios::qbit_connection_refused()).await,
-        "mam-rate-limit"          => s.mam.set_mappings(scenarios::mam_rate_limit()).await,
-        "mam-not-connectable"     => s.mam.set_mappings(scenarios::mam_not_connectable()).await,
-        "mam-asn-mismatch"        => s.mam.set_mappings(scenarios::mam_asn_mismatch()).await,
-        "gotify-down"             => s.gotify.set_mappings(scenarios::gotify_down()).await,
+        "qbit-auth-fail" => s.qbit.set_mappings(scenarios::qbit_auth_fail()).await,
+        "qbit-connection-refused" => {
+            s.qbit
+                .set_mappings(scenarios::qbit_connection_refused())
+                .await
+        }
+        "mam-rate-limit" => s.mam.set_mappings(scenarios::mam_rate_limit()).await,
+        "mam-not-connectable" => s.mam.set_mappings(scenarios::mam_not_connectable()).await,
+        "mam-asn-mismatch" => s.mam.set_mappings(scenarios::mam_asn_mismatch()).await,
+        "gotify-down" => s.gotify.set_mappings(scenarios::gotify_down()).await,
         _ => {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown scenario: {name}")})));
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("unknown scenario: {name}")})),
+            );
         }
     };
     match result {
@@ -168,7 +188,10 @@ async fn scenario_handler(
         }
         Err(e) => {
             tracing::error!("Chaos scenario '{name}' failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
         }
     }
 }
@@ -184,7 +207,11 @@ struct GluetunStateResponse {
 
 async fn gluetun_state_handler(State(s): State<Arc<ChaosState>>) -> Json<GluetunStateResponse> {
     let vpn = s.vpn.read().await;
-    Json(GluetunStateResponse { ip: vpn.ip.clone(), port: vpn.port, healthy: vpn.healthy })
+    Json(GluetunStateResponse {
+        ip: vpn.ip.clone(),
+        port: vpn.port,
+        healthy: vpn.healthy,
+    })
 }
 
 #[derive(Deserialize)]
@@ -205,19 +232,31 @@ async fn gluetun_set_files_handler(
             vpn.ip = body.ip.clone();
             vpn.port = body.port;
             vpn.healthy = true;
-            tracing::info!("Chaos/gluetun: set VPN files ip={} port={}", body.ip, body.port);
-            (StatusCode::OK, Json(json!({"ip": body.ip, "port": body.port})))
+            tracing::info!(
+                "Chaos/gluetun: set VPN files ip={} port={}",
+                body.ip,
+                body.port
+            );
+            (
+                StatusCode::OK,
+                Json(json!({"ip": body.ip, "port": body.port})),
+            )
         }
         Err(e) => {
             tracing::error!("Chaos/gluetun: set-files failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
         }
     }
 }
 
 /// Clears the VPN port file so the Docker healthcheck fails.
 /// Triggers `DockerGluetunDied` via the Docker event watcher.
-async fn gluetun_health_down_handler(State(s): State<Arc<ChaosState>>) -> (StatusCode, Json<Value>) {
+async fn gluetun_health_down_handler(
+    State(s): State<Arc<ChaosState>>,
+) -> (StatusCode, Json<Value>) {
     match s.gluetun.clear_port().await {
         Ok(()) => {
             s.vpn.write().await.healthy = false;
@@ -226,7 +265,10 @@ async fn gluetun_health_down_handler(State(s): State<Arc<ChaosState>>) -> (Statu
         }
         Err(e) => {
             tracing::error!("Chaos/gluetun: health/down failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
         }
     }
 }
@@ -242,11 +284,17 @@ async fn gluetun_health_up_handler(State(s): State<Arc<ChaosState>>) -> (StatusC
         Ok(()) => {
             s.vpn.write().await.healthy = true;
             tracing::info!("Chaos/gluetun: port file restored (health → up) ip={ip} port={port}");
-            (StatusCode::OK, Json(json!({"healthy": true, "ip": ip, "port": port})))
+            (
+                StatusCode::OK,
+                Json(json!({"healthy": true, "ip": ip, "port": port})),
+            )
         }
         Err(e) => {
             tracing::error!("Chaos/gluetun: health/up failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
         }
     }
 }

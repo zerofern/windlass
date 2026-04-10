@@ -24,9 +24,9 @@ use arc_swap::ArcSwap;
 use serde::Serialize;
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use uuid::Uuid;
+use windlass_core::HttpObserver;
 use windlass_core::events::Event;
 use windlass_core::types::SystemState;
-use windlass_core::HttpObserver;
 use windlass_types::HttpExchange;
 
 pub(crate) use stream::QueueSink;
