@@ -1,5 +1,6 @@
 // ── Tier 4: Docker container integration ─────────────────────────────────
-// Run with: cargo test -- --include-ignored
+// Run via: just integration  (included automatically)
+// Or manually: cargo test -p windlass-local -- --include-ignored
 
 use super::*;
 
@@ -8,7 +9,7 @@ fn test_client() -> DockerClient {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker socket; run with: cargo test -- --include-ignored"]
+#[ignore = "requires Docker socket"]
 async fn docker_is_container_healthy_returns_false_for_nonexistent() {
     let client = test_client();
     assert!(
@@ -19,7 +20,7 @@ async fn docker_is_container_healthy_returns_false_for_nonexistent() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker socket; run with: cargo test -- --include-ignored"]
+#[ignore = "requires Docker socket"]
 async fn docker_discover_dependents_finds_containers_in_network_mode() {
     use bollard::container::{
         Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
@@ -109,7 +110,7 @@ async fn docker_discover_dependents_finds_containers_in_network_mode() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker socket; run with: cargo test -- --include-ignored"]
+#[ignore = "requires Docker socket"]
 async fn docker_fetch_and_dump_logs_creates_log_file() {
     use bollard::container::{
         Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
