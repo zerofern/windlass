@@ -116,6 +116,7 @@ pub fn spawn_file_watcher_inner(
     tokio::spawn(async move {
         let _debouncer = debouncer; // keep alive for the duration of the task
         let mut last_sent: Option<(VpnIp, VpnPort)> = None;
+        let mut last_was_err = false;
         while notify_rx.recv().await.is_some() {
             let ip_f = ip_file.clone();
             let port_f = port_file.clone();
@@ -123,14 +124,27 @@ pub fn spawn_file_watcher_inner(
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
 
-            // Deduplicate: skip sending if content is identical to the last
-            // successful send — prevents feedback loops where read-triggered
-            // inotify events re-fire the debouncer.
-            if let Ok(ref val) = result {
-                if last_sent.as_ref() == Some(val) {
-                    continue;
+            match &result {
+                Ok(val) => {
+                    // Skip if content is identical to the last successful send —
+                    // prevents feedback loops where read-triggered inotify events
+                    // re-fire the debouncer.
+                    if last_sent.as_ref() == Some(val) {
+                        continue;
+                    }
+                    last_sent = Some(*val);
+                    last_was_err = false;
                 }
-                last_sent = Some(*val);
+                Err(_) => {
+                    // Send only the first error in a run; suppress the storm that
+                    // occurs when the container stops and the port file is cleared
+                    // or deleted across many inotify windows.
+                    if last_was_err {
+                        continue;
+                    }
+                    last_was_err = true;
+                    last_sent = None; // force the next Ok to always be forwarded
+                }
             }
 
             if tx
@@ -280,6 +294,54 @@ mod tests {
         assert_eq!(
             count, 1,
             "debouncer must emit exactly 1 event per write burst, got {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_watcher_suppresses_repeated_errors_after_first() {
+        use std::time::Duration;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ip_path = dir.path().join("ip");
+        let port_path = dir.path().join("forwarded_port");
+        std::fs::write(&ip_path, "10.8.0.1").unwrap();
+        std::fs::write(&port_path, "51820").unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        spawn_file_watcher_inner(
+            dir.path().to_str().unwrap(),
+            ip_path.to_str().unwrap().to_string(),
+            port_path.to_str().unwrap().to_string(),
+            tx,
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Simulate container going down: write empty port file many times
+        for _ in 0..5 {
+            std::fs::write(&port_path, "").unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await; // outside debounce window
+        }
+
+        // Drain all events received within a short window
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut events = vec![];
+        while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+            events.push(e);
+        }
+
+        let err_count = events
+            .iter()
+            .filter(|e| matches!(e, Event::PortFileReadResult { result: Err(_), .. }))
+            .count();
+        assert_eq!(err_count, 1, "only the first error should be forwarded, got {err_count}");
+
+        // Verify recovery: write a valid port — should always be forwarded
+        std::fs::write(&port_path, "51820").unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for recovery PortFileReadResult")
+            .unwrap();
+        assert!(
+            matches!(event, Event::PortFileReadResult { result: Ok(_), .. }),
+            "recovery event should be Ok, got {event:?}"
         );
     }
 
