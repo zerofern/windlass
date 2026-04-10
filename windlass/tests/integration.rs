@@ -446,6 +446,59 @@ async fn windlass_state_endpoint_returns_system_state() {
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
+async fn disable_debug_mode_updates_snapshot() {
+    // Verify that POSTing /disable updates the debug snapshot to debug_mode=false.
+    // Previously, publish() was a no-op when debug_mode was false so the SSE
+    // stream never received a final update and the UI stayed stuck.
+    let client = Client::new();
+
+    // Enable debug mode.
+    let resp = client
+        .post(format!("{WINDLASS}/api/v1/debug/enable"))
+        .send()
+        .await
+        .expect("enable request failed");
+    assert_eq!(resp.status(), 200, "enable should return 200");
+
+    // Confirm it's enabled.
+    let snap: Value = client
+        .get(format!("{WINDLASS}/api/v1/debug"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap["debug_mode"], true,
+        "debug_mode should be true after enable"
+    );
+
+    // Disable debug mode.
+    let resp = client
+        .post(format!("{WINDLASS}/api/v1/debug/disable"))
+        .send()
+        .await
+        .expect("disable request failed");
+    assert_eq!(resp.status(), 200, "disable should return 200");
+
+    // The snapshot must now reflect debug_mode=false.
+    let snap: Value = client
+        .get(format!("{WINDLASS}/api/v1/debug"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap["debug_mode"], false,
+        "debug_mode should be false after disable"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dev stack"]
 async fn mam_rate_limit_scenario_does_not_break_recovery() {
     // Apply the mam-rate-limit scenario (MAM returns 429).
     // Windlass should continue operating normally without crashing.

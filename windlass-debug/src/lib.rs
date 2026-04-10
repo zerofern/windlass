@@ -216,6 +216,18 @@ impl DebugController {
         // Restore intake routing to the direct mpsc path.
         self.queue_sink
             .store(Arc::new(QueueSink::Mpsc(self.internal_tx.clone())));
+        // Push a final snapshot with debug_mode=false so SSE clients update.
+        // publish() is a no-op when debug mode is off, so we do it directly here.
+        let current = self.snapshot.load_full();
+        let seq = current.seq + 1;
+        let final_state = Arc::new(DebugState {
+            seq,
+            debug_mode: false,
+            paused_on: None,
+            ..(*current).clone()
+        });
+        self.snapshot.store(final_state);
+        let _ = self.notify_tx.send(seq);
     }
 
     #[must_use]
