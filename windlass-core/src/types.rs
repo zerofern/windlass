@@ -133,3 +133,136 @@ impl SystemState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use windlass_types::{AuthCookie, RetryCount};
+
+    fn ip() -> VpnIp {
+        VpnIp(Ipv4Addr::new(10, 8, 0, 1))
+    }
+
+    fn port() -> VpnPort {
+        VpnPort::try_new(51820).unwrap()
+    }
+
+    fn cookie() -> AuthCookie {
+        AuthCookie("sid".to_string())
+    }
+
+    #[test]
+    fn vpn_state_display_stopped() {
+        assert_eq!(VpnState::Stopped.to_string(), "stopped");
+    }
+
+    #[test]
+    fn vpn_state_display_dumping_logs() {
+        assert_eq!(VpnState::DumpingLogs.to_string(), "dumping-logs");
+    }
+
+    #[test]
+    fn vpn_state_display_starting() {
+        assert_eq!(VpnState::Starting.to_string(), "starting");
+    }
+
+    #[test]
+    fn vpn_state_display_awaiting_tunnel() {
+        assert_eq!(VpnState::AwaitingTunnel.to_string(), "awaiting-tunnel");
+    }
+
+    #[test]
+    fn vpn_state_display_connected() {
+        let s = VpnState::Connected {
+            ip: ip(),
+            port: port(),
+        };
+        assert_eq!(s.to_string(), "connected(10.8.0.1:51820)");
+    }
+
+    #[test]
+    fn qbit_state_display_offline() {
+        assert_eq!(QbitState::Offline.to_string(), "offline");
+    }
+
+    #[test]
+    fn qbit_state_display_authenticating() {
+        let s = QbitState::Authenticating {
+            attempt: RetryCount(2),
+        };
+        assert_eq!(s.to_string(), "authenticating(#2)");
+    }
+
+    #[test]
+    fn qbit_state_display_authenticated() {
+        let s = QbitState::Authenticated { cookie: cookie() };
+        assert_eq!(s.to_string(), "authenticated");
+    }
+
+    #[test]
+    fn qbit_state_display_syncing_port() {
+        let s = QbitState::SyncingPort {
+            attempt: RetryCount(1),
+            cookie: cookie(),
+            target: port(),
+        };
+        assert_eq!(s.to_string(), "syncing-port(51820:#1)");
+    }
+
+    #[test]
+    fn qbit_state_display_ready() {
+        let s = QbitState::Ready {
+            port: port(),
+            cookie: cookie(),
+        };
+        assert_eq!(s.to_string(), "ready(51820)");
+    }
+
+    #[test]
+    fn qbit_state_authenticated_serializes_cookie_as_redacted() {
+        let s = QbitState::Authenticated { cookie: cookie() };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("[redacted]"));
+        assert!(!json.contains("sid"));
+    }
+
+    #[test]
+    fn qbit_state_ready_serializes_cookie_as_redacted() {
+        let s = QbitState::Ready {
+            port: port(),
+            cookie: cookie(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("[redacted]"));
+    }
+
+    #[test]
+    fn mam_state_display_unknown() {
+        assert_eq!(MamState::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn mam_state_display_sync_pending() {
+        let s = MamState::SyncPending {
+            target_ip: ip(),
+            target_port: port(),
+        };
+        assert_eq!(s.to_string(), "sync-pending(10.8.0.1)");
+    }
+
+    #[test]
+    fn mam_state_display_synced() {
+        let s = MamState::Synced {
+            ip: ip(),
+            port: port(),
+        };
+        assert_eq!(s.to_string(), "synced(10.8.0.1:51820)");
+    }
+
+    #[test]
+    fn mam_state_display_asn_blocked() {
+        let s = MamState::AsnBlocked { ip: ip() };
+        assert_eq!(s.to_string(), "asn-blocked(10.8.0.1)");
+    }
+}

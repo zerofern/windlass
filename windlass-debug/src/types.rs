@@ -35,6 +35,33 @@ impl StoredEvent {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn stored_event_event_returns_inner_event() {
+        let at = Utc::now();
+        let event = Event::Init {
+            at,
+            is_gluetun_healthy: true,
+            port_files: Err("nope".to_string()),
+        };
+        let stored = StoredEvent {
+            id: Uuid::new_v4(),
+            at,
+            arrived_at: Utc::now(),
+            variant: "Init",
+            payload: serde_json::Value::Null,
+            caused_by_action: None,
+            event: event.clone(),
+        };
+        assert!(matches!(stored.event(), Event::Init { .. }));
+    }
+}
+
 /// An action that was dispatched but whose result has not yet been recorded.
 #[derive(Serialize, Clone, Debug)]
 pub struct ActionEntry {

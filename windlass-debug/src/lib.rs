@@ -212,7 +212,13 @@ impl DebugController {
         self.debug_mode.store(false, Ordering::SeqCst);
         self.skip.store(false, Ordering::SeqCst);
         self.paused_on.store(Arc::new(None));
-        self.step.add_permits(usize::MAX / 2);
+        // Release up to MAX_PERMITS so any waiter is unblocked. We use
+        // MAX_PERMITS - available_permits() to avoid exceeding the tokio limit.
+        let available = self.step.available_permits();
+        let to_add = Semaphore::MAX_PERMITS.saturating_sub(available);
+        if to_add > 0 {
+            self.step.add_permits(to_add);
+        }
         // Restore intake routing to the direct mpsc path.
         self.queue_sink
             .store(Arc::new(QueueSink::Mpsc(self.internal_tx.clone())));
@@ -384,5 +390,199 @@ impl DebugController {
                 let _ = exchange_tx.try_send((action_id, exchange));
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windlass_core::types::SystemState;
+
+    fn ctrl() -> DebugController {
+        DebugController::new()
+    }
+
+    #[test]
+    fn new_starts_with_debug_mode_off() {
+        assert!(!ctrl().is_debug_mode());
+    }
+
+    #[test]
+    fn enable_then_disable_toggles_debug_mode() {
+        let c = ctrl();
+        c.enable_debug();
+        assert!(c.is_debug_mode());
+        c.disable_debug();
+        assert!(!c.is_debug_mode());
+    }
+
+    #[test]
+    fn debug_mode_flag_reflects_state() {
+        let c = ctrl();
+        let flag = c.debug_mode_flag();
+        assert!(!flag.load(Ordering::SeqCst));
+        c.enable_debug();
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn should_pause_on_event_respects_debug_mode() {
+        let c = ctrl();
+        assert!(!c.should_pause_on_event("Init"));
+        c.enable_debug();
+        assert!(c.should_pause_on_event("Init"));
+    }
+
+    #[test]
+    fn event_breakpoint_add_remove() {
+        let c = ctrl();
+        c.add_event_breakpoint("Init");
+        assert!(c.should_pause_on_event("Init"));
+        assert!(!c.should_pause_on_event("Wakeup"));
+        c.remove_event_breakpoint("Init");
+        assert!(!c.should_pause_on_event("Init"));
+    }
+
+    #[test]
+    fn action_breakpoint_add_remove() {
+        let c = ctrl();
+        c.add_action_breakpoint("ReadPortFiles");
+        assert!(c.should_pause_on_action("ReadPortFiles"));
+        assert!(!c.should_pause_on_action("AuthenticateQbit"));
+        c.remove_action_breakpoint("ReadPortFiles");
+        assert!(!c.should_pause_on_action("ReadPortFiles"));
+    }
+
+    #[test]
+    fn release_step_increases_permits() {
+        let c = ctrl();
+        c.release_step();
+        // If no permits were available before, the semaphore should now have 1.
+        assert_eq!(c.step.available_permits(), 1);
+    }
+
+    #[test]
+    fn request_skip_sets_skip_flag_and_adds_permit() {
+        let c = ctrl();
+        c.request_skip();
+        assert!(c.skip.load(Ordering::SeqCst));
+        assert_eq!(c.step.available_permits(), 1);
+    }
+
+    #[test]
+    fn set_paused_on_stores_value() {
+        let c = ctrl();
+        let p = PausedOn::Action {
+            variant: "Init",
+            index: 1,
+            of: 1,
+        };
+        c.set_paused_on(Some(p));
+        assert!(c.paused_on.load_full().is_some());
+        c.set_paused_on(None);
+        assert!(c.paused_on.load_full().is_none());
+    }
+
+    #[test]
+    fn publish_noop_when_debug_mode_off() {
+        let c = ctrl();
+        let h = crate::history::DebugHistory::new(SystemState::initial());
+        let seq_before = c.snapshot.load_full().seq;
+        c.publish(&h); // should be noop
+        assert_eq!(c.snapshot.load_full().seq, seq_before);
+    }
+
+    #[test]
+    fn publish_updates_snapshot_when_debug_mode_on() {
+        let c = ctrl();
+        c.enable_debug();
+        let mut h = crate::history::DebugHistory::new(SystemState::initial());
+        h.seq = 42;
+        c.publish(&h);
+        assert_eq!(c.snapshot.load_full().seq, 42);
+        assert!(c.snapshot.load_full().debug_mode);
+    }
+
+    #[test]
+    fn publish_paused_noop_when_debug_mode_off() {
+        let c = ctrl();
+        let seq_before = c.snapshot.load_full().seq;
+        c.publish_paused();
+        assert_eq!(c.snapshot.load_full().seq, seq_before);
+    }
+
+    #[test]
+    fn publish_paused_bumps_seq_when_debug_mode_on() {
+        let c = ctrl();
+        c.enable_debug();
+        let seq_before = c.snapshot.load_full().seq;
+        c.publish_paused();
+        assert_eq!(c.snapshot.load_full().seq, seq_before + 1);
+    }
+
+    #[test]
+    fn disable_debug_publishes_final_snapshot_with_debug_mode_false() {
+        let c = ctrl();
+        c.enable_debug();
+        // Publish a snapshot with debug_mode=true (via history).
+        let h = crate::history::DebugHistory::new(SystemState::initial());
+        c.publish(&h);
+        assert!(c.snapshot.load_full().debug_mode);
+        c.disable_debug();
+        assert!(!c.snapshot.load_full().debug_mode);
+    }
+
+    #[test]
+    fn make_http_observer_noop_when_debug_mode_off() {
+        let c = ctrl();
+        let observer = c.make_http_observer();
+        // Should not panic and should be a no-op.
+        observer(windlass_types::HttpExchange {
+            module: "test".to_string(),
+            method: "GET".to_string(),
+            url: "http://example.com".to_string(),
+            request_body: None,
+            response_status: 200,
+            response_body: "ok".to_string(),
+        });
+    }
+
+    #[tokio::test]
+    async fn acquire_step_returns_true_when_permit_available() {
+        let c = ctrl();
+        c.release_step();
+        assert!(c.acquire_step().await);
+    }
+
+    #[tokio::test]
+    async fn acquire_step_returns_false_when_skip_requested() {
+        let c = ctrl();
+        c.request_skip();
+        assert!(!c.acquire_step().await);
+    }
+
+    #[tokio::test]
+    async fn make_http_observer_sends_exchange_when_debug_mode_on() {
+        let (c, mut owned) = DebugController::new_with_owned();
+        c.enable_debug();
+        let observer = c.make_http_observer();
+        let exchange = windlass_types::HttpExchange {
+            module: "test".to_string(),
+            method: "GET".to_string(),
+            url: "http://example.com".to_string(),
+            request_body: None,
+            response_status: 200,
+            response_body: "ok".to_string(),
+        };
+        let action_id = uuid::Uuid::new_v4();
+        causal_tx::CURRENT_ACTION_ID
+            .scope(Some(action_id), async { observer(exchange) })
+            .await;
+        let received = owned
+            .exchange_rx
+            .try_recv()
+            .expect("exchange should be sent");
+        assert_eq!(received.0, action_id);
+        assert_eq!(received.1.url, "http://example.com");
     }
 }

@@ -44,7 +44,15 @@ clippy:
     cargo clippy -- -W clippy::pedantic -W clippy::nursery
 
 coverage:
-    cargo tarpaulin --exclude-files "mlm/*" "mousehole/*" --ignore-tests
+    cargo tarpaulin \
+        --exclude-files "mlm/*" "mousehole/*" \
+        --exclude-files "windlass/src/main.rs" \
+        --exclude-files "windlass/src/shell/*" \
+        --exclude-files "windlass/tests/*" \
+        --exclude-files "windlass-web/src/*" \
+        --exclude-files "windlass-testkit/src/*" \
+        --exclude-files "windlass-local/src/docker*.rs" \
+        --ignore-tests
 
 audit:
     cargo audit

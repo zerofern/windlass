@@ -144,3 +144,48 @@ impl Event {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uom::si::f64::Information;
+    use uom::si::information::byte;
+
+    #[test]
+    fn disk_space_observed_roundtrips_through_json() {
+        let at = Utc::now();
+        let space = Information::new::<byte>(1_073_741_824.0); // 1 GiB
+        let event = Event::DiskSpaceObserved { at, space };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back {
+            Event::DiskSpaceObserved { space: s, .. } => {
+                assert!((s.get::<byte>() - 1_073_741_824.0).abs() < 1.0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn event_at_returns_correct_timestamp() {
+        let at = Utc::now();
+        let event = Event::MamRateLimitViolation { at };
+        assert_eq!(event.at(), at);
+    }
+
+    #[test]
+    fn init_event_at_returns_correct_timestamp() {
+        use std::net::Ipv4Addr;
+        use windlass_types::{VpnIp, VpnPort};
+        let at = Utc::now();
+        let event = Event::Init {
+            at,
+            is_gluetun_healthy: true,
+            port_files: Ok((
+                VpnIp(Ipv4Addr::new(10, 8, 0, 1)),
+                VpnPort::try_new(51820).unwrap(),
+            )),
+        };
+        assert_eq!(event.at(), at);
+    }
+}

@@ -54,3 +54,16 @@ pub enum Action {
 
     SendGotifyAlert(AlertPriority, String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windlass_types::WakeupId;
+
+    #[test]
+    fn schedule_wakeup_serializes_duration_as_seconds() {
+        let action = Action::ScheduleWakeup(WakeupId::RetryPortRead, Duration::from_secs(30));
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("30"), "expected seconds in JSON: {json}");
+    }
+}

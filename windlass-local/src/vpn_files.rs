@@ -173,6 +173,77 @@ mod tests {
         f
     }
 
+    #[tokio::test]
+    async fn read_boot_port_files_returns_parsed_values() {
+        let ip_f = write_temp("10.8.0.1");
+        let port_f = write_temp("51820");
+        let (ip, port) = read_boot_port_files(
+            ip_f.path().to_str().unwrap(),
+            port_f.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ip.0.to_string(), "10.8.0.1");
+        assert_eq!(port.into_inner(), 51820);
+    }
+
+    #[tokio::test]
+    async fn read_boot_port_files_missing_file_returns_err() {
+        let err = read_boot_port_files("/nonexistent/ip", "/nonexistent/port")
+            .await
+            .unwrap_err();
+        assert!(err.contains("ip file"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_and_watch_returns_boot_result_and_spawns_watcher() {
+        use std::time::Duration;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ip_path = dir.path().join("ip");
+        let port_path = dir.path().join("forwarded_port");
+        std::fs::write(&ip_path, "10.8.0.1").unwrap();
+        std::fs::write(&port_path, "51820").unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let result =
+            read_and_watch(ip_path.to_str().unwrap(), port_path.to_str().unwrap(), tx).await;
+        assert!(result.is_ok());
+        let (ip, port) = result.unwrap();
+        assert_eq!(ip.0.to_string(), "10.8.0.1");
+        assert_eq!(port.into_inner(), 51820);
+        // Give the watcher task a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn spawn_file_watcher_uses_parent_dir() {
+        use std::time::Duration;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ip_path = dir.path().join("ip");
+        let port_path = dir.path().join("forwarded_port");
+        std::fs::write(&ip_path, "10.8.0.1").unwrap();
+        std::fs::write(&port_path, "51820").unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        // Should not panic — the parent dir is inferred from the ip file path.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            spawn_file_watcher(ip_path.to_str().unwrap(), port_path.to_str().unwrap(), tx);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+    }
+
+    #[test]
+    fn spawn_file_watcher_falls_back_to_tmp_when_no_parent() {
+        // "/" has no parent directory; the fallback "/tmp/gluetun" path should be used.
+        use std::time::Duration;
+        std::fs::create_dir_all("/tmp/gluetun").ok();
+        let (tx, _rx) = mpsc::channel(8);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            spawn_file_watcher("/", "/forwarded_port", tx);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+    }
+
     #[test]
     fn read_port_files_parses_valid_input() {
         let ip_f = write_temp("10.8.0.1");
@@ -228,9 +299,21 @@ mod tests {
     }
 
     #[test]
-    fn read_port_files_malformed_port_returns_err() {
+    fn read_port_files_port_zero_fails_validation() {
         let ip_f = write_temp("10.8.0.1");
-        let port_f = write_temp("notaport");
+        let port_f = write_temp("0");
+        let err = read_port_files(
+            ip_f.path().to_str().unwrap(),
+            port_f.path().to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("port validate"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn read_port_files_port_too_large_fails_parsing() {
+        let ip_f = write_temp("10.8.0.1");
+        let port_f = write_temp("99999");
         let err = read_port_files(
             ip_f.path().to_str().unwrap(),
             port_f.path().to_str().unwrap(),

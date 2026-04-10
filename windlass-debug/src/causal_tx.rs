@@ -79,3 +79,52 @@ impl CausalTx {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn init_event() -> Event {
+        Event::Init {
+            at: Utc::now(),
+            is_gluetun_healthy: true,
+            port_files: Err("no".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn causal_tx_plain_sends_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let id = Uuid::new_v4();
+        let causal = CausalTx::plain(id, tx);
+        causal.send(init_event()).await;
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn causal_tx_debug_sends_event_with_action_id() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let id = Uuid::new_v4();
+        let causal = CausalTx::debug(id, tx);
+        causal.send(init_event()).await;
+        let (_, action_id) = rx.recv().await.unwrap();
+        assert_eq!(action_id, id);
+    }
+
+    #[tokio::test]
+    async fn causal_tx_run_sets_task_local() {
+        let (tx, _rx) = mpsc::channel(1);
+        let id = Uuid::new_v4();
+        let causal = CausalTx::plain(id, tx);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(causal.run(|_ctx| async move {
+            let captured = CURRENT_ACTION_ID.with(|v| *v);
+            let _ = result_tx.send(captured);
+        }))
+        .await
+        .unwrap();
+        let captured = result_rx.await.unwrap();
+        assert_eq!(captured, Some(id));
+    }
+}

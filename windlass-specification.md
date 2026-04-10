@@ -161,7 +161,7 @@ the account from automated bans.
   torrents when limits are reached, Windlass actively orchestrates the queue, temporarily
   pausing fully satisfied torrents to guarantee unsatisfied torrents remain actively seeding.
 - **MAM HnR Compliance Monitor (Rules 2.5 & 2.7):**
-  - _No Partials:_ Forces qBittorrent to download 100% of torrent contents.
+  - _No Partials:_ Forces qBittorrent to download 100% of a torrent's files. MAM's rules prohibit stopping a download partway through and keeping only some files — every file in the torrent must be downloaded in full.
   - _HnR Lock:_ Auto-eviction is mathematically prohibited from deleting any torrent that
     has downloaded data until `seed_time ≥ 72 hours`.
   - _Safe Deletion:_ Stalled or dead torrents are only automatically deleted and
@@ -225,36 +225,51 @@ the account from automated bans.
 ## 5. Search & Scoring Engine
 
 Windlass evaluates raw tracker search results to automatically select the optimal release.
+All scoring data comes directly from the MAM search API response fields.
 
-- **Base Rules:** Evaluates seeders and Freeleech status. The base score for each
-  candidate starts at 0 and is adjusted by Custom Format Weight rules.
-- **Custom Format Weights (Radarr-Style):** Users define custom score adjustments in the
-  Action Center using Regex or plain keyword rules matched against the torrent title,
-  uploader, and format fields (e.g., `+50` for "Ray Porter", `−100` for "Abridged",
-  `+25` for "Graphic Audio"). Rules are evaluated in priority order and combined additively
-  with the base score. These weights are the primary mechanism by which the auto-grabber
-  selects the correct release without user approval — a narrator preference or format
-  rejection defined here directly controls which torrents are snatched automatically.
+- **Built-in Base Factors (not user-editable):** Applied before Custom Format Weight rules.
+  These use MAM API fields directly:
+
+  | Factor | Field | Effect |
+  |---|---|---|
+  | Seeder count | `seeders` | `+min(seeders, 20)` — rewards well-seeded torrents up to a cap |
+  | Community trust | `times_completed` | `+min(times_completed / 50, 10)` — heavily snatched = proven |
+  | Already snatched | `my_snatched` | **Auto-skip** — never re-download a previously snatched torrent |
+  | Collection detected | `numfiles > 20` | **Auto-skip** — multi-book collections cannot be auto-processed (see below) |
+
+- **Custom Format Weights (Radarr-Style):** User-defined score adjustments matched against
+  torrent title, tags, narrator name, uploader name, and format fields. Rules are evaluated
+  in priority order and combined additively with the base score. This is the primary
+  mechanism by which the auto-grabber selects the correct release — narrator preferences,
+  bitrate preferences, and uploader trust defined here directly control what is snatched.
 
   **Default rules (pre-installed, user-editable):**
 
-  | Rule | Score | Rationale |
-  |---|---|---|
-  | Format: `m4b` | `+0` | Baseline — preferred format |
-  | Format: `mp3` | `−100` | Excluded by default |
-  | Format: `m4a`, `ogg`, other audio | `−100` | Excluded by default |
-  | Title contains `Abridged` | `−100` | MAM rule compliance |
-  | Language: `English` | `+50` | Prefer English editions by default |
-  | Language: not `English` | `−50` | Deprioritise non-English editions |
+  | Rule | Field | Score | Rationale |
+  |---|---|---|---|
+  | Format: `m4b` | `filetypes` | `+0` | Baseline — preferred format |
+  | Format: `mp3`, `m4a`, `ogg`, other | `filetypes` | `−100` | Excluded by default |
+  | Tags contain `Abridged` | `tags` | `−100` | Condensed content — missing plotlines, not the full work |
+  | Tags contain `Unabridged` | `tags` | `+20` | Mild confirmation of full content; abridged already excluded by the rule above |
+  | Bitrate ≥ 128 Kbps | `tags` | `+30` | Good audio quality |
+  | Bitrate < 64 Kbps | `tags` | `−50` | Poor audio quality |
+  | Language: `English` | `lang_code` | `+50` | Prefer English editions by default |
+  | Language: not `English` | `lang_code` | `−50` | Deprioritise non-English editions |
 
-  Narrator preference is not pre-installed — users add their own rules (e.g. `+80` for
-  "Ray Porter", `+60` for "Kate Reading"). This is the primary mechanism for resolving
-  between multiple editions of the same work.
+  Users add narrator and uploader rules (e.g. `+80` for narrator "Ray Porter", `+40` for
+  uploader "trusted_user"). These are the primary mechanism for resolving between multiple
+  editions of the same work. Scores are integers on the same **−100 → +100 scale** used
+  throughout Windlass.
 
-  Scores are integers on the same **-100 → +100 scale** used throughout Windlass. A
-  candidate scoring below **0** after all rules are combined is not auto-grabbed. When
-  multiple torrents match the same work, the highest-scoring one is selected — only one
-  torrent is ever downloaded per work.
+  A candidate whose total score (base + format weights) falls below **0** is not
+  auto-grabbed. When multiple torrents match the same work, the highest-scoring one is
+  selected — only one torrent is ever downloaded per work.
+
+- **Collection Handling:** Torrents with `numfiles > 20` are skipped by automated
+  discovery. However, any MAM torrent URL pasted into the Universal Input Box is accepted
+  regardless — collections can be added manually. When a collection is added manually it
+  surfaces in Panel 1 with an "Unknown contents — manual review required" flag; the user
+  must review and approve before download begins.
 
 - **MAM New Additions Monitor:** Windlass polls MAM's audiobook catalogue sorted by date
   added at regular intervals. New entries are cross-referenced against `books` (skip

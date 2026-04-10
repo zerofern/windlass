@@ -154,3 +154,62 @@ pub enum MamStatus {
     /// Network failure, HTTP error, or parse failure reaching MAM.
     Unreachable,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_count_increment_adds_one() {
+        let r = RetryCount(3);
+        assert_eq!(r.increment(), RetryCount(4));
+    }
+
+    #[test]
+    fn retry_count_increment_saturates_at_u8_max() {
+        let r = RetryCount(u8::MAX);
+        assert_eq!(r.increment(), RetryCount(u8::MAX));
+    }
+
+    #[test]
+    fn backoff_exponential_attempt_zero_returns_base() {
+        let b = Backoff(Duration::from_secs(1));
+        assert_eq!(b.exponential(RetryCount(0)), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_exponential_doubles_each_attempt() {
+        let b = Backoff(Duration::from_secs(1));
+        assert_eq!(b.exponential(RetryCount(1)), Duration::from_secs(2));
+        assert_eq!(b.exponential(RetryCount(2)), Duration::from_secs(4));
+        assert_eq!(b.exponential(RetryCount(3)), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn interval_into_duration() {
+        let d = Duration::from_secs(60);
+        let i = Interval(d);
+        assert_eq!(Duration::from(i), d);
+    }
+
+    #[test]
+    fn backoff_into_duration() {
+        let d = Duration::from_secs(5);
+        let b = Backoff(d);
+        assert_eq!(Duration::from(b), d);
+    }
+
+    #[test]
+    fn auth_cookie_serializes_as_redacted() {
+        let c = AuthCookie("my-secret-cookie".to_string());
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#""[redacted]""#);
+    }
+
+    #[test]
+    fn auth_cookie_deserializes_from_string() {
+        let c: AuthCookie = serde_json::from_str(r#""some-value""#).unwrap();
+        assert_eq!(c.0, "some-value");
+    }
+}

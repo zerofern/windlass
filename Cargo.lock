@@ -2649,6 +2649,7 @@ dependencies = [
  "chrono",
  "proptest",
  "serde",
+ "serde_json",
  "tracing",
  "uom",
  "windlass-types",
@@ -2711,6 +2712,7 @@ dependencies = [
  "nutype",
  "secrecy",
  "serde",
+ "serde_json",
  "uom",
 ]
 
