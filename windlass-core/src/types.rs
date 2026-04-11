@@ -1,7 +1,9 @@
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use windlass_types::{AuthCookie, RetryCount, TorrentName, VpnIp, VpnPort};
+use windlass_types::{AuthCookie, RetryCount, TorrentHash, TorrentName, VpnIp, VpnPort};
+
+use crate::torrent::TorrentRecord;
 
 /// Serializes any value as the string `"[redacted]"`.
 mod redact {
@@ -102,6 +104,14 @@ pub struct SystemState {
     pub qbit: QbitState,
     pub mam: MamState,
     pub known_torrents: HashSet<TorrentName>,
+    /// All torrents currently tracked by the compliance monitor, keyed by hash.
+    pub torrents: HashMap<TorrentHash, TorrentRecord>,
+    /// qBittorrent's `max_active_torrents` limit, updated from preferences poll.
+    pub max_active_torrents: u32,
+    /// Maximum unsatisfied torrents allowed before alerting (loaded from config).
+    pub unsatisfied_quota_limit: u32,
+    /// Interval between compliance polls in seconds (loaded from config).
+    pub compliance_poll_interval_secs: u64,
     #[serde(skip)]
     pub(crate) version: u64,
 }
@@ -112,6 +122,10 @@ impl PartialEq for SystemState {
             && self.qbit == other.qbit
             && self.mam == other.mam
             && self.known_torrents == other.known_torrents
+            && self.torrents == other.torrents
+            && self.max_active_torrents == other.max_active_torrents
+            && self.unsatisfied_quota_limit == other.unsatisfied_quota_limit
+            && self.compliance_poll_interval_secs == other.compliance_poll_interval_secs
     }
 }
 
@@ -129,8 +143,24 @@ impl SystemState {
             qbit: QbitState::Offline,
             mam: MamState::Unknown,
             known_torrents: HashSet::new(),
+            torrents: HashMap::new(),
+            max_active_torrents: 5,
+            unsatisfied_quota_limit: 50,
+            compliance_poll_interval_secs: 60,
             version: 0,
         }
+    }
+
+    /// Applies compliance configuration values loaded from the environment.
+    #[must_use]
+    pub const fn with_compliance_config(
+        mut self,
+        unsatisfied_quota_limit: u32,
+        compliance_poll_interval_secs: u64,
+    ) -> Self {
+        self.unsatisfied_quota_limit = unsatisfied_quota_limit;
+        self.compliance_poll_interval_secs = compliance_poll_interval_secs;
+        self
     }
 }
 

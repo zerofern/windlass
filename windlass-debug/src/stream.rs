@@ -166,6 +166,9 @@ pub(crate) const fn event_variant(event: &Event) -> &'static str {
         Event::LogsDumped { .. } => "LogsDumped",
         Event::Wakeup { .. } => "Wakeup",
         Event::MamRateLimitViolation { .. } => "MamRateLimitViolation",
+        Event::QbitTorrentDetailsReceived { .. } => "QbitTorrentDetailsReceived",
+        Event::QbitPreferencesReceived { .. } => "QbitPreferencesReceived",
+        Event::DeleteTorrentRequested { .. } => "DeleteTorrentRequested",
     }
 }
 
@@ -187,5 +190,14 @@ pub(crate) const fn action_variant(action: &Action) -> &'static str {
         Action::CheckDiskSpace => "CheckDiskSpace",
         Action::CheckNewTorrents(_) => "CheckNewTorrents",
         Action::SendAlert { .. } => "SendAlert",
+        Action::FetchTorrentDetails(_) => "FetchTorrentDetails",
+        Action::FetchQbitPreferences(_) => "FetchQbitPreferences",
+        Action::PauseTorrent(_, _) => "PauseTorrent",
+        Action::ForceResumeTorrent(_, _) => "ForceResumeTorrent",
+        Action::DeleteTorrent(_, _) => "DeleteTorrent",
+        Action::SetAllFilesPriority(_, _) => "SetAllFilesPriority",
+        Action::UpsertTorrentRecords(_) => "UpsertTorrentRecords",
+        Action::BlacklistMamId(_) => "BlacklistMamId",
+        Action::WriteEvent { .. } => "WriteEvent",
     }
 }

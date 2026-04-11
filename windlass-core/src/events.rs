@@ -1,8 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use windlass_types::{
-    AuthCookie, HttpStatusCode, Information, MamStatus, TorrentName, VpnIp, VpnPort, WakeupId,
+    AuthCookie, HttpStatusCode, Information, MamStatus, TorrentHash, TorrentName, VpnIp, VpnPort,
+    WakeupId,
 };
+
+use crate::torrent::TorrentRecord;
 
 mod serde_information {
     use uom::si::f64::Information;
@@ -117,6 +120,26 @@ pub enum Event {
     MamRateLimitViolation {
         at: DateTime<Utc>,
     },
+
+    /// Full torrent details received from qBittorrent, converted to core types by the shell.
+    QbitTorrentDetailsReceived {
+        at: DateTime<Utc>,
+        torrents: Vec<TorrentRecord>,
+    },
+
+    /// qBittorrent application preferences received (from compliance poll).
+    QbitPreferencesReceived {
+        at: DateTime<Utc>,
+        max_active_torrents: u32,
+        max_active_downloads: u32,
+        max_active_uploads: u32,
+    },
+
+    /// User-initiated torrent deletion (wired from web UI in Step 6).
+    DeleteTorrentRequested {
+        at: DateTime<Utc>,
+        hash: TorrentHash,
+    },
 }
 
 impl Event {
@@ -140,7 +163,10 @@ impl Event {
             | Self::NewTorrentsObserved { at, .. }
             | Self::LogsDumped { at }
             | Self::Wakeup { at, .. }
-            | Self::MamRateLimitViolation { at } => *at,
+            | Self::MamRateLimitViolation { at }
+            | Self::QbitTorrentDetailsReceived { at, .. }
+            | Self::QbitPreferencesReceived { at, .. }
+            | Self::DeleteTorrentRequested { at, .. } => *at,
         }
     }
 }

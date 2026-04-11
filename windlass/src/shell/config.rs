@@ -25,6 +25,10 @@ pub struct Config {
     pub db_path: String,
     pub vpn_ip_file: String,
     pub vpn_port_file: String,
+    /// Interval between compliance polls in seconds (default: 60).
+    pub compliance_poll_interval_secs: u64,
+    /// Maximum unsatisfied torrents before alerting (default: 50).
+    pub unsatisfied_quota_limit: u32,
 }
 
 impl Config {
@@ -54,6 +58,14 @@ impl Config {
             vpn_ip_file: var("VPN_IP_FILE").unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),
             vpn_port_file: var("VPN_PORT_FILE")
                 .unwrap_or_else(|_| "/tmp/gluetun/forwarded_port".to_string()),
+            compliance_poll_interval_secs: var("COMPLIANCE_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            unsatisfied_quota_limit: var("MAM_UNSATISFIED_QUOTA_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50),
         })
     }
 }

@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod events;
 pub mod observation;
+pub mod torrent;
 pub mod types;
 
 pub use observation::{HttpObserver, Observation};
@@ -85,6 +86,16 @@ impl SystemState {
             Event::NewTorrentsObserved { torrents, .. } => self.on_new_torrents_observed(torrents),
             Event::Wakeup { id, .. } => self.on_wakeup(id),
             Event::MamRateLimitViolation { .. } => handlers::on_mam_rate_limit_violation(),
+
+            // ── Compliance ────────────────────────────────────────────────────
+            Event::QbitTorrentDetailsReceived { torrents, .. } => {
+                self.on_qbit_torrent_details_received(torrents)
+            }
+            Event::QbitPreferencesReceived {
+                max_active_torrents,
+                ..
+            } => self.on_qbit_preferences_received(max_active_torrents),
+            Event::DeleteTorrentRequested { hash, .. } => self.on_delete_torrent_requested(hash),
         };
 
         let state_changed = self.version != before_version;

@@ -41,6 +41,7 @@ fn any_wakeup_id() -> impl Strategy<Value = WakeupId> {
         Just(WakeupId::QbitAuthRetry),
         Just(WakeupId::QbitSyncRetry),
         Just(WakeupId::RetryPortRead),
+        Just(WakeupId::CompliancePoll),
     ]
 }
 
@@ -221,6 +222,25 @@ fn any_event() -> impl Strategy<Value = Event> {
         Just(Event::MamRateLimitViolation {
             at: DateTime::UNIX_EPOCH
         }),
+        // Compliance events
+        Just(Event::QbitTorrentDetailsReceived {
+            at: DateTime::UNIX_EPOCH,
+            torrents: vec![],
+        }),
+        (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(|(t, d, u)| {
+            Event::QbitPreferencesReceived {
+                at: DateTime::UNIX_EPOCH,
+                max_active_torrents: t,
+                max_active_downloads: d,
+                max_active_uploads: u,
+            }
+        }),
+        proptest::string::string_regex("[a-f0-9]{40}")
+            .unwrap()
+            .prop_map(|h| Event::DeleteTorrentRequested {
+                at: DateTime::UNIX_EPOCH,
+                hash: windlass_types::TorrentHash(h),
+            }),
     ]
 }
 

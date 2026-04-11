@@ -1,6 +1,7 @@
 use std::time::Duration;
 use windlass_types::{Backoff, Interval, RetryCount};
 
+mod compliance;
 mod mam;
 mod monitoring;
 mod qbit;

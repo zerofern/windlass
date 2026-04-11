@@ -1,4 +1,5 @@
 mod actions;
+mod compliance;
 mod config;
 
 use std::collections::HashMap;
@@ -103,7 +104,10 @@ pub async fn run(
     });
 
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
-    let mut state = SystemState::initial();
+    let mut state = SystemState::initial().with_compliance_config(
+        config.unsatisfied_quota_limit,
+        config.compliance_poll_interval_secs,
+    );
     let mut history = DebugHistory::new(SystemState::initial());
     let mut cmd_rx = debug_owned.cmd_rx;
     let mut log_rx = debug_owned.log_rx;
@@ -371,6 +375,27 @@ impl ShellContext<'_> {
                 title,
                 body,
             } => self.send_alert(priority, title, body),
+            // ── Compliance ────────────────────────────────────────────────────
+            Action::FetchTorrentDetails(cookie) => {
+                self.fetch_torrent_details(cookie, causal_tx);
+            }
+            Action::FetchQbitPreferences(cookie) => {
+                self.fetch_qbit_preferences(cookie, causal_tx);
+            }
+            Action::PauseTorrent(hash, cookie) => self.pause_torrent(hash, cookie),
+            Action::ForceResumeTorrent(hash, cookie) => self.force_resume_torrent(hash, cookie),
+            Action::DeleteTorrent(hash, cookie) => self.delete_torrent(hash, cookie),
+            Action::SetAllFilesPriority(hash, cookie) => {
+                self.set_all_files_priority(hash, cookie);
+            }
+            Action::UpsertTorrentRecords(records) => self.upsert_torrent_records(records),
+            Action::BlacklistMamId(mam_id) => self.blacklist_mam_id(mam_id),
+            Action::WriteEvent {
+                source,
+                action,
+                book_id,
+                detail,
+            } => self.write_event(source, action, book_id, detail),
         }
     }
 }

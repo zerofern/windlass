@@ -51,6 +51,7 @@ impl SystemState {
                     vec![]
                 }
             }
+            WakeupId::CompliancePoll => self.on_wakeup_compliance_poll(),
             WakeupId::QbitAuthRetry => {
                 if matches!(self.qbit, QbitState::Authenticating { .. }) {
                     vec![Action::AuthenticateQbit]

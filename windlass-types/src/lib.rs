@@ -61,7 +61,7 @@ impl serde::Serialize for AuthCookie {
 
 impl<'de> serde::Deserialize<'de> for AuthCookie {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(AuthCookie(String::deserialize(d)?))
+        Ok(Self(String::deserialize(d)?))
     }
 }
 
@@ -131,6 +131,7 @@ pub enum WakeupId {
     QbitAuthRetry,
     QbitSyncRetry,
     RetryPortRead,
+    CompliancePoll,
 }
 
 // ── Alert priority ───────────────────────────────────────────────────────────

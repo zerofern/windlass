@@ -1,6 +1,10 @@
 use serde::Serialize;
 use std::time::Duration;
-use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
+use windlass_types::{
+    AlertPriority, AuthCookie, MamTorrentId, TorrentHash, VpnIp, VpnPort, WakeupId,
+};
+
+use crate::torrent::TorrentRecord;
 
 mod serde_duration_secs {
     pub(super) fn serialize<S: serde::Serializer>(
@@ -56,6 +60,32 @@ pub enum Action {
         priority: AlertPriority,
         title: String,
         body: String,
+    },
+
+    /// Fetches full torrent details from qBittorrent for compliance checking.
+    FetchTorrentDetails(AuthCookie),
+    /// Fetches qBittorrent application preferences (e.g. `max_active_torrents`).
+    FetchQbitPreferences(AuthCookie),
+
+    /// Pauses a torrent in qBittorrent.
+    PauseTorrent(TorrentHash, AuthCookie),
+    /// Force-resumes a torrent, bypassing qBit's seeding ratio/time limits.
+    ForceResumeTorrent(TorrentHash, AuthCookie),
+    /// Removes a torrent from qBittorrent without deleting the data files.
+    DeleteTorrent(TorrentHash, AuthCookie),
+    /// Sets all files in a torrent to normal priority (enforces MAM no-partials rule).
+    SetAllFilesPriority(TorrentHash, AuthCookie),
+
+    /// Persists torrent compliance records to the database.
+    UpsertTorrentRecords(Vec<TorrentRecord>),
+    /// Marks a MAM torrent ID as blacklisted in the download queue.
+    BlacklistMamId(MamTorrentId),
+    /// Writes a compliance or user action event to the events table.
+    WriteEvent {
+        source: String,
+        action: String,
+        book_id: Option<i64>,
+        detail: Option<String>,
     },
 }
 

@@ -86,7 +86,13 @@ impl SystemState {
                     target_port: port,
                 };
                 self.mark_changed();
-                return vec![Action::UpdateMam(ip)];
+                return vec![
+                    Action::UpdateMam(ip),
+                    Action::ScheduleWakeup(
+                        WakeupId::CompliancePoll,
+                        std::time::Duration::from_secs(self.compliance_poll_interval_secs),
+                    ),
+                ];
             }
         }
         vec![]
@@ -141,6 +147,13 @@ impl SystemState {
                 Action::AuthenticateQbit,
             ];
         }
+        vec![]
+    }
+
+    pub(crate) fn on_qbit_preferences_received(&mut self, max_active_torrents: u32) -> Vec<Action> {
+        debug!(max_active_torrents, "qBit preferences updated");
+        self.max_active_torrents = max_active_torrents;
+        self.mark_changed();
         vec![]
     }
 }
