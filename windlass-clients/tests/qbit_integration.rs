@@ -56,12 +56,9 @@ async fn add_torrent_then_list_returns_record_with_mam_id() {
         panic!("auth failed");
     };
 
-    // add_torrent is a stub in Step 3 — full implementation in Step 4.
-    let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec());
-    assert!(
-        hash.is_some(),
-        "expected add_torrent to return a hash (stub returns None — update in Step 4)"
-    );
+    // add_torrent is now async and real — await the result.
+    let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
+    assert!(hash.is_some(), "expected add_torrent to return a hash");
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -92,4 +89,82 @@ async fn get_preferences_returns_non_zero_limits() {
     assert!(prefs.is_some(), "expected Some preferences");
     let p = prefs.unwrap();
     assert!(p.torrents > 0);
+}
+
+#[tokio::test]
+#[ignore = "requires qbit integration stack"]
+async fn pause_then_resume_torrent() {
+    let client = make_client();
+    let event = client.authenticate().await;
+    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
+        panic!("auth failed");
+    };
+
+    let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
+    let Some(hash) = hash else {
+        panic!("add_torrent returned None");
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    client.pause_torrent(&cookie, &hash).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let details = client.list_torrent_details(&cookie).await;
+    let found = details.iter().find(|d| d.hash == hash);
+    assert!(found.is_some(), "torrent not found after pause");
+    // qBit with no peers will show PausedDownloading
+    assert!(
+        matches!(
+            found.unwrap().state,
+            windlass_clients::qbit::QbitTorrentState::PausedDownloading
+                | windlass_clients::qbit::QbitTorrentState::PausedUploading
+        ),
+        "expected paused state, got {:?}",
+        found.unwrap().state
+    );
+
+    client.resume_torrent(&cookie, &hash).await;
+    // Don't assert state after resume — no peers means it will stall immediately
+}
+
+#[tokio::test]
+#[ignore = "requires qbit integration stack"]
+async fn set_all_files_priority_succeeds() {
+    let client = make_client();
+    let event = client.authenticate().await;
+    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
+        panic!("auth failed");
+    };
+
+    let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
+    let Some(hash) = hash else {
+        panic!("add_torrent returned None");
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Should not panic
+    client.set_all_files_priority(&cookie, &hash).await;
+}
+
+#[tokio::test]
+#[ignore = "requires qbit integration stack"]
+async fn delete_torrent_removes_it_from_list() {
+    let client = make_client();
+    let event = client.authenticate().await;
+    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
+        panic!("auth failed");
+    };
+
+    let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
+    let Some(hash) = hash else {
+        panic!("add_torrent returned None");
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    client.delete_torrent(&cookie, &hash).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let details = client.list_torrent_details(&cookie).await;
+    let still_there = details.iter().any(|d| d.hash == hash);
+    assert!(!still_there, "torrent should be gone after delete");
 }

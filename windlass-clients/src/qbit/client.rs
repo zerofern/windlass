@@ -19,11 +19,11 @@ struct TorrentInfo {
 /// All qBittorrent operations are methods so call sites only pass `&self`.
 #[derive(Clone)]
 pub struct QbitClient {
-    client: reqwest::Client,
-    base_url: String,
+    pub(super) client: reqwest::Client,
+    pub(super) base_url: String,
     user: String,
     pass: String,
-    on_http: HttpObserver,
+    pub(super) on_http: HttpObserver,
 }
 
 impl QbitClient {
@@ -44,7 +44,7 @@ impl QbitClient {
         }
     }
 
-    fn emit_http(
+    pub(crate) fn emit_http(
         &self,
         method: &str,
         url: &str,
@@ -248,16 +248,6 @@ impl QbitClient {
                 }
             },
         }
-    }
-
-    /// Placeholder stub — full implementation in Step 4.
-    #[must_use]
-    pub fn add_torrent(
-        &self,
-        _cookie: &AuthCookie,
-        _torrent_bytes: Vec<u8>,
-    ) -> Option<windlass_types::TorrentHash> {
-        None
     }
 }
 

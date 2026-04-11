@@ -108,9 +108,9 @@ best torrent to download. Everything else hangs off `books`.
 
 | Table                 | Contents                                                                                                                                                                                                                                                                     |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `books`               | Every title Windlass knows about. Library status lifecycle (`known → queued → downloading → seeding → completed`), source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`), Audnexus ASIN, Hardcover ID, ABS item ID, `epub_status` (`searching` / `found` / `not_found`), `tag_scores_json` (tag intensity scores -100→+100; top 20–30 tags also denormalised as real columns for indexed dot-product queries), `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`), `enrichment_summary_path` (path to file-backed enrichment summary, null until Stage 2), `reason` (LLM-generated blurb for why this book suits the user; overwritten on re-evaluation). A book record survives disk deletion. |
+| `books`               | Every title Windlass knows about. Library status lifecycle (`known → queued → downloading → seeding → completed`), source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`), Audnexus ASIN, Hardcover ID, ABS item ID, `epub_status` (`searching` / `found` / `not_found`), `tag_scores_json` (tag intensity scores -100→+100; top 20–30 tags also denormalised as real columns for indexed dot-product queries), `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`), `enrichment_summary_path` (path to file-backed enrichment artifact `windlass_data/enrichment/{book_id}.json` — contains raw per-batch score arrays, Savitzky-Golay smoothed arrays, LIX readability score, and full prose narrative summary; null until Stage 2; never stored in SQLite to avoid bloat), `reason` (LLM-generated blurb for why this book suits the user; overwritten on re-evaluation). A book record survives disk deletion. |
 | `metadata_cache`      | Read-through cache for external API responses. Keyed by `(source, external_id)` where `source` is `audnexus` or `hardcover` and `external_id` is the ASIN or Hardcover ID. Stores the raw `response_json` and `fetched_at` timestamp. TTL: Audnexus 30 days (stable data), Hardcover 7 days (community reviews change frequently). Eliminates redundant API calls across Stage 1, Stage 2, and all LLM context assembly. |
-| `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
+| `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `narrative` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
 | `series`              | Series identity and health (Audnexus data, user started/following flags). `engagement_trend_json`: array of `{book_number, rating, completion_ratio, slog_events}` appended after each series book review. Used for series drop-off detection. |
 | `torrents`            | File data once a download starts: qBittorrent hash, seed time, HnR status, ratio, disk path. |
 | `download_queue`      | Thin table: books actively in the approval/download funnel only. `status` lifecycle: `pending_review → approved → monitoring → downloading`. `priority`: `critical` (series continuation) / `high` (strong profile match, freeleech) / `normal` / `low`. `freeleech_window_end` (nullable — elevates urgency when set). `enrichment_confidence` (float). Row deleted once `books.library_status` advances to `seeding`. |
@@ -809,16 +809,18 @@ Decide, Mood Inference) are compatible with either engine.
 Windlass maintains a canonical `tags` table as the shared vocabulary for both books and the
 user profile. Tags are grouped into categories:
 
-| Category           | Examples                                                               |
-| ------------------ | ---------------------------------------------------------------------- |
-| `genre`            | `hard_scifi`, `space_opera`, `romantasy`, `epic_fantasy`, `litrpg`    |
+| Category           | Examples / Description                                                  |
+| ------------------ | ----------------------------------------------------------------------- |
+| `genre`            | `hard_scifi`, `space_opera`, `romantasy`, `epic_fantasy`, `litrpg`     |
 | `mood`             | `funny`, `hopeful`, `dark`, `tense`, `cozy`, `atmospheric`, `emotional` |
-| `tone`             | `dry_wit`, `banter_heavy`, `slow_burn`, `action_packed`, `satirical`  |
-| `style`            | `puzzle_solving`, `character_driven`, `world_building_heavy`          |
-| `content_warning`  | `sexual_content`, `graphic_violence`, `death`, `trauma`, `war`        |
-| `length`           | `short` (<8h), `medium` (8–15h), `long` (15–25h), `epic` (>25h)      |
-| `format`           | `standalone`, `series_complete`, `series_ongoing`                     |
-| `protagonist`      | `solo_protagonist`, `ensemble_cast`, `morally_grey`, `found_family`   |
+| `tone`             | `dry_wit`, `banter_heavy`, `slow_burn`, `action_packed`, `satirical`   |
+| `style`            | Stage 2 prose & structural dimensions scored -100 to +100. Four legacy examples: `puzzle_solving`, `character_driven`, `world_building_heavy`. Stage 2 adds 14 systematic axes — see §8.0 for the full list. |
+| `arc`              | Overarching emotional arc shape, assigned by Stage 2. Six types: `arc:rags_to_riches` (steady rise), `arc:tragedy` (steady fall), `arc:man_in_hole` (fall–rise), `arc:icarus` (rise–fall), `arc:cinderella` (rise–fall–rise), `arc:oedipus` (fall–rise–fall). |
+| `narrative`        | Syntactic structure and viewpoint. Stage 2 examples: `narrative:1st_person`, `narrative:3rd_limited`, `narrative:3rd_omniscient`, `narrative:2nd_person`, `narrative:single_pov`, `narrative:dual_pov`, `narrative:multi_pov`, `tense:past`, `tense:present`. Always +100 (present) or absent — treated as scoreable preference dimensions like any other tag, not as hard filters. |
+| `content_warning`  | `sexual_content`, `graphic_violence`, `death`, `trauma`, `war`         |
+| `length`           | `short` (<8h), `medium` (8–15h), `long` (15–25h), `epic` (>25h)       |
+| `format`           | `standalone`, `series_complete`, `series_ongoing`                      |
+| `protagonist`      | `solo_protagonist`, `ensemble_cast`, `morally_grey`, `found_family`    |
 
 **Sourced tags** come directly from Audnexus and Hardcover, normalised to canonical slugs
 at acquisition time. **LLM-enriched tags** are derived from the book description at
@@ -836,16 +838,26 @@ The user profile is a flat table of scored dimensions in `profile_signals`. Each
 dimension: a tag, an author, or a narrator. Scores range from **-100 to +100** with 0
 meaning no opinion:
 
-| Score range | Meaning |
-|---|---|
-| -100 → -60 | Hard avoid / near-dealbreaker |
-| -59 → -20 | Lean away |
-| -19 → +19 | Neutral |
-| +20 → +59 | Prefer |
-| +60 → +100 | Love it |
+| Score | User-facing label | LLM-facing definition |
+|---|---|---|
+| +100 | Must-Have | Absolute Positive Driver. Heavily elevates the score; can override minor negative traits. |
+| +75 | Love It | Strong Positive Weight. A significant draw; weight the recommendation positively. |
+| +50 | Like It | Moderate Positive Weight. Adds value but is not the sole driver of choice. |
+| +25 | Nice to Have | Minor Positive Weight. A small contributing factor that slightly boosts appeal. |
+| 0 | Neutral | Zero Affinity. Presence or absence has no impact on the score. |
+| -25 | Not My Thing | Minor Negative Weight. Slightly lowers appeal but won't ruin a good book. |
+| -50 | Dislike It | Moderate Negative Weight. Apply a moderate penalty; decreases enjoyment. |
+| -75 | Hate It | Strong Negative Weight. Strongly penalise; only recommend if countered by +100 tags. |
+| -100 | Dealbreaker | Hard Constraint (Veto). If prominently featured, reject regardless of other positives. |
 
 There are no separate "hard constraint" and "soft preference" tables — a `content_warning`
 tag scored at -85 is functionally a dealbreaker. The same scale covers everything.
+
+> **LLM prompt injection:** Raw numbers are never passed to LLMs alone. Each score is
+> accompanied by its anchor label at construction time, e.g.:
+> `"Romance: -100 (Dealbreaker — Hard Constraint), Gritty: 85 (between Love It and Must-Have), Humor: 20 (Nice to Have)."`
+> This gives the LLM both the mathematical weight and the semantic meaning it needs to
+> reason accurately about tradeoffs.
 
 #### The Three Call Types
 
@@ -1031,14 +1043,88 @@ decision, not the LLM's.
 Stage 2 runs automatically after a book finishes downloading. It has two paths:
 
 **Path A — Full enrichment (epub available):**
-As soon as the epub is on disk, the main Windlass server runs an async enrichment job:
-1. The epub text is chunked by act and sent to the configured LLM provider (§7.5) with
-   a summarisation prompt. The output — a structured act-by-act prose summary — is stored
-   stored at the path in `books.enrichment_summary_path` (`windlass_data/enrichment/{book_id}.json`). Never shown to the user.
-2. A second LLM call receives the full summary and produces detailed tag intensity scores,
-   updating `books.tag_scores_json` with high-confidence scores across all categories.
-3. `enrichment_stage` is set to `post_download_full`. The book becomes eligible for Active
-   Queue promotion immediately — it does not wait for the Worker Node.
+As soon as the epub is on disk, the main Windlass server runs an async enrichment job across
+five stages:
+
+**Stage A1 — Batch splitting & baseline metrics:**
+The epub is segmented into ≥ 10 sequential batches of approximately 10,000 words each (the
+minimum window proven by narrative arc research to yield meaningful sentiment extraction and
+reliable Savitzky-Golay smoothing). A LIX readability score is computed once from the full
+text as a baseline complexity signal.
+
+**Stage A2 — Three-track per-batch LLM scoring + prose summarisation:**
+For each batch, a single LLM call processes the text across four simultaneous outputs:
+- **Emotional track:** A single sentiment score (0–100) representing the protagonist's
+  overall fortune/circumstances in that section. Produces the raw emotional arc array.
+- **Thematic track:** Presence scores (0–100) for all active tags in the `tags` table
+  across `genre`, `mood`, `tone`, `style`, `protagonist`, and `arc` categories. Produces
+  one raw time-series array per tag.
+- **Syntactic track:** The dominant narrative perspective (`narrative:1st_person` /
+  `narrative:3rd_limited` / `narrative:3rd_omniscient` / `narrative:2nd_person`) and tense
+  (`tense:past` / `tense:present`) per batch. Usually constant, but per-batch checking
+  catches experimental alternating-chapter structures.
+- **Prose summary:** A structured short summary of this batch — key plot advancements,
+  active characters, and world-lore introduced. These per-batch summaries are the raw
+  material for Stage A5.
+
+**Stage A3 — Algorithmic smoothing (Savitzky-Golay):**
+Raw per-batch arrays are too noisy for direct LLM interpretation (a single dark chapter in a
+comedy creates a misleading spike). Each array is smoothed using a **Savitzky-Golay filter**:
+window size = 1/10 of the total sequence length; polynomial degree 3. This eliminates noise
+while preserving the true local maxima (peaks) and minima (valleys) of the trajectory.
+
+**Stage A4 — LLM semantic translation:**
+The smoothed arrays are passed to a single LLM prompt that produces:
+1. **Core emotional arc classification:** The overarching emotional array is matched to one
+   of the six arc shapes and stored as an `arc:*` tag score (e.g., `"arc:cinderella": +85`).
+2. **Thematic arc labels:** Each significant thematic array is translated into a semantic arc
+   modifier added to the tag slug (e.g., romance `[0,10,30,70,100]` → `"romance:slow_burn"`
+   scored +80; grief `[90,80,40,10,0]` → grief scored with `"arc:falling"` modifier in the
+   summary).
+3. **Narrative tag confirmation:** Dominant perspective and tense are written as +100 tags
+   (e.g., `"narrative:1st_person": +100`, `"tense:past": +100`).
+4. **14 writing style dimensions:** Each axis scored by averaging per-batch LLM scores:
+
+| Tag slug | -100 anchor | +100 anchor | Note |
+|---|---|---|---|
+| `style:prose_ornamentation` | Sparse / Hemingway | Lyrical / Tolkien | |
+| `style:narrative_pacing` | Deliberate / slow-burn | Staccato / frantic | |
+| `style:focus` | Internal / introspective | External / action-driven | |
+| `style:emotional_distance` | Clinical / detached | Visceral / intimate | |
+| `style:concreteness` | Abstract / conceptual | Concrete / sensory | Top predictor in algorithmic reader-preference research |
+| `style:formality` | Colloquial / slangy | Formal / literary | |
+| `style:subjectivity` | Objective / detached narrator | Subjective / feeling-heavy | |
+| `style:core_drives` | Affiliation (allies, belonging) | Achievement / power | Psychological motivation of narrative |
+| `style:dialog_density` | Narration-heavy | Dialog-heavy | High-influence predictor in preference algorithms |
+| `style:expansiveness` | Intimate / small cast | Expansive / large cast + many settings | |
+| `style:event_density` | Variable pacing / literary | Constant action / pulp | Low variance = pulp; high variance = literary |
+| `style:rhythmic_punctuation` | Staccato delivery | Flowing / cadenced | Audiobook-specific: punctuation drives narrator breathing rhythm |
+| `style:cognitive_load` | Easy listen | Dense / multi-clause | Audiobook-specific: visual readers can re-scan; listeners cannot |
+| `style:tone_shift_magnitude` | Consistent / predictable tone | Volatile / bait-and-switch | Computed from smoothed variance of the Tone batch array, not averaged |
+
+5. **POV count tag:** Single POV (1 unique perspective character), Dual POV (2), or
+   Multi-POV (3+) assigned from the per-batch POV character lists after fuzzy-match
+   deduplication (e.g., "Jon" and "Jon Snow" collapsed to one entity).
+
+**Stage A5 — Narrative summary consolidation:**
+A single LLM call receives all per-batch prose summaries from Stage A2 in sequence and
+produces the consolidated **act-by-act narrative summary** — a structured document covering
+key plot advancements, character roster, and world-lore for the full book. This summary
+powers: JIT context injection (§8.3), "Previously On…" recaps, Glossary / Dramatis
+Personae generation, Sleep Recovery session-bounded search, and Series Health Forecasting.
+The summary is never shown to the user directly; it is consumed by other pipeline stages and
+LLM calls as high-signal context.
+
+**Stage A6 — Dual storage:**
+- **SQLite (lean):** Only the final concrete tag scores from Stage A4 are written into
+  `books.tag_scores_json`. `enrichment_stage` advances to `post_download_full`. The book
+  becomes eligible for Active Queue promotion immediately.
+- **File artifact (rich):** The raw unsmoothed arrays, the Savitzky-Golay smoothed arrays,
+  the LIX score, and the LLM's full prose summary are bundled into
+  `windlass_data/enrichment/{book_id}.json`. Raw arrays are **never** stored in SQLite —
+  they would bloat `windlass.db` and slow the Decide call's dot-product queries. The file
+  is retained for 90 days, giving a re-enrichment window if smoothing parameters or tag
+  definitions improve without needing to re-download the epub.
 
 Separately and in parallel, the Worker Node runs forced alignment (§8.1/§8.2), which
 unlocks the precision user-facing features (Glossary spoiler boundary, Sleep Recovery,
