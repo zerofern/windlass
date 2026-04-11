@@ -8,8 +8,6 @@ pub struct Config {
     pub qbit_user: String,
     pub qbit_pass: QbitPassword,
     pub mam_session: String,
-    pub gotify_url: String,
-    pub gotify_token: String,
     /// Gluetun's built-in HTTP proxy, used to route MAM traffic through the VPN.
     /// When `None` (env var absent), the VPN client makes direct connections — useful
     /// in integration tests and local dev where no VPN tunnel is running.
@@ -41,8 +39,6 @@ impl Config {
                     .into(),
             )),
             mam_session: var("MAM_SESSION").context("MAM_SESSION missing")?,
-            gotify_url: var("GOTIFY_URL").context("GOTIFY_URL missing")?,
-            gotify_token: var("GOTIFY_TOKEN").context("GOTIFY_TOKEN missing")?,
             gluetun_proxy_url: var("GLUETUN_PROXY_URL").ok(),
             mam_seedbox_url: var("MAM_SEEDBOX_URL").unwrap_or_else(|_| {
                 "https://t.myanonamouse.net/json/dynamicSeedbox.php".to_string()

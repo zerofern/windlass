@@ -116,14 +116,14 @@ best torrent to download. Everything else hangs off `books`.
 | `download_queue`      | Thin table: books actively in the approval/download funnel only. `status` lifecycle: `pending_review → approved → monitoring → downloading`. `priority`: `critical` (series continuation) / `high` (strong profile match, freeleech) / `normal` / `low`. `freeleech_window_end` (nullable — elevates urgency when set). `enrichment_confidence` (float). Row deleted once `books.library_status` advances to `seeding`. |
 | `active_queue`        | The 3-slot ABS playlist Windlass manages. `slot` (1–3), `book_id` FK to `books`, `pinned` (bool — user-locked slot; never auto-replaced), `reason` (the Decide call's blurb for this pick), `mood_snapshot_json` (snapshot of `mood_state` at time of selection). Pinned slots survive mood re-evaluations. When a pinned book finishes, the pin is consumed and the slot returns to Windlass control. |
 | `reading_ledger`      | One row per listening attempt (supports re-reads). `started_at` (first playback session), `finished_at` (ABS completion webhook), `completion_ratio` (actual calendar days ÷ expected days, computed at finish), `mood_snapshot_json` (mood state at listen-start). Retained permanently after disk deletion. |
-| `reviews`             | User feedback rows keyed by ledger entry: completion review, optional midway note, DNF autopsy. Retained permanently. |
+| `reviews`             | User feedback rows keyed by ledger entry: completion review, optional midway note, DNF autopsy. Fields: `star_rating` (1–5), `review_text`, `circumplex_pleasure_endemo INTEGER` (1–5, null for midway notes), `circumplex_activeness_endemo INTEGER` (1–5, null for midway notes), `ranking_peers_json` (ordered array of the last 5 book IDs as explicitly placed by the user via drag-and-drop; null for midway notes and when skipped). Retained permanently. |
 | `slog_detector`       | Pacing stall detection state per active ledger entry. Purged when the ledger entry is closed (finished or DNF). |
 | `series_check_ins`    | Records of the 60–75% series check-in: what was offered, what the user chose. |
-| `profile_signals`     | One row per scored dimension. `dimension_type` (`tag` / `author` / `narrator`), `dimension_id` (canonical tag slug or name), `score` (integer -100→+100). Updated after every review via Learn call delta. |
-| `mood_state`          | Single-row table (replaced on each update). `inferred_modifiers_json` (tag score deltas from inference), `explicit_override_json` (user-set modifiers with per-pick decay multiplier at 0.65×, dropped when `\|score\| < 5`), `inferred_context` (human-readable explanation shown in Queue View and Panel 6), `computed_at` timestamp. |
+| `profile_signals`     | One row per scored dimension. `dimension_type` (`tag` / `author` / `narrator`), `dimension_id` (canonical tag slug or name), `score` (integer -100→+100), `context_id` (`global` by default). `context_id = 'global'` is the always-present baseline. Context-specific subprofiles (e.g. `circumplex_high_activeness`, `circumplex_low_activeness`) are created by the Learn call only when a two-step statistical gate passes — see §7.6. The Decide call uses subprofile rows matching the current Circumplex state, falling back to `global` for any dimension not yet present in the subprofile. |
+| `mood_state`          | Single-row table (replaced on each update). `circumplex_pleasure INTEGER` (1–5, null until first inference or explicit input — see §7.6 for label mapping), `circumplex_activeness INTEGER` (1–5, null until first inference or explicit input). These represent the current Circumplex state anchor: set by explicit grid input (un-decayed, updated only on new input) or by the Mood Inference call. `inferred_modifiers_json` (tag score deltas from inference), `explicit_override_json` (user-set tag modifier deltas from grid-triggered Mood Inference and vibe text; decays at 0.65× per pick, dropped when `\|score\| < 5` — **never** contains raw Circumplex coordinates), `inferred_context` (human-readable explanation shown in Queue View and Panel 6), `computed_at` timestamp. |
 | `events`              | Internal audit log. One row per significant system action. `source` (which rule or feature triggered it — e.g. `freeleech_scavenger`, `mood_inference`, `series_continuation`, `stage2_enrichment`), `action` (e.g. `book_grabbed`, `slot_replaced`, `epub_found`), `book_id` (nullable FK), `detail_json` (structured context). Read-only — never modified after insert. **Retention: 90 days rolling.** Visible in the desktop UI Event Log panel. Distinct from `alerts` (which are user-facing and actionable). |
 | `alerts`              | Fired alerts. UUID primary key for notification deep-links. Severity, timestamp, triggering event, system state snapshot. **Retention: 30 days rolling.** |
-| `playback_sessions`   | One row per play/pause event (or scheduled ABS position poll) per book. `start_time`, `start_position_sec`, `end_time`, `end_position_sec`, `device_id`, `time_of_day_bucket` (`morning` / `afternoon` / `evening` / `night`), `day_of_week`, `source` (`webhook` / `poll`). Used for Sleep Recovery, slog detection, and mood inference. Retained permanently (required for seasonal pattern queries). |
+| `playback_sessions`   | One row per play/pause event (or scheduled ABS position poll) per book. `start_time`, `start_position_sec`, `end_time`, `end_position_sec`, `playback_speed` (float — e.g. 1.0, 1.25, 1.5; null if not reported by client), `device_id`, `time_of_day_bucket` (`morning` / `afternoon` / `evening` / `night`), `day_of_week`, `source` (`webhook` / `poll`). Used for Sleep Recovery, slog detection, and mood inference. Retained permanently (required for seasonal pattern queries). |
 | `sync_artifacts`      | Metadata row for a book's forced-alignment file. `book_id` FK, `alignment_path` (path to `windlass_data/sync/{book_id}.json`), `state` (`pending_alignment → aligned`). Only present when an epub counterpart exists. The file is deleted with the book; this row is deleted at the same time. |
 | `context_chunks`      | Hierarchical Act summaries per book generated JIT as the user progresses. FK to `books`. Stores `act_index`, `plot_advancements`, `character_roster`, and `world_lore` as structured JSON. **Retention: deleted 24 hours after `reading_ledger.finished_at`, or after a "Previously On" recap has been generated — whichever is later.** |
 
@@ -383,8 +383,8 @@ All scoring data comes directly from the MAM search API response fields.
 
   Ignoring the notification keeps the book in the queue. **Already Read** opens the
   Universal Review Component inline, logs the entry to the `reading_ledger`, and
-  immediately triggers a replacement pick. **Change mood** updates `mood_state` with an
-  explicit override and re-runs the Decide call.
+  immediately triggers a replacement pick. **Change mood** opens the hybrid mood input
+  (Circumplex grid + optional vibe text) and re-runs the Decide call on submission.
 
   **Long-awaited series arrival:** when a new entry becomes available for a series where
   the user has read all existing books and the next was previously unreleased, Windlass
@@ -610,8 +610,11 @@ who DNFs a slow romance and prefers hard sci-fi.
 wizard, or marks a suggested book as "Already Read," they are presented with the exact same
 UI card.
 
-- **The Interface:** A standard 1 to 5 star rating scale, accompanied by a single free-text
-  box prompted with _"What did you think?"_ (or _"What went wrong?"_ during a Bailout).
+- **The Interface:** Four sections on a single card:
+  1. **Absolute rating:** A standard 1–5 star rating scale.
+  2. **EndEmo grid:** The same Circumplex 5×5 grid used for "Change mood" — tapped immediately after finishing or DNF'ing to capture the *End Emotion* (the affective state the book induced at its conclusion). Stored in `reviews` as `circumplex_pleasure_endemo` / `circumplex_activeness_endemo`. Fed into the Learn call to correlate which literary tags produce which emotional outcomes.
+  3. **Free text:** A box prompted with _"What did you think?"_ (or _"What went wrong?"_ during a Bailout).
+  4. **Relative ranking:** A vertical drag-and-drop list of the last 5 finished/DNF books, ordered from most to least preferred based on prior rankings. The new book appears as a floating item at the edge; the user drags it to its correct relative position among the five. Powered by `@dnd-kit/core` (already used in Active Queue Manager). The resulting explicit order is saved as `ranking_peers_json` in `reviews` and consumed by the Learn call as ground-truth pairwise preferences. Because Windlass is a single-user personal tool, this minor friction is acceptable and produces substantially higher-fidelity profile signals than backend-inferred pairs alone.
 - **The Pipeline:** The raw text and rating are saved permanently to the `reviews` and
   `reading_ledger` tables. A Learn call (§7.6) ingests this payload alongside the book's
   tags, the current mood snapshot, and recent reading history to produce a calibrated delta
@@ -666,7 +669,17 @@ a better fit, the slot is quietly replaced.
 The Queue View displays the current `mood_state.inferred_context` string at the top of the
 screen (e.g. *"Detecting a high-energy week — lighter, faster books prioritised"*). This
 gives the user full transparency into why Windlass picked these books. A **"Change mood"**
-button opens a vibe query input directly from this display.
+button opens the hybrid mood input directly from this display:
+
+- **Circumplex grid (required):** a 5×5 grid with Pleasure (P1 very displeased → P5 very
+  pleased) on one axis and Activeness (A1 very inactive → A5 very active) on the other.
+  Tapping a cell immediately captures the coordinate anchor, stores it in
+  `mood_state.circumplex_pleasure/activeness`, and triggers a fresh Mood Inference call.
+- **Vibe text box (optional):** free-text input processed as a vibe query. The LLM
+  translates context (e.g. *"exhausted from travelling"*) into tag modifier deltas and also
+  detects life-context cues — if the negative affect is clearly external (e.g. work stress),
+  the current book's tags are not penalised. Tag deltas are stored in
+  `mood_state.explicit_override_json` with the standard 0.65× decay.
 
 #### Slot Pinning — User Override
 
@@ -839,11 +852,11 @@ tag scored at -85 is functionally a dealbreaker. The same scale covers everythin
 **Learn** — runs after every review submission.
 
 *Input:*
-1. Full `profile_signals` table (all current scores)
-2. The new review: book's tag scores + star rating + free-text
+1. Full `profile_signals` table (all current scores, all context_ids)
+2. The new review: book's tag scores + star rating + free-text + EndEmo Circumplex coordinates (`circumplex_pleasure_endemo`, `circumplex_activeness_endemo`) + explicit ranking position (`ranking_peers_json` — ordered list of the last 5 book IDs as placed by the user)
 3. `completion_ratio` from `reading_ledger` (fast finish amplifies signal; slow finish dampens it)
 4. `mood_snapshot_json` stored at listen-start (prevents mood-inflated ratings from over-writing the base profile)
-5. Last 5 finished books: tags + rating + one-line review
+5. Last 5 finished books: tags + rating + one-line review (same books shown in the ranking UI)
 6. Last 3 DNF books: tags + stated reason
 
 *Output:* a JSON delta of only the dimensions that changed, e.g.
@@ -851,35 +864,86 @@ tag scored at -85 is functionally a dealbreaker. The same scale covers everythin
 Windlass merges the delta into `profile_signals` and stores the previous version for
 Panel 6's optional re-calibration feature.
 
+> **Pairwise Ranking Integration:** When `ranking_peers_json` is present, the Learn call
+> uses a relative prompting strategy rather than evaluating the new book in isolation.
+> The LLM is instructed: *"The user ranked Book A higher than Book B but lower than Book C.
+> Analyse the `tag_scores_json` for all three books and identify the specific tags that
+> explain this placement."* A **minimum distance filter** discards any pair where the
+> absolute star rating difference is 0 to eliminate noise. The LLM outputs a tag delta
+> based on this comparative analysis — isolating the user's core literary preferences from
+> mood-congruent rating drift that would corrupt the absolute star score alone.
+
+**Subprofile Routing:** After merging the delta, the Learn call checks the Circumplex
+quadrant recorded in `mood_snapshot_json` and applies a two-step gate:
+
+1. **Minimum Data Gate:** Query `reading_ledger` — require ≥5 reviews where the
+   Circumplex state falls in the target quadrant AND ≥5 where it does not. If unmet,
+   the delta is applied to `global` only and the gate is silently skipped.
+2. **Statistical Gate:** Calculate:
+   $$t_{mean} = \frac{|\mu_{ic} - \mu_{\bar{ic}}|}{\sqrt{s_{ic}/n_{ic} + s_{\bar{ic}}/n_{\bar{ic}}}}$$
+   where $ic$ = in-context ratings, $\bar{ic}$ = out-of-context ratings, $s$ = variance,
+   $n$ = count. If $t_{mean} > 4.0$ (≈ p ≤ 0.05), the target subprofile rows are created
+   in `profile_signals` (if absent) and the delta is routed there in addition to `global`.
+
+Context ID naming convention: `circumplex_high_activeness` (A4–A5),
+`circumplex_low_activeness` (A1–A2), `circumplex_high_pleasure` (P4–P5),
+`circumplex_low_pleasure` (P1–P2). Quadrant combinations (e.g.
+`circumplex_low_pleasure_low_activeness`) are created if subsequent splits pass the gate.
+
 ---
 
 **Mood Inference** — runs at every queue pick and after every review.
+
+> **Architecture note:** The Mood Inference call acts as the system's attention mechanism,
+> translating the user's current behavioural state into concrete tag score deltas. The
+> Circumplex coordinates it outputs serve as the subprofile routing key for subsequent
+> Learn and Decide calls. SQL then executes the mathematical fusion; the Decide call is
+> freed to explain, not rank.
+
+> **Circumplex label mapping:** Coordinates are always translated to semantic labels
+> before inclusion in any LLM prompt — raw integers are never passed. Fixed mappings:
+> `circumplex_pleasure`: 1 = "very displeased", 2 = "displeased", 3 = "neutral",
+> 4 = "pleased", 5 = "very pleased". `circumplex_activeness`: 1 = "very inactive",
+> 2 = "inactive", 3 = "neutral", 4 = "active", 5 = "very active". Example prompt
+> fragment: *"The user is currently feeling displeased and active (P2, A4)."*
 
 *Input:*
 1. Current date and month, with explicit prompt instruction to consider season as a
    potential factor — only if the data supports it, not as an assumption
 2. Cross-book velocity delta: total listening hours in the last 7 days vs the previous 7 days
 3. Time-of-day session pattern: which `time_of_day_bucket` slots dominate this week vs history
-4. Last 5 finished books + last 3 DNF books (tags, ratings, review text)
-5. Same-period historical reviews: all reviews where `finished_at` falls within ±4 weeks of
+4. Rewind ratio: per-session backward jump frequency computed from `playback_sessions`
+   (`start_position_sec` regressions ÷ total session duration) — high ratio signals
+   distraction or low activeness
+5. Last 5 finished books + last 3 DNF books (tags, ratings, review text)
+6. Same-period historical reviews: all reviews where `finished_at` falls within ±4 weeks of
    today's calendar date in any prior year — included with a recency-weighting instruction
    so the LLM can detect (or dismiss) seasonal patterns without algorithmic pre-processing
-6. Any active explicit vibe input or Vacation Mode flag
+7. Any active explicit vibe input or Vacation Mode flag
+8. Current `mood_state.circumplex_pleasure` and `mood_state.circumplex_activeness` if
+   recently set by explicit user input (translated to semantic labels per the mapping above)
+9. Active subprofile rows from `profile_signals` where `context_id` matches the nearest
+   Circumplex quadrant (if any exist) — allows the LLM to reference learned subprofile
+   weights when generating tag deltas
 
 *Output:*
 ```json
 {
+  "circumplex_pleasure": 2,
+  "circumplex_activeness": 4,
   "inferred_modifiers": { "short": 35, "emotional": -20, "dark": -30 },
   "inferred_context": "Listening time down ~60% this week — favouring shorter, lower-commitment picks",
   "explicit_override_decay": 0.65
 }
 ```
 
-Inferred modifiers are recomputed fresh at every queue pick — they are never stored with
-a decay function. **Explicit overrides** (vibe query, "Change mood" button) are stored
-separately in `mood_state` and multiplied by 0.65 after each queue pick, dropping off the
-table when `|score| < 5`. This gives explicit user intent a natural 4–5 pick fade without
-a jarring cutoff.
+`circumplex_pleasure` and `circumplex_activeness` are stored in `mood_state` as the
+current inferred state anchor and used as the subprofile routing key for subsequent
+Learn and Decide calls. Inferred modifiers are recomputed fresh at every queue pick —
+they are never stored with a decay function. **Explicit overrides** (vibe query,
+"Change mood" grid input) are stored separately in `mood_state.explicit_override_json`
+and multiplied by 0.65 after each queue pick, dropping off the table when `|score| < 5`.
+This gives explicit user intent a natural 4–5 pick fade without a jarring cutoff.
 
 The `inferred_context` string is displayed in Panel 6 so the user always knows why the
 queue shifted. It is never shown as a notification — it is ambient information.
@@ -890,10 +954,27 @@ queue shifted. It is never shown as a notification — it is ambient information
 cleanser request.
 
 *Input:*
-1. Full `profile_signals` table
+1. Active `profile_signals` rows — subprofile rows for the current Circumplex context_id
+   (if they exist) take precedence over `global` rows for matching dimension_ids; `global`
+   rows fill any dimensions not yet present in the subprofile
 2. Current `mood_state` (inferred modifiers + any active explicit override, combined)
-3. Task context: candidate book list with their tag scores, or a free-text vibe query
-4. For queue picks: pipeline depth tier
+3. Task context: candidate book list with tag scores and **popularity class** — each
+   candidate is classified H-class (top 20% of library by Hardcover `ratings_count`) or
+   T-class (all others). Derived from `metadata_cache` Hardcover data at query time.
+4. **User popularity segment:** N-Group (niche-biased) if the weighted average Hardcover
+   `ratings_count` of the user's top-20 scoring `profile_signals` dimensions skews into the
+   bottom 60% of the library by ratings volume; otherwise P-Group (popularity-biased).
+   Computed from `profile_signals` × `metadata_cache` at Decide call time.
+5. For queue picks: pipeline depth tier
+
+> **FairLRM Grounding Constraint:** The Decide prompt must include an explicit instruction
+> grounding the pick in the user's `profile_signals` scores rather than the LLM's
+> pre-trained preferences. For N-Group users the prompt states that niche/T-class candidates
+> are the *correct* recommendation for this user; for P-Group users H-class candidates are
+> preferred. This Dual-Side Semantic Understanding (user segment + item class together)
+> prevents the LLM from substituting one popular title for another in the name of
+> "diversity." Generic instructions like "avoid popular books" are insufficient and must not
+> be used alone.
 
 *Output:*
 ```json
@@ -913,6 +994,12 @@ call produces both a decision and an explanation in one response. If the queue a
 silent (series continuation), `reason` is stored in `book_blurbs` but never surfaced. If it
 fires an Action notification, `reason` is the notification body. The routing is Windlass's
 decision, not the LLM's.
+
+> **Bias constraint:** The `reason` field must never contain star ratings, numeric scores,
+> "X/5", "5-star", or any rating-scale language. Qualitative, descriptive prose only. This
+> prevents the Scale Compatibility Effect: the review UI uses a 1–5 star scale, and a
+> matching numeric format in the blurb anchors the user's post-consumption rating even
+> when the blurb was delivered before the book was started.
 
 ---
 
@@ -1178,9 +1265,12 @@ A dedicated control panel exposing the user's full taste profile as it exists in
 - **Tag scores** — sliders grouped by category (genre, mood, tone, style,
   content_warning, length, format, protagonist). Every slider is directly editable.
 - **Author & narrator scores** — same -100→+100 sliders.
-- **Current mood** — displays the active `inferred_context` string so the user can see
-  why the queue has shifted. Shows any active explicit override with its remaining decay
-  strength. The user can clear the inferred mood or set a new explicit override here.
+- **Current mood** — displays the active `inferred_context` string and the current
+  Circumplex coordinates (`circumplex_pleasure` / `circumplex_activeness`) translated to
+  their semantic labels (e.g. "pleased · inactive") so the user can see why the queue has
+  shifted. Shows any active explicit override tag deltas with their remaining decay strength.
+  The user can clear the inferred mood, set a new explicit override via the Circumplex grid
+  + vibe text input, or view which subprofile (if any) is currently active.
 - **Tag registry** — lists all tags in the canonical registry. User can rename, merge, or
   retire tags. Any tag edit propagates immediately to all book records and profile scores.
 
@@ -1243,7 +1333,8 @@ The primary mobile screen. Shows the current 3-slot Active Queue (the ABS playli
 plays), the current mood context string, and downloaded-but-not-yet-queued books.
 
 - **Mood context banner:** displays `mood_state.inferred_context` with a **"Change mood"**
-  button that opens an inline vibe query input
+  button that opens the hybrid mood input (Circumplex 5×5 grid + optional vibe text —
+  same flow as Queue View)
 - Drag-and-drop slot reorder (reordering a non-pinned slot implicitly pins it)
 - **Build My Queue** button — opens the wizard (§7.7) for guided queue building
 - Each card shows: cover, title, narrator, duration, AI blurb (`active_queue.reason`), tags, 📌 if pinned

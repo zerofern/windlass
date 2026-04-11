@@ -44,13 +44,6 @@ pub fn happy_path_mam() -> Vec<Value> {
     ]
 }
 
-pub fn happy_path_gotify() -> Vec<Value> {
-    vec![json!({
-        "request": { "method": "POST", "url": "/message" },
-        "response": { "status": 200, "jsonBody": { "id": 1 } }
-    })]
-}
-
 pub fn qbit_auth_fail() -> Vec<Value> {
     vec![
         json!({
@@ -129,13 +122,6 @@ pub fn mam_asn_mismatch() -> Vec<Value> {
             }
         }),
     ]
-}
-
-pub fn gotify_down() -> Vec<Value> {
-    vec![json!({
-        "request": { "method": "POST", "url": "/message" },
-        "response": { "status": 503, "body": "Service Unavailable" }
-    })]
 }
 
 pub fn mam_rate_limit() -> Vec<Value> {

@@ -34,11 +34,9 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "http://mock-qbittorrent:8080/__admin".to_string());
             let mam_admin = std::env::var("MAM_ADMIN_URL")
                 .unwrap_or_else(|_| "http://mock-mam:8080/__admin".to_string());
-            let gotify_admin = std::env::var("GOTIFY_ADMIN_URL")
-                .unwrap_or_else(|_| "http://mock-gotify:8080/__admin".to_string());
             let gluetun_control = std::env::var("GLUETUN_CONTROL_URL")
                 .unwrap_or_else(|_| "http://mock-gluetun:9001".to_string());
-            chaos::run(&qbit_admin, &mam_admin, &gotify_admin, &gluetun_control).await?;
+            chaos::run(&qbit_admin, &mam_admin, &gluetun_control).await?;
         }
         other => anyhow::bail!("Unknown TESTKIT_MODE: {other}. Use 'gluetun' or 'chaos'"),
     }

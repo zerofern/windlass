@@ -27,10 +27,11 @@ impl SystemState {
                 .map(|n| n.0.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            actions.push(Action::SendGotifyAlert(
-                AlertPriority::Info,
-                format!("🧲 New torrent(s) added: {list}"),
-            ));
+            actions.push(Action::SendAlert {
+                priority: AlertPriority::Info,
+                title: "New torrents".into(),
+                body: format!("🧲 New torrent(s) added: {list}"),
+            });
         }
         actions.push(Action::ScheduleWakeup(
             WakeupId::TorrentCheck,
@@ -75,10 +76,11 @@ pub fn on_disk_space_observed(space: Information) -> Vec<Action> {
     let mut actions = vec![];
     if gib < 50.0 {
         warn!(space_gib = format_args!("{gib:.1}"), "disk space low");
-        actions.push(Action::SendGotifyAlert(
-            AlertPriority::Warning,
-            format!("💾 Low disk space: {gib:.1} GB remaining on /mnt/Data."),
-        ));
+        actions.push(Action::SendAlert {
+            priority: AlertPriority::Warning,
+            title: "Low disk space".into(),
+            body: format!("💾 Low disk space: {gib:.1} GB remaining on /mnt/Data."),
+        });
     } else {
         debug!(space_gib = format_args!("{gib:.1}"), "disk space OK");
     }
@@ -91,9 +93,9 @@ pub fn on_disk_space_observed(space: Information) -> Vec<Action> {
 
 pub fn on_mam_rate_limit_violation() -> Vec<Action> {
     warn!("MAM rate-limit violation — system entering debug mode");
-    vec![Action::SendGotifyAlert(
-        AlertPriority::Critical,
-        "🛑 MAM rate limit guard triggered — requests were too fast. System paused in debug mode."
-            .into(),
-    )]
+    vec![Action::SendAlert {
+        priority: AlertPriority::Critical,
+        title: "MAM rate limit".into(),
+        body: "🛑 MAM rate limit guard triggered — requests were too fast. System paused in debug mode.".into(),
+    }]
 }

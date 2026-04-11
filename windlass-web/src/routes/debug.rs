@@ -54,7 +54,7 @@ const ACTION_VARIANTS: &[&str] = &[
     "CheckMamConnectability",
     "CheckDiskSpace",
     "CheckNewTorrents",
-    "SendGotifyAlert",
+    "SendAlert",
 ];
 
 /// Builds the router for all debug-mode endpoints.

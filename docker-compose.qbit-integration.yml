@@ -1,0 +1,23 @@
+# Integration test stack with a real qBittorrent instance.
+# Used by: windlass-clients/tests/qbit_integration.rs
+# Run with: docker compose -f docker-compose.qbit-integration.yml up -d
+# Tear down: docker compose -f docker-compose.qbit-integration.yml down -v
+
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      WEBUI_PORT: "8080"
+      QBITTORRENT__WebUI__Username: admin
+      QBITTORRENT__WebUI__Password: adminadmin
+    ports:
+      - "18090:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/app/version || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes: {}

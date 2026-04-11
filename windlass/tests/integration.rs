@@ -12,7 +12,6 @@ const WINDLASS: &str = "http://localhost:5010";
 const CHAOS: &str = "http://localhost:9000";
 const GLUETUN_CTL: &str = "http://localhost:9001";
 const QBIT_ADMIN: &str = "http://localhost:18080/__admin";
-const GOTIFY_ADMIN: &str = "http://localhost:18081/__admin";
 const MAM_ADMIN: &str = "http://localhost:18082/__admin";
 
 async fn reset(client: &Client) {
@@ -294,28 +293,21 @@ async fn mam_asn_mismatch_windlass_stays_alive() {
 
 #[tokio::test]
 #[ignore = "requires dev stack"]
-async fn gotify_down_windlass_stays_alive() {
+async fn boot_sequence_writes_alert_to_db() {
     let client = Client::new();
-    reset(&client).await;
-
-    client
-        .post(format!("{CHAOS}/scenario/gotify-down"))
-        .send()
-        .await
-        .expect("scenario request failed");
-
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
-    let resp = client
-        .get(format!("{WINDLASS}/api/v1/health"))
-        .send()
-        .await
-        .expect("health request failed");
-    assert_eq!(
-        resp.status(),
-        200,
-        "Windlass should stay alive when Gotify is down"
-    );
+    wait_for("alert written at boot", 30, || {
+        let client = client.clone();
+        async move {
+            let Ok(resp) = client.get(format!("{WINDLASS}/api/v1/alerts")).send().await else {
+                return false;
+            };
+            let Ok(alerts): Result<Vec<Value>, _> = resp.json().await else {
+                return false;
+            };
+            !alerts.is_empty()
+        }
+    })
+    .await;
 }
 
 // ── State helpers ─────────────────────────────────────────────────────────────
@@ -365,17 +357,6 @@ async fn boot_sequence_syncs_port_to_51820() {
                 .await
                 >= 1
         }
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires dev stack"]
-async fn boot_sequence_sends_gotify_alert() {
-    let client = Client::new();
-    wait_for("Gotify alert at boot", 30, || {
-        let client = client.clone();
-        async move { count_requests(&client, GOTIFY_ADMIN, "/message").await >= 1 }
     })
     .await;
 }

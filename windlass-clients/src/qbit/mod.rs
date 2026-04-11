@@ -1,195 +1,18 @@
-use chrono::Utc;
-use serde::Deserialize;
-use tracing::{debug, warn};
+#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
-use windlass_core::HttpObserver;
-use windlass_core::events::Event;
-use windlass_types::{AuthCookie, HttpExchange, HttpStatusCode, TorrentName, VpnPort};
+mod client;
+mod types;
 
-#[derive(Deserialize)]
-struct TorrentInfo {
-    name: String,
-}
-
-/// Wraps a `reqwest::Client` together with the qBittorrent connection details.
-/// All qBittorrent operations are methods so call sites only pass `&self`.
-#[derive(Clone)]
-pub struct QbitClient {
-    client: reqwest::Client,
-    base_url: String,
-    user: String,
-    pass: String,
-    on_http: HttpObserver,
-}
-
-impl QbitClient {
-    #[must_use]
-    pub fn new(
-        client: reqwest::Client,
-        base_url: String,
-        user: String,
-        pass: String,
-        on_http: HttpObserver,
-    ) -> Self {
-        Self {
-            client,
-            base_url,
-            user,
-            pass,
-            on_http,
-        }
-    }
-
-    fn emit_http(
-        &self,
-        method: &str,
-        url: &str,
-        request_body: Option<String>,
-        response_status: u16,
-        response_body: &str,
-    ) {
-        (self.on_http)(HttpExchange {
-            module: "qbit".into(),
-            method: method.into(),
-            url: url.into(),
-            request_body,
-            response_status,
-            response_body: response_body.into(),
-        });
-    }
-
-    /// Authenticates with qBittorrent and returns the SID cookie on success.
-    pub async fn authenticate(&self) -> Event {
-        let url = format!("{}/api/v2/auth/login", self.base_url);
-        match self
-            .client
-            .post(&url)
-            .form(&[
-                ("username", self.user.as_str()),
-                ("password", self.pass.as_str()),
-            ])
-            .send()
-            .await
-        {
-            Err(e) => {
-                // Connection refused is normal during container startup — report as
-                // ConnectionRefused so the Core can retry silently without alerting.
-                debug!("qBit auth request failed (connection): {e}");
-                Event::QbitConnectionRefused { at: Utc::now() }
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let sid = extract_sid_cookie(&resp);
-                let body = resp.text().await.unwrap_or_default();
-                self.emit_http("POST", &url, None, status.as_u16(), &body);
-
-                if status.is_success() && body.trim() == "Ok." {
-                    let Some(cookie) = sid else {
-                        warn!("qBit auth: ok status but no SID cookie in response");
-                        return Event::QbitAuthFailed { at: Utc::now() };
-                    };
-                    debug!("qBit auth success");
-                    return Event::QbitAuthSuccess {
-                        at: Utc::now(),
-                        cookie: AuthCookie(cookie),
-                    };
-                }
-                if body.trim() == "Fails." {
-                    warn!("qBit auth: credentials rejected (Fails.)");
-                    return Event::QbitAuthFailed { at: Utc::now() };
-                }
-                warn!("qBit auth unexpected response: status={status}, body={body:?}");
-                Event::QbitApiError {
-                    at: Utc::now(),
-                    code: HttpStatusCode(status.as_u16()),
-                }
-            }
-        }
-    }
-
-    /// Updates qBittorrent's listen port via the preferences API.
-    pub async fn sync_port(&self, cookie: &AuthCookie, port: VpnPort) -> Event {
-        let url = format!("{}/api/v2/app/setPreferences", self.base_url);
-        let req_body = format!(r#"{{"listen_port":"{}"}}"#, port.into_inner());
-        match self
-            .client
-            .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
-            .form(&[("json", &req_body)])
-            .send()
-            .await
-        {
-            Err(e) => {
-                warn!("qBit port sync request failed: {e}");
-                Event::QbitPortSyncFailed {
-                    at: Utc::now(),
-                    code: HttpStatusCode(0),
-                }
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                self.emit_http("POST", &url, Some(req_body), status.as_u16(), &body);
-                if status.is_success() {
-                    debug!("qBit port sync success");
-                    Event::QbitPortSyncSuccess { at: Utc::now() }
-                } else {
-                    warn!("qBit port sync failed: status={status}");
-                    Event::QbitPortSyncFailed {
-                        at: Utc::now(),
-                        code: HttpStatusCode(status.as_u16()),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Fetches the current list of torrent names from qBittorrent.
-    /// Returns an empty vec on error rather than propagating — the torrent
-    /// checker treats an empty result as "no new torrents" and reschedules.
-    pub async fn list_torrents(&self, cookie: &AuthCookie) -> Vec<TorrentName> {
-        let url = format!("{}/api/v2/torrents/info", self.base_url);
-        match self
-            .client
-            .get(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
-            .send()
-            .await
-        {
-            Err(e) => {
-                warn!("Failed to list torrents: {e}");
-                vec![]
-            }
-            Ok(resp) => match resp.json::<Vec<TorrentInfo>>().await {
-                Ok(torrents) => torrents.into_iter().map(|t| TorrentName(t.name)).collect(),
-                Err(e) => {
-                    warn!("Failed to parse torrent list: {e}");
-                    vec![]
-                }
-            },
-        }
-    }
-}
-
-fn extract_sid_cookie(resp: &reqwest::Response) -> Option<String> {
-    for value in resp.headers().get_all(reqwest::header::SET_COOKIE) {
-        if let Ok(s) = value.to_str() {
-            for part in s.split(';') {
-                if let Some(sid) = part.trim().strip_prefix("SID=") {
-                    return Some(sid.to_string());
-                }
-            }
-        }
-    }
-    None
-}
+pub use client::QbitClient;
+pub use types::{QbitPreferences, QbitTorrentDetails, QbitTorrentState, parse_mam_id};
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::*;
-
+    use super::{QbitClient, QbitTorrentState};
+    use windlass_core::events::Event;
+    use windlass_types::{AuthCookie, HttpStatusCode, MamTorrentId, TorrentName, VpnPort};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -464,5 +287,168 @@ mod tests {
         let cookie = AuthCookie("abc123".into());
         let names = qbit.list_torrents(&cookie).await;
         assert!(names.is_empty());
+    }
+
+    // ── list_torrent_details ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_torrent_details_returns_parsed_records() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "hash": "abc123def456abc123def456abc123def456abc1",
+                    "name": "My Audiobook",
+                    "state": "uploading",
+                    "seeding_time": 7200u64,
+                    "downloaded": 1048576u64,
+                    "comment": "https://www.myanonamouse.net/t/99999"
+                },
+                {
+                    "hash": "bbb111bbb111bbb111bbb111bbb111bbb111bbb1",
+                    "name": "Other Book",
+                    "state": "downloading",
+                    "seeding_time": 0u64,
+                    "downloaded": 0u64,
+                    "comment": ""
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            "admin".into(),
+            "pass".into(),
+            Arc::new(|_| {}),
+        );
+        let cookie = AuthCookie("sid".into());
+        let details = qbit.list_torrent_details(&cookie).await;
+        assert_eq!(details.len(), 2);
+        assert_eq!(
+            details[0].hash.0,
+            "abc123def456abc123def456abc123def456abc1"
+        );
+        assert_eq!(details[0].state, QbitTorrentState::Uploading);
+        assert_eq!(details[0].seeding_time_secs, 7200);
+        assert_eq!(details[0].downloaded_bytes, 1_048_576);
+        assert_eq!(details[0].mam_id, Some(MamTorrentId(99999)));
+        assert_eq!(details[1].mam_id, None);
+    }
+
+    #[tokio::test]
+    async fn list_torrent_details_maps_all_state_strings() {
+        let states = [
+            ("downloading", QbitTorrentState::Downloading),
+            ("stalledDL", QbitTorrentState::StalledDownloading),
+            ("uploading", QbitTorrentState::Uploading),
+            ("stalledUP", QbitTorrentState::StalledUploading),
+            ("forcedUP", QbitTorrentState::ForcedUpload),
+            ("pausedDL", QbitTorrentState::PausedDownloading),
+            ("pausedUP", QbitTorrentState::PausedUploading),
+            ("error", QbitTorrentState::Error),
+        ];
+        for (state_str, expected) in &states {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v2/torrents/info"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "hash": "aaa", "name": "t", "state": state_str,
+                        "seeding_time": 0u64, "downloaded": 0u64, "comment": ""
+                    }])),
+                )
+                .mount(&server)
+                .await;
+            let qbit = QbitClient::new(
+                reqwest::Client::new(),
+                server.uri(),
+                "a".into(),
+                "p".into(),
+                Arc::new(|_| {}),
+            );
+            let details = qbit.list_torrent_details(&AuthCookie("s".into())).await;
+            assert_eq!(&details[0].state, expected, "state={state_str}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_torrent_details_returns_empty_on_bad_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            "a".into(),
+            "p".into(),
+            Arc::new(|_| {}),
+        );
+        let details = qbit.list_torrent_details(&AuthCookie("s".into())).await;
+        assert!(details.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_torrent_details_returns_empty_on_network_error() {
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            "a".into(),
+            "p".into(),
+            Arc::new(|_| {}),
+        );
+        let details = qbit.list_torrent_details(&AuthCookie("s".into())).await;
+        assert!(details.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_preferences_returns_parsed_limits() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "max_active_torrents": 10i64,
+                "max_active_downloads": 3i64,
+                "max_active_uploads": 5i64
+            })))
+            .mount(&server)
+            .await;
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            "a".into(),
+            "p".into(),
+            Arc::new(|_| {}),
+        );
+        let prefs = qbit.get_preferences(&AuthCookie("s".into())).await;
+        assert!(prefs.is_some());
+        let p = prefs.unwrap();
+        assert_eq!(p.torrents, 10);
+        assert_eq!(p.downloads, 3);
+        assert_eq!(p.uploads, 5);
+    }
+
+    #[tokio::test]
+    async fn get_preferences_returns_none_on_bad_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("bad"))
+            .mount(&server)
+            .await;
+        let qbit = QbitClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            "a".into(),
+            "p".into(),
+            Arc::new(|_| {}),
+        );
+        let prefs = qbit.get_preferences(&AuthCookie("s".into())).await;
+        assert!(prefs.is_none());
     }
 }

@@ -30,7 +30,7 @@ pub struct HttpStatusCode(pub u16);
 /// Stored per-action in `ActionEntry.http_exchanges` when debug mode is on.
 #[derive(Debug, Clone, Serialize)]
 pub struct HttpExchange {
-    /// Which client emitted this: `"qbit"`, `"mam"`, or `"gotify"`.
+    /// Which client emitted this: `"qbit"` or `"mam"`.
     pub module: String,
     pub method: String,
     pub url: String,

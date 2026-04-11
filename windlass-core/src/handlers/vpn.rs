@@ -53,10 +53,11 @@ impl SystemState {
                 warn!(vpn = %self.vpn, qbit = %self.qbit, "Gluetun died unexpectedly — beginning recovery");
                 self.vpn = VpnState::DumpingLogs;
                 actions.push(Action::FetchAndDumpAllLogs);
-                actions.push(Action::SendGotifyAlert(
-                    AlertPriority::Critical,
-                    "💀 Gluetun died unexpectedly. Dumping logs and recovering.".into(),
-                ));
+                actions.push(Action::SendAlert {
+                    priority: AlertPriority::Critical,
+                    title: "Gluetun died".into(),
+                    body: "💀 Gluetun died unexpectedly. Dumping logs and recovering.".into(),
+                });
             }
             // Intentional restart from Hard Recovery — skip the dump.
             VpnState::Starting | VpnState::DumpingLogs => {

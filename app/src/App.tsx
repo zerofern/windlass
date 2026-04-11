@@ -2,6 +2,7 @@ import { Routes, Route, NavLink } from 'react-router-dom'
 import { Dashboard } from '@/routes/Dashboard'
 import { Debug } from '@/routes/Debug'
 import { Chaos } from '@/routes/Chaos'
+import { Notifications } from '@/routes/Notifications'
 import { useConfig } from '@/hooks/useConfig'
 import { ObservationsProvider } from '@/contexts/ObservationsContext'
 
@@ -30,6 +31,7 @@ export default function App() {
             <span className="font-bold text-lg tracking-tight">⚓ Windlass</span>
             <NavItem to="/" end label="Dashboard" />
             <NavItem to="/debug" label="Debug" />
+            <NavItem to="/notifications" label="Notifications" />
             {config.chaos_url && <NavItem to="/chaos" label="Chaos" />}
           </nav>
         </header>
@@ -37,6 +39,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/debug" element={<Debug />} />
+            <Route path="/notifications" element={<Notifications />} />
             {config.chaos_url && (
               <Route path="/chaos" element={<Chaos chaosUrl={config.chaos_url} />} />
             )}

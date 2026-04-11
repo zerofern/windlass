@@ -149,10 +149,12 @@ impl ShellContext<'_> {
 
     // ── Alerts ────────────────────────────────────────────────────────────────
 
-    pub(super) fn send_gotify_alert(&self, priority: AlertPriority, message: String) {
-        let gotify = self.gotify.clone();
+    pub(super) fn send_alert(&self, priority: AlertPriority, title: String, body: String) {
+        let pool = self.db_pool.clone();
         tokio::spawn(async move {
-            gotify.send_alert(priority, &message).await;
+            if let Err(e) = windlass_db::alerts::insert(&pool, priority, &title, &body).await {
+                tracing::warn!("Failed to write alert to DB: {e}");
+            }
         });
     }
 }

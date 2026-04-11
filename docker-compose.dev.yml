@@ -50,22 +50,6 @@ services:
       timeout: 2s
       retries: 10
 
-  # ── Mock Gotify (WireMock) ────────────────────────────────────────────────────
-  mock-gotify:
-    image: wiremock/wiremock:3.5.4-alpine
-    ports:
-      - "18081:8080"
-    command: ["--port", "8080"]
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "wget -qO- http://localhost:8080/__admin/health | grep -q healthy",
-        ]
-      interval: 3s
-      timeout: 2s
-      retries: 10
-
   # ── Mock MAM (WireMock) ───────────────────────────────────────────────────────
   mock-mam:
     image: wiremock/wiremock:3.5.4-alpine
@@ -93,13 +77,10 @@ services:
       TESTKIT_MODE: chaos
       QBIT_ADMIN_URL: http://mock-qbittorrent:8080/__admin
       MAM_ADMIN_URL: http://mock-mam:8080/__admin
-      GOTIFY_ADMIN_URL: http://mock-gotify:8080/__admin
       GLUETUN_CONTROL_URL: http://mock-gluetun:9001
       RUST_LOG: info
     depends_on:
       mock-qbittorrent:
-        condition: service_healthy
-      mock-gotify:
         condition: service_healthy
       mock-mam:
         condition: service_healthy
@@ -126,8 +107,6 @@ services:
         condition: service_healthy
       mock-qbittorrent:
         condition: service_healthy
-      mock-gotify:
-        condition: service_healthy
       mock-mam:
         condition: service_healthy
       chaos-controller:
@@ -140,8 +119,6 @@ services:
       QBITTORRENT_USER: admin
       QBITTORRENT_PASS: adminadmin
       MAM_SESSION: test_session
-      GOTIFY_URL: http://mock-gotify:8080
-      GOTIFY_TOKEN: test_token
       MAM_SEEDBOX_URL: http://mock-mam:8080/json/dynamicSeedbox.php
       MAM_LOAD_URL: "http://mock-mam:8080/jsonLoad.php?snatch_summary=true&clientStats"
       DATA_PATH: /tmp

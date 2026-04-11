@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use windlass_clients::{gotify, mam, qbit};
+use windlass_clients::{mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
 use windlass_db::DbPool;
 use windlass_debug::{
@@ -58,7 +58,7 @@ pub async fn run(
         .build()?;
 
     let qbit = qbit::QbitClient::new(
-        direct.clone(),
+        direct,
         config.qbit_url.clone(),
         config.qbit_user.clone(),
         config.qbit_pass.0.expose_secret().to_owned(),
@@ -70,14 +70,8 @@ pub async fn run(
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
         &config.mam_user_agent,
-        on_http.clone(),
-    )?;
-    let gotify = gotify::GotifyClient::new(
-        direct.clone(),
-        config.gotify_url.clone(),
-        config.gotify_token.clone(),
         on_http,
-    );
+    )?;
 
     let vpn_ip_file = config.vpn_ip_file.clone();
     let vpn_port_file = config.vpn_port_file.clone();
@@ -187,7 +181,6 @@ pub async fn run(
             docker: &docker,
             qbit: &qbit,
             mam: &mam,
-            gotify: &gotify,
             wakeups: &mut wakeups,
             dependents: &boot.dependents,
             tx: &tx,
@@ -348,14 +341,12 @@ struct ShellContext<'a> {
     docker: &'a docker::DockerClient,
     qbit: &'a qbit::QbitClient,
     mam: &'a mam::MamClient,
-    gotify: &'a gotify::GotifyClient,
     wakeups: &'a mut HashMap<WakeupId, JoinHandle<()>>,
     dependents: &'a [String],
     tx: &'a mpsc::Sender<Event>,
     vpn_ip_file: &'a str,
     vpn_port_file: &'a str,
     data_path: &'a str,
-    #[allow(dead_code)] // field is populated now; used by Step-2 DB-writing actions
     db_pool: &'a DbPool,
 }
 
@@ -375,7 +366,11 @@ impl ShellContext<'_> {
             Action::CheckMamConnectability => self.check_mam_connectability(causal_tx),
             Action::CheckDiskSpace => self.check_disk_space(causal_tx),
             Action::CheckNewTorrents(cookie) => self.check_new_torrents(cookie, causal_tx),
-            Action::SendGotifyAlert(priority, msg) => self.send_gotify_alert(priority, msg),
+            Action::SendAlert {
+                priority,
+                title,
+                body,
+            } => self.send_alert(priority, title, body),
         }
     }
 }

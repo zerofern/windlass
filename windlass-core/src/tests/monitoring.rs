@@ -15,11 +15,13 @@ fn low_disk_space_sends_alert() {
     let outcome = state.process_event(Event::DiskSpaceObserved { at: now(), space }, now());
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Warning, _)))
-    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::SendAlert {
+            priority: AlertPriority::Warning,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -32,7 +34,7 @@ fn sufficient_disk_space_sends_no_alert() {
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(_, _)))
+            .any(|a| matches!(a, Action::SendAlert { .. }))
     );
 }
 
@@ -69,11 +71,13 @@ fn new_torrents_sends_alert_for_unseen_names() {
     );
     let actions = outcome.actions;
     assert!(outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Info, _)))
-    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::SendAlert {
+            priority: AlertPriority::Info,
+            ..
+        }
+    )));
     assert!(
         actions
             .iter()
@@ -117,7 +121,7 @@ fn already_known_torrents_send_no_alert() {
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(_, _)))
+            .any(|a| matches!(a, Action::SendAlert { .. }))
     );
     assert!(
         actions
@@ -146,7 +150,11 @@ fn mixed_known_and_new_torrents_alerts_only_for_new() {
     let actions = outcome.actions;
     assert!(outcome.state_changed);
     let alert = actions.iter().find_map(|a| match a {
-        Action::SendGotifyAlert(AlertPriority::Info, msg) => Some(msg.clone()),
+        Action::SendAlert {
+            priority: AlertPriority::Info,
+            body,
+            ..
+        } => Some(body.clone()),
         _ => None,
     });
     assert!(alert.is_some(), "Expected an alert for the new torrent");
@@ -178,7 +186,7 @@ fn empty_torrent_list_sends_no_alert_but_reschedules() {
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(_, _)))
+            .any(|a| matches!(a, Action::SendAlert { .. }))
     );
     assert!(
         actions

@@ -52,7 +52,11 @@ pub enum Action {
     CheckDiskSpace,
     CheckNewTorrents(AuthCookie),
 
-    SendGotifyAlert(AlertPriority, String),
+    SendAlert {
+        priority: AlertPriority,
+        title: String,
+        body: String,
+    },
 }
 
 #[cfg(test)]

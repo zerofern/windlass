@@ -18,11 +18,13 @@ fn mam_update_success_sends_ok_alert() {
     let actions = outcome.actions;
     assert!(outcome.state_changed);
     assert!(matches!(state.mam, MamState::Synced { .. }));
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Info, _)))
-    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::SendAlert {
+            priority: AlertPriority::Info,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -49,7 +51,11 @@ fn mam_asn_mismatch_blocks_and_alerts_with_ip() {
     assert!(outcome.state_changed);
     assert!(matches!(state.mam, MamState::AsnBlocked { .. }));
     let alert = actions.iter().find_map(|a| match a {
-        Action::SendGotifyAlert(AlertPriority::Critical, msg) => Some(msg.clone()),
+        Action::SendAlert {
+            priority: AlertPriority::Critical,
+            body,
+            ..
+        } => Some(body.clone()),
         _ => None,
     });
     assert!(alert.is_some(), "expected a Critical alert");
@@ -149,11 +155,13 @@ fn hard_recovery_dumps_logs_and_restarts_stack() {
             .iter()
             .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
     );
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Critical, _)))
-    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::SendAlert {
+            priority: AlertPriority::Critical,
+            ..
+        }
+    )));
 }
 
 #[test]

@@ -111,11 +111,13 @@ fn qbit_auth_failed_emits_critical_alert_and_schedules_retry() {
             attempt: RetryCount(0)
         }
     ));
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Critical, _)))
-    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::SendAlert {
+            priority: AlertPriority::Critical,
+            ..
+        }
+    )));
     assert!(
         actions
             .iter()
@@ -142,7 +144,7 @@ fn qbit_connection_refused_schedules_silent_retry() {
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(_, _)))
+            .any(|a| matches!(a, Action::SendAlert { .. }))
     );
     assert!(
         actions
@@ -347,11 +349,13 @@ fn qbit_port_sync_failed_falls_back_at_limit() {
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendGotifyAlert(AlertPriority::Warning, _)))
-    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::SendAlert {
+            priority: AlertPriority::Warning,
+            ..
+        }
+    )));
 }
 
 #[test]

@@ -12,10 +12,11 @@ impl SystemState {
             info!(ip = %ip.0, port = port.into_inner(), "MAM seedbox registered — VPN recovery complete");
             self.mam = MamState::Synced { port, ip };
             self.mark_changed();
-            return vec![Action::SendGotifyAlert(
-                AlertPriority::Info,
-                "✅ VPN Recovered. Port synced.".into(),
-            )];
+            return vec![Action::SendAlert {
+                priority: AlertPriority::Info,
+                title: "VPN recovered".into(),
+                body: "✅ VPN Recovered. Port synced.".into(),
+            }];
         }
         vec![]
     }
@@ -24,13 +25,14 @@ impl SystemState {
         warn!(ip = %ip.0, "MAM ASN mismatch — manual IP whitelist required");
         self.mam = MamState::AsnBlocked { ip };
         self.mark_changed();
-        vec![Action::SendGotifyAlert(
-            AlertPriority::Critical,
-            format!(
+        vec![Action::SendAlert {
+            priority: AlertPriority::Critical,
+            title: "MAM ASN mismatch".into(),
+            body: format!(
                 "🚨 MAM ASN mismatch for {}. Log into MAM and whitelist the new IP manually.",
                 ip.0
             ),
-        )]
+        }]
     }
 
     pub(crate) fn on_mam_connectable(&self) -> Vec<Action> {
@@ -70,10 +72,11 @@ impl SystemState {
                 self.mark_changed();
                 vec![
                     Action::FetchAndDumpAllLogs,
-                    Action::SendGotifyAlert(
-                        AlertPriority::Critical,
-                        "⚠️ NAT Frozen. Initiating Hard Recovery.".into(),
-                    ),
+                    Action::SendAlert {
+                        priority: AlertPriority::Critical,
+                        title: "NAT frozen".into(),
+                        body: "⚠️ NAT Frozen. Initiating Hard Recovery.".into(),
+                    },
                 ]
             }
         }

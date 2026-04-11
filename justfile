@@ -19,9 +19,18 @@ test-all:
 
 integration:
     docker compose -f docker-compose.dev.yml up --build -d
+    docker compose -f docker-compose.qbit-integration.yml up -d
     cargo test --test integration -- --ignored --test-threads=1 --nocapture; \
     cargo test -p windlass-local -- --include-ignored --test-threads=1 --nocapture; \
-    docker compose -f docker-compose.dev.yml down -v --remove-orphans
+    cargo test --test qbit_integration -- --ignored --test-threads=1 --nocapture; \
+    docker compose -f docker-compose.dev.yml down -v --remove-orphans; \
+    docker compose -f docker-compose.qbit-integration.yml down -v --remove-orphans
+
+# Run qBit-specific integration tests (requires docker-compose.qbit-integration.yml up)
+integration-qbit:
+    docker compose -f docker-compose.qbit-integration.yml up -d
+    cargo test --test qbit_integration -- --ignored --test-threads=1 --nocapture; \
+    docker compose -f docker-compose.qbit-integration.yml down -v --remove-orphans
 
 # Bring up the dev/test stack
 stack-up:

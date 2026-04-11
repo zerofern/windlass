@@ -186,6 +186,6 @@ pub(crate) const fn action_variant(action: &Action) -> &'static str {
         Action::CheckMamConnectability => "CheckMamConnectability",
         Action::CheckDiskSpace => "CheckDiskSpace",
         Action::CheckNewTorrents(_) => "CheckNewTorrents",
-        Action::SendGotifyAlert(_, _) => "SendGotifyAlert",
+        Action::SendAlert { .. } => "SendAlert",
     }
 }

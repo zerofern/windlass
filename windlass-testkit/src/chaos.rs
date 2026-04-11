@@ -74,7 +74,6 @@ impl Default for VpnFileState {
 pub struct ChaosState {
     pub qbit: WireMockAdmin,
     pub mam: WireMockAdmin,
-    pub gotify: WireMockAdmin,
     pub gluetun: GluetunClient,
     /// Currently active fault scenario IDs (empty = happy path).
     pub active: Arc<RwLock<HashSet<String>>>,
@@ -82,16 +81,10 @@ pub struct ChaosState {
     pub vpn: Arc<RwLock<VpnFileState>>,
 }
 
-pub async fn run(
-    qbit_admin: &str,
-    mam_admin: &str,
-    gotify_admin: &str,
-    gluetun_control: &str,
-) -> anyhow::Result<()> {
+pub async fn run(qbit_admin: &str, mam_admin: &str, gluetun_control: &str) -> anyhow::Result<()> {
     let state = Arc::new(ChaosState {
         qbit: WireMockAdmin::new(qbit_admin),
         mam: WireMockAdmin::new(mam_admin),
-        gotify: WireMockAdmin::new(gotify_admin),
         gluetun: GluetunClient::new(gluetun_control),
         active: Arc::new(RwLock::new(HashSet::new())),
         vpn: Arc::new(RwLock::new(VpnFileState::default())),
@@ -127,13 +120,8 @@ async fn apply_happy_path(state: &ChaosState) -> anyhow::Result<()> {
         .set_mappings(scenarios::happy_path_qbit())
         .await?;
     state.mam.set_mappings(scenarios::happy_path_mam()).await?;
-    state
-        .gotify
-        .set_mappings(scenarios::happy_path_gotify())
-        .await?;
     state.qbit.reset_requests().await?;
     state.mam.reset_requests().await?;
-    state.gotify.reset_requests().await?;
     Ok(())
 }
 
@@ -172,7 +160,6 @@ async fn scenario_handler(
         "mam-rate-limit" => s.mam.set_mappings(scenarios::mam_rate_limit()).await,
         "mam-not-connectable" => s.mam.set_mappings(scenarios::mam_not_connectable()).await,
         "mam-asn-mismatch" => s.mam.set_mappings(scenarios::mam_asn_mismatch()).await,
-        "gotify-down" => s.gotify.set_mappings(scenarios::gotify_down()).await,
         _ => {
             return (
                 StatusCode::NOT_FOUND,

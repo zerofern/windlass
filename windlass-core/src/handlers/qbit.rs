@@ -51,11 +51,11 @@ impl SystemState {
         };
         self.mark_changed();
         vec![
-            Action::SendGotifyAlert(
-                AlertPriority::Critical,
-                "🔐 qBittorrent rejected credentials. Check QBITTORRENT_USER / QBITTORRENT_PASS."
-                    .into(),
-            ),
+            Action::SendAlert {
+                priority: AlertPriority::Critical,
+                title: "qBit auth failed".into(),
+                body: "🔐 qBittorrent rejected credentials. Check QBITTORRENT_USER / QBITTORRENT_PASS.".into(),
+            },
             Action::ScheduleWakeup(WakeupId::QbitAuthRetry, QBIT_AUTH_BACKOFF_BASE.into()),
         ]
     }
@@ -130,13 +130,14 @@ impl SystemState {
             };
             self.mark_changed();
             return vec![
-                Action::SendGotifyAlert(
-                    AlertPriority::Warning,
-                    format!(
+                Action::SendAlert {
+                    priority: AlertPriority::Warning,
+                    title: "qBit port sync failed".into(),
+                    body: format!(
                         "⚠️ qBittorrent rejecting port updates (HTTP {}) after {} attempts. Forcing re-auth.",
                         err_code.0, QBIT_SYNC_RETRY_LIMIT.0,
                     ),
-                ),
+                },
                 Action::AuthenticateQbit,
             ];
         }
