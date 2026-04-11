@@ -2,6 +2,7 @@ import { Routes, Route, NavLink } from 'react-router-dom'
 import { Dashboard } from '@/routes/Dashboard'
 import { Debug } from '@/routes/Debug'
 import { Chaos } from '@/routes/Chaos'
+import { Download } from '@/routes/Download'
 import { Notifications } from '@/routes/Notifications'
 import { useConfig } from '@/hooks/useConfig'
 import { ObservationsProvider } from '@/contexts/ObservationsContext'
@@ -30,6 +31,7 @@ export default function App() {
           <nav className="container mx-auto flex h-14 items-center gap-6 px-4">
             <span className="font-bold text-lg tracking-tight">⚓ Windlass</span>
             <NavItem to="/" end label="Dashboard" />
+            <NavItem to="/download" label="Download" />
             <NavItem to="/debug" label="Debug" />
             <NavItem to="/notifications" label="Notifications" />
             {config.chaos_url && <NavItem to="/chaos" label="Chaos" />}
@@ -38,6 +40,7 @@ export default function App() {
         <main className="container mx-auto px-4 py-6">
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/download" element={<Download />} />
             <Route path="/debug" element={<Debug />} />
             <Route path="/notifications" element={<Notifications />} />
             {config.chaos_url && (

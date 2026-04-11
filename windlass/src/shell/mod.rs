@@ -1,6 +1,7 @@
 mod actions;
 mod compliance;
 mod config;
+mod download;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -104,10 +105,15 @@ pub async fn run(
     });
 
     let mut wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
-    let mut state = SystemState::initial().with_compliance_config(
-        config.unsatisfied_quota_limit,
-        config.compliance_poll_interval_secs,
-    );
+    let blacklisted = windlass_db::download_queue::get_blacklisted_ids(&db_pool)
+        .await
+        .unwrap_or_default();
+    let mut state = SystemState::initial()
+        .with_compliance_config(
+            config.unsatisfied_quota_limit,
+            config.compliance_poll_interval_secs,
+        )
+        .with_blacklisted_ids(blacklisted);
     let mut history = DebugHistory::new(SystemState::initial());
     let mut cmd_rx = debug_owned.cmd_rx;
     let mut log_rx = debug_owned.log_rx;
@@ -396,6 +402,9 @@ impl ShellContext<'_> {
                 book_id,
                 detail,
             } => self.write_event(source, action, book_id, detail),
+            Action::FetchAndAddTorrent { mam_id, cookie } => {
+                self.fetch_and_add_torrent(mam_id, cookie, causal_tx);
+            }
         }
     }
 }

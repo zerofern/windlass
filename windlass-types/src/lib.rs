@@ -154,6 +154,29 @@ pub struct TorrentHash(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MamTorrentId(pub u64);
 
+impl MamTorrentId {
+    /// Parses a MAM torrent ID from a URL (`https://www.myanonamouse.net/t/12345`)
+    /// or a plain numeric string (`"12345"`). Returns `None` for invalid input or zero.
+    #[must_use]
+    pub fn from_url_or_id(s: &str) -> Option<Self> {
+        let s = s.trim();
+        // Try plain numeric first.
+        if let Ok(id) = s.parse::<u64>() {
+            return if id > 0 { Some(Self(id)) } else { None };
+        }
+        // Try URL: strip scheme + host, then accept /t/ or /tor/ prefixes.
+        let path = s
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.myanonamouse.net");
+        let rest = path
+            .strip_prefix("/t/")
+            .or_else(|| path.strip_prefix("/tor/"))?;
+        let id = rest.split('/').next()?.parse::<u64>().ok()?;
+        if id > 0 { Some(Self(id)) } else { None }
+    }
+}
+
 // ── MAM connectivity ─────────────────────────────────────────────────────────
 
 /// The result of a MAM connectivity heartbeat check.
@@ -223,5 +246,43 @@ mod tests {
     fn auth_cookie_deserializes_from_string() {
         let c: AuthCookie = serde_json::from_str(r#""some-value""#).unwrap();
         assert_eq!(c.0, "some-value");
+    }
+
+    #[test]
+    fn mam_torrent_id_from_numeric_string() {
+        assert_eq!(
+            MamTorrentId::from_url_or_id("12345"),
+            Some(MamTorrentId(12345))
+        );
+    }
+
+    #[test]
+    fn mam_torrent_id_from_t_url() {
+        let url = "https://www.myanonamouse.net/t/12345";
+        assert_eq!(MamTorrentId::from_url_or_id(url), Some(MamTorrentId(12345)));
+    }
+
+    #[test]
+    fn mam_torrent_id_from_tor_url() {
+        let url = "https://www.myanonamouse.net/tor/12345";
+        assert_eq!(MamTorrentId::from_url_or_id(url), Some(MamTorrentId(12345)));
+    }
+
+    #[test]
+    fn mam_torrent_id_rejects_zero() {
+        assert_eq!(MamTorrentId::from_url_or_id("0"), None);
+    }
+
+    #[test]
+    fn mam_torrent_id_rejects_non_mam_url() {
+        assert_eq!(
+            MamTorrentId::from_url_or_id("https://example.com/t/12345"),
+            None
+        );
+    }
+
+    #[test]
+    fn mam_torrent_id_rejects_empty_string() {
+        assert_eq!(MamTorrentId::from_url_or_id(""), None);
     }
 }

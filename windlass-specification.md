@@ -110,7 +110,7 @@ best torrent to download. Everything else hangs off `books`.
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `books`               | Every title Windlass knows about. Library status lifecycle (`known → queued → downloading → seeding → completed`), source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`), Audnexus ASIN, Hardcover ID, ABS item ID, `epub_status` (`searching` / `found` / `not_found`), `tag_scores_json` (tag intensity scores -100→+100; top 20–30 tags also denormalised as real columns for indexed dot-product queries), `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`), `enrichment_summary_path` (path to file-backed enrichment artifact `windlass_data/enrichment/{book_id}.json` — contains raw per-batch score arrays, Savitzky-Golay smoothed arrays, LIX readability score, and full prose narrative summary; null until Stage 2; never stored in SQLite to avoid bloat), `reason` (LLM-generated blurb for why this book suits the user; overwritten on re-evaluation). A book record survives disk deletion. |
 | `metadata_cache`      | Read-through cache for external API responses. Keyed by `(source, external_id)` where `source` is `audnexus` or `hardcover` and `external_id` is the ASIN or Hardcover ID. Stores the raw `response_json` and `fetched_at` timestamp. TTL: Audnexus 30 days (stable data), Hardcover 7 days (community reviews change frequently). Eliminates redundant API calls across Stage 1, Stage 2, and all LLM context assembly. |
-| `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `narrative` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
+| `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `narrative` / `preference` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
 | `series`              | Series identity and health (Audnexus data, user started/following flags). `engagement_trend_json`: array of `{book_number, rating, completion_ratio, slog_events}` appended after each series book review. Used for series drop-off detection. |
 | `torrents`            | File data once a download starts: qBittorrent hash, seed time, HnR status, ratio, disk path. |
 | `download_queue`      | Thin table: books actively in the approval/download funnel only. `status` lifecycle: `pending_review → approved → monitoring → downloading`. `priority`: `critical` (series continuation) / `high` (strong profile match, freeleech) / `normal` / `low`. `freeleech_window_end` (nullable — elevates urgency when set). `enrichment_confidence` (float). Row deleted once `books.library_status` advances to `seeding`. |
@@ -817,6 +817,7 @@ user profile. Tags are grouped into categories:
 | `style`            | Stage 2 prose & structural dimensions scored -100 to +100. Four legacy examples: `puzzle_solving`, `character_driven`, `world_building_heavy`. Stage 2 adds 14 systematic axes — see §8.0 for the full list. |
 | `arc`              | Overarching emotional arc shape, assigned by Stage 2. Six types: `arc:rags_to_riches` (steady rise), `arc:tragedy` (steady fall), `arc:man_in_hole` (fall–rise), `arc:icarus` (rise–fall), `arc:cinderella` (rise–fall–rise), `arc:oedipus` (fall–rise–fall). |
 | `narrative`        | Syntactic structure and viewpoint. Stage 2 examples: `narrative:1st_person`, `narrative:3rd_limited`, `narrative:3rd_omniscient`, `narrative:2nd_person`, `narrative:single_pov`, `narrative:dual_pov`, `narrative:multi_pov`, `tense:past`, `tense:present`. Always +100 (present) or absent — treated as scoreable preference dimensions like any other tag, not as hard filters. |
+| `preference`       | User-side queue composition meta-preferences. Example: `preference:tonal_variance` (-100 = binge reader — prefers sustained tonal consistency; +100 = variety reader — fatigues quickly on similar tone). **Never enters the SQL dot-product pre-score** — books carry no `preference:` score. Used exclusively in the Decide prompt as a semantic distance instruction and updated by the Learn call. Starts at 0 (neutral) and drifts with behaviour. |
 | `content_warning`  | `sexual_content`, `graphic_violence`, `death`, `trauma`, `war`         |
 | `length`           | `short` (<8h), `medium` (8–15h), `long` (15–25h), `epic` (>25h)       |
 | `format`           | `standalone`, `series_complete`, `series_ongoing`                      |
@@ -885,6 +886,15 @@ Panel 6's optional re-calibration feature.
 > based on this comparative analysis — isolating the user's core literary preferences from
 > mood-congruent rating drift that would corrupt the absolute star score alone.
 
+> **Queue Variance Learning:** The Learn call also evaluates the sequential pattern of the
+> last 5 finished + last 3 DNF books to update `preference:tonal_variance` in
+> `profile_signals`. Signals: if the user gave high ratings to consecutive books sharing
+> dominant tone/mood tags, decrease (more negative) the score — binge pattern detected.
+> If the user DNF'd a tonally similar book but highly rated a contrasting one, increase
+> (more positive) the score — variety preference detected. `preference:tonal_variance` is
+> never routed through subprofile logic directly in the Learn call; the existing subprofile
+> gate handles mood-conditional splitting automatically over time.
+
 **Subprofile Routing:** After merging the delta, the Learn call checks the Circumplex
 quadrant recorded in `mood_snapshot_json` and applies a two-step gate:
 
@@ -937,6 +947,13 @@ Context ID naming convention: `circumplex_high_activeness` (A4–A5),
 9. Active subprofile rows from `profile_signals` where `context_id` matches the nearest
    Circumplex quadrant (if any exist) — allows the LLM to reference learned subprofile
    weights when generating tag deltas
+10. **Cumulative emotional load:** For each of the last 5 finished books: `style:cognitive_load`,
+    `style:emotional_distance`, and dominant `arc:*` tag from `books.tag_scores_json`. The
+    LLM uses this to estimate the user's current "emotional battery" — consecutive
+    `arc:tragedy` + high `style:cognitive_load` books deplete it faster than light,
+    fast-paced novellas. When battery is judged low, output modifiers should reflect a
+    recovery need (boosting `tone:hopeful`, `pacing:fast`, or `preference:tonal_variance`).
+    This is a continuous judgment — there is no hard numeric streak threshold.
 
 *Output:*
 ```json
@@ -965,19 +982,32 @@ queue shifted. It is never shown as a notification — it is ambient information
 **Decide** — runs at every queue pick, freeleech scoring, vibe query, and DNF palate
 cleanser request.
 
+> **Prompt structure (hourglass order):** Role & task → User profile + mood + popularity
+> segment → Candidates → Constraints. Constraints go last to exploit the LLM's recency
+> bias — rules placed mid-prompt after dense JSON are forgotten.
+
 *Input:*
 1. Active `profile_signals` rows — subprofile rows for the current Circumplex context_id
    (if they exist) take precedence over `global` rows for matching dimension_ids; `global`
-   rows fill any dimensions not yet present in the subprofile
+   rows fill any dimensions not yet present in the subprofile. Each score injected with its
+   anchor label (e.g., "Romance: -100 (Dealbreaker)") — never raw numbers alone.
 2. Current `mood_state` (inferred modifiers + any active explicit override, combined)
-3. Task context: candidate book list with tag scores and **popularity class** — each
-   candidate is classified H-class (top 20% of library by Hardcover `ratings_count`) or
-   T-class (all others). Derived from `metadata_cache` Hardcover data at query time.
-4. **User popularity segment:** N-Group (niche-biased) if the weighted average Hardcover
-   `ratings_count` of the user's top-20 scoring `profile_signals` dimensions skews into the
-   bottom 60% of the library by ratings volume; otherwise P-Group (popularity-biased).
-   Computed from `profile_signals` × `metadata_cache` at Decide call time.
-5. For queue picks: pipeline depth tier
+3. **Top 10 pre-scored candidates** from the SQL dot-product, **randomly shuffled** before
+   prompt injection (eliminates position bias). Each candidate includes title, author,
+   `tag_scores_json`, and popularity class (H-class / T-class). The aggregate dot-product
+   score is **not shown** — showing it causes the LLM to anchor on it and echo the SQL
+   ranking rather than applying semantic reasoning. The `tag_scores_json` provides the
+   "why" without handing the LLM the answer.
+4. **User popularity segment:** N-Group or P-Group — computed from `profile_signals` ×
+   `metadata_cache` at call time (see FairLRM Grounding Constraint below).
+5. **Current Active Queue dominant tags:** For each occupied slot, the top 3–5 dominant
+   `tone`, `mood`, and `arc` tags from `books.tag_scores_json`. Used by the Queue Variance
+   Rule to evaluate semantic distance between candidates and what the user is already
+   reading.
+6. **`preference:tonal_variance`** from `profile_signals` (current Circumplex subprofile
+   if available, else `global`). This is a queue composition meta-preference — it has no
+   item-side counterpart in `tag_scores_json` and never enters the dot-product pre-score.
+7. For queue picks: pipeline depth tier
 
 > **FairLRM Grounding Constraint:** The Decide prompt must include an explicit instruction
 > grounding the pick in the user's `profile_signals` scores rather than the LLM's
@@ -988,24 +1018,34 @@ cleanser request.
 > "diversity." Generic instructions like "avoid popular books" are insufficient and must not
 > be used alone.
 
+> **Queue Variance Rule:** The Decide prompt includes the current Active Queue dominant
+> tags and the user's `preference:tonal_variance` score. The LLM is instructed to act as a
+> semantic distance evaluator: if the score is negative (binge reader), prioritise the
+> candidate whose dominant tags most closely match the current queue tone; if positive
+> (variety reader), prioritise a candidate that matches the user's `profile_signals` but
+> has contrasting primary `tone`/`mood` tags to the current queue. The LLM does not
+> calculate numeric distances — it reasons about semantic similarity. Because all 10
+> candidates are already strong profile matches from the SQL stage, even a "variety" pick
+> is guaranteed to be a book the user will enjoy.
+
 *Output:*
 ```json
 {
-  "picks": [
-    {
-      "book_id": "abc123",
-      "score": 0.91,
-      "reason": "Matches your appetite for dry wit and brisk pacing after a heavy fantasy run. Short enough for a work week."
-    }
-  ]
+  "reason": "Matches your appetite for dry wit and brisk pacing after a heavy fantasy run. Short enough for a work week.",
+  "book_id": "abc123"
 }
 ```
 
-The `reason` field is the blurb. There is no separate blurb generation call — every Decide
-call produces both a decision and an explanation in one response. If the queue addition is
-silent (series continuation), `reason` is stored in `book_blurbs` but never surfaced. If it
-fires an Action notification, `reason` is the notification body. The routing is Windlass's
-decision, not the LLM's.
+`reason` is always output **first** — this forces the LLM to evaluate constraints and
+articulate its justification before committing to a `book_id`, acting as a lightweight
+chain-of-thought mechanism without the hallucination risk of open-ended reasoning.
+`reason` must be ≤ 50 words. No picks array — the Decide call always returns exactly one
+book per call.
+
+There is no separate blurb generation call — every Decide call produces both a decision and
+an explanation in one response. If the queue addition is silent (series continuation),
+`reason` is stored in `book_blurbs` but never surfaced. If it fires an Action notification,
+`reason` is the notification body. The routing is Windlass's decision, not the LLM's.
 
 > **Bias constraint:** The `reason` field must never contain star ratings, numeric scores,
 > "X/5", "5-star", or any rating-scale language. Qualitative, descriptive prose only. This

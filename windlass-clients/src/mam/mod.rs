@@ -40,6 +40,7 @@ pub struct MamClient {
     check_session_url: String,
     seedbox_url: String,
     load_url: String,
+    torrent_base_url: String,
     last_request_at: Arc<Mutex<Option<std::time::Instant>>>,
     on_http: HttpObserver,
 }
@@ -70,6 +71,7 @@ impl MamClient {
             check_session_url: "https://www.myanonamouse.net/json/checkCookie.php".into(),
             seedbox_url,
             load_url,
+            torrent_base_url: "https://www.myanonamouse.net".into(),
             last_request_at: Arc::new(Mutex::new(None)),
             on_http,
         })
@@ -289,6 +291,42 @@ impl MamClient {
     #[cfg(test)]
     pub fn with_check_session_url(mut self, url: String) -> Self {
         self.check_session_url = url;
+        self
+    }
+
+    /// Downloads the `.torrent` file bytes for a given MAM torrent ID.
+    ///
+    /// URL: `{torrent_base_url}/tor/download.php?tid={mam_id}`
+    /// Returns `None` on any network or HTTP error.
+    ///
+    /// # Panics
+    /// Panics if the internal session mutex is poisoned.
+    pub async fn fetch_torrent(&self, mam_id: windlass_types::MamTorrentId) -> Option<Vec<u8>> {
+        let current = self.session.lock().unwrap().clone();
+        let url = format!(
+            "{}/tor/download.php?tid={}",
+            self.torrent_base_url, mam_id.0
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header(reqwest::header::COOKIE, format!("mam_id={current}"))
+            .send()
+            .await
+            .ok()?;
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            self.emit_http(&url, status, "");
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?;
+        self.emit_http(&url, status, "<binary torrent data>");
+        Some(bytes.to_vec())
+    }
+
+    #[cfg(test)]
+    pub fn with_torrent_base_url(mut self, url: String) -> Self {
+        self.torrent_base_url = url;
         self
     }
 }
@@ -847,5 +885,59 @@ mod tests {
             Arc::new(|_| {}),
         );
         assert!(result.is_ok());
+    }
+
+    // ── fetch_torrent ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_torrent_returns_bytes_on_success() {
+        use wiremock::matchers::{path_regex, query_param};
+        let server = MockServer::start().await;
+        let torrent_bytes = b"d8:announce...e".to_vec();
+        Mock::given(method("GET"))
+            .and(path_regex("/tor/download.php"))
+            .and(query_param("tid", "12345"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(torrent_bytes.clone()))
+            .mount(&server)
+            .await;
+
+        let base = server.uri();
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            base.clone(),
+            base.clone(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap()
+        .with_torrent_base_url(base);
+        let result = mam.fetch_torrent(windlass_types::MamTorrentId(12345)).await;
+        assert_eq!(result, Some(torrent_bytes));
+    }
+
+    #[tokio::test]
+    async fn fetch_torrent_returns_none_on_403() {
+        use wiremock::matchers::path_regex;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/tor/download.php"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let base = server.uri();
+        let mam = MamClient::new(
+            None,
+            "my_session".into(),
+            base.clone(),
+            base.clone(),
+            "windlass",
+            Arc::new(|_| {}),
+        )
+        .unwrap()
+        .with_torrent_base_url(base);
+        let result = mam.fetch_torrent(windlass_types::MamTorrentId(99)).await;
+        assert!(result.is_none());
     }
 }

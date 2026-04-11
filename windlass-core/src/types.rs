@@ -1,7 +1,9 @@
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use windlass_types::{AuthCookie, RetryCount, TorrentHash, TorrentName, VpnIp, VpnPort};
+use windlass_types::{
+    AuthCookie, MamTorrentId, RetryCount, TorrentHash, TorrentName, VpnIp, VpnPort,
+};
 
 use crate::torrent::TorrentRecord;
 
@@ -106,6 +108,8 @@ pub struct SystemState {
     pub known_torrents: HashSet<TorrentName>,
     /// All torrents currently tracked by the compliance monitor, keyed by hash.
     pub torrents: HashMap<TorrentHash, TorrentRecord>,
+    /// MAM torrent IDs that have been blacklisted (loaded from DB at startup).
+    pub blacklisted_mam_ids: HashSet<MamTorrentId>,
     /// qBittorrent's `max_active_torrents` limit, updated from preferences poll.
     pub max_active_torrents: u32,
     /// Maximum unsatisfied torrents allowed before alerting (loaded from config).
@@ -123,6 +127,7 @@ impl PartialEq for SystemState {
             && self.mam == other.mam
             && self.known_torrents == other.known_torrents
             && self.torrents == other.torrents
+            && self.blacklisted_mam_ids == other.blacklisted_mam_ids
             && self.max_active_torrents == other.max_active_torrents
             && self.unsatisfied_quota_limit == other.unsatisfied_quota_limit
             && self.compliance_poll_interval_secs == other.compliance_poll_interval_secs
@@ -144,6 +149,7 @@ impl SystemState {
             mam: MamState::Unknown,
             known_torrents: HashSet::new(),
             torrents: HashMap::new(),
+            blacklisted_mam_ids: HashSet::new(),
             max_active_torrents: 5,
             unsatisfied_quota_limit: 50,
             compliance_poll_interval_secs: 60,
@@ -160,6 +166,13 @@ impl SystemState {
     ) -> Self {
         self.unsatisfied_quota_limit = unsatisfied_quota_limit;
         self.compliance_poll_interval_secs = compliance_poll_interval_secs;
+        self
+    }
+
+    /// Populates the blacklisted MAM IDs loaded from the database at startup.
+    #[must_use]
+    pub fn with_blacklisted_ids(mut self, ids: Vec<MamTorrentId>) -> Self {
+        self.blacklisted_mam_ids = ids.into_iter().collect();
         self
     }
 }

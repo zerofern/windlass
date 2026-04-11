@@ -2,11 +2,13 @@ use std::time::Duration;
 use windlass_types::{Backoff, Interval, RetryCount};
 
 mod compliance;
+mod download;
 mod mam;
 mod monitoring;
 mod qbit;
 mod vpn;
 
+pub use download::{on_torrent_add_failed, on_torrent_added_to_qbit};
 pub use monitoring::{on_disk_space_observed, on_mam_rate_limit_violation};
 pub use vpn::on_port_file_read_err;
 

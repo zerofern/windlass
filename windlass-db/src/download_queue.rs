@@ -45,6 +45,21 @@ pub async fn blacklist(pool: &DbPool, mam_id: MamTorrentId) -> Result<(), DbErro
     update_status(pool, mam_id, "blacklisted").await
 }
 
+/// Returns all MAM IDs currently marked as blacklisted in the download queue.
+/// Used at startup to populate `SystemState.blacklisted_mam_ids`.
+///
+/// # Errors
+/// Returns `DbError` if the database query fails.
+pub async fn get_blacklisted_ids(pool: &DbPool) -> Result<Vec<MamTorrentId>, DbError> {
+    let rows = sqlx::query!("SELECT mam_id FROM download_queue WHERE status = 'blacklisted'")
+        .fetch_all(pool.inner())
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| MamTorrentId(u64::try_from(r.mam_id).unwrap_or(0)))
+        .collect())
+}
+
 /// Returns all download queue entries ordered by creation time descending.
 ///
 /// # Errors
@@ -110,5 +125,17 @@ mod tests {
         blacklist(&pool, MamTorrentId(300)).await.unwrap();
         let rows = get_all(&pool).await.unwrap();
         assert_eq!(rows[0].status, "blacklisted");
+    }
+
+    #[tokio::test]
+    async fn get_blacklisted_ids_returns_blacklisted_only() {
+        let (pool, _dir) = test_pool().await;
+        let book_id = make_book(&pool).await;
+        enqueue(&pool, MamTorrentId(400), book_id).await.unwrap();
+        enqueue(&pool, MamTorrentId(401), book_id).await.unwrap();
+        blacklist(&pool, MamTorrentId(400)).await.unwrap();
+        let ids = get_blacklisted_ids(&pool).await.unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], MamTorrentId(400));
     }
 }

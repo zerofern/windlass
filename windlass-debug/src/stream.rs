@@ -169,6 +169,9 @@ pub(crate) const fn event_variant(event: &Event) -> &'static str {
         Event::QbitTorrentDetailsReceived { .. } => "QbitTorrentDetailsReceived",
         Event::QbitPreferencesReceived { .. } => "QbitPreferencesReceived",
         Event::DeleteTorrentRequested { .. } => "DeleteTorrentRequested",
+        Event::ManualDownloadRequested { .. } => "ManualDownloadRequested",
+        Event::TorrentAddedToQbit { .. } => "TorrentAddedToQbit",
+        Event::TorrentAddFailed { .. } => "TorrentAddFailed",
     }
 }
 
@@ -199,5 +202,6 @@ pub(crate) const fn action_variant(action: &Action) -> &'static str {
         Action::UpsertTorrentRecords(_) => "UpsertTorrentRecords",
         Action::BlacklistMamId(_) => "BlacklistMamId",
         Action::WriteEvent { .. } => "WriteEvent",
+        Action::FetchAndAddTorrent { .. } => "FetchAndAddTorrent",
     }
 }

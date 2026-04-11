@@ -87,6 +87,13 @@ pub enum Action {
         book_id: Option<i64>,
         detail: Option<String>,
     },
+
+    /// Fetches a `.torrent` file from MAM and adds it to qBittorrent.
+    /// Shell emits `TorrentAddedToQbit` on success or `TorrentAddFailed` on error.
+    FetchAndAddTorrent {
+        mam_id: MamTorrentId,
+        cookie: AuthCookie,
+    },
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use windlass_types::{
-    AuthCookie, HttpStatusCode, Information, MamStatus, TorrentHash, TorrentName, VpnIp, VpnPort,
-    WakeupId,
+    AuthCookie, HttpStatusCode, Information, MamStatus, MamTorrentId, TorrentHash, TorrentName,
+    VpnIp, VpnPort, WakeupId,
 };
 
 use crate::torrent::TorrentRecord;
@@ -140,6 +140,26 @@ pub enum Event {
         at: DateTime<Utc>,
         hash: TorrentHash,
     },
+
+    /// User requested a manual download of a MAM torrent.
+    ManualDownloadRequested {
+        at: DateTime<Utc>,
+        mam_id: MamTorrentId,
+    },
+
+    /// Shell successfully added the torrent to qBittorrent.
+    TorrentAddedToQbit {
+        at: DateTime<Utc>,
+        mam_id: MamTorrentId,
+        hash: TorrentHash,
+    },
+
+    /// Shell failed to fetch from MAM or add to qBittorrent.
+    TorrentAddFailed {
+        at: DateTime<Utc>,
+        mam_id: MamTorrentId,
+        reason: String,
+    },
 }
 
 impl Event {
@@ -166,7 +186,10 @@ impl Event {
             | Self::MamRateLimitViolation { at }
             | Self::QbitTorrentDetailsReceived { at, .. }
             | Self::QbitPreferencesReceived { at, .. }
-            | Self::DeleteTorrentRequested { at, .. } => *at,
+            | Self::DeleteTorrentRequested { at, .. }
+            | Self::ManualDownloadRequested { at, .. }
+            | Self::TorrentAddedToQbit { at, .. }
+            | Self::TorrentAddFailed { at, .. } => *at,
         }
     }
 }

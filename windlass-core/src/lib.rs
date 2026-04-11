@@ -96,6 +96,17 @@ impl SystemState {
                 ..
             } => self.on_qbit_preferences_received(max_active_torrents),
             Event::DeleteTorrentRequested { hash, .. } => self.on_delete_torrent_requested(hash),
+
+            // ── Manual download ───────────────────────────────────────────────
+            Event::ManualDownloadRequested { mam_id, .. } => {
+                self.on_manual_download_requested(mam_id)
+            }
+            Event::TorrentAddedToQbit { mam_id, hash, at } => {
+                handlers::on_torrent_added_to_qbit(mam_id, &hash, at)
+            }
+            Event::TorrentAddFailed { mam_id, reason, .. } => {
+                handlers::on_torrent_add_failed(mam_id, &reason)
+            }
         };
 
         let state_changed = self.version != before_version;

@@ -1,5 +1,7 @@
 # M1 Implementation Spec: Replace MLM
 
+copilot --resume=b3c8c23b-65b7-4ca4-b012-bd1d32d3f50e
+
 ## Goal
 
 A fully working, MAM-compliant, safe audiobook downloader with a web UI.
@@ -34,17 +36,20 @@ migrations and a connected pool.
 ### New crate: `windlass-db`
 
 Add to `[workspace]` members in root `Cargo.toml`:
+
 ```toml
 "windlass-db",
 ```
 
 Add to `[workspace.dependencies]`:
+
 ```toml
 sqlx      = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "chrono", "migrate", "macros"] }
 windlass-db = { path = "windlass-db" }
 ```
 
 Create `windlass-db/Cargo.toml`:
+
 ```toml
 [package]
 name = "windlass-db"
@@ -117,6 +122,7 @@ Files live in `windlass-db/migrations/`, named `NNNN_description.sql`,
 run in order by `sqlx::migrate!()`.
 
 **`windlass/migrations/0001_books.sql`**
+
 ```sql
 CREATE TABLE IF NOT EXISTS books (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +135,7 @@ CREATE TABLE IF NOT EXISTS books (
 ```
 
 **`windlass/migrations/0002_torrents.sql`**
+
 ```sql
 CREATE TABLE IF NOT EXISTS torrents (
     hash              TEXT PRIMARY KEY,
@@ -144,6 +151,7 @@ CREATE TABLE IF NOT EXISTS torrents (
 ```
 
 **`windlass/migrations/0003_download_queue.sql`**
+
 ```sql
 CREATE TABLE IF NOT EXISTS download_queue (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,6 +165,7 @@ CREATE TABLE IF NOT EXISTS download_queue (
 ```
 
 **`windlass/migrations/0004_events.sql`**
+
 ```sql
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,6 +180,7 @@ CREATE TABLE IF NOT EXISTS events (
 ```
 
 **`windlass/migrations/0005_alerts.sql`**
+
 ```sql
 CREATE TABLE IF NOT EXISTS alerts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -219,11 +229,13 @@ not core types. They are the DB representation. The shell converts between
 ### Config changes (`windlass/src/shell/config.rs`)
 
 Add:
+
 ```rust
 pub db_path: String,
 ```
 
 Parse from env:
+
 ```rust
 db_path: var("DB_PATH").unwrap_or_else(|_| "./windlass.db".to_string()),
 ```
@@ -233,6 +245,7 @@ db_path: var("DB_PATH").unwrap_or_else(|_| "./windlass.db".to_string()),
 Add `windlass-db` to `windlass/Cargo.toml` dependencies.
 
 Before the event loop:
+
 ```rust
 let db_pool = windlass_db::DbPool::connect(&config.db_path)
     .await
@@ -245,6 +258,7 @@ db_pool.migrate().await.context("Database migration failed")?;
 Add `windlass-web` dep on `windlass-db`.
 
 Add to `AppState`:
+
 ```rust
 pub db_pool: windlass_db::DbPool,
 ```
@@ -279,10 +293,13 @@ uses `Action::SendAlert` from core — no direct I/O.
 ### Types (`windlass-core/src/actions.rs`)
 
 Replace:
+
 ```rust
 SendGotifyAlert(AlertPriority, String),
 ```
+
 With:
+
 ```rust
 SendAlert {
     priority: AlertPriority,
@@ -297,6 +314,7 @@ SendAlert {
 
 Find every handler in `windlass-core/src/handlers/` that produces
 `Action::SendGotifyAlert(priority, message)` and replace with:
+
 ```rust
 Action::SendAlert {
     priority,
@@ -310,6 +328,7 @@ Update all `match action` arms and tests that reference `SendGotifyAlert`.
 ### Shell actions (`windlass/src/shell/actions.rs`)
 
 Replace `send_gotify_alert`:
+
 ```rust
 pub(super) async fn send_alert(
     &self,
@@ -353,13 +372,16 @@ Note: fire-and-forget, consistent with the previous Gotify behaviour.
 ### Web route (`windlass-web/`)
 
 Add `GET /api/v1/alerts` handler:
+
 - Query all alerts from `db_pool`, order by `created_at DESC`, limit 200.
 - Return JSON array: `[{ id, priority, title, body, read, created_at }]`.
 
 Add `POST /api/v1/alerts/{id}/read` handler:
+
 - Sets `read = 1` for the given alert id.
 
 Add frontend Notifications page at `/notifications`:
+
 - Lists all alerts, newest first, unread highlighted.
 - "Mark as read" button per alert.
 - Unread count shown in nav badge.
@@ -476,6 +498,7 @@ Deserialize the JSON array. Each object has at minimum:
 `hash`, `name`, `state`, `seeding_time` (seconds), `downloaded`, `comment`.
 
 The `state` string from qBit maps to `QbitTorrentState` variants:
+
 - `"downloading"` → `Downloading`
 - `"stalledDL"` → `StalledDownloading`
 - `"uploading"` → `Uploading`
@@ -538,7 +561,11 @@ services:
     ports:
       - "18090:8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/app/version || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:8080/api/v2/app/version || exit 1",
+        ]
       interval: 5s
       timeout: 3s
       retries: 15
@@ -552,6 +579,7 @@ This torrent contains a single 1 KB file and has a comment field set to
 immediately, but adding it is sufficient to exercise all API methods.
 
 To generate the fixture (run once, commit the result):
+
 ```
 # Using mktorrent or any torrent creation tool:
 dd if=/dev/urandom of=/tmp/windlass_test_file.bin bs=1024 count=1
@@ -599,23 +627,27 @@ failure and do not propagate errors. The compliance monitor (Step 5) will observ
 the new state on the next poll.
 
 **`pause_torrent`** — POST `/api/v2/torrents/pause`, form body `hashes={hash}`:
+
 ```rust
 pub async fn pause_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash)
 ```
 
 **`resume_torrent`** — POST `/api/v2/torrents/resume`, form body `hashes={hash}`:
+
 ```rust
 pub async fn resume_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash)
 ```
 
 **`force_resume_torrent`** — POST `/api/v2/torrents/setForceStart`,
 form body `hashes={hash}&value=true`:
+
 ```rust
 pub async fn force_resume_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash)
 ```
 
 **`delete_torrent`** — POST `/api/v2/torrents/delete`,
 form body `hashes={hash}&deleteFiles=false`:
+
 ```rust
 pub async fn delete_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash)
 ```
@@ -625,6 +657,7 @@ removes the torrent from qBit's list.
 
 **`set_all_files_priority`** — POST `/api/v2/torrents/filePrio`,
 form body `hash={hash}&id=all&priority=1`:
+
 ```rust
 pub async fn set_all_files_priority(&self, cookie: &AuthCookie, hash: &TorrentHash)
 ```
@@ -636,6 +669,7 @@ enforcing the MAM "no partials" rule.
 ### WireMock tests (Tier 2)
 
 For each write method:
+
 - Success (200 response) — assert the correct endpoint and form params were sent.
 - Network error — assert the method returns without panicking.
 
@@ -664,6 +698,7 @@ This step does NOT add any new external HTTP clients. It wires together Steps 1�
 ### New types (`windlass-types/src/lib.rs`)
 
 Add to `WakeupId`:
+
 ```rust
 CompliancePoll,
 ```
@@ -703,18 +738,21 @@ shell-side deserialization type. The shell converts `QbitTorrentState → Torren
 before sending the event. This keeps the core free of client-layer knowledge.
 
 Add to `SystemState`:
+
 ```rust
 pub torrents: HashMap<TorrentHash, TorrentRecord>,
 pub unsatisfied_quota_limit: u32,   // loaded from config, default 50
 ```
 
 Add `ComplianceConfig` to `windlass/src/shell/config.rs`:
+
 ```rust
 pub unsatisfied_quota_limit: u32,
 pub compliance_poll_interval_secs: u64,
 ```
 
 Parsed from env:
+
 ```rust
 unsatisfied_quota_limit: var("MAM_UNSATISFIED_QUOTA_LIMIT")
     .ok()
@@ -805,6 +843,7 @@ Steps in order:
 3. **HnR at-risk alert.** For every torrent where
    `downloaded_bytes > 0 AND seeding_time_secs < 72 * 3600 AND state ∈ {StalledUploading, Error}`,
    push:
+
    ```rust
    Action::SendAlert {
        priority: AlertPriority::Critical,
@@ -881,11 +920,13 @@ fn handle_delete_torrent_requested(
 
 To support queue orchestration, the core needs to know qBit's `max_active_torrents`.
 Add to `SystemState`:
+
 ```rust
 pub max_active_torrents: u32,   // default 5; updated by FetchPreferences result
 ```
 
 Add new event and action:
+
 ```rust
 // In events.rs:
 QbitPreferencesReceived {
@@ -935,6 +976,7 @@ pub(super) async fn write_event(
     }
 }
 ```
+
     let qbit = self.qbit.clone();
     tokio::spawn(causal_tx.run(move |causal_tx| async move {
         let raw = qbit.list_torrent_details(&cookie).await;
@@ -944,66 +986,67 @@ pub(super) async fn write_event(
             torrents,
         }).await;
     }));
+
 }
 
 pub(super) fn fetch_qbit_preferences(&self, cookie: AuthCookie, causal_tx: CausalTx) {
-    let qbit = self.qbit.clone();
-    tokio::spawn(causal_tx.run(move |causal_tx| async move {
-        if let Some(prefs) = qbit.get_preferences(&cookie).await {
-            causal_tx.send(Event::QbitPreferencesReceived {
-                at: Utc::now(),
-                max_active_torrents: prefs.max_active_torrents,
-                max_active_downloads: prefs.max_active_downloads,
-                max_active_uploads: prefs.max_active_uploads,
-            }).await;
-        }
-    }));
+let qbit = self.qbit.clone();
+tokio::spawn(causal_tx.run(move |causal_tx| async move {
+if let Some(prefs) = qbit.get_preferences(&cookie).await {
+causal_tx.send(Event::QbitPreferencesReceived {
+at: Utc::now(),
+max_active_torrents: prefs.max_active_torrents,
+max_active_downloads: prefs.max_active_downloads,
+max_active_uploads: prefs.max_active_uploads,
+}).await;
+}
+}));
 }
 
 pub(super) fn pause_torrent(&self, hash: TorrentHash) {
-    let qbit = self.qbit.clone();
-    let cookie = self.cached_cookie(); // helper that reads cookie from ShellContext
-    tokio::spawn(async move {
-        qbit.pause_torrent(&cookie, &hash).await;
-    });
+let qbit = self.qbit.clone();
+let cookie = self.cached_cookie(); // helper that reads cookie from ShellContext
+tokio::spawn(async move {
+qbit.pause_torrent(&cookie, &hash).await;
+});
 }
 
-pub(super) fn force_resume_torrent(&self, hash: TorrentHash) { /* same pattern */ }
+pub(super) fn force_resume_torrent(&self, hash: TorrentHash) { /_ same pattern _/ }
 
 pub(super) fn delete_torrent(&self, hash: TorrentHash) {
-    let qbit = self.qbit.clone();
-    let cookie = self.cached_cookie();
-    tokio::spawn(async move {
-        qbit.delete_torrent(&cookie, &hash).await;
-    });
+let qbit = self.qbit.clone();
+let cookie = self.cached_cookie();
+tokio::spawn(async move {
+qbit.delete_torrent(&cookie, &hash).await;
+});
 }
 
-pub(super) fn set_all_files_priority(&self, hash: TorrentHash) { /* same pattern */ }
+pub(super) fn set_all_files_priority(&self, hash: TorrentHash) { /_ same pattern _/ }
 
 pub(super) async fn upsert_torrent_records(&self, records: Vec<TorrentRecord>) {
-    for r in records {
-        sqlx::query!(
-            "INSERT INTO torrents (hash, name, state, seeding_time_secs, downloaded_bytes,
-             mam_id, seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(hash) DO UPDATE SET
-               name = excluded.name,
-               state = excluded.state,
-               seeding_time_secs = excluded.seeding_time_secs,
-               downloaded_bytes = excluded.downloaded_bytes,
-               mam_id = COALESCE(excluded.mam_id, torrents.mam_id),
-               seen_at = excluded.seen_at",
-            r.hash.0, r.name.0, torrent_state_str(&r.state),
-            r.seeding_time_secs as i64, r.downloaded_bytes as i64,
-            r.mam_id.map(|id| id.0 as i64), r.seen_at.to_rfc3339()
-        )
-        .execute(&self.db_pool)
-        .await
-        .unwrap_or_else(|e| { tracing::warn!("Failed to upsert torrent: {e}"); ... });
-    }
+for r in records {
+sqlx::query!(
+"INSERT INTO torrents (hash, name, state, seeding_time_secs, downloaded_bytes,
+mam_id, seen_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(hash) DO UPDATE SET
+name = excluded.name,
+state = excluded.state,
+seeding_time_secs = excluded.seeding_time_secs,
+downloaded_bytes = excluded.downloaded_bytes,
+mam_id = COALESCE(excluded.mam_id, torrents.mam_id),
+seen_at = excluded.seen_at",
+r.hash.0, r.name.0, torrent_state_str(&r.state),
+r.seeding_time_secs as i64, r.downloaded_bytes as i64,
+r.mam_id.map(|id| id.0 as i64), r.seen_at.to_rfc3339()
+)
+.execute(&self.db_pool)
+.await
+.unwrap_or_else(|e| { tracing::warn!("Failed to upsert torrent: {e}"); ... });
+}
 }
 
-```
+````
 
 Note on cookie access: `pause_torrent`, `force_resume_torrent`, `delete_torrent`,
 and `set_all_files_priority` need the current auth cookie. The Action variants
@@ -1065,7 +1108,7 @@ Add method to `MamClient` (`windlass-clients/src/mam/`):
 /// Downloads the .torrent file bytes for a given MAM torrent ID.
 /// Returns `None` on any error.
 pub async fn fetch_torrent(&self, mam_id: MamTorrentId) -> Option<Vec<u8>>
-```
+````
 
 URL: `https://www.myanonamouse.net/tor/download.php?tid={mam_id}`
 Uses the existing session cookie. The response body is the raw `.torrent` bytes.
@@ -1148,6 +1191,7 @@ FetchAndAddTorrent {
 ```
 
 The shell, when executing `FetchAndAddTorrent`:
+
 1. Writes a `books` row (`mam_id`, `status = 'pending_metadata'`).
 2. Gets the new `book_id`.
 3. Fetches the `.torrent` file from MAM.
@@ -1233,15 +1277,19 @@ Add to `windlass-web/src/routes/`:
 `POST /api/v1/download/add`
 
 Request body:
+
 ```json
 { "mam_url": "https://www.myanonamouse.net/t/12345" }
 ```
+
 or
+
 ```json
 { "mam_id": 12345 }
 ```
 
 Handler:
+
 1. Parse `mam_id` from `mam_url` using the same `parse_mam_id` logic (share the
    implementation — consider putting `parse_mam_id` in `windlass-types` or
    `windlass-core` so both the client and the web handler can use it).
@@ -1282,17 +1330,20 @@ Windlass is doing. The Notifications page (added in Step 2) is already in nav.
 ### New web routes
 
 `GET /api/v1/torrents`
+
 - Query `torrents` table, join `books` for title where available.
 - Return JSON: `[{ hash, name, title?, mam_id?, state, seeding_time_secs, downloaded_bytes,
-  hnr_satisfied, hnr_hours_remaining, added_at, seen_at }]`
+hnr_satisfied, hnr_hours_remaining, added_at, seen_at }]`
 - `hnr_satisfied = seeding_time_secs >= 72 * 3600`
 - `hnr_hours_remaining = max(0, 72 - seeding_time_secs / 3600)`
 
 `GET /api/v1/download-queue`
+
 - Query `download_queue` join `books`.
 - Return JSON: `[{ id, mam_id, title?, status, created_at, updated_at }]`
 
 `GET /api/v1/events`
+
 - Query `events`, order by `created_at DESC`, limit 200.
 - Return JSON: `[{ id, source, action, book_id?, detail?, created_at }]`
 
@@ -1302,23 +1353,27 @@ All panels use SSE (`/api/v1/stream`) to refresh when new observations arrive �
 the existing SSE infrastructure already broadcasts on every state change.
 
 **Torrent Monitor panel** (`/torrents`):
+
 - Table: Name | State | Seeded | HnR Status | Downloaded
 - HnR Status column: green badge "Satisfied" if ≥72h, amber "X h remaining" if <72h
   and downloading/seeding, red "At Risk" if stalled with <72h.
 - Auto-refreshes on SSE event.
 
 **Download Queue panel** (`/queue`):
+
 - Table: MAM ID | Title | Status | Queued At
 - "Add Download" form: text input + button (from Step 6).
 - Status badges: pending (grey), downloading (blue), seeding (green),
   satisfied (light green), failed (red), blacklisted (dark grey).
 
 **Event Log panel** (`/events`):
+
 - Table: Time | Source | Action | Detail
 - Searchable by source and action.
 - Paginated (load more button).
 
 **Navigation**:
+
 - Update the existing nav to include: Dashboard | Torrents | Queue | Events | Notifications | Chaos (dev only).
 
 ### Definition of done
