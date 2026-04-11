@@ -1,3 +1,7 @@
+
+copilot --resume=6297a6b6-9bb5-4c09-ba2e-f205c9e438c6
+
+
 Today • 13:30
 I am trying to build a single user audio book recomndation engine using the full ebook text. I want to track both user prefrences and user mood and use that with long term detailed listening tracking and user reviews and both implicit and explicit user mood tracking.
 i need help on how to structure the user prefernce profile while allowing for multiple subprofiles for the user.
