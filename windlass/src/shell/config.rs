@@ -24,6 +24,7 @@ pub struct Config {
     /// Mount path to check for available disk space.
     pub data_path: String,
     pub dump_dir: String,
+    pub db_path: String,
     pub vpn_ip_file: String,
     pub vpn_port_file: String,
 }
@@ -53,6 +54,7 @@ impl Config {
             mam_user_agent: var("MAM_USER_AGENT").unwrap_or_else(|_| "windlass".to_string()),
             data_path: var("DATA_PATH").unwrap_or_else(|_| "/mnt/Data".to_string()),
             dump_dir: var("DUMP_DIR").unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),
+            db_path: var("DB_PATH").unwrap_or_else(|_| "./windlass.db".to_string()),
             vpn_ip_file: var("VPN_IP_FILE").unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),
             vpn_port_file: var("VPN_PORT_FILE")
                 .unwrap_or_else(|_| "/tmp/gluetun/forwarded_port".to_string()),

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT hash, book_id, mam_id, name, state, seeding_time_secs,\n         downloaded_bytes, seen_at FROM torrents ORDER BY added_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "hash",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "book_id",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "mam_id",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "name",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "state",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "seeding_time_secs",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "downloaded_bytes",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "seen_at",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "064ebfcda1f00b1d687f8c32f9a11d2b3c3e633b8e24dc15d064b2ea4cf28338"
+}

@@ -9,6 +9,7 @@ members = [
     "windlass-web",
     "windlass",
     "windlass-testkit",
+    "windlass-db",
 ]
 
 [workspace.dependencies]
@@ -38,10 +39,12 @@ axum             = { version = "0.8", features = ["json"] }
 tower-http       = { version = "0.6", features = ["cors"] }
 arc-swap         = "1"
 uuid             = { version = "1", features = ["v4", "serde"] }
+sqlx             = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "chrono", "migrate", "macros"] }
 windlass-debug   = { path = "windlass-debug" }
 windlass-types   = { path = "windlass-types" }
 windlass-core    = { path = "windlass-core" }
 windlass-local   = { path = "windlass-local" }
 windlass-clients = { path = "windlass-clients" }
 windlass-web     = { path = "windlass-web" }
+windlass-db      = { path = "windlass-db" }
 

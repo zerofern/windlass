@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO download_queue (mam_id, book_id, status) VALUES (?, ?, 'pending')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "ce49f639475e5190de9aee9098f2e77853de9b5515566f797e34b7bda3508ece"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO books (mam_id) VALUES (?) ON CONFLICT(mam_id) DO UPDATE SET mam_id = excluded.mam_id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "965c238df5ab2ca76cba4c411583a6c7f1a59683af05ea7cee9812221e9ca169"
+}

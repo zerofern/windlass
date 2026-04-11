@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO alerts (priority, title, body) VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "bf9b765c168942d78bf343ac99c52715f9d3019fe32db3f7e43d321e4471ea74"
+}

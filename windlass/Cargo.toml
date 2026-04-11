@@ -8,6 +8,8 @@ name = "windlass"
 path = "src/main.rs"
 
 [dependencies]
+windlass-db      = { workspace = true }
+sqlx             = { workspace = true }
 arc-swap         = { workspace = true }
 windlass-types   = { workspace = true }
 windlass-core    = { workspace = true }

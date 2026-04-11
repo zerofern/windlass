@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use windlass_clients::{gotify, mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
+use windlass_db::DbPool;
 use windlass_debug::{
     CausalTx, DebugController, DebugDispatcher, DebugHistory, DebuggableEventStream,
 };
@@ -36,6 +37,15 @@ pub async fn run(
     let (tx, rx) = mpsc::channel::<Event>(128);
 
     let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone(), tx.clone()).await?;
+
+    let db_pool = DbPool::connect(&config.db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to open SQLite database: {e}"))?;
+    db_pool
+        .migrate()
+        .await
+        .map_err(|e| anyhow::anyhow!("Database migration failed: {e}"))?;
+
     let port_files =
         vpn_files::read_and_watch(&config.vpn_ip_file, &config.vpn_port_file, tx.clone()).await;
 
@@ -87,6 +97,7 @@ pub async fn run(
         debug_ctrl: debug_ctrl.clone(),
         observations: obs_tx.clone(),
         chaos_url: std::env::var("CHAOS_URL").ok(),
+        db_pool: db_pool.clone(),
     };
     let bind_addr = std::env::var("WINDLASS_BIND").unwrap_or_else(|_| "0.0.0.0:5010".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -183,6 +194,7 @@ pub async fn run(
             vpn_ip_file: &vpn_ip_file,
             vpn_port_file: &vpn_port_file,
             data_path: &data_path,
+            db_pool: &db_pool,
         };
 
         if let Some(eid) = event_id {
@@ -343,6 +355,8 @@ struct ShellContext<'a> {
     vpn_ip_file: &'a str,
     vpn_port_file: &'a str,
     data_path: &'a str,
+    #[allow(dead_code)] // field is populated now; used by Step-2 DB-writing actions
+    db_pool: &'a DbPool,
 }
 
 impl ShellContext<'_> {

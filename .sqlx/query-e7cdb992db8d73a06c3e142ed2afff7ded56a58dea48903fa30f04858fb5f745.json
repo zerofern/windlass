@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,\n           downloaded_bytes, seen_at)\n           VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n           ON CONFLICT(hash) DO UPDATE SET\n             book_id = COALESCE(excluded.book_id, torrents.book_id),\n             mam_id = COALESCE(excluded.mam_id, torrents.mam_id),\n             name = excluded.name,\n             state = excluded.state,\n             seeding_time_secs = excluded.seeding_time_secs,\n             downloaded_bytes = excluded.downloaded_bytes,\n             seen_at = excluded.seen_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "e7cdb992db8d73a06c3e142ed2afff7ded56a58dea48903fa30f04858fb5f745"
+}

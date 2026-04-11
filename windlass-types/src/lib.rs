@@ -142,6 +142,17 @@ pub enum AlertPriority {
     Critical,
 }
 
+// ── MAM / Torrent IDs ────────────────────────────────────────────────────────
+
+/// The info hash of a torrent as reported by qBittorrent (40-char hex string).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TorrentHash(pub String);
+
+/// A MAM torrent ID parsed from the torrent's comment field.
+/// Comment URL format: `https://www.myanonamouse.net/t/12345`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MamTorrentId(pub u64);
+
 // ── MAM connectivity ─────────────────────────────────────────────────────────
 
 /// The result of a MAM connectivity heartbeat check.
