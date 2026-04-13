@@ -110,7 +110,7 @@ best torrent to download. Everything else hangs off `books`.
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `books`               | Every title Windlass knows about. Library status lifecycle (`known → queued → downloading → seeding → completed`), source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`), Audnexus ASIN, Hardcover ID, ABS item ID, `epub_status` (`searching` / `found` / `not_found`), `tag_scores_json` (tag intensity scores -100→+100; top 20–30 tags also denormalised as real columns for indexed dot-product queries), `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`), `enrichment_summary_path` (path to file-backed enrichment artifact `windlass_data/enrichment/{book_id}.json` — contains raw per-batch score arrays, Savitzky-Golay smoothed arrays, LIX readability score, and full prose narrative summary; null until Stage 2; never stored in SQLite to avoid bloat), `reason` (LLM-generated blurb for why this book suits the user; overwritten on re-evaluation). A book record survives disk deletion. |
 | `metadata_cache`      | Read-through cache for external API responses. Keyed by `(source, external_id)` where `source` is `audnexus` or `hardcover` and `external_id` is the ASIN or Hardcover ID. Stores the raw `response_json` and `fetched_at` timestamp. TTL: Audnexus 30 days (stable data), Hardcover 7 days (community reviews change frequently). Eliminates redundant API calls across Stage 1, Stage 2, and all LLM context assembly. |
-| `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `narrative` / `preference` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
+| `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `arc_relation` / `narrative` / `preference` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
 | `series`              | Series identity and health (Audnexus data, user started/following flags). `engagement_trend_json`: array of `{book_number, rating, completion_ratio, slog_events}` appended after each series book review. Used for series drop-off detection. |
 | `torrents`            | File data once a download starts: qBittorrent hash, seed time, HnR status, ratio, disk path. |
 | `download_queue`      | Thin table: books actively in the approval/download funnel only. `status` lifecycle: `pending_review → approved → monitoring → downloading`. `priority`: `critical` (series continuation) / `high` (strong profile match, freeleech) / `normal` / `low`. `freeleech_window_end` (nullable — elevates urgency when set). `enrichment_confidence` (float). Row deleted once `books.library_status` advances to `seeding`. |
@@ -814,8 +814,9 @@ user profile. Tags are grouped into categories:
 | `genre`            | `hard_scifi`, `space_opera`, `romantasy`, `epic_fantasy`, `litrpg`     |
 | `mood`             | `funny`, `hopeful`, `dark`, `tense`, `cozy`, `atmospheric`, `emotional` |
 | `tone`             | `dry_wit`, `banter_heavy`, `slow_burn`, `action_packed`, `satirical`   |
-| `style`            | Stage 2 prose & structural dimensions scored -100 to +100. Four legacy examples: `puzzle_solving`, `character_driven`, `world_building_heavy`. Stage 2 adds 14 systematic axes — see §8.0 for the full list. |
+| `style`            | Prose, structural, and psychological dimensions scored -100 to +100. Stage 2 produces two types: **algorithmic** (computed deterministically by NLP libraries — never passed through an LLM) and **LLM-estimated** (semantic dimensions requiring contextual reasoning). Both are stored as independent scores in `tag_scores_json` and fused at inference time by the dot-product and Decide call. See §8.0 for the full 20-dimension table with source annotations. Legacy discovery-time tags `puzzle_solving` and `world_building_heavy` are superseded by `style:puzzle_density` and `style:lore_density`. `character_driven` is retired — replaced by the algorithmic `style:cs_density`. |
 | `arc`              | Overarching emotional arc shape, assigned by Stage 2. Six types: `arc:rags_to_riches` (steady rise), `arc:tragedy` (steady fall), `arc:man_in_hole` (fall–rise), `arc:icarus` (rise–fall), `arc:cinderella` (rise–fall–rise), `arc:oedipus` (fall–rise–fall). |
+| `arc_relation`     | Character relationship arc dynamics, assigned by Stage 2 Relation Arc sub-stage (§8.0). Distinct from `arc:*` which captures plot-level sentiment — `arc_relation` captures the *interpersonal circumstance* between directed character pairs. `arc_relation:volatile` (-100 = static dynamics throughout; +100 = highly volatile — betrayals, enemies-to-lovers, shifting power). **Gate: only computed for books with ≥ 500 extractable narrative events; novellas and short stories are skipped.** Runs locally on AMD GPU via ROCm using BookNLP (big model) + RoBERTa + GoEmotions. |
 | `narrative`        | Syntactic structure and viewpoint. Stage 2 examples: `narrative:1st_person`, `narrative:3rd_limited`, `narrative:3rd_omniscient`, `narrative:2nd_person`, `narrative:single_pov`, `narrative:dual_pov`, `narrative:multi_pov`, `tense:past`, `tense:present`. Always +100 (present) or absent — treated as scoreable preference dimensions like any other tag, not as hard filters. |
 | `preference`       | User-side queue composition meta-preferences. Example: `preference:tonal_variance` (-100 = binge reader — prefers sustained tonal consistency; +100 = variety reader — fatigues quickly on similar tone). **Never enters the SQL dot-product pre-score** — books carry no `preference:` score. Used exclusively in the Decide prompt as a semantic distance instruction and updated by the Learn call. Starts at 0 (neutral) and drifts with behaviour. |
 | `content_warning`  | `sexual_content`, `graphic_violence`, `death`, `trauma`, `war`         |
@@ -826,7 +827,10 @@ user profile. Tags are grouped into categories:
 **Sourced tags** come directly from Audnexus and Hardcover, normalised to canonical slugs
 at acquisition time. **LLM-enriched tags** are derived from the book description at
 acquisition time — the LLM assigns tags from categories that the source APIs do not cover
-(tone, style, protagonist, detailed length).
+(tone, style, protagonist, detailed length). **Algorithmically computed tags** are produced
+by the Stage 2 NLP library pipeline (textstat, spaCy, LitNER, BookNLP, VADER, TextBlob,
+LIWC-equivalent lexicons) — these are deterministic, GPU-accelerated where applicable
+(ROCm/HIP), and never passed through an LLM for estimation.
 
 **Controlled growth:** If the LLM encounters a quality no existing tag covers, it proposes a
 new tag with a `canonical_name` and `description`. Windlass runs a normalisation check
@@ -947,9 +951,10 @@ Context ID naming convention: `circumplex_high_activeness` (A4–A5),
 9. Active subprofile rows from `profile_signals` where `context_id` matches the nearest
    Circumplex quadrant (if any exist) — allows the LLM to reference learned subprofile
    weights when generating tag deltas
-10. **Cumulative emotional load:** For each of the last 5 finished books: `style:cognitive_load`,
-    `style:emotional_distance`, and dominant `arc:*` tag from `books.tag_scores_json`. The
-    LLM uses this to estimate the user's current "emotional battery" — consecutive
+10. **Cumulative emotional load:** For each of the last 5 finished books: `style:cognitive_load`
+    (narrative complexity — working memory load), `style:linguistic_complexity` (sentence-level
+    density), `style:emotional_distance`, and dominant `arc:*` tag from `books.tag_scores_json`.
+    The LLM uses this to estimate the user's current "emotional battery" — consecutive
     `arc:tragedy` + high `style:cognitive_load` books deplete it faster than light,
     fast-paced novellas. When battery is judged low, output modifiers should reflect a
     recovery need (boosting `tone:hopeful`, `pacing:fast`, or `preference:tonal_variance`).
@@ -1086,26 +1091,67 @@ Stage 2 runs automatically after a book finishes downloading. It has two paths:
 As soon as the epub is on disk, the main Windlass server runs an async enrichment job across
 five stages:
 
-**Stage A1 — Batch splitting & baseline metrics:**
+**Stage A1 — Batch splitting, baseline metrics & full-text algorithmic pass:**
 The epub is segmented into ≥ 10 sequential batches of approximately 10,000 words each (the
 minimum window proven by narrative arc research to yield meaningful sentiment extraction and
-reliable Savitzky-Golay smoothing). A LIX readability score is computed once from the full
-text as a baseline complexity signal.
+reliable Savitzky-Golay smoothing). Simultaneously, a one-time full-text algorithmic pass
+runs deterministically using NLP libraries:
 
-**Stage A2 — Three-track per-batch LLM scoring + prose summarisation:**
-For each batch, a single LLM call processes the text across four simultaneous outputs:
-- **Emotional track:** A single sentiment score (0–100) representing the protagonist's
-  overall fortune/circumstances in that section. Produces the raw emotional arc array.
-- **Thematic track:** Presence scores (0–100) for all active tags in the `tags` table
-  across `genre`, `mood`, `tone`, `style`, `protagonist`, and `arc` categories. Produces
-  one raw time-series array per tag.
-- **Syntactic track:** The dominant narrative perspective (`narrative:1st_person` /
-  `narrative:3rd_limited` / `narrative:3rd_omniscient` / `narrative:2nd_person`) and tense
-  (`tense:past` / `tense:present`) per batch. Usually constant, but per-batch checking
-  catches experimental alternating-chapter structures.
+- **Readability:** LIX score; Flesch reading ease score and average syllables-per-word
+  (textstat). Together these calibrate `style:linguistic_complexity`.
+- **Vocabulary richness:** Type-token ratio (unique words ÷ total words) for
+  `style:vocabulary_richness`.
+- **Structural density:** Total dialogue percentage (quote-span extraction);
+  `style:dialog_density` baseline.
+- **Expansiveness:** LitNER or spaCy NER run on full text — exact count of unique fictional
+  characters and distinct location entities for `style:expansiveness`.
+- **Invented vocabulary proxy:** Out-of-vocabulary (OOV) word density against a standard
+  English dictionary. High OOV = dense invented terminology. Feeds as one component of
+  `style:invented_vocabulary`.
+- **Stylistic lexicon:** Concreteness scores from the MRC Psycholinguistic Database
+  (word-level imageability) for `style:concreteness`; spaCy POS distribution
+  (adverb %, adjective %, noun %) as a formality proxy for `style:formality`;
+  TextBlob subjectivity score for `style:subjectivity`.
+- **Perceptual word density:** LIWC-equivalent open-source lexicons (seeing/observation
+  words for `style:perceptual_visual`; hearing + feeling + touch words for
+  `style:perceptual_sensory`). These are among the strongest individual predictors of
+  reading preference in algorithmic recommender research.
+
+All full-text metrics are stored once in the file artifact (§Stage A6). They do **not**
+need per-batch time-series — they are single scores computed over the entire text.
+
+**Stage A2 — Multi-track per-batch processing:**
+For each batch, five parallel tracks process the text. Tracks 1–4 produce one time-series
+array per dimension. Track 5 produces a running character sentence count.
+
+- **Track 1 — Emotional (LLM):** A single sentiment score (0–100) representing the
+  protagonist's overall fortune/circumstances in that section. Produces the raw emotional
+  arc array.
+- **Track 2 — Thematic (LLM):** Presence scores (0–100) for *semantic* style dimensions
+  that require contextual reasoning: `style:prose_ornamentation`, `style:narrative_pacing`,
+  `style:focus`, `style:emotional_distance`, `style:core_drives`, `style:cognitive_load`,
+  `style:lore_density`, `style:puzzle_density`, `style:tone_shift_magnitude`, and all
+  `genre`, `mood`, `tone`, `protagonist` tags. Dimensions already computed algorithmically
+  in A1 or A2-Track 4 are **excluded** from this prompt — the LLM is never asked to
+  estimate things that libraries compute more accurately.
+- **Track 3 — Syntactic (rule-based):** The dominant narrative perspective
+  (`narrative:1st_person` / `narrative:3rd_limited` / `narrative:3rd_omniscient` /
+  `narrative:2nd_person`) and tense (`tense:past` / `tense:present`) per batch. Usually
+  constant, but per-batch checking catches experimental alternating-chapter structures.
+- **Track 4 — Algorithmic (NLP libraries, per-batch):** Deterministic metrics that vary
+  across the book and benefit from time-series smoothing: VADER sentiment score, TextBlob
+  subjectivity score, dialogue % for this batch, average sentence length, sentence length
+  variance, and punctuation frequency (!, ?, ;, :, em-dash) for `style:rhythmic_punctuation`.
+  These run CPU-local with no LLM involvement.
+- **Track 5 — Character Sentence (BookNLP + spaCy):** BookNLP (`big` model, GPU-accelerated
+  via ROCm) performs coreference resolution and event tagging across the batch. spaCy
+  dependency parsing then filters to sentences where a resolved character entity is the
+  grammatical subject of an action, thought, or emotional predicate — a **Character Sentence
+  (CS)**. The CS count per batch divided by total sentences gives a per-batch CS density.
+  Produces the raw CS density array for `style:cs_density`.
+
 - **Prose summary:** A structured short summary of this batch — key plot advancements,
-  active characters, and world-lore introduced. These per-batch summaries are the raw
-  material for Stage A5.
+  active characters, and world-lore introduced. Raw material for Stage A5.
 
 **Stage A3 — Algorithmic smoothing (Savitzky-Golay):**
 Raw per-batch arrays are too noisy for direct LLM interpretation (a single dark chapter in a
@@ -1113,7 +1159,7 @@ comedy creates a misleading spike). Each array is smoothed using a **Savitzky-Go
 window size = 1/10 of the total sequence length; polynomial degree 3. This eliminates noise
 while preserving the true local maxima (peaks) and minima (valleys) of the trajectory.
 
-**Stage A4 — LLM semantic translation:**
+**Stage A4 — LLM semantic translation + Relation Arc computation:**
 The smoothed arrays are passed to a single LLM prompt that produces:
 1. **Core emotional arc classification:** The overarching emotional array is matched to one
    of the six arc shapes and stored as an `arc:*` tag score (e.g., `"arc:cinderella": +85`).
@@ -1123,28 +1169,57 @@ The smoothed arrays are passed to a single LLM prompt that produces:
    summary).
 3. **Narrative tag confirmation:** Dominant perspective and tense are written as +100 tags
    (e.g., `"narrative:1st_person": +100`, `"tense:past": +100`).
-4. **14 writing style dimensions:** Each axis scored by averaging per-batch LLM scores:
+4. **POV count tag:** Single POV (1 unique perspective character), Dual POV (2), or
+   Multi-POV (3+) assigned from the per-batch POV character lists after fuzzy-match
+   deduplication (e.g., "Jon" and "Jon Snow" collapsed to one entity).
+5. **20 writing style dimensions** — split by source:
+
+**Algorithmically computed** (derived from A1 full-text pass or A2 Track 4 time-series;
+averaged or directly stored; never LLM-estimated):
+
+| Tag slug | -100 anchor | +100 anchor | Source |
+|---|---|---|---|
+| `style:linguistic_complexity` | Simple sentences / easy listen | Dense multi-clause / high syllable load | Flesch reading ease + syllable count (textstat) |
+| `style:dialog_density` | Narration-heavy | Dialog-heavy | Dialogue span % per batch (A2 Track 4) |
+| `style:concreteness` | Abstract / conceptual | Concrete / sensory | MRC Psycholinguistic Database imageability scores |
+| `style:formality` | Colloquial / slangy | Formal / literary | spaCy POS distribution — adverb/adjective density |
+| `style:subjectivity` | Objective / detached narrator | Subjective / feeling-heavy | TextBlob subjectivity score |
+| `style:expansiveness` | Intimate / small cast | Expansive / large cast + many settings | LitNER unique character + location count |
+| `style:event_density` | Variable pacing / literary | Constant action / pulp | BookNLP event count per batch (A2 Track 5 by-product) |
+| `style:rhythmic_punctuation` | Staccato / clipped delivery | Flowing / cadenced | Punctuation frequency + sentence length variance (A2 Track 4) |
+| `style:cs_density` | Exposition / world-building dominated | Character thought / action dominated | BookNLP coreference + spaCy dep parse CS count (A2 Track 5) |
+| `style:vocabulary_richness` | Repetitive / narrow vocabulary | Varied / sophisticated vocabulary | Type-token ratio (A1) |
+| `style:invented_vocabulary` | Contemporary realism / standard English | Dense invented terminology (Tolkien / Sanderson) | OOV word density against standard English dictionary (A1) |
+| `style:perceptual_visual` | Abstract / non-observational | Highly visual / seeing-word-dense | LIWC-equivalent seeing/observation lexicon (A1) |
+| `style:perceptual_sensory` | Non-sensory | Hearing + feeling + touch word-dense | LIWC-equivalent hearing/feeling/touch lexicon (A1) |
+
+**LLM-estimated** (require semantic reasoning; computed from A2 Track 2 smoothed arrays):
 
 | Tag slug | -100 anchor | +100 anchor | Note |
 |---|---|---|---|
 | `style:prose_ornamentation` | Sparse / Hemingway | Lyrical / Tolkien | |
-| `style:narrative_pacing` | Deliberate / slow-burn | Staccato / frantic | |
+| `style:narrative_pacing` | Deliberate / slow-burn | Staccato / frantic | Distinct from event_density — subjective feel, not event count |
 | `style:focus` | Internal / introspective | External / action-driven | |
 | `style:emotional_distance` | Clinical / detached | Visceral / intimate | |
-| `style:concreteness` | Abstract / conceptual | Concrete / sensory | Top predictor in algorithmic reader-preference research |
-| `style:formality` | Colloquial / slangy | Formal / literary | |
-| `style:subjectivity` | Objective / detached narrator | Subjective / feeling-heavy | |
 | `style:core_drives` | Affiliation (allies, belonging) | Achievement / power | Psychological motivation of narrative |
-| `style:dialog_density` | Narration-heavy | Dialog-heavy | High-influence predictor in preference algorithms |
-| `style:expansiveness` | Intimate / small cast | Expansive / large cast + many settings | |
-| `style:event_density` | Variable pacing / literary | Constant action / pulp | Low variance = pulp; high variance = literary |
-| `style:rhythmic_punctuation` | Staccato delivery | Flowing / cadenced | Audiobook-specific: punctuation drives narrator breathing rhythm |
-| `style:cognitive_load` | Easy listen | Dense / multi-clause | Audiobook-specific: visual readers can re-scan; listeners cannot |
-| `style:tone_shift_magnitude` | Consistent / predictable tone | Volatile / bait-and-switch | Computed from smoothed variance of the Tone batch array, not averaged |
+| `style:cognitive_load` | Light mental load | Heavy working-memory load — many characters, plot threads, unreliable narrators | Distinct from linguistic_complexity — narrative complexity, not sentence difficulty |
+| `style:lore_density` | Contemporary realism / minimal world-building | Dense explanatory lore / magic systems / invented history | Complements invented_vocabulary — captures depth, not just vocabulary |
+| `style:puzzle_density` | Pure immersive narrative | Highly clue-structured / reader-solves-alongside-protagonist | |
+| `style:tone_shift_magnitude` | Consistent / predictable tone | Volatile / bait-and-switch | Computed from smoothed *variance* of the Tone batch array, not averaged |
 
-5. **POV count tag:** Single POV (1 unique perspective character), Dual POV (2), or
-   Multi-POV (3+) assigned from the per-batch POV character lists after fuzzy-match
-   deduplication (e.g., "Jon" and "Jon Snow" collapsed to one entity).
+**Relation Arc sub-stage** (runs after the main LLM call, GPU-accelerated via ROCm):
+Using the BookNLP entity and event output already produced in Stage A2 Track 5:
+1. Extract all narrative events with their actor and experiencer entities.
+2. Score each event's sentiment using RoBERTa and assign fine-grained emotion labels
+   (anger, joy, fear, trust, etc.) using a GoEmotions multi-label classifier.
+3. For each significant directed character pair (protagonist ↔ antagonist, protagonist ↔
+   love interest, etc.), plot a time-series of event sentiment across the book.
+4. Apply Savitzky-Golay smoothing to each pair's arc.
+5. Compute the variance across all pair arcs → stored as `arc_relation:volatile`.
+
+**Gate:** This sub-stage only runs if BookNLP extracted ≥ 500 narrative events from the
+full text. Books with fewer events (novellas, short stories) skip this sub-stage silently —
+insufficient events produce statistically unreliable arcs.
 
 **Stage A5 — Narrative summary consolidation:**
 A single LLM call receives all per-batch prose summaries from Stage A2 in sequence and
@@ -1156,15 +1231,23 @@ The summary is never shown to the user directly; it is consumed by other pipelin
 LLM calls as high-signal context.
 
 **Stage A6 — Dual storage:**
-- **SQLite (lean):** Only the final concrete tag scores from Stage A4 are written into
-  `books.tag_scores_json`. `enrichment_stage` advances to `post_download_full`. The book
-  becomes eligible for Active Queue promotion immediately.
-- **File artifact (rich):** The raw unsmoothed arrays, the Savitzky-Golay smoothed arrays,
-  the LIX score, and the LLM's full prose summary are bundled into
-  `windlass_data/enrichment/{book_id}.json`. Raw arrays are **never** stored in SQLite —
-  they would bloat `windlass.db` and slow the Decide call's dot-product queries. The file
-  is retained for 90 days, giving a re-enrichment window if smoothing parameters or tag
-  definitions improve without needing to re-download the epub.
+- **SQLite (lean):** Only the final concrete tag scores from Stages A1, A2, and A4 are
+  written into `books.tag_scores_json`. `enrichment_stage` advances to
+  `post_download_full`. The book becomes eligible for Active Queue promotion immediately.
+- **File artifact (rich):** The following are bundled into
+  `windlass_data/enrichment/{book_id}.json`:
+  - Raw unsmoothed per-batch arrays (all tracks)
+  - Savitzky-Golay smoothed arrays
+  - Full-text A1 metric values (LIX, Flesch, type-token ratio, POS distributions, OOV
+    density, perceptual word counts, character/location counts)
+  - BookNLP entity and event output files (`.entities`, `.tokens`, `.events`)
+  - Per character-pair Relation Arc time-series and smoothed arrays (if ≥ 500 events)
+  - LLM's full prose narrative summary
+
+  Raw arrays and BookNLP outputs are **never** stored in SQLite — they would bloat
+  `windlass.db` and slow the Decide call's dot-product queries. The file artifact is
+  retained for 90 days, giving a re-enrichment window if smoothing parameters, tag
+  definitions, or NLP models improve without needing to re-download the epub.
 
 Separately and in parallel, the Worker Node runs forced alignment (§8.1/§8.2), which
 unlocks the precision user-facing features (Glossary spoiler boundary, Sleep Recovery,
