@@ -10,7 +10,6 @@ use std::time::Duration;
 
 const WINDLASS: &str = "http://localhost:5010";
 const CHAOS: &str = "http://localhost:9000";
-const GLUETUN_CTL: &str = "http://localhost:9001";
 const QBIT_ADMIN: &str = "http://localhost:18080/__admin";
 const MAM_ADMIN: &str = "http://localhost:18082/__admin";
 
@@ -83,9 +82,10 @@ where
         if f().await {
             return;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("Timed out waiting for: {label}");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for: {label}"
+        );
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }

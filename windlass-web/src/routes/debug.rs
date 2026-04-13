@@ -337,7 +337,7 @@ async fn debug_stream_handler(
 
     // Subscribe to future snapshot changes via notify_tx.
     let rx = app.debug_ctrl.notify_tx.subscribe();
-    let ctrl = app.debug_ctrl.clone();
+    let ctrl = app.debug_ctrl;
     let live = BroadcastStream::new(rx).filter_map(move |_msg| {
         let ctrl = ctrl.clone();
         async move {

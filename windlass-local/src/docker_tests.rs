@@ -176,7 +176,7 @@ async fn docker_fetch_and_dump_logs_creates_log_file() {
 
     let files: Vec<_> = std::fs::read_dir(dump_dir.path())
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().contains(container_name))
         .collect();
     assert!(

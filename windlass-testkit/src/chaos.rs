@@ -216,9 +216,10 @@ async fn gluetun_set_files_handler(
     match s.gluetun.set(&body.ip, body.port).await {
         Ok(()) => {
             let mut vpn = s.vpn.write().await;
-            vpn.ip = body.ip.clone();
+            vpn.ip.clone_from(&body.ip);
             vpn.port = body.port;
             vpn.healthy = true;
+            drop(vpn);
             tracing::info!(
                 "Chaos/gluetun: set VPN files ip={} port={}",
                 body.ip,

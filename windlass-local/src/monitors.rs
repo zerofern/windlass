@@ -45,6 +45,9 @@ mod tests {
     }
 
     #[test]
+    // f64::MAX is the exact sentinel value returned on statvfs error; testing for
+    // exact equality here is intentional (we assigned that specific bit pattern).
+    #[allow(clippy::float_cmp)]
     fn check_disk_space_invalid_path_returns_max() {
         let space = check_disk_space("/nonexistent/path/windlass_test");
         let bytes = space.get::<byte>();

@@ -292,7 +292,7 @@ async fn list_torrent_details_returns_parsed_records() {
                 "name": "My Audiobook",
                 "state": "uploading",
                 "seeding_time": 7200u64,
-                "downloaded": 1048576u64,
+                "downloaded": 1_048_576_u64,
                 "comment": "https://www.myanonamouse.net/t/99999"
             },
             {

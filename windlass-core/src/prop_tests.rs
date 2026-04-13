@@ -46,7 +46,7 @@ fn any_wakeup_id() -> impl Strategy<Value = WakeupId> {
 }
 
 fn any_information() -> impl Strategy<Value = Information> {
-    (0.0f64..=2000.0f64).prop_map(|gb| Information::new::<gigabyte>(gb))
+    (0.0f64..=2000.0f64).prop_map(Information::new::<gigabyte>)
 }
 
 // ── State component strategies ────────────────────────────────────────────────
@@ -130,7 +130,7 @@ fn any_synced_state() -> impl Strategy<Value = SystemState> {
 
 // ── Event strategies ──────────────────────────────────────────────────────────
 
-fn any_event() -> impl Strategy<Value = Event> {
+fn any_init_events() -> impl Strategy<Value = Event> {
     prop_oneof![
         (any::<bool>(), any_vpn_ip(), any_vpn_port()).prop_map(|(healthy, ip, port)| Event::Init {
             at: DateTime::UNIX_EPOCH,
@@ -142,6 +142,11 @@ fn any_event() -> impl Strategy<Value = Event> {
             is_gluetun_healthy: healthy,
             port_files: Err("not ready".into()),
         }),
+    ]
+}
+
+fn any_docker_port_events() -> impl Strategy<Value = Event> {
+    prop_oneof![
         Just(Event::DockerGluetunDied {
             at: DateTime::UNIX_EPOCH
         }),
@@ -158,6 +163,11 @@ fn any_event() -> impl Strategy<Value = Event> {
                 at: DateTime::UNIX_EPOCH,
                 result: Err(s)
             }),
+    ]
+}
+
+fn any_qbit_events() -> impl Strategy<Value = Event> {
+    prop_oneof![
         any_auth_cookie().prop_map(|cookie| Event::QbitAuthSuccess {
             at: DateTime::UNIX_EPOCH,
             cookie
@@ -179,6 +189,11 @@ fn any_event() -> impl Strategy<Value = Event> {
             at: DateTime::UNIX_EPOCH,
             code: HttpStatusCode(c)
         }),
+    ]
+}
+
+fn any_mam_events() -> impl Strategy<Value = Event> {
+    prop_oneof![
         Just(Event::MamUpdateSuccess {
             at: DateTime::UNIX_EPOCH
         }),
@@ -200,6 +215,11 @@ fn any_event() -> impl Strategy<Value = Event> {
                 status: MamStatus::Unreachable
             }),
         ],
+    ]
+}
+
+fn any_observation_events() -> impl Strategy<Value = Event> {
+    prop_oneof![
         any_information().prop_map(|space| Event::DiskSpaceObserved {
             at: DateTime::UNIX_EPOCH,
             space
@@ -222,10 +242,14 @@ fn any_event() -> impl Strategy<Value = Event> {
         Just(Event::MamRateLimitViolation {
             at: DateTime::UNIX_EPOCH
         }),
-        // Compliance events
+    ]
+}
+
+fn any_compliance_events() -> impl Strategy<Value = Event> {
+    prop_oneof![
         Just(Event::QbitTorrentDetailsReceived {
             at: DateTime::UNIX_EPOCH,
-            torrents: vec![],
+            torrents: vec![]
         }),
         (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(|(t, d, u)| {
             Event::QbitPreferencesReceived {
@@ -241,6 +265,17 @@ fn any_event() -> impl Strategy<Value = Event> {
                 at: DateTime::UNIX_EPOCH,
                 hash: windlass_types::TorrentHash(h),
             }),
+    ]
+}
+
+fn any_event() -> impl Strategy<Value = Event> {
+    prop_oneof![
+        any_init_events(),
+        any_docker_port_events(),
+        any_qbit_events(),
+        any_mam_events(),
+        any_observation_events(),
+        any_compliance_events(),
     ]
 }
 

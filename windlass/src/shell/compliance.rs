@@ -134,7 +134,7 @@ fn qbit_details_to_record(d: QbitTorrentDetails) -> TorrentRecord {
     }
 }
 
-fn qbit_state_to_core(s: &QbitTorrentState) -> TorrentState {
+const fn qbit_state_to_core(s: &QbitTorrentState) -> TorrentState {
     match s {
         QbitTorrentState::Downloading => TorrentState::Downloading,
         QbitTorrentState::StalledDownloading => TorrentState::StalledDownloading,

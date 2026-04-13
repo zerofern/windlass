@@ -12,7 +12,7 @@ pub type HttpObserver = Arc<dyn Fn(HttpExchange) + Send + Sync>;
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum Observation {
-    StateSnapshot(SystemState),
+    StateSnapshot(Box<SystemState>),
     /// Emitted when debug mode is enabled or disabled, including automatic
     /// entry triggered by the MAM rate-limit guardrail.
     DebugModeChanged(bool),

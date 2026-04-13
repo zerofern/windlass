@@ -43,7 +43,8 @@ pub struct DebugHistory {
 }
 
 impl DebugHistory {
-    pub fn new(initial_state: SystemState) -> Self {
+    #[must_use]
+    pub const fn new(initial_state: SystemState) -> Self {
         Self {
             seq: 0,
             event_queue: VecDeque::new(),
@@ -82,6 +83,10 @@ impl DebugHistory {
 
     /// Moves the identified event from the queue to `current_event`, recording
     /// the state snapshot taken before processing begins.
+    ///
+    /// # Panics
+    /// Panics if `event_id` is present in the queue but `VecDeque::remove`
+    /// returns `None` (which cannot happen given the `position` check above).
     pub fn event_started(&mut self, event_id: Uuid, state_before: SystemState) {
         let pos = self.event_queue.iter().position(|e| e.id == event_id);
         if let Some(pos) = pos {
@@ -167,13 +172,13 @@ impl DebugHistory {
     /// `current_event` first and then walks the trace backwards.
     pub fn action_completed(&mut self, action_id: Uuid, caused_event_id: Option<Uuid>) {
         self.running_actions.retain(|a| a.id != action_id);
-        if let Some(current) = &mut self.current_event {
-            if let Some(entry) = current.actions.iter_mut().find(|a| a.id == action_id) {
-                entry.completed_at = Some(Utc::now());
-                entry.caused_event_id = caused_event_id;
-                self.seq += 1;
-                return;
-            }
+        if let Some(current) = &mut self.current_event
+            && let Some(entry) = current.actions.iter_mut().find(|a| a.id == action_id)
+        {
+            entry.completed_at = Some(Utc::now());
+            entry.caused_event_id = caused_event_id;
+            self.seq += 1;
+            return;
         }
         // Action completed after its parent event was finalised — update in trace.
         for trace_entry in self.trace.iter_mut().rev() {
@@ -210,12 +215,12 @@ impl DebugHistory {
     /// Searches `current_event.actions` first, then walks the trace backwards,
     /// since the action may have completed before its exchange is processed.
     pub fn action_http_exchange(&mut self, action_id: Uuid, exchange: HttpExchange) {
-        if let Some(current) = &mut self.current_event {
-            if let Some(entry) = current.actions.iter_mut().find(|a| a.id == action_id) {
-                entry.http_exchanges.push(exchange);
-                self.seq += 1;
-                return;
-            }
+        if let Some(current) = &mut self.current_event
+            && let Some(entry) = current.actions.iter_mut().find(|a| a.id == action_id)
+        {
+            entry.http_exchanges.push(exchange);
+            self.seq += 1;
+            return;
         }
         for trace_entry in self.trace.iter_mut().rev() {
             if let Some(entry) = trace_entry.actions.iter_mut().find(|a| a.id == action_id) {
@@ -229,19 +234,19 @@ impl DebugHistory {
     /// Finalises the current event: updates `latest_state` and appends to trace.
     pub fn event_completed(&mut self, event_id: Uuid, state_after: SystemState) {
         self.latest_state = state_after.clone();
-        if let Some(active) = self.current_event.take() {
-            if active.stored.id == event_id {
-                if self.trace.len() >= TRACE_CAP {
-                    self.trace.pop_front();
-                }
-                self.trace.push_back(TraceEntry {
-                    event: active.stored,
-                    state_before: active.state_before,
-                    state_after,
-                    actions: active.actions,
-                    completed_at: Utc::now(),
-                });
+        if let Some(active) = self.current_event.take()
+            && active.stored.id == event_id
+        {
+            if self.trace.len() >= TRACE_CAP {
+                self.trace.pop_front();
             }
+            self.trace.push_back(TraceEntry {
+                event: active.stored,
+                state_before: active.state_before,
+                state_after,
+                actions: active.actions,
+                completed_at: Utc::now(),
+            });
         }
         self.seq += 1;
     }
@@ -259,6 +264,11 @@ impl DebugHistory {
     // ── Queue commands ────────────────────────────────────────────────────────
 
     /// Applies a queue-manipulation command from an HTTP handler.
+    ///
+    /// # Panics
+    /// Panics if a `ReorderQueue` command references a valid position but
+    /// `VecDeque::remove` returns `None` (cannot happen since position was just
+    /// found via `iter().position()`).
     pub fn apply_cmd(&mut self, cmd: DebugCommand) {
         match cmd {
             DebugCommand::RemoveQueuedEvent(id) => {
@@ -322,12 +332,11 @@ impl DebugHistory {
                 }
                 let mut new_queue = VecDeque::with_capacity(ids.len());
                 for id in &ids {
-                    match self.event_queue.iter().position(|e| &e.id == id) {
-                        Some(pos) => new_queue.push_back(self.event_queue.remove(pos).unwrap()),
-                        None => {
-                            let _ = reply.send(Err(format!("Unknown event ID: {id}")));
-                            return;
-                        }
+                    if let Some(pos) = self.event_queue.iter().position(|e| &e.id == id) {
+                        new_queue.push_back(self.event_queue.remove(pos).unwrap());
+                    } else {
+                        let _ = reply.send(Err(format!("Unknown event ID: {id}")));
+                        return;
                     }
                 }
                 self.event_queue = new_queue;
@@ -361,7 +370,7 @@ impl DebugHistory {
     /// Returns the latest known system state. Always valid — initialised to
     /// `SystemState::initial()` before the first event is processed.
     #[must_use]
-    pub fn latest_state(&self) -> &SystemState {
+    pub const fn latest_state(&self) -> &SystemState {
         &self.latest_state
     }
 }

@@ -24,7 +24,7 @@ pub struct DebugLogLayer {
 
 impl DebugLogLayer {
     #[must_use]
-    pub fn new(log_tx: mpsc::Sender<LogEntry>, debug_mode: Arc<AtomicBool>) -> Self {
+    pub const fn new(log_tx: mpsc::Sender<LogEntry>, debug_mode: Arc<AtomicBool>) -> Self {
         Self { log_tx, debug_mode }
     }
 }
@@ -41,15 +41,15 @@ impl<S: tracing::Subscriber> Layer<S> for DebugLogLayer {
 
         let _ = self.log_tx.try_send(LogEntry {
             at: Utc::now(),
-            level: level_str(meta.level()).to_owned(),
+            level: level_str(*meta.level()).to_owned(),
             target: meta.target().to_owned(),
             message: visitor.message,
         });
     }
 }
 
-fn level_str(level: &Level) -> &'static str {
-    match *level {
+const fn level_str(level: Level) -> &'static str {
+    match level {
         Level::ERROR => "ERROR",
         Level::WARN => "WARN",
         Level::INFO => "INFO",
@@ -67,7 +67,7 @@ struct MessageVisitor {
 impl tracing::field::Visit for MessageVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
-            self.message = value.to_owned();
+            value.clone_into(&mut self.message);
         }
     }
 

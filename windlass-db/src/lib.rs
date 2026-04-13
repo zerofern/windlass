@@ -135,7 +135,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    pub(crate) async fn test_pool() -> (DbPool, TempDir) {
+    pub async fn test_pool() -> (DbPool, TempDir) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.db");
         let pool = DbPool::connect(path.to_str().unwrap()).await.unwrap();

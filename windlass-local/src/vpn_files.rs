@@ -124,27 +124,24 @@ pub fn spawn_file_watcher_inner(
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
 
-            match &result {
-                Ok(val) => {
-                    // Skip if content is identical to the last successful send —
-                    // prevents feedback loops where read-triggered inotify events
-                    // re-fire the debouncer.
-                    if last_sent.as_ref() == Some(val) {
-                        continue;
-                    }
-                    last_sent = Some(*val);
-                    last_was_err = false;
+            if let Ok(val) = &result {
+                // Skip if content is identical to the last successful send —
+                // prevents feedback loops where read-triggered inotify events
+                // re-fire the debouncer.
+                if last_sent.as_ref() == Some(val) {
+                    continue;
                 }
-                Err(_) => {
-                    // Send only the first error in a run; suppress the storm that
-                    // occurs when the container stops and the port file is cleared
-                    // or deleted across many inotify windows.
-                    if last_was_err {
-                        continue;
-                    }
-                    last_was_err = true;
-                    last_sent = None; // force the next Ok to always be forwarded
+                last_sent = Some(*val);
+                last_was_err = false;
+            } else {
+                // Send only the first error in a run; suppress the storm that
+                // occurs when the container stops and the port file is cleared
+                // or deleted across many inotify windows.
+                if last_was_err {
+                    continue;
                 }
+                last_was_err = true;
+                last_sent = None; // force the next Ok to always be forwarded
             }
 
             if tx

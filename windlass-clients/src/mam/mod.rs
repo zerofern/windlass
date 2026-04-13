@@ -284,11 +284,15 @@ impl MamClient {
     }
 
     #[cfg(test)]
+    /// # Panics
+    /// Panics if the internal session mutex is poisoned.
+    #[must_use]
     pub fn session_value(&self) -> String {
         self.session.lock().unwrap().clone()
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn with_check_session_url(mut self, url: String) -> Self {
         self.check_session_url = url;
         self
@@ -325,6 +329,7 @@ impl MamClient {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub fn with_torrent_base_url(mut self, url: String) -> Self {
         self.torrent_base_url = url;
         self

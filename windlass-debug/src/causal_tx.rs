@@ -33,14 +33,16 @@ enum CausalTxInner {
 }
 
 impl CausalTx {
-    pub fn debug(action_id: Uuid, tx: mpsc::Sender<(Event, Uuid)>) -> Self {
+    #[must_use]
+    pub const fn debug(action_id: Uuid, tx: mpsc::Sender<(Event, Uuid)>) -> Self {
         Self {
             action_id,
             inner: CausalTxInner::Debug(tx),
         }
     }
 
-    pub fn plain(action_id: Uuid, tx: mpsc::Sender<Event>) -> Self {
+    #[must_use]
+    pub const fn plain(action_id: Uuid, tx: mpsc::Sender<Event>) -> Self {
         Self {
             action_id,
             inner: CausalTxInner::Plain(tx),

@@ -14,13 +14,13 @@ use super::{DebugController, PausedOn, StoredEvent};
 ///
 /// - `Mpsc`: debug mode off — forward the raw `Event` directly to the main loop.
 /// - `Queue`: debug mode on — stamp the event as a `StoredEvent` and forward
-///   to the VecDeque path so it accumulates in `DebugHistory.event_queue`.
+///   to the `VecDeque` path so it accumulates in `DebugHistory.event_queue`.
 ///
 /// Stored inside an `ArcSwap` so `enable_debug()`/`disable_debug()` can swap
 /// the sink atomically without stopping the intake task.
 ///
 /// `mpsc::Sender` does not implement `Debug`, so we implement it manually.
-pub(crate) enum QueueSink {
+pub enum QueueSink {
     Mpsc(mpsc::Sender<Event>),
     Queue(mpsc::Sender<StoredEvent>),
 }
@@ -146,7 +146,7 @@ impl DebuggableEventStream {
 
 // ── Variant name helpers ──────────────────────────────────────────────────────
 
-pub(crate) const fn event_variant(event: &Event) -> &'static str {
+pub const fn event_variant(event: &Event) -> &'static str {
     match event {
         Event::Init { .. } => "Init",
         Event::DockerGluetunDied { .. } => "DockerGluetunDied",
@@ -178,7 +178,7 @@ pub(crate) const fn event_variant(event: &Event) -> &'static str {
 /// Returns the variant name of an [`Action`] as a static string.
 /// Used to look up breakpoints and populate [`PausedOn`] without heap allocation.
 #[must_use]
-pub(crate) const fn action_variant(action: &Action) -> &'static str {
+pub const fn action_variant(action: &Action) -> &'static str {
     match action {
         Action::ScheduleWakeup(_, _) => "ScheduleWakeup",
         Action::ReadPortFiles => "ReadPortFiles",

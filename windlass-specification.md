@@ -127,7 +127,8 @@ best torrent to download. Everything else hangs off `books`.
 | `reviews`             | User feedback rows keyed by ledger entry: completion review, optional midway note, DNF autopsy. Fields: `star_rating` (1–5), `review_text`, `circumplex_pleasure_endemo INTEGER` (1–5, null for midway notes), `circumplex_activeness_endemo INTEGER` (1–5, null for midway notes), `ranking_peers_json` (ordered array of the last 5 book IDs as explicitly placed by the user via drag-and-drop; null for midway notes and when skipped). Retained permanently. |
 | `slog_detector`       | Pacing stall detection state per active ledger entry. Purged when the ledger entry is closed (finished or DNF). |
 | `series_check_ins`    | Records of the 60–75% series check-in: what was offered, what the user chose. |
-| `profile_signals`     | One row per scored dimension. `dimension_type` (`tag` / `author` / `narrator`), `dimension_id` (canonical tag slug or name), `score` (integer -100→+100), `context_id` (`global` by default). `context_id = 'global'` is the always-present baseline. Context-specific subprofiles (e.g. `circumplex_high_activeness`, `circumplex_low_activeness`) are created by the Learn call only when a two-step statistical gate passes — see §7.6. The Decide call uses subprofile rows matching the current Circumplex state, falling back to `global` for any dimension not yet present in the subprofile. |
+| `profile_signals`     | One row per scored dimension. `dimension_type` (`tag` / `author` / `narrator`), `dimension_id` (canonical tag slug or name), `score` (integer -100→+100), `context_id`. Two context types: **circumplex subprofiles** (`circumplex_high_activeness`, `circumplex_low_activeness`, etc.) created when the mood-split gate fires; **taste-cluster subprofiles** (`taste_{genre}_{cluster}`, e.g. `taste_fantasy_grimdark`) created when the taste-cluster split gate fires. `context_id = 'global'` is always present — the universal repository for dimensions not yet statistically proven to vary across contexts, and the cold-start baseline. The Decide call fuses the active subprofile with `global` for any dimension absent from the subprofile. **Author and narrator scores** (`dimension_type: author/narrator`) are stored here but never enter `tag_vector` — they are injected into the Decide prompt as context and used by the Learn call to strengthen correlated style/genre dimensions. See §7.6 for split gate mechanics. |
+| `user_constraints`    | Hard veto constraints that apply regardless of profile scores. `constraint_type` (`content_warning` / `format` / `author_block` / `narrator_block`), `dimension_id` (tag slug or name), `reason` (optional user note). Applied as SQL `WHERE` filters **before** any dot-product scoring runs — never stored in `tag_vector` and never mathematically blended with scores. A dealbreaker must never be outweighed by a high genre score. Populated from the same -100 entries the user sets, but enforced as hard filters rather than soft scoring weights. |
 | `mood_state`          | Single-row table (replaced on each update). `circumplex_pleasure INTEGER` (1–5, null until first inference or explicit input — see §7.6 for label mapping), `circumplex_activeness INTEGER` (1–5, null until first inference or explicit input). These represent the current Circumplex state anchor: set by explicit grid input (un-decayed, updated only on new input) or by the Mood Inference call. `inferred_modifiers_json` (tag score deltas from inference), `explicit_override_json` (user-set tag modifier deltas from grid-triggered Mood Inference and vibe text; decays at 0.65× per pick, dropped when `\|score\| < 5` — **never** contains raw Circumplex coordinates), `inferred_context` (human-readable explanation shown in Queue View and Panel 6), `computed_at` timestamp. |
 | `events`              | Internal audit log. One row per significant system action. `source` (which rule or feature triggered it — e.g. `freeleech_scavenger`, `mood_inference`, `series_continuation`, `stage2_enrichment`), `action` (e.g. `book_grabbed`, `slot_replaced`, `epub_found`), `book_id` (nullable FK), `detail_json` (structured context). Read-only — never modified after insert. **Retention: 90 days rolling.** Visible in the desktop UI Event Log panel. Distinct from `alerts` (which are user-facing and actionable). |
 | `alerts`              | Fired alerts. UUID primary key for notification deep-links. Severity, timestamp, triggering event, system state snapshot. **Retention: 30 days rolling.** |
@@ -664,17 +665,48 @@ books (PostgreSQL)
 
 
 
+#### Stage 0.5 — Free API Enrichment & Structured Scoring
+
+Runs on every candidate that passes ingestion. No LLM calls — uses only free public API data. Purpose: eliminate books with no profile overlap before paying for Stage 1 LLM calls.
+
+**Input:**
+- Audnexus: genre tags, series info (position, completion status), narrator, publisher
+- Hardcover: mood tags, community rating count, "related titles" list
+- Open Library: additional subject classifications, related authors
+
+**Tag normalization:** Community tags are noisy and fragmented (e.g. `ya-dystopian`, `teen-dystopian`, `antiutopian` all map to one canonical slug). All API tags are normalized to canonical Windlass slugs before scoring. This is the primary value of Stage 0.5 — structured, normalized tags enable a reliable dot-product even without LLM interpretation.
+
+**Scoring:** Dot-product using the normalized API tags against the Stratified Portfolio (all subprofiles × historical frequency weights). Only tag indices populated by API data are used — no imputation for missing dimensions.
+
+**Gate:** Score below a low floor → discard (DuckDB `status: rejected`). The bar is intentionally low — Stage 0.5 only eliminates books with zero profile relevance, not borderline cases. Those go to Stage 1.
+
+**Output:** ~50–100 survivors/day promoted to PostgreSQL `library_status: pending_s1`.
+
+**Rate limiting:** Stage 1 is capped at ~20–50 LLM calls/day. Stage 0.5 feeds a queue; the Stage 1 worker drains it at the configured rate.
+
+#### Stage 1 Enrichment (Discovery-Time)
+
 Runs on every candidate promoted from the pre-filter. Fast and cheap — many books pass
 through here.
 
-**Input:** book description + Audnexus genre/narrator tags + Hardcover mood tags + up to 5
-community review excerpts from Hardcover.
+**Input:**
+- Already-normalized Stage 0.5 API tags (no re-fetch needed — cached in DuckDB)
+- Book description
+- Up to 5 Hardcover community review excerpts
+- Current Stratified Portfolio subprofile vectors (for scoring output)
+
+**What the LLM adds beyond Stage 0.5 API tags:**
+- `tone:*` — banter_heavy, dry_wit, satirical, slow_burn (APIs never tag these)
+- `protagonist:*` — morally_grey, found_family, ensemble_cast
+- Content warnings with accurate intensity scores
+- Format/length verification and correction of noisy API data
+- Preliminary `style:*` hints (low confidence — full style analysis is Stage 2)
+- Cross-genre signal that API subject codes miss (e.g. "literary sci-fi")
 
 **Output (written into `books.tag_vector` S1 index band):**
-- Intensity scores (-100→+100) for all applicable genre / mood / tone / protagonist /
-  content_warning / format / length tags — stored as `sparsevec(500)` indices
+- Full S1 tag scores (-100→+100) for genre / mood / tone / protagonist / content_warning / format / length
 - `enrichment_stage: discovery`, `enrichment_confidence: low/medium`
-- Live dot-product against current `profile_signals` subprofile vector
+- Stratified Portfolio re-score to determine queue placement
 
 Strong matches (above the **Acquisition Confidence Threshold** — configurable with a
 sensible default, adjustable in the Action Center settings) auto-enter the epub queue as
@@ -716,25 +748,24 @@ download pipeline can consume, and keeps worker GPU usage predictable.
 **Epub deletion:** the epub file is deleted after Stage 2 completes — all signal is
 captured in `windlass_data/enrichment/{book_id}.json`. Storage cost is transient.
 
-#### Epub Queue — Stratified Portfolio Sort
+#### Stratified Portfolio — Universal Queue Mechanism
 
-The epub queue (books at `library_status: known`) is sorted using a **Stratified
-Portfolio** approach rather than a single dot-product against the current mood. This
-prevents overspecialization — a queue sorted against today's mood will mismatch when mood
-shifts next week.
+The Stratified Portfolio is the queue management mechanism for **all upstream stages** — epub queue sort, download queue sort, Stage 0.5 acquisition, and Stage 1 acquisition gating. It is never used at Decide time (which uses current mood directly).
 
-**Algorithm (runs on every profile update):**
-1. **Compute subprofile frequencies** — query `reading_ledger.mood_snapshot_json` history
-   to derive the probability of each circumplex subprofile (e.g. 60% low-activeness,
-   30% high-activeness, 10% exploratory).
-2. **Allocate queue slots proportionally** — if scheduling 10 epub jobs, allocate 6 slots
-   to low-activeness, 3 to high-activeness, 1 to exploratory.
-3. **Score each partition with its pure isolated subprofile** — run separate
-   `ORDER BY tag_vector <#> $subprofile_vector LIMIT $slots` passes, one per partition.
-   Vectors are never blended; each pass uses the unweighted subprofile vector.
-4. **Merge** the ranked partition results into the final queue order.
+**Why not current mood for upstream stages:** A book acquired based on today's mood will be consumed weeks or months later when mood will be different. Using current mood at acquisition causes overspecialization — the buffer fills with books that mismatch when mood shifts.
 
-The download queue (`watchlist` / `monitoring`) uses the same algorithm.
+**Why not max-score-across-subprofiles:** Ignores probability — fills the buffer with books for a 5%-frequency mood state at the expense of the 60%-frequency baseline state.
+
+**Why not blended/averaged scores:** Destroys polarization — a book scoring +100 in one subprofile and -100 in another averages to 0, losing to a mediocre book that safely scores +20 everywhere.
+
+**Algorithm (runs on every profile update and at each acquisition decision):**
+1. **Compute subprofile frequencies** — query `reading_ledger` history to derive the probability distribution across ALL active subprofiles: circumplex subprofiles (from `mood_snapshot_json`) AND taste-cluster subprofiles (from the secondary tags of rated books). Example: 40% `taste_fantasy_grimdark`, 25% `taste_fantasy_romantasy`, 20% `circumplex_low_activeness`, 15% `circumplex_high_activeness`.
+2. **Allocate slots proportionally** — partition the available queue slots or acquisition budget by frequency weight.
+3. **Score each partition with its pure isolated subprofile** — run entirely separate `ORDER BY tag_vector <#> $subprofile_vector LIMIT $slots` passes, one per partition. Vectors are never blended.
+4. **Apply `user_constraints` as a pre-filter** — SQL `WHERE` filters excluding hard-vetoed books before any subprofile scoring.
+5. **Merge** the ranked partition results into the final queue order.
+
+The epub queue (`library_status: known`), download queue (`watchlist`/`monitoring`), and Stage 1 acquisition gate all use this algorithm.
 
 #### The Monitoring Queue
 
@@ -1099,8 +1130,7 @@ meaning no opinion:
 | -75 | Hate It | Strong Negative Weight. Strongly penalise; only recommend if countered by +100 tags. |
 | -100 | Dealbreaker | Hard Constraint (Veto). If prominently featured, reject regardless of other positives. |
 
-There are no separate "hard constraint" and "soft preference" tables — a `content_warning`
-tag scored at -85 is functionally a dealbreaker. The same scale covers everything.
+Hard veto constraints (content warnings at -100, format dealbreakers, author/narrator blocks) are stored in `user_constraints` and applied as SQL `WHERE` filters before any dot-product scoring. Soft preferences (-99 to +99) remain in `profile_signals` as scoring weights. This separation ensures a dealbreaker cannot be mathematically outweighed by high scores on other dimensions.
 
 > **LLM prompt injection:** Raw numbers are never passed to LLMs alone. Each score is
 > accompanied by its anchor label at construction time, e.g.:
@@ -1143,22 +1173,38 @@ Panel 6's optional re-calibration feature.
 > never routed through subprofile logic directly in the Learn call; the existing subprofile
 > gate handles mood-conditional splitting automatically over time.
 
-**Subprofile Routing:** After merging the delta, the Learn call checks the Circumplex
-quadrant recorded in `mood_snapshot_json` and applies a two-step gate:
+**Subprofile Routing:** After merging the delta, the Learn call runs two independent split gates. Both gates run on every Learn call.
+
+#### Gate A — Mood Splits (Circumplex-based)
+
+Checks whether the user's ratings differ significantly between Circumplex states.
 
 1. **Minimum Data Gate:** Query `reading_ledger` — require ≥5 reviews where the
    Circumplex state falls in the target quadrant AND ≥5 where it does not. If unmet,
-   the delta is applied to `global` only and the gate is silently skipped.
-2. **Statistical Gate:** Calculate:
+   the delta is applied to `global` only and this gate is silently skipped.
+2. **Statistical Gate (t_mean):** Calculate:
    $$t_{mean} = \frac{|\mu_{ic} - \mu_{\bar{ic}}|}{\sqrt{s_{ic}/n_{ic} + s_{\bar{ic}}/n_{\bar{ic}}}}$$
    where $ic$ = in-context ratings, $\bar{ic}$ = out-of-context ratings, $s$ = variance,
    $n$ = count. If $t_{mean} > 4.0$ (≈ p ≤ 0.05), the target subprofile rows are created
    in `profile_signals` (if absent) and the delta is routed there in addition to `global`.
 
-Context ID naming convention: `circumplex_high_activeness` (A4–A5),
-`circumplex_low_activeness` (A1–A2), `circumplex_high_pleasure` (P4–P5),
-`circumplex_low_pleasure` (P1–P2). Quadrant combinations (e.g.
-`circumplex_low_pleasure_low_activeness`) are created if subsequent splits pass the gate.
+Context ID naming: `circumplex_high_activeness` (A4–A5), `circumplex_low_activeness` (A1–A2),
+`circumplex_high_pleasure` (P4–P5), `circumplex_low_pleasure` (P1–P2). Quadrant combinations
+(e.g. `circumplex_low_pleasure_low_activeness`) are created if subsequent splits pass the gate.
+
+#### Gate B — Taste-Cluster Splits (Bimodal variance detection)
+
+Checks whether the user has incompatible preference clusters within a genre — e.g. consistently loving both grimdark fantasy and romantasy while rating genre-blending books poorly.
+
+1. **Minimum Data Gate:** Require ≥10 ratings within the target genre dimension before running the scan.
+2. **Variance Gate:** For each genre dimension with high rating variance, evaluate secondary tag axes (tone, style, content_warning) using Information Gain (t_IG / KL divergence):
+   $$t_{IG} = \sum_{v} P(v) \cdot KL(R_{genre} \| R_{genre|secondary=v})$$
+   If splitting the genre ratings along a secondary tag axis reduces entropy significantly (threshold: t_IG > 0.3), the system creates two taste-cluster subprofiles for that genre.
+3. **Split creation:** Two `profile_signals` rows created with `context_id = 'taste_{genre}_{secondary_tag}'` (e.g. `taste_fantasy_grimdark`, `taste_fantasy_romantasy`). Future ratings are routed to the matching cluster based on the book's secondary tags.
+
+Context ID naming: `taste_{genre_slug}_{cluster_slug}` — e.g. `taste_fantasy_grimdark`, `taste_scifi_hardscifi`, `taste_scifi_spaceoperera`.
+
+**Author/narrator style transfer:** When the Learn call processes a highly-rated book by a known author (score in `profile_signals` dimension_type:author ≥ +50), it strengthens correlated style and genre dimensions in the active subprofile. A +5 Sanderson read → `style:cognitive_load`, `genre:epic_fantasy`, `style:lore_density` all drift upward in the matching taste-cluster subprofile. This propagates author affinity into the scoring vector without storing authors in `tag_vector`.
 
 ---
 
@@ -1236,10 +1282,13 @@ cleanser request.
 > bias — rules placed mid-prompt after dense JSON are forgotten.
 
 *Input:*
-1. Active `profile_signals` rows — subprofile rows for the current Circumplex context_id
-   (if they exist) take precedence over `global` rows for matching dimension_ids; `global`
-   rows fill any dimensions not yet present in the subprofile. Each score injected with its
-   anchor label (e.g., "Romance: -100 (Dealbreaker)") — never raw numbers alone.
+1. Active `profile_signals` rows — fused from two layers:
+   - **Active circumplex subprofile** (if it exists for the current quadrant) takes precedence for matching dimension_ids
+   - **`global`** fills any dimension not yet present in the active subprofile
+   - Taste-cluster subprofiles are NOT used at Decide time — they shape what is already in the download buffer via the Stratified Portfolio; by the time Decide runs, the buffer already contains well-matched books for all clusters
+   - `user_constraints` are applied as SQL `WHERE` filters before candidates reach the Decide call — hard vetos never appear in the prompt
+   - Each score injected with its anchor label (e.g., "Space Opera: +80 (Love It)") — never raw numbers alone
+   - Author/narrator preferences injected as a separate section: "User strongly prefers: [authors]. User avoids: [authors]."
 2. Current `mood_state` (inferred modifiers + any active explicit override, combined)
 3. **Top 10 pre-scored candidates** from the SQL dot-product, **randomly shuffled** before
    prompt injection (eliminates position bias). Each candidate includes title, author,
@@ -1277,24 +1326,43 @@ cleanser request.
 > candidates are already strong profile matches from the SQL stage, even a "variety" pick
 > is guaranteed to be a book the user will enjoy.
 
-*Output:*
+The Decide call is **two sequential LLM passes**. Ranking and blurb generation are
+structurally different tasks (TKR vs. generative prose) — combining them in one prompt
+causes negative knowledge transfer: the prose constraint degrades ranking accuracy and the
+ranking context inflates blurb length. Separating them costs one extra call but both passes
+become cheaper because each is simpler.
+
+**Pass 1 — TKR Ranking:** Receives all inputs listed above. Returns only a ranked
+selection with internal rationale.
+
+*Output (Pass 1):*
 ```json
 {
-  "reason": "Matches your appetite for dry wit and brisk pacing after a heavy fantasy run. Short enough for a work week.",
-  "book_id": "abc123"
+  "book_id": "abc123",
+  "ranking_rationale": "Best mood-match on tone:dry_wit + arc:episodic; lowest tonal overlap with current queue; niche T-class consistent with user's N-Group segment."
 }
 ```
 
-`reason` is always output **first** — this forces the LLM to evaluate constraints and
-articulate its justification before committing to a `book_id`, acting as a lightweight
-chain-of-thought mechanism without the hallucination risk of open-ended reasoning.
-`reason` must be ≤ 50 words. No picks array — the Decide call always returns exactly one
-book per call.
+`ranking_rationale` is output **first** — lightweight chain-of-thought that forces the LLM
+to articulate constraint satisfaction before committing to a `book_id`. It is never stored
+or surfaced; it exists only to improve pick accuracy. No picks array — Pass 1 returns
+exactly one book.
 
-There is no separate blurb generation call — every Decide call produces both a decision and
-an explanation in one response. If the queue addition is silent (series continuation),
-`reason` is stored in `book_blurbs` but never surfaced. If it fires an Action notification,
-`reason` is the notification body. The routing is Windlass's decision, not the LLM's.
+**Pass 2 — Blurb Generation:** Receives only the selected `book_id`, its decoded tag
+labels, the current `mood_state`, and the user's top 5 `profile_signals` dimensions. No
+candidate list, no queue context. Can use a lighter/faster model than Pass 1.
+
+*Output (Pass 2):*
+```json
+{
+  "reason": "Matches your appetite for dry wit and brisk pacing after a heavy fantasy run. Short enough for a work week."
+}
+```
+
+`reason` must be ≤ 50 words. If the queue addition is silent (series continuation),
+`reason` is stored in `active_queue.reason` but never surfaced. If it fires an Action
+notification, `reason` is the notification body. The routing is Windlass's decision, not
+the LLM's.
 
 > **Bias constraint:** The `reason` field must never contain star ratings, numeric scores,
 > "X/5", "5-star", or any rating-scale language. Qualitative, descriptive prose only. This

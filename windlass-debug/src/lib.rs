@@ -4,7 +4,7 @@ pub mod causal_tx;
 mod dispatcher;
 pub mod history;
 pub mod log_layer;
-mod stream;
+pub(crate) mod stream;
 pub mod types;
 
 pub use causal_tx::CausalTx;
@@ -123,7 +123,7 @@ pub struct DebugController {
     pub(crate) queue_sink: Arc<ArcSwap<QueueSink>>,
     /// Sender for the non-debug (mpsc) path — restored on `disable_debug()`.
     internal_tx: mpsc::Sender<Event>,
-    /// Sender for the debug (VecDeque) path — activated on `enable_debug()`.
+    /// Sender for the debug (`VecDeque`) path — activated on `enable_debug()`.
     stored_tx: mpsc::Sender<StoredEvent>,
     // ── Shared handles for history / snapshot ─────────────────────────────────
     /// Latest published snapshot of `DebugState`. Read by GET /api/v1/debug.
@@ -155,6 +155,7 @@ pub struct DebugOwnedPart {
 impl DebugController {
     /// Creates a `DebugController` alongside the receiver halves that the main
     /// event loop must own. Pass the returned `DebugOwnedPart` to `shell::run`.
+    #[must_use]
     pub fn new_with_owned() -> (Self, DebugOwnedPart) {
         let (internal_tx, internal_rx) = mpsc::channel::<Event>(128);
         let (stored_tx, queue_rx) = mpsc::channel::<StoredEvent>(128);
@@ -390,6 +391,12 @@ impl DebugController {
                 let _ = exchange_tx.try_send((action_id, exchange));
             }
         })
+    }
+}
+
+impl Default for DebugController {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

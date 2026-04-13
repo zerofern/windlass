@@ -30,7 +30,7 @@ pub struct StoredEvent {
 impl StoredEvent {
     /// Returns a reference to the original event (used for dispatch).
     #[must_use]
-    pub fn event(&self) -> &Event {
+    pub const fn event(&self) -> &Event {
         &self.event
     }
 }
@@ -56,7 +56,7 @@ mod tests {
             variant: "Init",
             payload: serde_json::Value::Null,
             caused_by_action: None,
-            event: event.clone(),
+            event,
         };
         assert!(matches!(stored.event(), Event::Init { .. }));
     }
@@ -92,7 +92,7 @@ pub struct ActiveEvent {
 }
 
 /// An async action that has been dispatched but not yet completed.
-/// Stays in `running_actions` until Phase 4 wires in CausalTx completion.
+/// Stays in `running_actions` until Phase 4 wires in `CausalTx` completion.
 #[derive(Serialize, Clone, Debug)]
 pub struct RunningAction {
     pub id: Uuid,
