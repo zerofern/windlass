@@ -127,7 +127,7 @@ services:
       VPN_PORT_FILE: /tmp/gluetun/forwarded_port
       WINDLASS_BIND: 0.0.0.0:5010
       CHAOS_URL: http://localhost:9000
-      DEBUG_MODE_ON_START: "true"
+      DB_PATH: /tmp/windlass.db
       RUST_LOG: windlass=debug,info
 volumes:
   vpn-files:
