@@ -2,12 +2,14 @@
 FROM rust:latest AS builder
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock .env ./
+COPY .sqlx/            .sqlx/
 COPY windlass-types/   windlass-types/
 COPY windlass-core/    windlass-core/
 COPY windlass-debug/   windlass-debug/
 COPY windlass-local/   windlass-local/
 COPY windlass-clients/ windlass-clients/
+COPY windlass-db/      windlass-db/
 COPY windlass-web/     windlass-web/
 COPY windlass/         windlass/
 COPY windlass-testkit/ windlass-testkit/
