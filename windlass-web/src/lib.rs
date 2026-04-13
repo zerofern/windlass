@@ -6,6 +6,9 @@ mod routes;
 
 pub use app_state::AppState;
 
+#[cfg(test)]
+pub mod test_helpers;
+
 /// Builds the application router with all API routes attached.
 #[must_use = "pass to axum::serve"]
 pub fn router(state: AppState) -> axum::Router {

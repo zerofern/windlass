@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 
 export function Download() {
   const [input, setInput] = useState('')
@@ -65,7 +66,10 @@ export function Download() {
       </form>
 
       {status === 'success' && (
-        <p className="text-sm text-green-600 dark:text-green-400">{message}</p>
+        <p className="text-sm text-green-600 dark:text-green-400">
+          {message}{' '}
+          <Link to="/events" className="underline hover:no-underline">View Event Log</Link>
+        </p>
       )}
       {status === 'error' && (
         <p className="text-sm text-red-600 dark:text-red-400">{message}</p>

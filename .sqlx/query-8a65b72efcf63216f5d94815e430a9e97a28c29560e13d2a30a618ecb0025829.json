@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT hash, book_id, mam_id, name, state, seeding_time_secs,\n         downloaded_bytes, seen_at FROM torrents ORDER BY added_at DESC",
+  "query": "SELECT hash, book_id, mam_id, name, state, seeding_time_secs,\n         downloaded_bytes, seen_at, added_at FROM torrents ORDER BY added_at DESC",
   "describe": {
     "columns": [
       {
@@ -42,6 +42,11 @@
         "name": "seen_at",
         "ordinal": 7,
         "type_info": "Text"
+      },
+      {
+        "name": "added_at",
+        "ordinal": 8,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -55,8 +60,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "064ebfcda1f00b1d687f8c32f9a11d2b3c3e633b8e24dc15d064b2ea4cf28338"
+  "hash": "8a65b72efcf63216f5d94815e430a9e97a28c29560e13d2a30a618ecb0025829"
 }

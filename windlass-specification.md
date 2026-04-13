@@ -116,7 +116,7 @@ best torrent to download. Everything else hangs off `books`.
 | Table                 | Contents                                                                                                                                                                                                                                                                     |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `book_candidates`     | **DuckDB only.** Pre-filter pool — potentially millions of lightweight rows sourced from discovery workers before any enrichment cost is incurred. Columns: `isbn13` (unique dedup key), `title`, `author`, `language_code`, `bisac_codes` (native `TEXT[]` array — GIN-indexed for fast genre lookup), `publication_year`, `word_count` (nullable), `rating_count`, `avg_rating` (stored for display only — never used as a filter), `source`, `discovered_at`, `status` (`candidate` / `promoted` / `rejected`), `rejection_reason` (which pre-filter gate dropped it: `language` / `bisac` / `rating_count` / `word_count`), `books_id` FK (set when promoted to PostgreSQL `books` table). Rejected rows are never deleted — they serve as the permanent dedup blacklist so a re-discovered ISBN is silently skipped. |
-| `books`               | Canonical library record for every title Windlass knows about. **One row per work — not per edition.** Library status lifecycle: `known → epub_pending → enriching → watchlist → monitoring → downloading → seeding → completed` (plus `rejected_s2` terminal state). Source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`). Audnexus ASIN, Hardcover ID, ABS item ID. `epub_status` (`searching` / `found` / `not_found`). **`tag_vector sparsevec(500)`** — a single sparse vector storing all tag intensity scores (-100→+100) using a stable application-level index dictionary (e.g. index 0 = `hard_scifi`, index 1 = `space_opera`, …). Sparse format stores only non-zero entries; declaring 500 dimensions provides headroom for future tags without schema migration. S1 tag indices are populated at discovery time; S2 indices (style, arc, narrative) are filled in when Stage 2 enrichment completes. Dot-product queue scoring uses `tag_vector <#> subprofile_vector` — always computed live (sub-5 ms for thousands of rows); no cached score columns. `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`). `enrichment_summary_path` (path to `windlass_data/enrichment/{book_id}.json` — raw NLP arrays, smoothed arcs, LIX score, prose summary; null until Stage 2). `reason` (LLM Decide blurb; overwritten on re-evaluation). A book record survives disk deletion. |
+| `books`               | Canonical library record for every title Windlass knows about. **One row per work — not per edition.** Library status lifecycle: `pending_s1 → known → epub_pending → enriching → watchlist → monitoring → downloading → seeding → completed` (plus `rejected_s2` terminal state for Stage 1 or Stage 2 failures). Source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`). Audnexus ASIN, Hardcover ID, ABS item ID. `epub_status` (`searching` / `found` / `not_found`). **`tag_vector sparsevec(500)`** — a single sparse vector storing all tag intensity scores (-100→+100) using a stable application-level index dictionary (e.g. index 0 = `hard_scifi`, index 1 = `space_opera`, …). Sparse format stores only non-zero entries; declaring 500 dimensions provides headroom for future tags without schema migration. S1 tag indices are populated at discovery time; S2 indices (style, arc, narrative) are filled in when Stage 2 enrichment completes. Dot-product queue scoring uses `tag_vector <#> subprofile_vector` — always computed live (sub-5 ms for thousands of rows); no cached score columns. `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`). `enrichment_summary_path` (path to `windlass_data/enrichment/{book_id}.json` — raw NLP arrays, smoothed arcs, LIX score, prose summary; null until Stage 2). `reason` (LLM Decide blurb; overwritten on re-evaluation). A book record survives disk deletion. |
 | `metadata_cache`      | Read-through cache for external API responses. Keyed by `(source, external_id)` where `source` is `audnexus` or `hardcover` and `external_id` is the ASIN or Hardcover ID. Stores the raw `response_json` and `fetched_at` timestamp. TTL: Audnexus 30 days (stable data), Hardcover 7 days (community reviews change frequently). Eliminates redundant API calls across Stage 1, Stage 2, and all LLM context assembly. |
 | `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `arc_relation` / `narrative` / `preference` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
 | `series`              | Series identity and health (Audnexus data, user started/following flags). `engagement_trend_json`: array of `{book_number, rating, completion_ratio, slog_events}` appended after each series book review. Used for series drop-off detection. |
@@ -203,7 +203,7 @@ All downstream tables (`download_queue`, `active_queue`, `reviews`, `reading_led
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TYPE lib_status   AS ENUM ('known','epub_pending','enriching','watchlist',
+CREATE TYPE lib_status   AS ENUM ('pending_s1','known','epub_pending','enriching','watchlist',
                                    'monitoring','downloading','seeding','completed','rejected_s2');
 CREATE TYPE enrich_stage AS ENUM ('discovery','post_download_lite','post_download_full');
 CREATE TYPE epub_state   AS ENUM ('searching','found','not_found');
@@ -229,7 +229,7 @@ CREATE TABLE books (
     hardcover_ratings_count INTEGER,   -- raw count for FairLRM H/T classification
 
     -- Pipeline state
-    library_status   lib_status   NOT NULL DEFAULT 'known',
+    library_status   lib_status   NOT NULL DEFAULT 'pending_s1',
     enrichment_stage enrich_stage NOT NULL DEFAULT 'discovery',
     epub_status      epub_state   DEFAULT 'searching',
     source           TEXT,
@@ -251,6 +251,8 @@ CREATE TABLE books (
 );
 
 -- Partial indexes — only index rows actively moving through each queue stage
+CREATE INDEX idx_books_s1_queue   ON books(id)
+    WHERE library_status = 'pending_s1';
 CREATE INDEX idx_books_epub_queue ON books(id)
     WHERE library_status = 'known';
 CREATE INDEX idx_books_dl_queue   ON books(id)
@@ -648,15 +650,16 @@ book_candidates (DuckDB)
                               └──► rejected (permanent blacklist; dedup shield)
 
 books (PostgreSQL)
-   known          ← passed pre-filter; in epub queue
-   epub_pending   ← epub fetch in progress
-   enriching      ← Stage 2 running on worker
-   watchlist      ← S2 done; not yet on MAM
-   monitoring     ← on MAM; awaiting download conditions
+   pending_s1   ← promoted from DuckDB; awaiting Stage 1 scoring
+   known        ← passed Stage 1; in epub queue
+   epub_pending ← epub fetch in progress
+   enriching    ← Stage 2 running on worker
+   watchlist    ← S2 done; not yet on MAM
+   monitoring   ← on MAM; awaiting download conditions
    downloading
    seeding
    completed
-   rejected_s2    ← terminal; failed Stage 2 score threshold
+   rejected_s2  ← terminal; failed Stage 1 or Stage 2 score threshold
 ```
 
 

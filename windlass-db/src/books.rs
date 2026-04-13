@@ -24,7 +24,32 @@ pub async fn upsert(pool: &DbPool, mam_id: MamTorrentId) -> Result<i64, DbError>
     Ok(id.expect("book id is always set after upsert"))
 }
 
-/// Returns the book with the given `mam_id`, if it exists.
+/// Returns all books ordered by creation time descending.
+///
+/// # Errors
+/// Returns `DbError` if the database query fails.
+///
+/// # Panics
+/// Panics if the `id` column is NULL — impossible for `INTEGER PRIMARY KEY`.
+pub async fn get_all(pool: &DbPool) -> Result<Vec<BookRow>, DbError> {
+    let rows = sqlx::query!(
+        "SELECT id, mam_id, title, author, status, created_at FROM books ORDER BY created_at DESC"
+    )
+    .fetch_all(pool.inner())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| BookRow {
+            id: r.id,
+            mam_id: r.mam_id,
+            title: r.title,
+            author: r.author,
+            status: r.status,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
 ///
 /// # Errors
 /// Returns `DbError` if the database query fails.
@@ -84,5 +109,17 @@ mod tests {
         let row = get_by_mam_id(&pool, mam_id).await.unwrap().unwrap();
         assert_eq!(row.mam_id, Some(7));
         assert_eq!(row.status, "pending_metadata");
+    }
+
+    #[tokio::test]
+    async fn get_all_returns_all_books() {
+        let (pool, _dir) = test_pool().await;
+        upsert(&pool, MamTorrentId(1)).await.unwrap();
+        upsert(&pool, MamTorrentId(2)).await.unwrap();
+        let rows = get_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let mam_ids: Vec<Option<i64>> = rows.iter().map(|r| r.mam_id).collect();
+        assert!(mam_ids.contains(&Some(1)));
+        assert!(mam_ids.contains(&Some(2)));
     }
 }

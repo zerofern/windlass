@@ -83,6 +83,7 @@ impl ShellContext<'_> {
                     seeding_time_secs: i64::try_from(record.seeding_time_secs).unwrap_or(i64::MAX),
                     downloaded_bytes: i64::try_from(record.downloaded_bytes).unwrap_or(i64::MAX),
                     seen_at: record.seen_at.to_rfc3339(),
+                    added_at: String::new(),
                 };
                 if let Err(e) = windlass_db::torrents::upsert(&pool, &row).await {
                     tracing::warn!("Failed to upsert torrent {}: {e}", row.hash);

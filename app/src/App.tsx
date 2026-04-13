@@ -3,7 +3,10 @@ import { Dashboard } from '@/routes/Dashboard'
 import { Debug } from '@/routes/Debug'
 import { Chaos } from '@/routes/Chaos'
 import { Download } from '@/routes/Download'
+import { DownloadQueue } from '@/routes/DownloadQueue'
+import { EventLog } from '@/routes/EventLog'
 import { Notifications } from '@/routes/Notifications'
+import { TorrentMonitor } from '@/routes/TorrentMonitor'
 import { useConfig } from '@/hooks/useConfig'
 import { ObservationsProvider } from '@/contexts/ObservationsContext'
 
@@ -32,6 +35,9 @@ export default function App() {
             <span className="font-bold text-lg tracking-tight">⚓ Windlass</span>
             <NavItem to="/" end label="Dashboard" />
             <NavItem to="/download" label="Download" />
+            <NavItem to="/torrents" label="Torrent Monitor" />
+            <NavItem to="/queue" label="Queue" />
+            <NavItem to="/events" label="Events" />
             <NavItem to="/debug" label="Debug" />
             <NavItem to="/notifications" label="Notifications" />
             {config.chaos_url && <NavItem to="/chaos" label="Chaos" />}
@@ -41,6 +47,9 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/download" element={<Download />} />
+            <Route path="/torrents" element={<TorrentMonitor />} />
+            <Route path="/queue" element={<DownloadQueue />} />
+            <Route path="/events" element={<EventLog />} />
             <Route path="/debug" element={<Debug />} />
             <Route path="/notifications" element={<Notifications />} />
             {config.chaos_url && (

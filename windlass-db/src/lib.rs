@@ -84,6 +84,7 @@ pub struct TorrentRow {
     pub seeding_time_secs: i64,
     pub downloaded_bytes: i64,
     pub seen_at: String,
+    pub added_at: String,
 }
 
 /// DB row representation of an event.

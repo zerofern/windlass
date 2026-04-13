@@ -44,7 +44,7 @@ pub async fn upsert(pool: &DbPool, r: &TorrentRow) -> Result<(), DbError> {
 pub async fn get_all(pool: &DbPool) -> Result<Vec<TorrentRow>, DbError> {
     let rows = sqlx::query!(
         "SELECT hash, book_id, mam_id, name, state, seeding_time_secs,
-         downloaded_bytes, seen_at FROM torrents ORDER BY added_at DESC"
+         downloaded_bytes, seen_at, added_at FROM torrents ORDER BY added_at DESC"
     )
     .fetch_all(pool.inner())
     .await?;
@@ -59,6 +59,7 @@ pub async fn get_all(pool: &DbPool) -> Result<Vec<TorrentRow>, DbError> {
             seeding_time_secs: r.seeding_time_secs,
             downloaded_bytes: r.downloaded_bytes,
             seen_at: r.seen_at,
+            added_at: r.added_at,
         })
         .collect())
 }
@@ -79,6 +80,7 @@ mod tests {
             seeding_time_secs: 0,
             downloaded_bytes: 0,
             seen_at: "2024-01-01T00:00:00".to_string(),
+            added_at: "2024-01-01T00:00:00".to_string(),
         }
     }
 
