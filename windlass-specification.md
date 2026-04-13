@@ -86,13 +86,20 @@ Apple's servers see a tap on the device at a timestamp — nothing else.
 
 ## 3. Data Persistence
 
-All persistent state is stored in a local SQLite database (`windlass.db`). There is no
-flat JSON state file. SQLite is appropriate for this workload: Windlass is single-user,
-single-writer, and the database is projected to stay under 10 MB (excluding file-backed
-artifacts) indefinitely. WAL mode is enabled.
+Windlass uses a **hybrid database architecture** matched to the access patterns of each tier:
+
+| Engine | Tables | Reason |
+|---|---|---|
+| **PostgreSQL + pgvector** (Docker on NUC) | All operational tables — `books`, `profile_signals`, `mood_state`, `active_queue`, `download_queue`, `reading_ledger`, `reviews`, `series`, `torrents`, `tags`, `alerts`, `events`, `playback_sessions`, `metadata_cache`, `sync_artifacts`, `context_chunks` | MVCC concurrency (worker writes + server reads simultaneously without locking), `pgvector` native `sparsevec(500)` for exact dot-product scoring, mature ACID guarantees |
+| **DuckDB** (in-process library, no separate server) | `book_candidates` | Columnar vectorised execution for batch pre-filter scans across millions of rows; native `ARRAY` types + GIN-equivalent zone maps; zero server overhead on the NUC |
+
+PostgreSQL is deployed as a Docker container on the NUC alongside Home Assistant. Memory
+usage is bounded via `shared_buffers` tuning. The `book_candidates` DuckDB file lives at
+`windlass_data/candidates.db` and is written by discovery workers, read by the daily
+pre-filter batch job that promotes candidates into the PostgreSQL `books` table.
 
 Large per-book artifacts are stored as flat files under `windlass_data/` rather than as
-SQLite blobs, keeping the database lean and making per-book deletion trivial:
+database blobs, keeping the databases lean and making per-book deletion trivial:
 
 | Artifact | Path | Deleted when |
 |---|---|---|
@@ -108,7 +115,8 @@ best torrent to download. Everything else hangs off `books`.
 
 | Table                 | Contents                                                                                                                                                                                                                                                                     |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `books`               | Every title Windlass knows about. Library status lifecycle (`known → queued → downloading → seeding → completed`), source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`), Audnexus ASIN, Hardcover ID, ABS item ID, `epub_status` (`searching` / `found` / `not_found`), `tag_scores_json` (tag intensity scores -100→+100; top 20–30 tags also denormalised as real columns for indexed dot-product queries), `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`), `enrichment_summary_path` (path to file-backed enrichment artifact `windlass_data/enrichment/{book_id}.json` — contains raw per-batch score arrays, Savitzky-Golay smoothed arrays, LIX readability score, and full prose narrative summary; null until Stage 2; never stored in SQLite to avoid bloat), `reason` (LLM-generated blurb for why this book suits the user; overwritten on re-evaluation). A book record survives disk deletion. |
+| `book_candidates`     | **DuckDB only.** Pre-filter pool — potentially millions of lightweight rows sourced from discovery workers before any enrichment cost is incurred. Columns: `isbn13` (unique dedup key), `title`, `author`, `language_code`, `bisac_codes` (native `TEXT[]` array — GIN-indexed for fast genre lookup), `publication_year`, `word_count` (nullable), `rating_count`, `avg_rating` (stored for display only — never used as a filter), `source`, `discovered_at`, `status` (`candidate` / `promoted` / `rejected`), `rejection_reason` (which pre-filter gate dropped it: `language` / `bisac` / `rating_count` / `word_count`), `books_id` FK (set when promoted to PostgreSQL `books` table). Rejected rows are never deleted — they serve as the permanent dedup blacklist so a re-discovered ISBN is silently skipped. |
+| `books`               | Canonical library record for every title Windlass knows about. **One row per work — not per edition.** Library status lifecycle: `known → epub_pending → enriching → watchlist → monitoring → downloading → seeding → completed` (plus `rejected_s2` terminal state). Source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`). Audnexus ASIN, Hardcover ID, ABS item ID. `epub_status` (`searching` / `found` / `not_found`). **`tag_vector sparsevec(500)`** — a single sparse vector storing all tag intensity scores (-100→+100) using a stable application-level index dictionary (e.g. index 0 = `hard_scifi`, index 1 = `space_opera`, …). Sparse format stores only non-zero entries; declaring 500 dimensions provides headroom for future tags without schema migration. S1 tag indices are populated at discovery time; S2 indices (style, arc, narrative) are filled in when Stage 2 enrichment completes. Dot-product queue scoring uses `tag_vector <#> subprofile_vector` — always computed live (sub-5 ms for thousands of rows); no cached score columns. `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`). `enrichment_summary_path` (path to `windlass_data/enrichment/{book_id}.json` — raw NLP arrays, smoothed arcs, LIX score, prose summary; null until Stage 2). `reason` (LLM Decide blurb; overwritten on re-evaluation). A book record survives disk deletion. |
 | `metadata_cache`      | Read-through cache for external API responses. Keyed by `(source, external_id)` where `source` is `audnexus` or `hardcover` and `external_id` is the ASIN or Hardcover ID. Stores the raw `response_json` and `fetched_at` timestamp. TTL: Audnexus 30 days (stable data), Hardcover 7 days (community reviews change frequently). Eliminates redundant API calls across Stage 1, Stage 2, and all LLM context assembly. |
 | `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `arc_relation` / `narrative` / `preference` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
 | `series`              | Series identity and health (Audnexus data, user started/following flags). `engagement_trend_json`: array of `{book_number, rating, completion_ratio, slog_events}` appended after each series book review. Used for series drop-off detection. |
@@ -130,7 +138,7 @@ best torrent to download. Everything else hangs off `books`.
 ### JIT (Just-In-Time) Context Injection
 
 Each LLM call receives only the data relevant to its task — the full context contract for
-each call type is defined in §7.6. The general principle: Windlass queries SQLite for a
+each call type is defined in §7.6. The general principle: Windlass queries PostgreSQL for a
 small, hyper-relevant payload rather than passing the entire reading history.
 
 ### External Meta-Scraping
@@ -139,9 +147,160 @@ small, hyper-relevant payload rather than passing the entire reading history.
 **Hardcover.app** provides written user reviews and social metrics. Both are bundled into
 the RAG payload before any LLM call.
 
+### Database Schemas
+
+#### Table A — `book_candidates` (DuckDB)
+
+```sql
+CREATE TABLE book_candidates (
+    id               INTEGER PRIMARY KEY,
+    isbn13           TEXT UNIQUE,
+    isbn10           TEXT,
+    openlibrary_key  TEXT,
+    title            TEXT NOT NULL,
+    author           TEXT NOT NULL,
+
+    -- Pre-filter columns (all indexed)
+    language_code    TEXT NOT NULL,
+    bisac_codes      TEXT[],          -- native array; GIN-equivalent zone map in DuckDB
+    publication_year INTEGER,
+    word_count       INTEGER,         -- nullable; unknown books pass through
+    rating_count     INTEGER DEFAULT 0,
+    avg_rating       REAL,            -- stored for display only; never used as filter
+
+    -- Pipeline state
+    source           TEXT NOT NULL,
+    discovered_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status           TEXT NOT NULL DEFAULT 'candidate'
+                     CHECK(status IN ('candidate','promoted','rejected')),
+    rejection_reason TEXT,            -- 'language' | 'bisac' | 'rating_count' | 'word_count'
+    books_id         INTEGER          -- set when promoted to PostgreSQL books table
+);
+
+-- Physical sort order — DuckDB uses zone maps; clustering on these columns
+-- lets the pre-filter skip entire data blocks
+-- ORDER BY (status, language_code, rating_count DESC) at load time
+CREATE INDEX idx_candidates_filter ON book_candidates(language_code, status, rating_count);
+CREATE UNIQUE INDEX idx_candidates_isbn ON book_candidates(isbn13);
+```
+
+**Pre-filter query** (daily batch — millions → hundreds):
+```sql
+SELECT id FROM book_candidates
+WHERE language_code = 'en'
+  AND status = 'candidate'
+  AND rating_count >= 30
+  AND (word_count >= 20000 OR word_count IS NULL)
+  AND list_has_any(bisac_codes, ['FIC028000','FIC009000','FIC010000','FIC002000'])
+ORDER BY rating_count DESC
+LIMIT 500;
+```
+
+#### Tables B/C — `books` (PostgreSQL + pgvector)
+
+All downstream tables (`download_queue`, `active_queue`, `reviews`, `reading_ledger`) FK to `books.id`. S1 and S2 enrichment live in the same table — S2 vector indices are 0.0 until Stage 2 completes.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TYPE lib_status   AS ENUM ('known','epub_pending','enriching','watchlist',
+                                   'monitoring','downloading','seeding','completed','rejected_s2');
+CREATE TYPE enrich_stage AS ENUM ('discovery','post_download_lite','post_download_full');
+CREATE TYPE epub_state   AS ENUM ('searching','found','not_found');
+
+CREATE TABLE books (
+    id               SERIAL PRIMARY KEY,
+    candidate_id     INTEGER,          -- FK to DuckDB book_candidates.id (soft reference)
+
+    -- External IDs
+    audnexus_asin    TEXT,
+    hardcover_id     TEXT,
+    abs_item_id      TEXT,
+
+    -- Metadata (populated at Stage 1)
+    title            TEXT NOT NULL,
+    author           TEXT NOT NULL,
+    narrator         TEXT,
+    series_id        INTEGER REFERENCES series(id),
+    series_position  REAL,
+    duration_seconds INTEGER,
+    publication_year INTEGER,
+    language_code    TEXT DEFAULT 'en',
+    hardcover_ratings_count INTEGER,   -- raw count for FairLRM H/T classification
+
+    -- Pipeline state
+    library_status   lib_status   NOT NULL DEFAULT 'known',
+    enrichment_stage enrich_stage NOT NULL DEFAULT 'discovery',
+    epub_status      epub_state   DEFAULT 'searching',
+    source           TEXT,
+    enrichment_summary_path TEXT,      -- windlass_data/enrichment/{id}.json; null until S2
+    reason           TEXT,             -- LLM Decide blurb; overwritten on re-evaluation
+    last_scored_at   TIMESTAMP,
+
+    -- Tag vector: sparsevec(500)
+    -- Application-level index dictionary maps tag slug → integer index (0–499).
+    -- S1 indices (genre/mood/tone/protagonist/cw/format/length) populated at discovery.
+    -- S2 indices (style/arc/arc_relation/narrative) populated when enrichment completes.
+    -- New tags are assigned the next unused index — no schema migration required.
+    -- Dot-product: ORDER BY tag_vector <#> $subprofile_vector (negative inner product;
+    --              ASC order returns highest similarity first).
+    tag_vector       sparsevec(500),
+
+    created_at       TIMESTAMP DEFAULT NOW(),
+    updated_at       TIMESTAMP DEFAULT NOW()
+);
+
+-- Partial indexes — only index rows actively moving through each queue stage
+CREATE INDEX idx_books_epub_queue ON books(id)
+    WHERE library_status = 'known';
+CREATE INDEX idx_books_dl_queue   ON books(id)
+    WHERE library_status IN ('watchlist','monitoring');
+CREATE INDEX idx_books_completed  ON books(id)
+    WHERE library_status = 'completed';
+CREATE INDEX idx_books_enriching  ON books(enrichment_stage, last_scored_at)
+    WHERE enrichment_stage = 'discovery';
+```
+
+**Queue sort query** (epub queue — live dot-product, no cached scores):
+```sql
+SELECT id, title
+FROM books
+WHERE library_status = 'known'
+  AND tag_vector IS NOT NULL
+ORDER BY tag_vector <#> $subprofile_vector
+LIMIT 50;
+```
+
+**Stratified portfolio pass** (run once per subprofile, results merged by caller):
+```sql
+-- Called N times with different $subprofile_vector and $limit per subprofile bucket
+SELECT id FROM books
+WHERE library_status IN ('watchlist','monitoring')
+  AND tag_vector IS NOT NULL
+ORDER BY tag_vector <#> $subprofile_vector
+LIMIT $limit;
+```
+
+#### Tag Vector Index Dictionary
+
+The application maintains a YAML/TOML dictionary (`windlass_data/tag_index.toml`) mapping
+each tag slug to its fixed vector index. Indices are append-only — never reused or
+reordered. Current allocation bands:
+
+| Indices | Category |
+|---|---|
+| 0–29 | Genre |
+| 30–49 | Mood + Tone |
+| 50–69 | Protagonist + Content Warning + Format + Length |
+| 70–99 | Narrative (POV, tense, structure) |
+| 100–149 | Arc + Arc Relation |
+| 150–219 | Style (algorithmic: linguistic_complexity, dialog_density, …) |
+| 220–289 | Style (LLM: prose_ornamentation, cognitive_load, lore_density, …) |
+| 290–499 | Reserved for future tags |
+
 ---
 
-## 4. MAM Compliance & Torrent Management
+
 
 Windlass is engineered to perfectly emulate a well-behaved MAM user, actively protecting
 the account from automated bans.
@@ -371,7 +530,7 @@ All scoring data comes directly from the MAM search API response fields.
      with no notification.
   2. *All other slots:* Windlass runs a two-stage pick. First, a SQL dot-product
      pre-score eliminates near-dealbreaker tag mismatches and ranks the eligible pool
-     using `books.tag_scores_json × (profile_signals + mood_state modifiers)`. The top 10
+     using `books.tag_vector <#> (profile_signals + mood_state modifiers)`. The top 10
      candidates go to a Decide call (§7.6), which reasons about contrast, narrative variety,
      and mood fit — returning a ranked list with a `reason` per pick. The top pick is
      promoted; its `reason` becomes the notification blurb.
@@ -406,16 +565,21 @@ All scoring data comes directly from the MAM search API response fields.
 
 #### Discovery Sources
 
-Windlass pulls candidates from five sources. All feed into the same enrichment and
-monitoring queue pipeline.
+Windlass pulls candidates from multiple sources. All feed into `book_candidates` (DuckDB)
+and share the same pre-filter → Stage 1 → epub queue pipeline.
 
 | Source | Mechanism | Cadence |
 |---|---|---|
 | **User-initiated** | Universal Input Box (see below) | On demand |
 | **MAM new additions** | Poll MAM audiobook catalogue sorted by date added | Hourly |
-| **Hardcover trending** | GraphQL API: trending, upcoming, popular lists | Daily |
+| **Hardcover trending** | GraphQL API: trending, upcoming, popular, anticipated lists | Daily |
 | **Hardcover mood/tag browse** | GraphQL API: filtered to user's top-scored genres and moods | Daily |
-| **Series continuation** | Predictive Series Syncing (§6) — bypasses enrichment, goes direct to `priority: critical` | Event-driven |
+| **NYT Books API** | Bestseller lists — Fiction, Hardcover Fiction, Audio Fiction | Weekly |
+| **iTunes Search API** | Top audiobooks chart (no key required) | Daily |
+| **bibliotek.dk / DBC** | Danish national library catalogue — useful for translated fiction | Weekly |
+| **Open Library bulk dump** | Periodic ingest of Open Library title metadata for pre-filter | Monthly |
+| **AudioFile / Kirkus / Locus RSS** | Critic review feeds for genre fiction — surfaces pre-release titles | Daily |
+| **Series continuation** | Predictive Series Syncing (§6) — bypasses pre-filter, goes direct to `priority: critical` | Event-driven |
 
 Freeleech candidates have their own pipeline (§7.4) but share the same monitoring queue.
 
@@ -456,43 +620,118 @@ searching:
 in Panel 1. The vibe modifiers are a one-shot strong override — they expire once the user
 acts (approves or rejects a result).
 
-#### Stage 1 Enrichment (Discovery-Time)
+#### Pre-filter Layer
 
-Runs on every new candidate before it enters the monitoring queue. Fast and cheap — many
-books pass through here.
+Before any enrichment cost is incurred, every discovered candidate passes through a
+lightweight DuckDB query that eliminates obviously irrelevant titles. This gate runs as a
+daily batch job, promoting survivors into the PostgreSQL `books` table as `library_status:
+known`.
+
+**Gates (applied in order — first failure sets `rejection_reason` and marks `rejected`):**
+
+| Gate | Condition | Notes |
+|---|---|---|
+| Language | `language_code = 'en'` | Deterministic; publisher-assigned |
+| Genre | `bisac_codes` overlaps fiction subcategory list | Excludes non-fiction, poetry, reference |
+| Popularity | `rating_count >= 30` | Ensures statistical signal; does **not** filter on `avg_rating` |
+| Length | `word_count >= 20000 OR word_count IS NULL` | Excludes short stories; unknown passes through |
+
+`avg_rating` is stored but **never used as a filter gate** — community ratings cluster
+tightly around 4.0 (no discriminating power) and niche books are systematically
+underrated by mainstream audiences.
+
+#### Book Lifecycle
+
+```
+book_candidates (DuckDB)
+   candidate ──[pre-filter]──► promoted
+                              └──► rejected (permanent blacklist; dedup shield)
+
+books (PostgreSQL)
+   known          ← passed pre-filter; in epub queue
+   epub_pending   ← epub fetch in progress
+   enriching      ← Stage 2 running on worker
+   watchlist      ← S2 done; not yet on MAM
+   monitoring     ← on MAM; awaiting download conditions
+   downloading
+   seeding
+   completed
+   rejected_s2    ← terminal; failed Stage 2 score threshold
+```
+
+
+
+Runs on every candidate promoted from the pre-filter. Fast and cheap — many books pass
+through here.
 
 **Input:** book description + Audnexus genre/narrator tags + Hardcover mood tags + up to 5
 community review excerpts from Hardcover.
 
-**Output (stored in `books.tag_scores_json`):**
-- Intensity scores (-100→+100) for all applicable tags across all categories
+**Output (written into `books.tag_vector` S1 index band):**
+- Intensity scores (-100→+100) for all applicable genre / mood / tone / protagonist /
+  content_warning / format / length tags — stored as `sparsevec(500)` indices
 - `enrichment_stage: discovery`, `enrichment_confidence: low/medium`
-- A rough profile match score against the current `profile_signals`
+- Live dot-product against current `profile_signals` subprofile vector
 
-Strong matches (above the **Acquisition Confidence Threshold** — a configurable score
-with a sensible default, adjustable in the Action Center settings) auto-enter the
-monitoring queue. Borderline matches surface in Panel 1 for user review. Non-matches are
-discarded (but the `books` record is retained so the same title is not re-evaluated on the
-next poll).
+Strong matches (above the **Acquisition Confidence Threshold** — configurable with a
+sensible default, adjustable in the Action Center settings) auto-enter the epub queue as
+`library_status: known`. Borderline matches surface in Panel 1 for user review.
+Non-matches advance to `rejected_s2` — the `books` record is retained so the same title
+is not re-evaluated on the next poll.
 
 **Discovery dispatch table:**
 
 | Score vs threshold | Action |
 |---|---|
-| ≥ threshold | Auto-approved → monitoring queue, no notification |
+| ≥ threshold | Auto-approved → `known` (epub queue), no notification |
 | 50–threshold | Shown in Panel 1 (Suggested Next Listens) for user approval |
-| < 50 | Discarded silently; `books` record retained |
+| < 50 | `rejected_s2`; `books` record retained as dedup shield |
 
 *During the cold-start period (fewer than 20 reviewed books in `reading_ledger`), the
 threshold is automatically raised so that more candidates surface in Panel 1 rather than
 auto-grabbing — profile confidence is too low to trust silent auto-approval.*
 
-**Epub acquisition:** whenever a book is approved for download, Windlass simultaneously
-searches MAM for the matching epub. If found, the epub is queued at `priority: high`
-alongside the audiobook — epubs are 2–5 MB and unlock Stage 2 full enrichment, forced
-alignment, Glossary, Sleep Recovery, and series recaps. `books.epub_status` is updated to
-`found` or `not_found`. If no epub is found the m4b is downloaded regardless and Stage 2
-runs Path B (lite enrichment from reviews and metadata). Epub absence is never a blocker.
+#### Epub-First Evaluation Pipeline
+
+Books that pass Stage 1 enter the **epub queue** (`library_status: known`). Windlass
+fetches the epub (2–5 MB) as a pre-evaluation tool **before** committing to the full
+audiobook download (400 MB–2 GB). This is the entry point for Stage 2 enrichment.
+
+**Epub sources (in priority order):**
+1. MAM — searched simultaneously with the audiobook on approval
+2. Open Library — public domain and community-contributed epubs
+3. Anna's Archive — investigated; policy and reliability TBD
+
+`books.epub_status` is updated to `found` or `not_found`. Epub absence is never a
+blocker — Stage 2 runs Path B (lite enrichment from reviews and metadata) when no epub
+exists.
+
+**Stage 2 rate limit:** a maximum of **5 epub enrichment jobs per day** are dispatched to
+the worker node. This prevents the epub queue from draining faster than the audiobook
+download pipeline can consume, and keeps worker GPU usage predictable.
+
+**Epub deletion:** the epub file is deleted after Stage 2 completes — all signal is
+captured in `windlass_data/enrichment/{book_id}.json`. Storage cost is transient.
+
+#### Epub Queue — Stratified Portfolio Sort
+
+The epub queue (books at `library_status: known`) is sorted using a **Stratified
+Portfolio** approach rather than a single dot-product against the current mood. This
+prevents overspecialization — a queue sorted against today's mood will mismatch when mood
+shifts next week.
+
+**Algorithm (runs on every profile update):**
+1. **Compute subprofile frequencies** — query `reading_ledger.mood_snapshot_json` history
+   to derive the probability of each circumplex subprofile (e.g. 60% low-activeness,
+   30% high-activeness, 10% exploratory).
+2. **Allocate queue slots proportionally** — if scheduling 10 epub jobs, allocate 6 slots
+   to low-activeness, 3 to high-activeness, 1 to exploratory.
+3. **Score each partition with its pure isolated subprofile** — run separate
+   `ORDER BY tag_vector <#> $subprofile_vector LIMIT $slots` passes, one per partition.
+   Vectors are never blended; each pass uses the unweighted subprofile vector.
+4. **Merge** the ranked partition results into the final queue order.
+
+The download queue (`watchlist` / `monitoring`) uses the same algorithm.
 
 #### The Monitoring Queue
 
@@ -504,6 +743,8 @@ sufficient resources to download them. The drain loop evaluates:
 3. **Pipeline depth** not already deep (freeleech bypasses this check)
 4. **Priority order:** `critical` (series) → `high` (strong match / freeleech) →
    `normal` → `low`
+5. **Stratified portfolio sort** (§ above) applied within each priority tier
+
 
 When resources are available, the highest-priority `monitoring` book advances to
 `status: downloading`. Multiple downloads can run concurrently subject to qBittorrent
@@ -814,7 +1055,7 @@ user profile. Tags are grouped into categories:
 | `genre`            | `hard_scifi`, `space_opera`, `romantasy`, `epic_fantasy`, `litrpg`     |
 | `mood`             | `funny`, `hopeful`, `dark`, `tense`, `cozy`, `atmospheric`, `emotional` |
 | `tone`             | `dry_wit`, `banter_heavy`, `slow_burn`, `action_packed`, `satirical`   |
-| `style`            | Prose, structural, and psychological dimensions scored -100 to +100. Stage 2 produces two types: **algorithmic** (computed deterministically by NLP libraries — never passed through an LLM) and **LLM-estimated** (semantic dimensions requiring contextual reasoning). Both are stored as independent scores in `tag_scores_json` and fused at inference time by the dot-product and Decide call. See §8.0 for the full 20-dimension table with source annotations. Legacy discovery-time tags `puzzle_solving` and `world_building_heavy` are superseded by `style:puzzle_density` and `style:lore_density`. `character_driven` is retired — replaced by the algorithmic `style:cs_density`. |
+| `style`            | Prose, structural, and psychological dimensions scored -100 to +100. Stage 2 produces two types: **algorithmic** (computed deterministically by NLP libraries — never passed through an LLM) and **LLM-estimated** (semantic dimensions requiring contextual reasoning). Both are stored as independent indices in `books.tag_vector` (S2 index band) and fused at inference time by the dot-product and Decide call. See §8.0 for the full 20-dimension table with source annotations. Legacy discovery-time tags `puzzle_solving` and `world_building_heavy` are superseded by `style:puzzle_density` and `style:lore_density`. `character_driven` is retired — replaced by the algorithmic `style:cs_density`. |
 | `arc`              | Overarching emotional arc shape, assigned by Stage 2. Six types: `arc:rags_to_riches` (steady rise), `arc:tragedy` (steady fall), `arc:man_in_hole` (fall–rise), `arc:icarus` (rise–fall), `arc:cinderella` (rise–fall–rise), `arc:oedipus` (fall–rise–fall). |
 | `arc_relation`     | Character relationship arc dynamics, assigned by Stage 2 Relation Arc sub-stage (§8.0). Distinct from `arc:*` which captures plot-level sentiment — `arc_relation` captures the *interpersonal circumstance* between directed character pairs. `arc_relation:volatile` (-100 = static dynamics throughout; +100 = highly volatile — betrayals, enemies-to-lovers, shifting power). **Gate: only computed for books with ≥ 500 extractable narrative events; novellas and short stories are skipped.** Runs locally on AMD GPU via ROCm using BookNLP (big model) + RoBERTa + GoEmotions. |
 | `narrative`        | Syntactic structure and viewpoint. Stage 2 examples: `narrative:1st_person`, `narrative:3rd_limited`, `narrative:3rd_omniscient`, `narrative:2nd_person`, `narrative:single_pov`, `narrative:dual_pov`, `narrative:multi_pov`, `tense:past`, `tense:present`. Always +100 (present) or absent — treated as scoreable preference dimensions like any other tag, not as hard filters. |
@@ -884,7 +1125,7 @@ Panel 6's optional re-calibration feature.
 > **Pairwise Ranking Integration:** When `ranking_peers_json` is present, the Learn call
 > uses a relative prompting strategy rather than evaluating the new book in isolation.
 > The LLM is instructed: *"The user ranked Book A higher than Book B but lower than Book C.
-> Analyse the `tag_scores_json` for all three books and identify the specific tags that
+> Analyse the decoded tag labels for all three books and identify the specific tags that
 > explain this placement."* A **minimum distance filter** discards any pair where the
 > absolute star rating difference is 0 to eliminate noise. The LLM outputs a tag delta
 > based on this comparative analysis — isolating the user's core literary preferences from
@@ -953,7 +1194,7 @@ Context ID naming convention: `circumplex_high_activeness` (A4–A5),
    weights when generating tag deltas
 10. **Cumulative emotional load:** For each of the last 5 finished books: `style:cognitive_load`
     (narrative complexity — working memory load), `style:linguistic_complexity` (sentence-level
-    density), `style:emotional_distance`, and dominant `arc:*` tag from `books.tag_scores_json`.
+    density), `style:emotional_distance`, and dominant `arc:*` tag from `books.tag_vector`.
     The LLM uses this to estimate the user's current "emotional battery" — consecutive
     `arc:tragedy` + high `style:cognitive_load` books deplete it faster than light,
     fast-paced novellas. When battery is judged low, output modifiers should reflect a
@@ -999,19 +1240,19 @@ cleanser request.
 2. Current `mood_state` (inferred modifiers + any active explicit override, combined)
 3. **Top 10 pre-scored candidates** from the SQL dot-product, **randomly shuffled** before
    prompt injection (eliminates position bias). Each candidate includes title, author,
-   `tag_scores_json`, and popularity class (H-class / T-class). The aggregate dot-product
-   score is **not shown** — showing it causes the LLM to anchor on it and echo the SQL
-   ranking rather than applying semantic reasoning. The `tag_scores_json` provides the
-   "why" without handing the LLM the answer.
+   decoded tag labels from `tag_vector`, and popularity class (H-class / T-class). The
+   aggregate dot-product score is **not shown** — showing it causes the LLM to anchor on it
+   and echo the SQL ranking rather than applying semantic reasoning. The decoded tag labels
+   provide the "why" without handing the LLM the answer.
 4. **User popularity segment:** N-Group or P-Group — computed from `profile_signals` ×
    `metadata_cache` at call time (see FairLRM Grounding Constraint below).
 5. **Current Active Queue dominant tags:** For each occupied slot, the top 3–5 dominant
-   `tone`, `mood`, and `arc` tags from `books.tag_scores_json`. Used by the Queue Variance
-   Rule to evaluate semantic distance between candidates and what the user is already
-   reading.
+   `tone`, `mood`, and `arc` tags decoded from `books.tag_vector`. Used by the Queue
+   Variance Rule to evaluate semantic distance between candidates and what the user is
+   already reading.
 6. **`preference:tonal_variance`** from `profile_signals` (current Circumplex subprofile
    if available, else `global`). This is a queue composition meta-preference — it has no
-   item-side counterpart in `tag_scores_json` and never enters the dot-product pre-score.
+   item-side counterpart in `tag_vector` and never enters the dot-product pre-score.
 7. For queue picks: pipeline depth tier
 
 > **FairLRM Grounding Constraint:** The Decide prompt must include an explicit instruction
@@ -1231,8 +1472,8 @@ The summary is never shown to the user directly; it is consumed by other pipelin
 LLM calls as high-signal context.
 
 **Stage A6 — Dual storage:**
-- **SQLite (lean):** Only the final concrete tag scores from Stages A1, A2, and A4 are
-  written into `books.tag_scores_json`. `enrichment_stage` advances to
+- **PostgreSQL (lean):** Only the final concrete tag scores from Stages A1, A2, and A4 are
+  written into `books.tag_vector` (S2 index band). `enrichment_stage` advances to
   `post_download_full`. The book becomes eligible for Active Queue promotion immediately.
 - **File artifact (rich):** The following are bundled into
   `windlass_data/enrichment/{book_id}.json`:
@@ -1244,8 +1485,8 @@ LLM calls as high-signal context.
   - Per character-pair Relation Arc time-series and smoothed arrays (if ≥ 500 events)
   - LLM's full prose narrative summary
 
-  Raw arrays and BookNLP outputs are **never** stored in SQLite — they would bloat
-  `windlass.db` and slow the Decide call's dot-product queries. The file artifact is
+  Raw arrays and BookNLP outputs are **never** stored in PostgreSQL — they would bloat
+  the database and slow the Decide call's dot-product queries. The file artifact is
   retained for 90 days, giving a re-enrichment window if smoothing parameters, tag
   definitions, or NLP models improve without needing to re-download the epub.
 
@@ -1261,7 +1502,7 @@ This substantially improves on Stage 1 but cannot capture structural narrative d
 - Tag categories scored with medium confidence
 - `enrichment_stage` updated to `post_download_lite`
 
-In both cases, `books.tag_scores_json` is updated in place. The book then becomes eligible
+In both cases, `books.tag_vector` (S2 indices) is updated in place. The book then becomes eligible
 for Active Queue promotion.
 
 ### 8.1 The Asynchronous Worker Node
