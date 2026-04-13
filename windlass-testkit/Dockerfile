@@ -1,7 +1,9 @@
 FROM rust:latest AS builder
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock .env ./
+ENV SQLX_OFFLINE=true
+
+COPY Cargo.toml Cargo.lock ./
 COPY .sqlx/            .sqlx/
 COPY windlass-types/   windlass-types/
 COPY windlass-core/    windlass-core/
