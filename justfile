@@ -37,7 +37,10 @@ integration-qbit:
 # Usage: just stack-up          (normal mode)
 #        just stack-up debug=true  (debug mode on from start)
 stack-up debug="":
-    DEBUG_MODE_ON_START="{{debug}}" docker compose -f docker-compose.dev.yml up --build -d
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export DEBUG_MODE_ON_START="{{debug}}"
+    docker compose -f docker-compose.dev.yml up --build -d
 
 # Tear down the dev/test stack
 stack-down:
