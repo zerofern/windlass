@@ -1,0 +1,7 @@
+# Compose override to enable debug mode on start.
+# Merge on top of docker-compose.dev.yml:
+#   just stack-up-debug
+services:
+  windlass:
+    environment:
+      DEBUG_MODE_ON_START: "true"
