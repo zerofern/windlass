@@ -33,8 +33,11 @@ integration-qbit:
     docker compose -f docker-compose.qbit-integration.yml down -v --remove-orphans
 
 # Bring up the dev/test stack
-stack-up:
-    docker compose -f docker-compose.dev.yml up --build -d
+# Bring up the dev/test stack. Pass debug=true to start in debug mode.
+# Usage: just stack-up          (normal mode)
+#        just stack-up debug=true  (debug mode on from start)
+stack-up debug="":
+    DEBUG_MODE_ON_START="{{debug}}" docker compose -f docker-compose.dev.yml up --build -d
 
 # Tear down the dev/test stack
 stack-down:

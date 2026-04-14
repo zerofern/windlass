@@ -128,6 +128,7 @@ services:
       WINDLASS_BIND: 0.0.0.0:5010
       CHAOS_URL: http://localhost:9000
       DB_PATH: /tmp/windlass.db
+      DEBUG_MODE_ON_START: "${DEBUG_MODE_ON_START:-}"
       RUST_LOG: windlass=debug,info
 volumes:
   vpn-files:
