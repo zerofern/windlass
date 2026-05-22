@@ -7,15 +7,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_EVENT_LIMIT: i64 = 100;
+const DEFAULT_ACTIVITY_LIMIT: i64 = 100;
 
 #[derive(Deserialize)]
-struct EventsQuery {
+struct ActivityQuery {
     limit: Option<i64>,
 }
 
 #[derive(Serialize)]
-struct EventJson {
+struct ActivityJson {
     id: i64,
     source: String,
     action: String,
@@ -24,30 +24,30 @@ struct EventJson {
     created_at: String,
 }
 
-/// Builds the router for event-log endpoints.
+/// Builds the router for activity-log endpoints.
 #[must_use = "pass to Router::merge"]
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/v1/events", get(get_events))
+        .route("/api/v1/activity", get(get_activity))
         .with_state(state)
 }
 
-async fn get_events(
+async fn get_activity(
     State(app): State<AppState>,
-    Query(params): Query<EventsQuery>,
-) -> Result<Json<Vec<EventJson>>, StatusCode> {
-    let limit = params.limit.unwrap_or(DEFAULT_EVENT_LIMIT);
-    let events = windlass_db::events::get_recent(&app.db_pool, limit)
+    Query(params): Query<ActivityQuery>,
+) -> Result<Json<Vec<ActivityJson>>, StatusCode> {
+    let limit = params.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
+    let entries = windlass_db::activity_log::get_recent(&app.db_pool, limit)
         .await
         .map_err(|e| {
-            tracing::warn!("Failed to fetch events: {e}");
+            tracing::warn!("Failed to fetch activity: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     Ok(Json(
-        events
+        entries
             .into_iter()
-            .map(|r| EventJson {
+            .map(|r| ActivityJson {
                 id: r.id,
                 source: r.source,
                 action: r.action,
@@ -66,13 +66,13 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn get_events_empty_db_returns_empty_array() {
+    async fn get_activity_empty_db_returns_empty_array() {
         let (state, _dir) = crate::test_helpers::test_state().await;
         let app = router(state);
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/events")
+                    .uri("/api/v1/activity")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -87,18 +87,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_events_limit_param_is_respected() {
+    async fn get_activity_limit_param_is_respected() {
         let (state, _dir) = crate::test_helpers::test_state().await;
         for i in 0..10_i32 {
-            windlass_db::events::insert(&state.db_pool, "test", &format!("action{i}"), None, None)
-                .await
-                .unwrap();
+            windlass_db::activity_log::insert(
+                &state.db_pool,
+                "test",
+                &format!("action{i}"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         }
         let app = router(state);
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/events?limit=5")
+                    .uri("/api/v1/activity?limit=5")
                     .body(Body::empty())
                     .unwrap(),
             )

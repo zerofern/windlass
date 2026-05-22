@@ -3,7 +3,7 @@
 pub mod alerts;
 pub mod books;
 pub mod download_queue;
-pub mod events;
+pub mod activity_log;
 pub mod torrents;
 
 use thiserror::Error;
@@ -87,9 +87,9 @@ pub struct TorrentRow {
     pub added_at: String,
 }
 
-/// DB row representation of an event.
+/// DB row representation of an activity record.
 #[derive(Debug, Clone)]
-pub struct EventRow {
+pub struct ActivityRow {
     pub id: i64,
     pub source: String,
     pub action: String,
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_create_all_five_tables() {
+    async fn migrations_create_all_tables() {
         let (pool, _dir) = test_pool().await;
         // Use runtime query — sqlite_master is a system table not in the sqlx cache.
         let tables: Vec<String> = sqlx::query_scalar(
@@ -163,8 +163,8 @@ mod tests {
             "download_queue table missing"
         );
         assert!(
-            tables.contains(&"events".to_string()),
-            "events table missing"
+            tables.contains(&"activity_log".to_string()),
+            "activity_log table missing"
         );
         assert!(
             tables.contains(&"alerts".to_string()),

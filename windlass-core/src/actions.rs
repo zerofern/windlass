@@ -80,8 +80,8 @@ pub enum Action {
     UpsertTorrentRecords(Vec<TorrentRecord>),
     /// Marks a MAM torrent ID as blacklisted in the download queue.
     BlacklistMamId(MamTorrentId),
-    /// Writes a compliance or user action event to the events table.
-    WriteEvent {
+    /// Writes a compliance or user action record to the activity_log table.
+    WriteActivity {
         source: String,
         action: String,
         book_id: Option<i64>,

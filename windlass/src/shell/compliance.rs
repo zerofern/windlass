@@ -101,7 +101,7 @@ impl ShellContext<'_> {
         });
     }
 
-    pub(super) fn write_event(
+    pub(super) fn write_activity(
         &self,
         source: String,
         action: String,
@@ -111,10 +111,10 @@ impl ShellContext<'_> {
         let pool = self.db_pool.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                windlass_db::events::insert(&pool, &source, &action, book_id, detail.as_deref())
+                windlass_db::activity_log::insert(&pool, &source, &action, book_id, detail.as_deref())
                     .await
             {
-                tracing::warn!("Failed to write event {action}: {e}");
+                tracing::warn!("Failed to write activity {action}: {e}");
             }
         });
     }

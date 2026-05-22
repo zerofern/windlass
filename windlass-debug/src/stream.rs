@@ -201,7 +201,7 @@ pub const fn action_variant(action: &Action) -> &'static str {
         Action::SetAllFilesPriority(_, _) => "SetAllFilesPriority",
         Action::UpsertTorrentRecords(_) => "UpsertTorrentRecords",
         Action::BlacklistMamId(_) => "BlacklistMamId",
-        Action::WriteEvent { .. } => "WriteEvent",
+        Action::WriteActivity { .. } => "WriteActivity",
         Action::FetchAndAddTorrent { .. } => "FetchAndAddTorrent",
     }
 }

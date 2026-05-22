@@ -29,6 +29,12 @@ impl SystemState {
                         attempt: RetryCount(0),
                     };
                     actions.push(Action::AuthenticateQbit);
+                    actions.push(Action::WriteActivity {
+                        source: "vpn".into(),
+                        action: "boot_vpn_ready".into(),
+                        book_id: None,
+                        detail: Some(format!("VPN up at boot: {}:{}", ip.0, port.into_inner())),
+                    });
                 }
                 Err(e) => {
                     // Gluetun healthy but files not ready yet — watcher will fire soon.
@@ -57,6 +63,12 @@ impl SystemState {
                     priority: AlertPriority::Critical,
                     title: "Gluetun died".into(),
                     body: "💀 Gluetun died unexpectedly. Dumping logs and recovering.".into(),
+                });
+                actions.push(Action::WriteActivity {
+                    source: "vpn".into(),
+                    action: "gluetun_died".into(),
+                    book_id: None,
+                    detail: None,
                 });
             }
             // Intentional restart from Hard Recovery — skip the dump.
@@ -95,7 +107,7 @@ impl SystemState {
     // No-op if content is identical to current state — the debounced
     // watcher sends this event on every write; the Core ignores no-change reads.
     pub(crate) fn on_port_file_read_ok(&mut self, ip: VpnIp, port: VpnPort) -> Vec<Action> {
-        if let VpnState::Connected {
+        let reconnected = if let VpnState::Connected {
             ip: cur_ip,
             port: cur_port,
         } = &self.vpn
@@ -109,15 +121,26 @@ impl SystemState {
                 old_ip = %cur_ip.0, old_port = cur_port.into_inner(),
                 "VPN reconnected with new address"
             );
+            true
         } else {
             info!(ip = %ip.0, port = port.into_inner(), "VPN tunnel established");
-        }
+            false
+        };
         self.vpn = VpnState::Connected { ip, port };
         self.qbit = QbitState::Authenticating {
             attempt: RetryCount(0),
         };
         self.mark_changed();
-        vec![Action::AuthenticateQbit]
+        let mut actions = vec![Action::AuthenticateQbit];
+        if reconnected {
+            actions.push(Action::WriteActivity {
+                source: "vpn".into(),
+                action: "vpn_reconnected".into(),
+                book_id: None,
+                detail: Some(format!("{}:{}", ip.0, port.into_inner())),
+            });
+        }
+        actions
     }
 }
 

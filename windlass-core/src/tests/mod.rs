@@ -1,3 +1,4 @@
+mod compliance;
 mod helpers;
 mod init;
 mod mam;

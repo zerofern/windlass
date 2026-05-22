@@ -18,11 +18,24 @@ impl SystemState {
                 target,
             };
             self.mark_changed();
-            vec![Action::SyncQbitPort(cookie, target)]
+            vec![
+                Action::SyncQbitPort(cookie, target),
+                Action::WriteActivity {
+                    source: "qbit".into(),
+                    action: "authenticated".into(),
+                    book_id: None,
+                    detail: None,
+                },
+            ]
         } else {
             self.qbit = QbitState::Authenticated { cookie };
             self.mark_changed();
-            vec![]
+            vec![Action::WriteActivity {
+                source: "qbit".into(),
+                action: "authenticated".into(),
+                book_id: None,
+                detail: None,
+            }]
         }
     }
 
@@ -92,6 +105,12 @@ impl SystemState {
                         WakeupId::CompliancePoll,
                         std::time::Duration::from_secs(self.compliance_poll_interval_secs),
                     ),
+                    Action::WriteActivity {
+                        source: "qbit".into(),
+                        action: "port_synced".into(),
+                        book_id: None,
+                        detail: Some(format!("port={}", port.into_inner())),
+                    },
                 ];
             }
         }

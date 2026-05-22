@@ -12,7 +12,7 @@ impl SystemState {
     pub(crate) fn on_manual_download_requested(&self, mam_id: MamTorrentId) -> Vec<Action> {
         // Blacklist check: silently log and block.
         if self.blacklisted_mam_ids.contains(&mam_id) {
-            return vec![Action::WriteEvent {
+            return vec![Action::WriteActivity {
                 source: "download".into(),
                 action: "download_blocked".into(),
                 book_id: None,
@@ -82,7 +82,7 @@ pub fn on_torrent_added_to_qbit(
             title: "Download started".into(),
             body: format!("MAM torrent {} added to qBittorrent.", mam_id.0),
         },
-        Action::WriteEvent {
+        Action::WriteActivity {
             source: "download".into(),
             action: "torrent_added".into(),
             book_id: None,
@@ -104,7 +104,7 @@ pub fn on_torrent_add_failed(mam_id: MamTorrentId, reason: &str) -> Vec<Action> 
             title: "Download failed".into(),
             body: format!("Failed to add MAM torrent {}: {reason}", mam_id.0),
         },
-        Action::WriteEvent {
+        Action::WriteActivity {
             source: "download".into(),
             action: "torrent_add_failed".into(),
             book_id: None,
@@ -160,7 +160,7 @@ mod tests {
         state.blacklisted_mam_ids.insert(mam_id());
         let actions = state.on_manual_download_requested(mam_id());
         assert!(actions.iter().any(
-            |a| matches!(a, Action::WriteEvent { action, .. } if action == "download_blocked")
+            |a| matches!(a, Action::WriteActivity { action, .. } if action == "download_blocked")
         ));
         assert!(
             !actions
@@ -222,7 +222,7 @@ mod tests {
         ));
         assert!(
             actions.iter().any(
-                |a| matches!(a, Action::WriteEvent { action, .. } if action == "torrent_added")
+                |a| matches!(a, Action::WriteActivity { action, .. } if action == "torrent_added")
             )
         );
         assert!(
@@ -241,7 +241,7 @@ mod tests {
                 .any(|a| matches!(a, Action::SendAlert { priority, .. } if *priority == AlertPriority::Warning))
         );
         assert!(actions.iter().any(
-            |a| matches!(a, Action::WriteEvent { action, .. } if action == "torrent_add_failed")
+            |a| matches!(a, Action::WriteActivity { action, .. } if action == "torrent_add_failed")
         ));
     }
 }

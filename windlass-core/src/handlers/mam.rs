@@ -12,11 +12,19 @@ impl SystemState {
             info!(ip = %ip.0, port = port.into_inner(), "MAM seedbox registered — VPN recovery complete");
             self.mam = MamState::Synced { port, ip };
             self.mark_changed();
-            return vec![Action::SendAlert {
-                priority: AlertPriority::Info,
-                title: "VPN recovered".into(),
-                body: "✅ VPN Recovered. Port synced.".into(),
-            }];
+            return vec![
+                Action::SendAlert {
+                    priority: AlertPriority::Info,
+                    title: "VPN recovered".into(),
+                    body: "✅ VPN Recovered. Port synced.".into(),
+                },
+                Action::WriteActivity {
+                    source: "mam".into(),
+                    action: "seedbox_updated".into(),
+                    book_id: None,
+                    detail: Some(format!("{}:{}", ip.0, port.into_inner())),
+                },
+            ];
         }
         vec![]
     }

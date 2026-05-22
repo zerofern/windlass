@@ -236,12 +236,12 @@ impl ShellContext<'_> {
             }
             Action::UpsertTorrentRecords(records) => self.upsert_torrent_records(records),
             Action::BlacklistMamId(mam_id) => self.blacklist_mam_id(mam_id),
-            Action::WriteEvent {
+            Action::WriteActivity {
                 source,
                 action,
                 book_id,
                 detail,
-            } => self.write_event(source, action, book_id, detail),
+            } => self.write_activity(source, action, book_id, detail),
             Action::FetchAndAddTorrent { mam_id, cookie } => {
                 self.fetch_and_add_torrent(mam_id, cookie, causal_tx);
             }

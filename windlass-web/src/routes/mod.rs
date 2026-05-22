@@ -5,7 +5,7 @@ mod alerts;
 mod debug;
 mod download;
 mod download_queue;
-mod events;
+mod activity_log;
 mod health;
 mod stream;
 mod torrents;
@@ -17,7 +17,7 @@ pub fn router(state: AppState) -> Router {
         .merge(alerts::router(state.clone()))
         .merge(download::router(state.clone()))
         .merge(download_queue::router(state.clone()))
-        .merge(events::router(state.clone()))
+        .merge(activity_log::router(state.clone()))
         .merge(health::router(state.clone()))
         .merge(stream::router(state.clone()))
         .merge(torrents::router(state.clone()))

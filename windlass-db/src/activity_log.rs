@@ -1,6 +1,6 @@
-use crate::{DbError, DbPool, EventRow};
+use crate::{ActivityRow, DbError, DbPool};
 
-/// Inserts an event record.
+/// Inserts an activity record.
 ///
 /// # Errors
 /// Returns `DbError` if the database query fails.
@@ -12,7 +12,7 @@ pub async fn insert(
     detail: Option<&str>,
 ) -> Result<(), DbError> {
     sqlx::query!(
-        "INSERT INTO events (source, action, book_id, detail) VALUES (?, ?, ?, ?)",
+        "INSERT INTO activity_log (source, action, book_id, detail) VALUES (?, ?, ?, ?)",
         source,
         action,
         book_id,
@@ -23,21 +23,21 @@ pub async fn insert(
     Ok(())
 }
 
-/// Returns the `limit` most recent events ordered by creation time descending.
+/// Returns the `limit` most recent activity records ordered by creation time descending.
 ///
 /// # Errors
 /// Returns `DbError` if the database query fails.
-pub async fn get_recent(pool: &DbPool, limit: i64) -> Result<Vec<EventRow>, DbError> {
+pub async fn get_recent(pool: &DbPool, limit: i64) -> Result<Vec<ActivityRow>, DbError> {
     let rows = sqlx::query!(
         "SELECT id, source, action, book_id, detail, created_at
-         FROM events ORDER BY created_at DESC LIMIT ?",
+         FROM activity_log ORDER BY created_at DESC LIMIT ?",
         limit
     )
     .fetch_all(pool.inner())
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| EventRow {
+        .map(|r| ActivityRow {
             id: r.id,
             source: r.source,
             action: r.action,
