@@ -1,5 +1,3 @@
-copilot --resume=53226173-92e3-4747-94ae-ba87b8a49e88
-
 # Windlass Operator: Product Specification
 
 This document is the long-term product specification for Windlass. It covers everything
