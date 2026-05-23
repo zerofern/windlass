@@ -36,11 +36,6 @@ const FAULTS: Fault[] = [
     label: 'MAM ASN Mismatch',
     description: 'MAM reports a different IP than the VPN port files — triggers mismatch handling.',
   },
-  {
-    id: 'gotify-down',
-    label: 'Gotify Down',
-    description: 'Gotify returns 503 — alert sends fail silently.',
-  },
 ]
 
 interface VpnState {
@@ -293,4 +288,3 @@ export function Chaos({ chaosUrl }: Props) {
     </div>
   )
 }
-

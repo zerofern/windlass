@@ -1,4 +1,5 @@
 use crate::{DbError, DbPool, DownloadQueueRow};
+use sqlx::Row;
 use windlass_types::MamTorrentId;
 
 /// Adds a new pending download queue entry for `mam_id` linked to `book_id`.
@@ -7,13 +8,11 @@ use windlass_types::MamTorrentId;
 /// Returns `DbError` if the database query fails.
 pub async fn enqueue(pool: &DbPool, mam_id: MamTorrentId, book_id: i64) -> Result<(), DbError> {
     let id = i64::try_from(mam_id.0).unwrap_or(i64::MAX);
-    sqlx::query!(
-        "INSERT INTO download_queue (mam_id, book_id, status) VALUES (?, ?, 'pending')",
-        id,
-        book_id
-    )
-    .execute(pool.inner())
-    .await?;
+    sqlx::query("INSERT INTO download_queue (mam_id, book_id, status) VALUES (?, ?, 'pending')")
+        .bind(id)
+        .bind(book_id)
+        .execute(pool.inner())
+        .await?;
     Ok(())
 }
 
@@ -27,11 +26,11 @@ pub async fn update_status(
     status: &str,
 ) -> Result<(), DbError> {
     let id = i64::try_from(mam_id.0).unwrap_or(i64::MAX);
-    sqlx::query!(
+    sqlx::query(
         "UPDATE download_queue SET status = ?, updated_at = datetime('now') WHERE mam_id = ?",
-        status,
-        id
     )
+    .bind(status)
+    .bind(id)
     .execute(pool.inner())
     .await?;
     Ok(())
@@ -51,12 +50,12 @@ pub async fn blacklist(pool: &DbPool, mam_id: MamTorrentId) -> Result<(), DbErro
 /// # Errors
 /// Returns `DbError` if the database query fails.
 pub async fn get_blacklisted_ids(pool: &DbPool) -> Result<Vec<MamTorrentId>, DbError> {
-    let rows = sqlx::query!("SELECT mam_id FROM download_queue WHERE status = 'blacklisted'")
+    let rows = sqlx::query("SELECT mam_id FROM download_queue WHERE status = 'blacklisted'")
         .fetch_all(pool.inner())
         .await?;
     Ok(rows
         .into_iter()
-        .map(|r| MamTorrentId(u64::try_from(r.mam_id).unwrap_or(0)))
+        .map(|r| MamTorrentId(u64::try_from(r.get::<i64, _>("mam_id")).unwrap_or(0)))
         .collect())
 }
 
@@ -65,21 +64,21 @@ pub async fn get_blacklisted_ids(pool: &DbPool) -> Result<Vec<MamTorrentId>, DbE
 /// # Errors
 /// Returns `DbError` if the database query fails.
 pub async fn get_all(pool: &DbPool) -> Result<Vec<DownloadQueueRow>, DbError> {
-    let rows = sqlx::query!(
+    let rows = sqlx::query(
         "SELECT id, book_id, mam_id, status, created_at, updated_at
-         FROM download_queue ORDER BY created_at DESC"
+         FROM download_queue ORDER BY created_at DESC",
     )
     .fetch_all(pool.inner())
     .await?;
     Ok(rows
         .into_iter()
         .map(|r| DownloadQueueRow {
-            id: r.id,
-            book_id: r.book_id,
-            mam_id: r.mam_id,
-            status: r.status,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+            id: r.get("id"),
+            book_id: r.get("book_id"),
+            mam_id: r.get("mam_id"),
+            status: r.get("status"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
         })
         .collect())
 }

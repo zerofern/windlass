@@ -58,7 +58,7 @@ impl QbitClient {
 
     /// Pauses a torrent. Fire-and-forget; logs a warning on failure.
     pub async fn pause_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash) {
-        let url = format!("{}/api/v2/torrents/pause", self.base_url);
+        let url = format!("{}/api/v2/torrents/stop", self.base_url);
         if let Err(e) = self
             .client
             .post(&url)
@@ -73,7 +73,7 @@ impl QbitClient {
 
     /// Resumes a paused torrent. Fire-and-forget; logs a warning on failure.
     pub async fn resume_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash) {
-        let url = format!("{}/api/v2/torrents/resume", self.base_url);
+        let url = format!("{}/api/v2/torrents/start", self.base_url);
         if let Err(e) = self
             .client
             .post(&url)

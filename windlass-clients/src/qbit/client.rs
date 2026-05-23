@@ -87,7 +87,7 @@ impl QbitClient {
                 let body = resp.text().await.unwrap_or_default();
                 self.emit_http("POST", &url, None, status.as_u16(), &body);
 
-                if status.is_success() && body.trim() == "Ok." {
+                if status.is_success() && (body.trim() == "Ok." || body.trim().is_empty()) {
                     let Some(cookie) = sid else {
                         warn!("qBit auth: ok status but no SID cookie in response");
                         return Event::QbitAuthFailed { at: Utc::now() };
@@ -255,7 +255,13 @@ fn extract_sid_cookie(resp: &reqwest::Response) -> Option<String> {
     for value in resp.headers().get_all(reqwest::header::SET_COOKIE) {
         if let Ok(s) = value.to_str() {
             for part in s.split(';') {
-                if let Some(sid) = part.trim().strip_prefix("SID=") {
+                let part = part.trim();
+                if let Some(sid) = part.strip_prefix("SID=") {
+                    return Some(sid.to_string());
+                }
+                if let Some((name, sid)) = part.split_once('=')
+                    && name.starts_with("QBT_SID")
+                {
                     return Some(sid.to_string());
                 }
             }

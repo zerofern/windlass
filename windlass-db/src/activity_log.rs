@@ -1,4 +1,5 @@
 use crate::{ActivityRow, DbError, DbPool};
+use sqlx::Row;
 
 /// Inserts an activity record.
 ///
@@ -11,15 +12,13 @@ pub async fn insert(
     book_id: Option<i64>,
     detail: Option<&str>,
 ) -> Result<(), DbError> {
-    sqlx::query!(
-        "INSERT INTO activity_log (source, action, book_id, detail) VALUES (?, ?, ?, ?)",
-        source,
-        action,
-        book_id,
-        detail
-    )
-    .execute(pool.inner())
-    .await?;
+    sqlx::query("INSERT INTO activity_log (source, action, book_id, detail) VALUES (?, ?, ?, ?)")
+        .bind(source)
+        .bind(action)
+        .bind(book_id)
+        .bind(detail)
+        .execute(pool.inner())
+        .await?;
     Ok(())
 }
 
@@ -28,22 +27,22 @@ pub async fn insert(
 /// # Errors
 /// Returns `DbError` if the database query fails.
 pub async fn get_recent(pool: &DbPool, limit: i64) -> Result<Vec<ActivityRow>, DbError> {
-    let rows = sqlx::query!(
+    let rows = sqlx::query(
         "SELECT id, source, action, book_id, detail, created_at
          FROM activity_log ORDER BY created_at DESC LIMIT ?",
-        limit
     )
+    .bind(limit)
     .fetch_all(pool.inner())
     .await?;
     Ok(rows
         .into_iter()
         .map(|r| ActivityRow {
-            id: r.id,
-            source: r.source,
-            action: r.action,
-            book_id: r.book_id,
-            detail: r.detail,
-            created_at: r.created_at,
+            id: r.get("id"),
+            source: r.get("source"),
+            action: r.get("action"),
+            book_id: r.get("book_id"),
+            detail: r.get("detail"),
+            created_at: r.get("created_at"),
         })
         .collect())
 }

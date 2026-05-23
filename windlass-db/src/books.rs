@@ -1,4 +1,5 @@
 use crate::{BookRow, DbError, DbPool};
+use sqlx::Row;
 use windlass_types::MamTorrentId;
 
 /// Upserts a book record by `mam_id`. Returns the book's primary key `id`.
@@ -6,22 +7,19 @@ use windlass_types::MamTorrentId;
 /// # Errors
 /// Returns `DbError` if the database query fails.
 ///
-/// # Panics
-/// Panics if the book row is missing after a successful insert — impossible in
-/// practice because the upsert always affects exactly one row.
 pub async fn upsert(pool: &DbPool, mam_id: MamTorrentId) -> Result<i64, DbError> {
     let mam = i64::try_from(mam_id.0).unwrap_or(i64::MAX);
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO books (mam_id) VALUES (?) ON CONFLICT(mam_id) DO UPDATE SET mam_id = excluded.mam_id",
-        mam
     )
+    .bind(mam)
     .execute(pool.inner())
     .await?;
-    let id = sqlx::query_scalar!("SELECT id FROM books WHERE mam_id = ?", mam)
+    let id = sqlx::query_scalar::<_, i64>("SELECT id FROM books WHERE mam_id = ?")
+        .bind(mam)
         .fetch_one(pool.inner())
         .await?;
-    // id is INTEGER PRIMARY KEY AUTOINCREMENT — never null after successful INSERT
-    Ok(id.expect("book id is always set after upsert"))
+    Ok(id)
 }
 
 /// Returns all books ordered by creation time descending.
@@ -29,23 +27,21 @@ pub async fn upsert(pool: &DbPool, mam_id: MamTorrentId) -> Result<i64, DbError>
 /// # Errors
 /// Returns `DbError` if the database query fails.
 ///
-/// # Panics
-/// Panics if the `id` column is NULL — impossible for `INTEGER PRIMARY KEY`.
 pub async fn get_all(pool: &DbPool) -> Result<Vec<BookRow>, DbError> {
-    let rows = sqlx::query!(
-        "SELECT id, mam_id, title, author, status, created_at FROM books ORDER BY created_at DESC"
+    let rows = sqlx::query(
+        "SELECT id, mam_id, title, author, status, created_at FROM books ORDER BY created_at DESC",
     )
     .fetch_all(pool.inner())
     .await?;
     Ok(rows
         .into_iter()
         .map(|r| BookRow {
-            id: r.id,
-            mam_id: r.mam_id,
-            title: r.title,
-            author: r.author,
-            status: r.status,
-            created_at: r.created_at,
+            id: r.get("id"),
+            mam_id: r.get("mam_id"),
+            title: r.get("title"),
+            author: r.get("author"),
+            status: r.get("status"),
+            created_at: r.get("created_at"),
         })
         .collect())
 }
@@ -54,27 +50,24 @@ pub async fn get_all(pool: &DbPool) -> Result<Vec<BookRow>, DbError> {
 /// # Errors
 /// Returns `DbError` if the database query fails.
 ///
-/// # Panics
-/// Panics if the `id` column is NULL — impossible for `INTEGER PRIMARY KEY`.
 pub async fn get_by_mam_id(
     pool: &DbPool,
     mam_id: MamTorrentId,
 ) -> Result<Option<BookRow>, DbError> {
     let id = i64::try_from(mam_id.0).unwrap_or(i64::MAX);
-    let row = sqlx::query!(
+    let row = sqlx::query(
         "SELECT id, mam_id, title, author, status, created_at FROM books WHERE mam_id = ?",
-        id
     )
+    .bind(id)
     .fetch_optional(pool.inner())
     .await?;
     Ok(row.map(|r| BookRow {
-        // id is INTEGER PRIMARY KEY — never null when a row exists
-        id: r.id.expect("book id is always non-null"),
-        mam_id: r.mam_id,
-        title: r.title,
-        author: r.author,
-        status: r.status,
-        created_at: r.created_at,
+        id: r.get("id"),
+        mam_id: r.get("mam_id"),
+        title: r.get("title"),
+        author: r.get("author"),
+        status: r.get("status"),
+        created_at: r.get("created_at"),
     }))
 }
 

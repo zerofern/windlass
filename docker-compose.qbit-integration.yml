@@ -5,13 +5,12 @@
 
 services:
   qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
+    build:
+      context: ./windlass-clients/tests/qbit-image
     environment:
       PUID: "1000"
       PGID: "1000"
       WEBUI_PORT: "8080"
-      QBITTORRENT__WebUI__Username: admin
-      QBITTORRENT__WebUI__Password: adminadmin
     ports:
       - "18090:8080"
     healthcheck:

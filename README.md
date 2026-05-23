@@ -12,10 +12,10 @@ automatically, so a VPN reconnect or IP change requires no manual intervention.
   port so you stay connectable on the tracker
 - **Container health monitoring** — detects when Gluetun dies or becomes
   unhealthy, dumps logs, restarts dependent containers when the tunnel recovers
-- **New torrent alerts** — sends a Gotify notification when new torrents appear
-  in qBittorrent
-- **Low disk space alerts** — sends a Gotify notification when available space
-  drops below the configured threshold
+- **New torrent alerts** — records an alert when new torrents appear in
+  qBittorrent
+- **Low disk space alerts** — records an alert when available space drops below
+  the configured threshold
 - **Crash log dumps** — collects container logs to disk on unhealthy events for
   post-mortem inspection
 - **Web UI** — embedded dashboard served at `:5010` showing live operator state
@@ -62,7 +62,6 @@ The stack includes:
 | ------------------ | ------------------------------------- | ---------------- |
 | `mock-gluetun`     | Writes VPN IP/port files; control API | `:9001`          |
 | `mock-qbittorrent` | WireMock stub for qBit API            | `:18080` (admin) |
-| `mock-gotify`      | WireMock stub for Gotify              | `:18081` (admin) |
 | `mock-mam`         | WireMock stub for MAM                 | `:18082` (admin) |
 | `chaos-controller` | Named scenario API                    | `:9000`          |
 | `windlass`         | Built from source                     | `:5010`          |
@@ -114,8 +113,6 @@ Windlass is configured entirely via environment variables.
 | `QBITTORRENT_USER`  | ✓        | —                             | qBittorrent WebUI username          |
 | `QBITTORRENT_PASS`  | ✓        | —                             | qBittorrent WebUI password          |
 | `MAM_SESSION`       | ✓        | —                             | MyAnonamouse session cookie value   |
-| `GOTIFY_URL`        | ✓        | —                             | Gotify server base URL              |
-| `GOTIFY_TOKEN`      | ✓        | —                             | Gotify application token            |
 | `GLUETUN_PROXY_URL` |          | —                             | Gluetun HTTP proxy for MAM traffic  |
 | `MAM_USER_AGENT`    |          | `windlass`                    | User-Agent sent to MAM              |
 | `DATA_PATH`         |          | `/mnt/Data`                   | Path to monitor for disk space      |
@@ -141,8 +138,6 @@ windlass:
     - QBITTORRENT_USER=admin
     - QBITTORRENT_PASS=changeme
     - MAM_SESSION=your_session_cookie
-    - GOTIFY_URL=https://gotify.example.com
-    - GOTIFY_TOKEN=your_token
     - GLUETUN_PROXY_URL=http://localhost:8888
   restart: unless-stopped
   depends_on:

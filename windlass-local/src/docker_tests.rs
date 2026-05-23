@@ -8,6 +8,20 @@ fn test_client() -> DockerClient {
     DockerClient::connect("/tmp".into()).expect("Docker socket unavailable")
 }
 
+async fn ensure_test_image(docker: &bollard::Docker) {
+    use bollard::image::CreateImageOptions;
+    use futures_util::StreamExt;
+
+    let options = CreateImageOptions {
+        from_image: "alpine:latest".to_string(),
+        ..Default::default()
+    };
+    let mut stream = docker.create_image(Some(options), None, None);
+    while let Some(result) = stream.next().await {
+        result.expect("pull alpine:latest");
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Docker socket"]
 async fn docker_is_container_healthy_returns_false_for_nonexistent() {
@@ -31,6 +45,8 @@ async fn docker_discover_dependents_finds_containers_in_network_mode() {
     let docker = &client.inner.clone();
     let anchor = "windlass_test_anchor";
     let dependent = "windlass_test_dep";
+
+    ensure_test_image(docker).await;
 
     for name in [anchor, dependent] {
         let _ = docker
@@ -121,6 +137,8 @@ async fn docker_fetch_and_dump_logs_creates_log_file() {
     let docker = &base_client.inner.clone();
     let container_name = "windlass_test_logs";
     let dump_dir = tempfile::TempDir::new().unwrap();
+
+    ensure_test_image(docker).await;
 
     let _ = docker
         .remove_container(

@@ -1,4 +1,5 @@
 use crate::{DbError, DbPool, TorrentRow};
+use sqlx::Row;
 
 /// Inserts or updates a torrent record keyed by `hash`.
 ///
@@ -8,8 +9,8 @@ use crate::{DbError, DbPool, TorrentRow};
 /// # Errors
 /// Returns `DbError` if the database query fails.
 pub async fn upsert(pool: &DbPool, r: &TorrentRow) -> Result<(), DbError> {
-    sqlx::query!(
-        r#"INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,
+    sqlx::query(
+        r"INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,
            downloaded_bytes, seen_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(hash) DO UPDATE SET
@@ -19,16 +20,16 @@ pub async fn upsert(pool: &DbPool, r: &TorrentRow) -> Result<(), DbError> {
              state = excluded.state,
              seeding_time_secs = excluded.seeding_time_secs,
              downloaded_bytes = excluded.downloaded_bytes,
-             seen_at = excluded.seen_at"#,
-        r.hash,
-        r.book_id,
-        r.mam_id,
-        r.name,
-        r.state,
-        r.seeding_time_secs,
-        r.downloaded_bytes,
-        r.seen_at
+             seen_at = excluded.seen_at",
     )
+    .bind(&r.hash)
+    .bind(r.book_id)
+    .bind(r.mam_id)
+    .bind(&r.name)
+    .bind(&r.state)
+    .bind(r.seeding_time_secs)
+    .bind(r.downloaded_bytes)
+    .bind(&r.seen_at)
     .execute(pool.inner())
     .await?;
     Ok(())
@@ -39,27 +40,25 @@ pub async fn upsert(pool: &DbPool, r: &TorrentRow) -> Result<(), DbError> {
 /// # Errors
 /// Returns `DbError` if the database query fails.
 ///
-/// # Panics
-/// Panics if the `hash` column is NULL — impossible for `TEXT PRIMARY KEY`.
 pub async fn get_all(pool: &DbPool) -> Result<Vec<TorrentRow>, DbError> {
-    let rows = sqlx::query!(
+    let rows = sqlx::query(
         "SELECT hash, book_id, mam_id, name, state, seeding_time_secs,
-         downloaded_bytes, seen_at, added_at FROM torrents ORDER BY added_at DESC"
+         downloaded_bytes, seen_at, added_at FROM torrents ORDER BY added_at DESC",
     )
     .fetch_all(pool.inner())
     .await?;
     Ok(rows
         .into_iter()
         .map(|r| TorrentRow {
-            hash: r.hash.expect("hash TEXT PRIMARY KEY is never null"),
-            book_id: r.book_id,
-            mam_id: r.mam_id,
-            name: r.name,
-            state: r.state,
-            seeding_time_secs: r.seeding_time_secs,
-            downloaded_bytes: r.downloaded_bytes,
-            seen_at: r.seen_at,
-            added_at: r.added_at,
+            hash: r.get("hash"),
+            book_id: r.get("book_id"),
+            mam_id: r.get("mam_id"),
+            name: r.get("name"),
+            state: r.get("state"),
+            seeding_time_secs: r.get("seeding_time_secs"),
+            downloaded_bytes: r.get("downloaded_bytes"),
+            seen_at: r.get("seen_at"),
+            added_at: r.get("added_at"),
         })
         .collect())
 }

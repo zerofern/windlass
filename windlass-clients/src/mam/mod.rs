@@ -191,8 +191,7 @@ impl MamClient {
                             .ip
                             .trim()
                             .parse()
-                            .map(VpnIp)
-                            .unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
+                            .map_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED), VpnIp);
                         warn!("MAM ASN mismatch: ip={}", ip.0);
                         (Event::MamAsnMismatch { at: Utc::now(), ip }, new_session)
                     }

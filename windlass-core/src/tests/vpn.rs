@@ -16,7 +16,7 @@ fn unexpected_vpn_death_dumps_logs() {
     assert!(outcome.state_changed);
     assert_eq!(state.vpn, VpnState::DumpingLogs);
     assert!(
-        actionsb
+        actions
             .iter()
             .any(|a| matches!(a, Action::FetchAndDumpAllLogs))
     );

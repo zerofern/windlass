@@ -207,6 +207,15 @@ impl DebugController {
         // Swap intake routing to the VecDeque path.
         self.queue_sink
             .store(Arc::new(QueueSink::Queue(self.stored_tx.clone())));
+        let current = self.snapshot.load_full();
+        let seq = current.seq + 1;
+        let enabled_state = Arc::new(DebugState {
+            seq,
+            debug_mode: true,
+            ..(*current).clone()
+        });
+        self.snapshot.store(enabled_state);
+        let _ = self.notify_tx.send(seq);
     }
 
     pub fn disable_debug(&self) {
@@ -234,6 +243,19 @@ impl DebugController {
             ..(*current).clone()
         });
         self.snapshot.store(final_state);
+        let _ = self.notify_tx.send(seq);
+    }
+
+    pub fn update_latest_state(&self, latest_state: SystemState) {
+        let current = self.snapshot.load_full();
+        let seq = current.seq + 1;
+        let updated_state = Arc::new(DebugState {
+            seq,
+            debug_mode: self.is_debug_mode(),
+            latest_state,
+            ..(*current).clone()
+        });
+        self.snapshot.store(updated_state);
         let _ = self.notify_tx.send(seq);
     }
 

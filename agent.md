@@ -2,7 +2,7 @@
 
 Windlass is a Rust operator that manages a Gluetun VPN stack: it syncs the
 forwarded port to qBittorrent, updates the MAM seedbox record, monitors
-container health, and sends Gotify alerts.
+container health, and records user-facing alerts.
 
 ## Architecture: Sans I/O / Functional Core Imperative Shell
 

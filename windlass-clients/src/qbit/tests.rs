@@ -36,6 +36,57 @@ async fn authenticate_success_extracts_sid_cookie() {
 }
 
 #[tokio::test]
+async fn authenticate_success_accepts_204_with_sid_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/auth/login"))
+        .respond_with(
+            ResponseTemplate::new(204).append_header("Set-Cookie", "SID=abc123; Path=/; HttpOnly"),
+        )
+        .mount(&server)
+        .await;
+
+    let qbit = QbitClient::new(
+        reqwest::Client::new(),
+        server.uri(),
+        "admin".into(),
+        "password".into(),
+        Arc::new(|_| {}),
+    );
+    let event = qbit.authenticate().await;
+    assert!(
+        matches!(&event, Event::QbitAuthSuccess { cookie: AuthCookie(s), .. } if s == "abc123"),
+        "Expected QbitAuthSuccess(abc123), got {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn authenticate_success_extracts_qbt_sid_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/auth/login"))
+        .respond_with(
+            ResponseTemplate::new(204)
+                .append_header("Set-Cookie", "QBT_SID_8080=abc123; Path=/; HttpOnly"),
+        )
+        .mount(&server)
+        .await;
+
+    let qbit = QbitClient::new(
+        reqwest::Client::new(),
+        server.uri(),
+        "admin".into(),
+        "password".into(),
+        Arc::new(|_| {}),
+    );
+    let event = qbit.authenticate().await;
+    assert!(
+        matches!(&event, Event::QbitAuthSuccess { cookie: AuthCookie(s), .. } if s == "abc123"),
+        "Expected QbitAuthSuccess(abc123), got {event:?}"
+    );
+}
+
+#[tokio::test]
 async fn authenticate_ok_body_without_sid_cookie_returns_auth_failed() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -337,7 +388,9 @@ async fn list_torrent_details_maps_all_state_strings() {
         ("stalledUP", QbitTorrentState::StalledUploading),
         ("forcedUP", QbitTorrentState::ForcedUpload),
         ("pausedDL", QbitTorrentState::PausedDownloading),
+        ("stoppedDL", QbitTorrentState::PausedDownloading),
         ("pausedUP", QbitTorrentState::PausedUploading),
+        ("stoppedUP", QbitTorrentState::PausedUploading),
         ("error", QbitTorrentState::Error),
     ];
     for (state_str, expected) in &states {
@@ -494,7 +547,7 @@ async fn add_torrent_returns_none_on_error_response() {
 async fn pause_torrent_posts_correct_form() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/v2/torrents/pause"))
+        .and(path("/api/v2/torrents/stop"))
         .and(wiremock::matchers::body_string_contains("hashes=abc123"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
@@ -534,7 +587,7 @@ async fn pause_torrent_does_not_panic_on_network_error() {
 async fn resume_torrent_posts_correct_form() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/v2/torrents/resume"))
+        .and(path("/api/v2/torrents/start"))
         .and(wiremock::matchers::body_string_contains("hashes=abc123"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)

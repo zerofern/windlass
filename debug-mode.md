@@ -89,7 +89,7 @@ While debug mode is active the user has full visibility into:
 - **System state snapshot** — the current `SystemState` as formatted JSON, updated
   after each event is processed.
 - **HTTP request/response detail** — full request and response bodies for every
-  outbound call made by `QbitClient`, `MamClient`, and `GotifyClient`. Emitted as
+  outbound call made by `QbitClient` and `MamClient`. Emitted as
   `Observation::HttpExchange` on the SSE stream only while debug mode is active.
 - **Active breakpoints** — which event and action variants are currently breakpointed.
 
@@ -178,7 +178,7 @@ blocked.
 
 ## HTTP Observation Detail
 
-Each HTTP client (`QbitClient`, `MamClient`, `GotifyClient`) receives an
+Each HTTP client (`QbitClient`, `MamClient`) receives an
 `on_http: HttpObserver` (i.e. `Arc<dyn Fn(Observation) + Send + Sync>`) callback at
 construction. It is called unconditionally after every HTTP response. The callback
 implementation in `windlass-debug` routes the observation to the SSE channel when debug

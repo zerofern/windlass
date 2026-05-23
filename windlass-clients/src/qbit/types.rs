@@ -37,8 +37,8 @@ impl From<&str> for QbitTorrentState {
             "uploading" => Self::Uploading,
             "stalledUP" => Self::StalledUploading,
             "forcedUP" => Self::ForcedUpload,
-            "pausedDL" => Self::PausedDownloading,
-            "pausedUP" => Self::PausedUploading,
+            "pausedDL" | "stoppedDL" => Self::PausedDownloading,
+            "pausedUP" | "stoppedUP" => Self::PausedUploading,
             "error" => Self::Error,
             other => Self::Other(other.to_owned()),
         }
@@ -171,7 +171,15 @@ mod tests {
             QbitTorrentState::PausedDownloading
         );
         assert_eq!(
+            QbitTorrentState::from("stoppedDL"),
+            QbitTorrentState::PausedDownloading
+        );
+        assert_eq!(
             QbitTorrentState::from("pausedUP"),
+            QbitTorrentState::PausedUploading
+        );
+        assert_eq!(
+            QbitTorrentState::from("stoppedUP"),
             QbitTorrentState::PausedUploading
         );
         assert_eq!(QbitTorrentState::from("error"), QbitTorrentState::Error);

@@ -126,6 +126,7 @@ impl DockerClient {
     pub fn spawn_event_watcher(&self, tx: mpsc::Sender<Event>) {
         let docker = self.inner.clone();
         let anchor = self.gluetun_anchor.clone();
+        spawn_health_poll_watcher(docker.clone(), anchor.clone(), tx.clone());
         tokio::spawn(async move {
             loop {
                 let mut stream = docker.events(None::<bollard::system::EventsOptions<String>>);
@@ -155,7 +156,9 @@ impl DockerClient {
                             let action = msg.action.as_deref().unwrap_or("");
                             let event = if action.starts_with("health_status: healthy") {
                                 Event::DockerGluetunHealthy { at: Utc::now() }
-                            } else if action == "die" {
+                            } else if action.starts_with("health_status: unhealthy")
+                                || action == "die"
+                            {
                                 Event::DockerGluetunDied { at: Utc::now() }
                             } else {
                                 continue;
@@ -227,8 +230,7 @@ impl DockerClient {
     pub async fn fetch_and_dump_logs(&self, dependents: &[String]) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         if let Err(e) = tokio::fs::create_dir_all(&self.dump_dir).await {
             warn!("Could not create dump dir {}: {e}", self.dump_dir);
@@ -262,6 +264,35 @@ impl DockerClient {
             }
         }
     }
+}
+
+fn spawn_health_poll_watcher(docker: Docker, anchor: String, tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        let mut last_healthy: Option<bool> = None;
+        loop {
+            let healthy = docker
+                .inspect_container(&anchor, None)
+                .await
+                .ok()
+                .and_then(|info| info.state)
+                .and_then(|state| state.health)
+                .and_then(|health| health.status)
+                == Some(HealthStatusEnum::HEALTHY);
+
+            let event = match last_healthy.replace(healthy) {
+                Some(true) if !healthy => Some(Event::DockerGluetunDied { at: Utc::now() }),
+                Some(false) if healthy => Some(Event::DockerGluetunHealthy { at: Utc::now() }),
+                _ => None,
+            };
+            if let Some(event) = event
+                && tx.send(event).await.is_err()
+            {
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
 }
 
 #[cfg(test)]

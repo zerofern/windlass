@@ -25,9 +25,9 @@ windlass/                   workspace root
   windlass-core/            pure state machine (current src/core/)
   windlass-local/           local system ops: DockerClient, vpn_files, monitors
                             (current src/shell/docker.rs, vpn_files.rs, monitors.rs)
-  windlass-clients/         outbound HTTP clients: QbitClient, MamClient, GotifyClient
+  windlass-clients/         outbound HTTP clients: QbitClient, MamClient
                             modules within; future: ABS, Audnexus, LLM
-                            (current src/shell/qbit.rs, mam.rs, gotify.rs)
+                            (current qbit/ and mam/ modules)
   windlass-web/             axum server, SSE, API route handlers, rust-embed of frontend
   windlass/                 binary — config, ShellContext, event loop, wires everything
 
@@ -54,17 +54,15 @@ All API routes under `/api/v1/`. Route handlers are modular axum sub-routers com
 in `windlass-web`. Adding `/api/v2/` later or adding new feature areas
 (e.g. `/api/v1/library/`, `/api/v1/ai/`) is additive and non-breaking.
 
-### 3. Alert IDs and Gotify deep links
+### 3. Alert IDs and notification deep links
 
-A nice-to-have, not a hard architectural constraint — can be added when the alerts
-history page is built (and when a database is introduced).
+Alerts are persisted before any external notification dispatch. The alert history
+page can deep-link to a specific alert once stable alert IDs are introduced.
 
-When it is implemented: every alert is persisted before being sent to Gotify.
-The notification body includes `https://<WINDLASS_HOST>/alerts/{id}`. Tapping it on
+When notification dispatch is implemented, the notification body includes
+`https://<WINDLASS_HOST>/alerts/{id}`. Tapping it on
 your phone opens the alert detail page showing the event that triggered it and the
 system state at that moment — useful hours after the fact when the system has moved on.
-
-Until then, Gotify notifications can omit the URL or link to `/`.
 
 ## Protocol
 
@@ -114,7 +112,7 @@ In development, Vite proxies `/api/` to the running Rust backend.
 | `/queue`      | Download queue, drag-and-drop prioritisation |
 | `/library`    | Ratings, series, ABS sync status             |
 | `/alerts`     | Alert history                                |
-| `/alerts/:id` | Alert detail page (Gotify deep link target)  |
+| `/alerts/:id` | Alert detail page                            |
 | `/ai`         | AI recommendations, approve/reject           |
 | `/calendar`   | Upcoming series releases                     |
 | `/settings`   | Configuration, custom format rules           |
@@ -240,7 +238,7 @@ is in the breakpoints set. Same logic for actions. This means breakpoints work
 independently of full debug mode — set a breakpoint on `QbitAuthFailed` and the
 system runs normally until that specific event arrives.
 
-**Shell HTTP logging:** `QbitClient`, `MamClient`, `GotifyClient` each hold an
+**Shell HTTP logging:** `QbitClient` and `MamClient` each hold an
 `Option<broadcast::Sender<Observation>>` — `None` in normal mode (zero overhead).
 When debug mode is active, HTTP request/response details are forwarded to the SSE
 stream as `HttpExchange` observations.
@@ -303,7 +301,7 @@ split by area (vpn, qbit, mam, monitoring) if it exceeds 300 lines.
 
 ## Pre-requisite refactor: HTTP client structs
 
-Before Tier 1, refactor `qbit.rs`, `mam.rs`, `gotify.rs` to match the `DockerClient`
+Before Tier 1, refactor qBit and MAM clients to match the `DockerClient`
 pattern. Each becomes a struct holding its `reqwest::Client`, URL, credentials, and
 (for MAM) the rotating session cookie:
 
@@ -311,10 +309,9 @@ pattern. Each becomes a struct holding its `reqwest::Client`, URL, credentials, 
 - **`MamClient`** — `reqwest::Client` (VPN-routed), `seedbox_url`, `load_url`,
   `Arc<Mutex<String>>` for rotating session (currently floating in `run()`).
   Lives in `mam/` subdirectory (not flat `mam.rs`) to accommodate future growth.
-- **`GotifyClient`** — `reqwest::Client` (direct), `url`, `token`
 
 `ShellContext` loses `config`, `direct`, `vpn`, and `mam_session` — replaced by the
-three client structs. This also provides the natural hook for attaching the optional
+client structs. This also provides the natural hook for attaching the optional
 debug observer channel to each client.
 
 ---
@@ -343,7 +340,7 @@ crates/
   windlass-types/src/lib.rs    Event, Action, SystemState, Observation (serde derives)
   windlass-core/src/           process_event state machine (current src/core/)
   windlass-local/src/          docker.rs, vpn_files.rs, monitors.rs
-  windlass-clients/src/        qbit.rs, mam/, gotify.rs (modules within)
+  windlass-clients/src/        qbit/, mam/ (modules within)
                                mam/ is a subdirectory to accommodate future growth
                                (search, stats, ratio, HnR tracking, series lookups)
   windlass-web/src/

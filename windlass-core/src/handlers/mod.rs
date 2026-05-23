@@ -13,9 +13,9 @@ pub use monitoring::{on_disk_space_observed, on_mam_rate_limit_violation};
 pub use vpn::on_port_file_read_err;
 
 const QBIT_SYNC_RETRY_LIMIT: RetryCount = RetryCount(3);
-const HEARTBEAT_INTERVAL: Interval = Interval(Duration::from_secs(45 * 60));
-const DISK_CHECK_INTERVAL: Interval = Interval(Duration::from_secs(6 * 60 * 60));
-const TORRENT_CHECK_INTERVAL: Interval = Interval(Duration::from_secs(5 * 60));
+const HEARTBEAT_INTERVAL: Interval = Interval(Duration::from_mins(45));
+const DISK_CHECK_INTERVAL: Interval = Interval(Duration::from_hours(6));
+const TORRENT_CHECK_INTERVAL: Interval = Interval(Duration::from_mins(5));
 const PORT_READ_RETRY_DELAY: Backoff = Backoff(Duration::from_millis(500));
 const QBIT_AUTH_BACKOFF_BASE: Backoff = Backoff(Duration::from_secs(2));
 const QBIT_SYNC_BACKOFF: Backoff = Backoff(Duration::from_secs(2));

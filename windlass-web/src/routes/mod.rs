@@ -1,11 +1,11 @@
 use crate::AppState;
 use axum::Router;
 
+mod activity_log;
 mod alerts;
 mod debug;
 mod download;
 mod download_queue;
-mod activity_log;
 mod health;
 mod stream;
 mod torrents;

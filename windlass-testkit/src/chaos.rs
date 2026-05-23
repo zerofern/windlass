@@ -39,6 +39,22 @@ impl GluetunClient {
         Ok(())
     }
 
+    pub async fn set_with_retries(&self, ip: &str, port: u16, attempts: u8) -> anyhow::Result<()> {
+        for attempt in 1..=attempts {
+            match self.set(ip, port).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt == attempts => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        "Gluetun set failed on attempt {attempt}/{attempts}: {e}; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn clear_port(&self) -> anyhow::Result<()> {
         self.client
             .post(format!("{}/clear-port", self.base))
@@ -135,7 +151,13 @@ async fn active_handler(State(s): State<Arc<ChaosState>>) -> Json<Value> {
 async fn reset_handler(State(s): State<Arc<ChaosState>>) -> StatusCode {
     match apply_happy_path(&s).await {
         Ok(()) => {
+            let defaults = VpnFileState::default();
+            if let Err(e) = s.gluetun.set(&defaults.ip, defaults.port).await {
+                tracing::error!("Chaos reset failed to restore VPN files: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
             s.active.write().await.clear();
+            *s.vpn.write().await = defaults;
             tracing::info!("Chaos: reset to happy-path");
             StatusCode::OK
         }
@@ -268,7 +290,7 @@ async fn gluetun_health_up_handler(State(s): State<Arc<ChaosState>>) -> (StatusC
         let vpn = s.vpn.read().await;
         (vpn.ip.clone(), vpn.port)
     };
-    match s.gluetun.set(&ip, port).await {
+    match s.gluetun.set_with_retries(&ip, port, 10).await {
         Ok(()) => {
             s.vpn.write().await.healthy = true;
             tracing::info!("Chaos/gluetun: port file restored (health → up) ip={ip} port={port}");

@@ -93,6 +93,9 @@ pub async fn run(
             let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(Box::new(
                 state.clone(),
             )));
+            if !debug_ctrl.is_debug_mode() {
+                debug_ctrl.update_latest_state(state.clone());
+            }
         }
 
         let mut ctx = ShellContext {

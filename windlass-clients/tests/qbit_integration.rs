@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use windlass_clients::qbit::QbitClient;
-use windlass_types::MamTorrentId;
+use windlass_types::{AuthCookie, MamTorrentId};
 
 const QBIT_URL: &str = "http://localhost:18090";
 const TORRENT_FIXTURE: &[u8] = include_bytes!("fixtures/test.torrent");
@@ -22,6 +22,24 @@ fn make_client() -> QbitClient {
         "adminadmin".to_owned(),
         Arc::new(|_| {}),
     )
+}
+
+async fn authenticated_clean_client() -> (QbitClient, AuthCookie) {
+    let client = make_client();
+    let event = client.authenticate().await;
+    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
+        panic!("auth failed");
+    };
+    clear_torrents(&client, &cookie).await;
+    (client, cookie)
+}
+
+async fn clear_torrents(client: &QbitClient, cookie: &AuthCookie) {
+    let details = client.list_torrent_details(cookie).await;
+    for torrent in details {
+        client.delete_torrent(cookie, &torrent.hash).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
 #[tokio::test]
@@ -38,11 +56,7 @@ async fn authenticate_succeeds() {
 #[tokio::test]
 #[ignore = "requires qbit integration stack"]
 async fn list_torrent_details_empty_on_fresh_qbit() {
-    let client = make_client();
-    let event = client.authenticate().await;
-    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
-        panic!("auth failed");
-    };
+    let (client, cookie) = authenticated_clean_client().await;
     let details = client.list_torrent_details(&cookie).await;
     assert!(details.is_empty(), "expected empty list on fresh qBit");
 }
@@ -50,11 +64,7 @@ async fn list_torrent_details_empty_on_fresh_qbit() {
 #[tokio::test]
 #[ignore = "requires qbit integration stack"]
 async fn add_torrent_then_list_returns_record_with_mam_id() {
-    let client = make_client();
-    let event = client.authenticate().await;
-    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
-        panic!("auth failed");
-    };
+    let (client, cookie) = authenticated_clean_client().await;
 
     // add_torrent is now async and real — await the result.
     let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
@@ -80,11 +90,7 @@ async fn add_torrent_then_list_returns_record_with_mam_id() {
 #[tokio::test]
 #[ignore = "requires qbit integration stack"]
 async fn get_preferences_returns_non_zero_limits() {
-    let client = make_client();
-    let event = client.authenticate().await;
-    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
-        panic!("auth failed");
-    };
+    let (client, cookie) = authenticated_clean_client().await;
     let prefs = client.get_preferences(&cookie).await;
     assert!(prefs.is_some(), "expected Some preferences");
     let p = prefs.unwrap();
@@ -94,11 +100,7 @@ async fn get_preferences_returns_non_zero_limits() {
 #[tokio::test]
 #[ignore = "requires qbit integration stack"]
 async fn pause_then_resume_torrent() {
-    let client = make_client();
-    let event = client.authenticate().await;
-    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
-        panic!("auth failed");
-    };
+    let (client, cookie) = authenticated_clean_client().await;
 
     let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
     let Some(hash) = hash else {
@@ -130,11 +132,7 @@ async fn pause_then_resume_torrent() {
 #[tokio::test]
 #[ignore = "requires qbit integration stack"]
 async fn set_all_files_priority_succeeds() {
-    let client = make_client();
-    let event = client.authenticate().await;
-    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
-        panic!("auth failed");
-    };
+    let (client, cookie) = authenticated_clean_client().await;
 
     let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
     let Some(hash) = hash else {
@@ -149,11 +147,7 @@ async fn set_all_files_priority_succeeds() {
 #[tokio::test]
 #[ignore = "requires qbit integration stack"]
 async fn delete_torrent_removes_it_from_list() {
-    let client = make_client();
-    let event = client.authenticate().await;
-    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
-        panic!("auth failed");
-    };
+    let (client, cookie) = authenticated_clean_client().await;
 
     let hash = client.add_torrent(&cookie, TORRENT_FIXTURE.to_vec()).await;
     let Some(hash) = hash else {

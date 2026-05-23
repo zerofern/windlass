@@ -1,7 +1,7 @@
 use super::helpers::*;
 use crate::actions::Action;
 use crate::torrent::{TorrentRecord, TorrentState};
-use crate::types::{QbitState, SystemState};
+use crate::types::QbitState;
 use chrono::Utc;
 use windlass_types::{AlertPriority, MamTorrentId, TorrentHash, TorrentName, WakeupId};
 
@@ -30,7 +30,13 @@ fn make_torrent(
 #[test]
 fn new_torrent_emits_set_all_files_priority() {
     let mut state = connected_state();
-    let torrents = vec![make_torrent("abc", TorrentState::Uploading, 100, 1024, None)];
+    let torrents = vec![make_torrent(
+        "abc",
+        TorrentState::Uploading,
+        100,
+        1024,
+        None,
+    )];
     let actions = state.on_qbit_torrent_details_received(torrents);
     assert!(
         actions
@@ -67,9 +73,11 @@ fn stalled_zero_bytes_emits_delete_and_blacklist() {
             .iter()
             .any(|a| matches!(a, Action::BlacklistMamId(m) if m.0 == 99))
     );
-    assert!(actions.iter().any(
-        |a| matches!(a, Action::WriteActivity { action, .. } if action == "torrent_deleted")
-    ));
+    assert!(
+        actions.iter().any(
+            |a| matches!(a, Action::WriteActivity { action, .. } if action == "torrent_deleted")
+        )
+    );
 }
 
 #[test]
@@ -153,11 +161,13 @@ fn active_limit_emits_torrent_paused_activity() {
         make_torrent("parked", TorrentState::PausedUploading, 3600, 1024, None),
     ];
     let actions = state.on_qbit_torrent_details_received(torrents);
-    assert!(actions.iter().any(
-        |a| matches!(a, Action::WriteActivity { action, detail, .. }
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::WriteActivity { action, detail, .. }
             if action == "torrent_paused"
-            && detail.as_deref().map_or(false, |d| d.contains("active2")))
-    ));
+            && detail.as_deref().map_or(false, |d| d.contains("active2"))))
+    );
 }
 
 #[test]
@@ -170,11 +180,13 @@ fn active_limit_emits_torrent_resumed_activity() {
         make_torrent("parked", TorrentState::PausedUploading, 3600, 1024, None),
     ];
     let actions = state.on_qbit_torrent_details_received(torrents);
-    assert!(actions.iter().any(
-        |a| matches!(a, Action::WriteActivity { action, detail, .. }
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::WriteActivity { action, detail, .. }
             if action == "torrent_resumed"
-            && detail.as_deref().map_or(false, |d| d.contains("parked")))
-    ));
+            && detail.as_deref().map_or(false, |d| d.contains("parked"))))
+    );
 }
 
 #[test]

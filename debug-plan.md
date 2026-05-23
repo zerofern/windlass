@@ -221,7 +221,7 @@ To link "AuthenticateQbit caused QbitAuthSuccess", HTTP-result action handlers u
 `CausalTx` instead of `self.tx`.
 
 **Not used for:** `ScheduleWakeup`, `StopDependentContainers`, `StartDependentContainers`,
-`RestartGluetun`, `SendGotifyAlert` (fire-and-forget or timer-based; WakeupId is the
+`RestartGluetun`, `SendAlert` (fire-and-forget or timer-based; WakeupId is the
 implicit link for wakeups).
 
 **Used for:** `ReadPortFiles`, `FetchAndDumpAllLogs`, `AuthenticateQbit`, `SyncQbitPort`,
@@ -389,7 +389,7 @@ pub enum Observation {
 │ ● PROCESSING: QbitAuthSuccess         │  │                                   │
 │   ├─ ✓ ScheduleWakeup(Heartbeat)     │  │ State diff                        │
 │   ├─ ⟳ UpdateMam (1.2s running)      │  │ - mam: Authenticating             │
-│   └─ ✓ SendGotifyAlert              │  │ + mam: Connected                  │
+│   └─ ✓ SendAlert                    │  │ + mam: Connected                  │
 │                                       │  │                                   │
 │ ▼ QUEUE (2 waiting)                   │  │ Actions                           │
 │   [Wakeup(DiskCheck)]  [preview][edit][×]│ AuthenticateQbit                 │

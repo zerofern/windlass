@@ -220,11 +220,9 @@ mod tests {
         assert!(actions.iter().any(
             |a| matches!(a, Action::SendAlert { priority, .. } if *priority == AlertPriority::Info)
         ));
-        assert!(
-            actions.iter().any(
-                |a| matches!(a, Action::WriteActivity { action, .. } if action == "torrent_added")
-            )
-        );
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::WriteActivity { action, .. } if action == "torrent_added")
+        ));
         assert!(
             actions
                 .iter()

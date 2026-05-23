@@ -110,9 +110,14 @@ impl ShellContext<'_> {
     ) {
         let pool = self.db_pool.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                windlass_db::activity_log::insert(&pool, &source, &action, book_id, detail.as_deref())
-                    .await
+            if let Err(e) = windlass_db::activity_log::insert(
+                &pool,
+                &source,
+                &action,
+                book_id,
+                detail.as_deref(),
+            )
+            .await
             {
                 tracing::warn!("Failed to write activity {action}: {e}");
             }
