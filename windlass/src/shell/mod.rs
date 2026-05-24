@@ -16,6 +16,8 @@ use tracing::debug;
 use windlass_clients::{mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
 use windlass_db::DbPool;
+use windlass_db::actor::PostgresDbActor;
+use windlass_db_core::{DbCommand, DbEvent};
 use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory};
 use windlass_local::docker;
 use windlass_types::WakeupId;
@@ -90,7 +92,9 @@ pub async fn run(
 
         debug!(?event, "←");
 
-        shadow_cores.observe(&event);
+        for command in shadow_cores.observe(&event) {
+            dispatch_shadow_db_command(&db_pool, command);
+        }
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {
             let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(Box::new(
@@ -129,6 +133,20 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn dispatch_shadow_db_command(db_pool: &DbPool, command: DbCommand) {
+    let actor = PostgresDbActor::new(db_pool.clone());
+    tokio::spawn(async move {
+        let event = actor.handle(command).await;
+        if let DbEvent::Failed(error) = event {
+            tracing::warn!(
+                operation = %error.operation,
+                "Shadow domain DB command failed: {}",
+                error.message
+            );
+        }
+    });
 }
 
 fn drain_channels(
