@@ -131,7 +131,8 @@ mod tests {
     pub async fn test_pool() -> DbPool {
         let admin_url = std::env::var("DATABASE_URL").expect("DATABASE_URL required for DB tests");
         let schema = format!(
-            "windlass_test_{}",
+            "windlass_test_{}_{}",
+            std::process::id(),
             TEST_SCHEMA_ID.fetch_add(1, Ordering::Relaxed)
         );
         let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();

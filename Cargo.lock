@@ -3340,6 +3340,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-vpn-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "windlass-machine",
+ "windlass-types",
+]
+
+[[package]]
 name = "windlass-web"
 version = "0.1.0"
 dependencies = [

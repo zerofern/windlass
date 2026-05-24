@@ -6,6 +6,7 @@ members = [
     "windlass-core",
     "windlass-debug",
     "windlass-db-core",
+    "windlass-vpn-core",
     "windlass-local",
     "windlass-clients",
     "windlass-web",
@@ -46,6 +47,7 @@ windlass-debug   = { path = "windlass-debug" }
 windlass-db-core = { path = "windlass-db-core" }
 windlass-machine = { path = "windlass-machine" }
 windlass-types   = { path = "windlass-types" }
+windlass-vpn-core = { path = "windlass-vpn-core" }
 windlass-core    = { path = "windlass-core" }
 windlass-local   = { path = "windlass-local" }
 windlass-clients = { path = "windlass-clients" }

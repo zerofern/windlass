@@ -7,7 +7,8 @@ static TEST_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
 pub(crate) async fn test_state() -> AppState {
     let admin_url = std::env::var("DATABASE_URL").expect("DATABASE_URL required for web tests");
     let schema = format!(
-        "windlass_web_test_{}",
+        "windlass_web_test_{}_{}",
+        std::process::id(),
         TEST_SCHEMA_ID.fetch_add(1, Ordering::Relaxed)
     );
     let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();
