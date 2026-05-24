@@ -3258,6 +3258,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-db-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "windlass-types",
+]
+
+[[package]]
 name = "windlass-debug"
 version = "0.1.0"
 dependencies = [
@@ -3289,6 +3299,15 @@ dependencies = [
  "uom",
  "windlass-core",
  "windlass-types",
+]
+
+[[package]]
+name = "windlass-machine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

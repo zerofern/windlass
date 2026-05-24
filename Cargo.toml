@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "windlass-machine",
     "windlass-types",
     "windlass-core",
     "windlass-debug",
+    "windlass-db-core",
     "windlass-local",
     "windlass-clients",
     "windlass-web",
@@ -41,6 +43,8 @@ arc-swap         = "1"
 uuid             = { version = "1", features = ["v4", "serde"] }
 sqlx             = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "chrono", "migrate", "macros"] }
 windlass-debug   = { path = "windlass-debug" }
+windlass-db-core = { path = "windlass-db-core" }
+windlass-machine = { path = "windlass-machine" }
 windlass-types   = { path = "windlass-types" }
 windlass-core    = { path = "windlass-core" }
 windlass-local   = { path = "windlass-local" }
