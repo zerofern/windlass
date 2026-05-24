@@ -44,12 +44,28 @@ pub enum QbitEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QbitAction {
     Login,
-    ReadPreferences,
-    SetListenPort { port: VpnPort },
-    ListTorrents,
-    PauseTorrent { hash: TorrentHash },
-    ResumeTorrent { hash: TorrentHash },
-    ScheduleTimer { timer: QbitTimer, after: Duration },
+    ReadPreferences {
+        cookie: AuthCookie,
+    },
+    SetListenPort {
+        cookie: AuthCookie,
+        port: VpnPort,
+    },
+    ListTorrents {
+        cookie: AuthCookie,
+    },
+    PauseTorrent {
+        cookie: AuthCookie,
+        hash: TorrentHash,
+    },
+    ResumeTorrent {
+        cookie: AuthCookie,
+        hash: TorrentHash,
+    },
+    ScheduleTimer {
+        timer: QbitTimer,
+        after: Duration,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,9 +145,9 @@ impl Machine for QbitMachine {
                 publish: Vec::new(),
             },
             QbitEvent::AuthSucceeded { cookie } => {
-                self.cookie = Some(cookie);
+                self.cookie = Some(cookie.clone());
                 Outcome {
-                    actions: vec![QbitAction::ReadPreferences],
+                    actions: vec![QbitAction::ReadPreferences { cookie }],
                     publish: vec![QbitPublish::Ready],
                 }
             }
@@ -178,11 +194,17 @@ impl Machine for QbitMachine {
                 publish: vec![QbitPublish::TorrentsUpdated { hashes }],
             },
             QbitEvent::TimerFired(QbitTimer::SyncRetry) => Outcome {
-                actions: vec![QbitAction::ReadPreferences],
+                actions: self.cookie.clone().map_or_else(
+                    || vec![QbitAction::Login],
+                    |cookie| vec![QbitAction::ReadPreferences { cookie }],
+                ),
                 publish: Vec::new(),
             },
             QbitEvent::TimerFired(QbitTimer::TorrentRefresh) => Outcome {
-                actions: vec![QbitAction::ListTorrents],
+                actions: self
+                    .cookie
+                    .clone()
+                    .map_or_else(Vec::new, |cookie| vec![QbitAction::ListTorrents { cookie }]),
                 publish: Vec::new(),
             },
         }
@@ -195,10 +217,24 @@ impl Machine for QbitMachine {
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         let actions = match cmd {
             QbitCommand::EnsureAuthenticated => vec![QbitAction::Login],
-            QbitCommand::EnsureListenPort { port } => vec![QbitAction::SetListenPort { port }],
-            QbitCommand::RefreshTorrents => vec![QbitAction::ListTorrents],
-            QbitCommand::PauseTorrent { hash } => vec![QbitAction::PauseTorrent { hash }],
-            QbitCommand::ResumeTorrent { hash } => vec![QbitAction::ResumeTorrent { hash }],
+            QbitCommand::EnsureListenPort { port } => self.cookie.clone().map_or_else(
+                || vec![QbitAction::Login],
+                |cookie| vec![QbitAction::SetListenPort { cookie, port }],
+            ),
+            QbitCommand::RefreshTorrents => self
+                .cookie
+                .clone()
+                .map_or_else(Vec::new, |cookie| vec![QbitAction::ListTorrents { cookie }]),
+            QbitCommand::PauseTorrent { hash } => {
+                self.cookie.clone().map_or_else(Vec::new, |cookie| {
+                    vec![QbitAction::PauseTorrent { cookie, hash }]
+                })
+            }
+            QbitCommand::ResumeTorrent { hash } => {
+                self.cookie.clone().map_or_else(Vec::new, |cookie| {
+                    vec![QbitAction::ResumeTorrent { cookie, hash }]
+                })
+            }
         };
         Self::outcome(actions, QbitResponse::Accepted)
     }
@@ -211,7 +247,7 @@ mod tests {
     use windlass_machine::Machine;
     use windlass_types::{AuthCookie, VpnPort};
 
-    use crate::{QbitAction, QbitConfig, QbitEvent, QbitMachine, QbitPublish};
+    use crate::{QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish};
 
     fn machine() -> QbitMachine {
         QbitMachine::new(
@@ -236,16 +272,47 @@ mod tests {
     fn auth_success_publishes_ready_and_reads_preferences() {
         let mut machine = machine();
 
+        let cookie = AuthCookie("sid".to_string());
         let out = machine.handle(
             Instant::now(),
             QbitEvent::AuthSucceeded {
-                cookie: AuthCookie("sid".to_string()),
+                cookie: cookie.clone(),
             },
         );
 
         assert!(machine.is_authenticated());
-        assert_eq!(out.actions, vec![QbitAction::ReadPreferences]);
+        assert_eq!(out.actions, vec![QbitAction::ReadPreferences { cookie }]);
         assert_eq!(out.publish, vec![QbitPublish::Ready]);
+    }
+
+    #[test]
+    fn ensure_listen_port_requires_authentication() {
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+
+        let out = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
+
+        assert_eq!(out.actions, vec![QbitAction::Login]);
+    }
+
+    #[test]
+    fn ensure_listen_port_carries_cookie_when_authenticated() {
+        let mut machine = machine();
+        let cookie = AuthCookie("sid".to_string());
+        let port = VpnPort::try_new(51_820).unwrap();
+        let _ = machine.handle(
+            Instant::now(),
+            QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            },
+        );
+
+        let out = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
+
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::SetListenPort { cookie, port }]
+        );
     }
 
     #[test]
