@@ -3313,6 +3313,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-mam-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "windlass-machine",
+ "windlass-types",
+]
+
+[[package]]
 name = "windlass-qbit-core"
 version = "0.1.0"
 dependencies = [

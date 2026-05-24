@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "windlass-machine",
+    "windlass-mam-core",
     "windlass-types",
     "windlass-core",
     "windlass-debug",
@@ -46,6 +47,7 @@ uuid             = { version = "1", features = ["v4", "serde"] }
 sqlx             = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "json", "migrate", "macros"] }
 windlass-debug   = { path = "windlass-debug" }
 windlass-db-core = { path = "windlass-db-core" }
+windlass-mam-core = { path = "windlass-mam-core" }
 windlass-machine = { path = "windlass-machine" }
 windlass-qbit-core = { path = "windlass-qbit-core" }
 windlass-types   = { path = "windlass-types" }
