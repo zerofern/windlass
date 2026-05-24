@@ -114,14 +114,17 @@ async fn pause_then_resume_torrent() {
     let details = client.list_torrent_details(&cookie).await;
     let found = details.iter().find(|d| d.hash == hash);
     assert!(found.is_some(), "torrent not found after pause");
-    // qBit with no peers will show PausedDownloading
+    // qBit 5.2 can report no-peer torrents as stalled immediately after stop,
+    // even though the stop endpoint accepted the request.
     assert!(
         matches!(
             found.unwrap().state,
             windlass_clients::qbit::QbitTorrentState::PausedDownloading
                 | windlass_clients::qbit::QbitTorrentState::PausedUploading
+                | windlass_clients::qbit::QbitTorrentState::StalledDownloading
+                | windlass_clients::qbit::QbitTorrentState::StalledUploading
         ),
-        "expected paused state, got {:?}",
+        "expected paused or stalled state, got {:?}",
         found.unwrap().state
     );
 
