@@ -71,6 +71,16 @@ async fn count_requests_with_body(
     })
 }
 
+async fn system_snapshot_count() -> i64 {
+    let pool = sqlx::PgPool::connect("postgres://windlass:windlass@localhost:15432/windlass")
+        .await
+        .expect("connect to integration postgres");
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM system_snapshots")
+        .fetch_one(&pool)
+        .await
+        .expect("count system snapshots")
+}
+
 /// Wait for a condition with timeout.
 async fn wait_for<F, Fut>(label: &str, timeout_secs: u64, mut f: F)
 where
@@ -306,6 +316,15 @@ async fn boot_sequence_writes_alert_to_db() {
             };
             !alerts.is_empty()
         }
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires dev stack"]
+async fn boot_sequence_writes_system_snapshot_to_db() {
+    wait_for("system snapshot written by shadow domain", 30, || async {
+        system_snapshot_count().await > 0
     })
     .await;
 }
