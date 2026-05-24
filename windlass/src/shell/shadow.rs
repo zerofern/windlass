@@ -287,8 +287,12 @@ fn legacy_to_shadow_events(event: &Event, forwarded_port: Option<VpnPort>) -> Ve
             ))],
             WakeupId::DiskCheck | WakeupId::TorrentCheck | WakeupId::CompliancePoll => Vec::new(),
         },
-        Event::QbitPreferencesReceived { .. }
-        | Event::DiskSpaceObserved { .. }
+        Event::QbitPreferencesReceived { listen_port, .. } => {
+            vec![ShadowEvent::Qbit(QbitEvent::PreferencesRead {
+                listen_port: *listen_port,
+            })]
+        }
+        Event::DiskSpaceObserved { .. }
         | Event::NewTorrentsObserved { .. }
         | Event::LogsDumped { .. }
         | Event::DeleteTorrentRequested { .. }

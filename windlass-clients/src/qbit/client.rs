@@ -241,6 +241,10 @@ impl QbitClient {
                     torrents: u32::try_from(w.max_active_torrents).unwrap_or(5),
                     downloads: u32::try_from(w.max_active_downloads).unwrap_or(3),
                     uploads: u32::try_from(w.max_active_uploads).unwrap_or(3),
+                    listen_port: w
+                        .listen_port
+                        .and_then(|port| u16::try_from(port).ok())
+                        .and_then(|port| windlass_types::VpnPort::try_new(port).ok()),
                 }),
                 Err(e) => {
                     warn!("Failed to parse preferences: {e}");

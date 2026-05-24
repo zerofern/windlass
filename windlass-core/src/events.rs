@@ -133,6 +133,7 @@ pub enum Event {
         max_active_torrents: u32,
         max_active_downloads: u32,
         max_active_uploads: u32,
+        listen_port: Option<VpnPort>,
     },
 
     /// User-initiated torrent deletion (wired from web UI in Step 6).

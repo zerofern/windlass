@@ -1,7 +1,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 use serde::Deserialize;
-use windlass_types::{MamTorrentId, TorrentName};
+use windlass_types::{MamTorrentId, TorrentName, VpnPort};
 
 /// Full torrent record as returned by `/api/v2/torrents/info`.
 #[derive(Debug, Clone)]
@@ -51,6 +51,7 @@ pub struct QbitPreferences {
     pub torrents: u32,
     pub downloads: u32,
     pub uploads: u32,
+    pub listen_port: Option<VpnPort>,
 }
 
 // ── Wire deserialization types (private to this module) ───────────────────────
@@ -73,6 +74,7 @@ pub(super) struct PreferencesWire {
     pub max_active_torrents: i64,
     pub max_active_downloads: i64,
     pub max_active_uploads: i64,
+    pub listen_port: Option<i64>,
 }
 
 // ── parse_mam_id ──────────────────────────────────────────────────────────────

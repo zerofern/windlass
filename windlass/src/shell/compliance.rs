@@ -37,6 +37,7 @@ impl ShellContext<'_> {
                         max_active_torrents: prefs.torrents,
                         max_active_downloads: prefs.downloads,
                         max_active_uploads: prefs.uploads,
+                        listen_port: prefs.listen_port,
                     })
                     .await;
             }

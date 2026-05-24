@@ -257,6 +257,7 @@ fn any_compliance_events() -> impl Strategy<Value = Event> {
                 max_active_torrents: t,
                 max_active_downloads: d,
                 max_active_uploads: u,
+                listen_port: None,
             }
         }),
         proptest::string::string_regex("[a-f0-9]{40}")

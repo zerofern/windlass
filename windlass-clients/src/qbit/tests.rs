@@ -457,7 +457,8 @@ async fn get_preferences_returns_parsed_limits() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "max_active_torrents": 10i64,
             "max_active_downloads": 3i64,
-            "max_active_uploads": 5i64
+            "max_active_uploads": 5i64,
+            "listen_port": 51_820i64
         })))
         .mount(&server)
         .await;
@@ -474,6 +475,10 @@ async fn get_preferences_returns_parsed_limits() {
     assert_eq!(p.torrents, 10);
     assert_eq!(p.downloads, 3);
     assert_eq!(p.uploads, 5);
+    assert_eq!(
+        p.listen_port,
+        Some(windlass_types::VpnPort::try_new(51_820).unwrap())
+    );
 }
 
 #[tokio::test]
