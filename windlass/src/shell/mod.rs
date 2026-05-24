@@ -17,13 +17,14 @@ use windlass_clients::{mam, qbit};
 use windlass_core::{actions::Action, events::Event, types::SystemState};
 use windlass_db::DbPool;
 use windlass_db::actor::PostgresDbActor;
-use windlass_db_core::{DbCommand, DbEvent};
+use windlass_db_core::DbEvent;
 use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory};
 use windlass_local::docker;
 use windlass_types::WakeupId;
 
 use dequeue::dequeue_debug;
 use init::{ShellRuntime, init_shell};
+use shadow::ShadowAction;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
 /// then runs the event loop forever.
@@ -92,8 +93,8 @@ pub async fn run(
 
         debug!(?event, "←");
 
-        for command in shadow_cores.observe(&event) {
-            dispatch_shadow_db_command(&db_pool, command);
+        for action in shadow_cores.observe(&event) {
+            dispatch_shadow_action(&db_pool, action);
         }
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {
@@ -135,18 +136,26 @@ pub async fn run(
     Ok(())
 }
 
-fn dispatch_shadow_db_command(db_pool: &DbPool, command: DbCommand) {
-    let actor = PostgresDbActor::new(db_pool.clone());
-    tokio::spawn(async move {
-        let event = actor.handle(command).await;
-        if let DbEvent::Failed(error) = event {
-            tracing::warn!(
-                operation = %error.operation,
-                "Shadow domain DB command failed: {}",
-                error.message
-            );
+fn dispatch_shadow_action(db_pool: &DbPool, action: ShadowAction) {
+    match action {
+        ShadowAction::Db(command) => {
+            let actor = PostgresDbActor::new(db_pool.clone());
+            tokio::spawn(async move {
+                let event = actor.handle(command).await;
+                if let DbEvent::Failed(error) = event {
+                    tracing::warn!(
+                        operation = %error.operation,
+                        "Shadow domain DB command failed: {}",
+                        error.message
+                    );
+                }
+            });
         }
-    });
+        ShadowAction::Vpn(_)
+        | ShadowAction::Qbit(_)
+        | ShadowAction::Mam(_)
+        | ShadowAction::ScheduleTimer { .. } => {}
+    }
 }
 
 fn drain_channels(
