@@ -4,6 +4,7 @@ mod config;
 mod dequeue;
 mod download;
 mod init;
+mod shadow;
 
 use std::collections::HashMap;
 
@@ -52,6 +53,7 @@ pub async fn run(
         mut exchange_rx,
         causal_debug_tx,
         mut causal_rx,
+        mut shadow_cores,
     } = init_shell(&debug_ctrl, debug_owned).await?;
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
 
@@ -88,6 +90,7 @@ pub async fn run(
 
         debug!(?event, "←");
 
+        shadow_cores.observe(&event);
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {
             let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(Box::new(

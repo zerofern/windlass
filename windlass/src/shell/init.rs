@@ -17,6 +17,7 @@ use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
 use super::config::Config;
+use super::shadow::ShadowCores;
 
 /// All runtime state extracted from `init_shell` so `run` stays concise.
 pub(super) struct ShellRuntime {
@@ -40,10 +41,12 @@ pub(super) struct ShellRuntime {
     pub(super) exchange_rx: mpsc::Receiver<(uuid::Uuid, windlass_types::HttpExchange)>,
     pub(super) causal_debug_tx: mpsc::Sender<(Event, uuid::Uuid)>,
     pub(super) causal_rx: mpsc::Receiver<(Event, uuid::Uuid)>,
+    pub(super) shadow_cores: ShadowCores,
 }
 
 /// Bootstraps all infrastructure and returns the runtime bundle.
 /// Spawns the HTTP server and sends the `Init` event before returning.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn init_shell(
     debug_ctrl: &DebugController,
     debug_owned: windlass_debug::DebugOwnedPart,
@@ -121,6 +124,7 @@ pub(super) async fn init_shell(
             config.compliance_poll_interval_secs,
         )
         .with_blacklisted_ids(blacklisted);
+    let shadow_cores = ShadowCores::new(Duration::from_secs(config.compliance_poll_interval_secs));
     let history = DebugHistory::new(SystemState::initial());
     let cmd_rx = debug_owned.cmd_rx;
     let log_rx = debug_owned.log_rx;
@@ -164,6 +168,7 @@ pub(super) async fn init_shell(
         exchange_rx,
         causal_debug_tx,
         causal_rx,
+        shadow_cores,
     })
 }
 
