@@ -3402,6 +3402,7 @@ dependencies = [
  "uuid",
  "windlass-core",
  "windlass-db",
+ "windlass-db-core",
  "windlass-debug",
  "windlass-types",
 ]

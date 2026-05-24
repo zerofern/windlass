@@ -15,6 +15,6 @@ pub struct AppState {
     /// URL of the chaos controller, if running (dev stack only).
     /// Set via `CHAOS_URL` env var. `None` in production.
     pub chaos_url: Option<String>,
-    /// `SQLite` connection pool for reading persistent state from the web layer.
+    /// Postgres connection pool for reading persistent state from the web layer.
     pub db_pool: windlass_db::DbPool,
 }

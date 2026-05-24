@@ -22,6 +22,7 @@ mime_guess     = { workspace = true }
 uuid           = { workspace = true }
 
 [dev-dependencies]
-tower    = { version = "0.5", features = ["util"] }
-tempfile = { workspace = true }
-sqlx     = { workspace = true }
+windlass-db-core = { workspace = true }
+tower             = { version = "0.5", features = ["util"] }
+tempfile          = { workspace = true }
+sqlx              = { workspace = true }

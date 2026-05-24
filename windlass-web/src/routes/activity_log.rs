@@ -64,6 +64,8 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+    use windlass_db::actor::PostgresDbActor;
+    use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand, DbEvent};
 
     #[tokio::test]
     async fn get_events_empty_db_returns_empty_array() {
@@ -89,16 +91,19 @@ mod tests {
     #[tokio::test]
     async fn get_events_limit_param_is_respected() {
         let state = crate::test_helpers::test_state().await;
+        let actor = PostgresDbActor::new(state.db_pool.clone());
         for i in 0..10_i32 {
-            windlass_db::activity_log::insert(
-                &state.db_pool,
-                "test",
-                &format!("action{i}"),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            let event = actor
+                .handle(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Web,
+                    action: format!("action{i}"),
+                    book_id: None,
+                    detail: None,
+                    metadata: serde_json::json!({}),
+                }))
+                .await;
+            assert!(matches!(event, DbEvent::ActivityRecorded { .. }));
         }
         let app = router(state);
         let response = app
