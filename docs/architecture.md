@@ -116,6 +116,16 @@ windlass-db/migrations/
   0001_initial.sql
 ```
 
+During the transition, the Postgres schema lives under:
+
+```text
+windlass-db/postgres/migrations/
+  0001_initial.sql
+```
+
+The current SQLite migrations remain in place until the `windlass-db` adapter
+has fully moved to `PgPool`.
+
 `windlass-db-core` defines the persistence protocol:
 
 ```rust

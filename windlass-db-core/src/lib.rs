@@ -131,6 +131,8 @@ pub struct BookRecord {
 pub enum DownloadStatus {
     Pending,
     Downloading,
+    Seeding,
+    Satisfied,
     Complete,
     Failed,
     Blacklisted,

@@ -35,6 +35,22 @@ integration-qbit:
     docker compose -f docker-compose.qbit-integration.yml up --build --wait -d; \
     cargo test --test qbit_integration -- --ignored --test-threads=1 --nocapture
 
+# Bring up only Postgres for DB development.
+db-up:
+    docker compose -f docker-compose.dev.yml up -d postgres
+
+# Tear down the dev stack and remove the Postgres volume.
+db-down:
+    docker compose -f docker-compose.dev.yml down -v --remove-orphans
+
+# Print the local Postgres URL used by SQLx tooling.
+db-url:
+    @echo postgres://windlass:windlass@localhost:15432/windlass
+
+# Refresh SQLx offline metadata after Postgres migrations are active.
+sqlx-prepare:
+    DATABASE_URL=postgres://windlass:windlass@localhost:15432/windlass cargo sqlx prepare --workspace
+
 # Bring up the dev/test stack
 # Bring up the dev/test stack (normal mode — safe for integration tests)
 stack-up:
