@@ -53,7 +53,6 @@ pub enum MamEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MamAction {
-    Login,
     FetchStatus,
     UpdateSeedboxPort { port: VpnPort },
     ScheduleTimer { timer: MamTimer, after: Duration },
@@ -203,11 +202,12 @@ impl Machine for MamMachine {
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         let actions = match cmd {
-            MamCommand::EnsureAuthenticated => vec![MamAction::Login],
+            MamCommand::EnsureAuthenticated | MamCommand::RefreshStatus => {
+                vec![MamAction::FetchStatus]
+            }
             MamCommand::EnsureSeedboxPort { port } => {
                 vec![MamAction::UpdateSeedboxPort { port }]
             }
-            MamCommand::RefreshStatus => vec![MamAction::FetchStatus],
         };
         Self::outcome(actions, MamResponse::Accepted)
     }
@@ -220,7 +220,7 @@ mod tests {
     use windlass_machine::Machine;
     use windlass_types::VpnPort;
 
-    use crate::{MamAction, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer};
+    use crate::{MamAction, MamCommand, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer};
 
     fn machine() -> MamMachine {
         MamMachine::new(
@@ -240,6 +240,15 @@ mod tests {
         assert!(machine.is_authenticated());
         assert_eq!(out.actions, vec![MamAction::FetchStatus]);
         assert_eq!(out.publish, vec![MamPublish::Ready]);
+    }
+
+    #[test]
+    fn ensure_authenticated_command_fetches_status() {
+        let mut machine = machine();
+
+        let out = machine.handle_command(Instant::now(), MamCommand::EnsureAuthenticated);
+
+        assert_eq!(out.actions, vec![MamAction::FetchStatus]);
     }
 
     #[test]

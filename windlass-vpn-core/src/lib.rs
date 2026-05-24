@@ -198,7 +198,14 @@ impl Machine for VpnMachine {
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         let actions = match cmd {
-            VpnCommand::StartMonitoring => vec![VpnAction::StartMonitoring],
+            VpnCommand::StartMonitoring => vec![
+                VpnAction::StartMonitoring,
+                VpnAction::InspectContainer,
+                VpnAction::ScheduleTimer {
+                    timer: VpnTimer::HealthPoll,
+                    after: self.config.health_poll_interval,
+                },
+            ],
             VpnCommand::RefreshState => vec![VpnAction::InspectContainer],
             VpnCommand::ReadForwardedPort => vec![VpnAction::ReadPortFiles],
         };
@@ -213,7 +220,7 @@ mod tests {
     use windlass_machine::Machine;
     use windlass_types::VpnPort;
 
-    use crate::{VpnAction, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
+    use crate::{VpnAction, VpnCommand, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
 
     fn machine() -> VpnMachine {
         VpnMachine::new(
@@ -242,6 +249,25 @@ mod tests {
             ]
         );
         assert!(out.publish.is_empty());
+    }
+
+    #[test]
+    fn start_monitoring_command_matches_init_actions() {
+        let mut machine = machine();
+
+        let out = machine.handle_command(Instant::now(), VpnCommand::StartMonitoring);
+
+        assert_eq!(
+            out.actions,
+            vec![
+                VpnAction::StartMonitoring,
+                VpnAction::InspectContainer,
+                VpnAction::ScheduleTimer {
+                    timer: VpnTimer::HealthPoll,
+                    after: Duration::from_secs(2),
+                },
+            ]
+        );
     }
 
     #[test]
