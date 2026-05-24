@@ -1,6 +1,6 @@
 use windlass_db_core::{
-    ActivityId, ActivitySource, AlertId, DbCommand, DbEvent, DbFailure, DownloadId, DownloadStatus,
-    SnapshotId, TorrentStateRecord,
+    ActivityId, ActivitySource, AlertId, BookId, BookStatus, DbCommand, DbEvent, DbFailure,
+    DownloadId, DownloadStatus, SnapshotId, TorrentStateRecord,
 };
 
 use crate::{DbPool, alert_priority_str};
@@ -51,11 +51,10 @@ impl PostgresDbActor {
                     Err(error) => DbEvent::Failed(error),
                 }
             }
-            DbCommand::UpsertBook(record) => DbEvent::Failed(DbFailure {
-                operation: format!("UpsertBook({record:?})"),
-                message: "DbCommand variant is not implemented by PostgresDbActor yet".to_string(),
-                retryable: false,
-            }),
+            DbCommand::UpsertBook(record) => match upsert_book(&self.pool, record).await {
+                Ok(id) => DbEvent::BookUpserted { id },
+                Err(error) => DbEvent::Failed(error),
+            },
         }
     }
 }
@@ -207,6 +206,63 @@ async fn enqueue_download(
     Ok(DownloadId(row.id))
 }
 
+async fn upsert_book(
+    pool: &DbPool,
+    record: windlass_db_core::BookRecord,
+) -> Result<BookId, DbFailure> {
+    let mam_id = record
+        .mam_id
+        .map(|id| i64::try_from(id.0).unwrap_or(i64::MAX));
+    let status = book_status_str(&record.status);
+    let id = if let Some(id) = record.id {
+        sqlx::query!(
+            r#"
+            INSERT INTO books (id, mam_id, title, author, status)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT(id) DO UPDATE SET
+                mam_id = COALESCE(excluded.mam_id, books.mam_id),
+                title = COALESCE(excluded.title, books.title),
+                author = COALESCE(excluded.author, books.author),
+                status = excluded.status
+            RETURNING id
+            "#,
+            id.0,
+            mam_id,
+            record.title,
+            record.author,
+            status
+        )
+        .fetch_one(pool.inner())
+        .await
+        .map(|row| row.id)
+    } else {
+        sqlx::query!(
+            r#"
+            INSERT INTO books (mam_id, title, author, status)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT(mam_id) DO UPDATE SET
+                title = COALESCE(excluded.title, books.title),
+                author = COALESCE(excluded.author, books.author),
+                status = excluded.status
+            RETURNING id
+            "#,
+            mam_id,
+            record.title,
+            record.author,
+            status
+        )
+        .fetch_one(pool.inner())
+        .await
+        .map(|row| row.id)
+    }
+    .map_err(|e| DbFailure {
+        operation: "UpsertBook".to_string(),
+        message: e.to_string(),
+        retryable: true,
+    })?;
+    Ok(BookId(id))
+}
+
 async fn mark_download_state(
     pool: &DbPool,
     change: windlass_db_core::DownloadStateChange,
@@ -291,18 +347,29 @@ const fn download_status_str(status: &DownloadStatus) -> &'static str {
     }
 }
 
+const fn book_status_str(status: &BookStatus) -> &'static str {
+    match status {
+        BookStatus::PendingMetadata => "pending_metadata",
+        BookStatus::Queued => "queued",
+        BookStatus::Downloading => "downloading",
+        BookStatus::Complete => "complete",
+        BookStatus::Failed => "failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use serde_json::json;
     use windlass_db_core::{
-        ActivityRecord, ActivitySource, AlertRecord, DbCommand, DbEvent, DownloadStateChange,
-        DownloadStatus, SystemSnapshotRecord, TorrentRecord, TorrentStateRecord,
+        ActivityRecord, ActivitySource, AlertRecord, BookRecord, BookStatus, DbCommand, DbEvent,
+        DownloadQueueRecord, DownloadStateChange, DownloadStatus, SystemSnapshotRecord,
+        TorrentRecord, TorrentStateRecord,
     };
     use windlass_types::{AlertPriority, MamTorrentId, TorrentHash};
 
     use super::PostgresDbActor;
-    use crate::{activity_log, alerts, download_queue, tests::test_pool, torrents};
+    use crate::{activity_log, alerts, books, download_queue, tests::test_pool, torrents};
 
     #[tokio::test]
     async fn handle_record_activity_persists_activity() {
@@ -391,6 +458,51 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hash, "abc123");
         assert_eq!(rows[0].state, "forcedUP");
+    }
+
+    #[tokio::test]
+    async fn handle_upsert_book_persists_book() {
+        let pool = test_pool().await;
+        let actor = PostgresDbActor::new(pool.clone());
+
+        let event = actor
+            .handle(DbCommand::UpsertBook(BookRecord {
+                id: None,
+                mam_id: Some(MamTorrentId(7)),
+                title: Some("Title".to_string()),
+                author: Some("Author".to_string()),
+                status: BookStatus::Queued,
+            }))
+            .await;
+
+        assert!(matches!(event, DbEvent::BookUpserted { .. }));
+        let row = books::get_by_mam_id(&pool, MamTorrentId(7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.title, Some("Title".to_string()));
+        assert_eq!(row.author, Some("Author".to_string()));
+        assert_eq!(row.status, "queued");
+    }
+
+    #[tokio::test]
+    async fn handle_enqueue_download_persists_queue_row() {
+        let pool = test_pool().await;
+        let actor = PostgresDbActor::new(pool.clone());
+
+        let event = actor
+            .handle(DbCommand::EnqueueDownload(DownloadQueueRecord {
+                book_id: None,
+                mam_id: MamTorrentId(123),
+                status: DownloadStatus::Pending,
+            }))
+            .await;
+
+        assert!(matches!(event, DbEvent::DownloadQueueUpdated { .. }));
+        let rows = download_queue::get_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mam_id, 123);
+        assert_eq!(rows[0].status, "pending");
     }
 
     #[tokio::test]

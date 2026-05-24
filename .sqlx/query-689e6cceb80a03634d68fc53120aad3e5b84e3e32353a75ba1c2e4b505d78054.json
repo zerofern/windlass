@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO books (mam_id, title, author, status)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT(mam_id) DO UPDATE SET\n                title = COALESCE(excluded.title, books.title),\n                author = COALESCE(excluded.author, books.author),\n                status = excluded.status\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "689e6cceb80a03634d68fc53120aad3e5b84e3e32353a75ba1c2e4b505d78054"
+}
