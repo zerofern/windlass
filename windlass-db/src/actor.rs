@@ -1,5 +1,6 @@
 use windlass_db_core::{
-    ActivityId, ActivitySource, AlertId, DbCommand, DbEvent, DbFailure, SnapshotId,
+    ActivityId, ActivitySource, AlertId, DbCommand, DbEvent, DbFailure, DownloadId, DownloadStatus,
+    SnapshotId, TorrentStateRecord,
 };
 
 use crate::{DbPool, alert_priority_str};
@@ -31,8 +32,27 @@ impl PostgresDbActor {
                     Err(error) => DbEvent::Failed(error),
                 }
             }
-            other => DbEvent::Failed(DbFailure {
-                operation: format!("{other:?}"),
+            DbCommand::UpsertTorrent(record) => {
+                let hash = record.hash.clone();
+                match upsert_torrent(&self.pool, record).await {
+                    Ok(()) => DbEvent::TorrentUpserted { hash },
+                    Err(error) => DbEvent::Failed(error),
+                }
+            }
+            DbCommand::EnqueueDownload(record) => {
+                match enqueue_download(&self.pool, record).await {
+                    Ok(id) => DbEvent::DownloadQueueUpdated { id },
+                    Err(error) => DbEvent::Failed(error),
+                }
+            }
+            DbCommand::MarkDownloadState(change) => {
+                match mark_download_state(&self.pool, change).await {
+                    Ok(id) => DbEvent::DownloadQueueUpdated { id },
+                    Err(error) => DbEvent::Failed(error),
+                }
+            }
+            DbCommand::UpsertBook(record) => DbEvent::Failed(DbFailure {
+                operation: format!("UpsertBook({record:?})"),
                 message: "DbCommand variant is not implemented by PostgresDbActor yet".to_string(),
                 retryable: false,
             }),
@@ -118,6 +138,120 @@ async fn save_system_snapshot(
     Ok(SnapshotId(row.id))
 }
 
+async fn upsert_torrent(
+    pool: &DbPool,
+    record: windlass_db_core::TorrentRecord,
+) -> Result<(), DbFailure> {
+    let state = torrent_state_str(&record.state);
+    let book_id = record.book_id.map(|id| id.0);
+    let mam_id = record
+        .mam_id
+        .map(|id| i64::try_from(id.0).unwrap_or(i64::MAX));
+    sqlx::query!(
+        r#"
+        INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,
+            downloaded_bytes, seen_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT(hash) DO UPDATE SET
+            book_id = COALESCE(excluded.book_id, torrents.book_id),
+            mam_id = COALESCE(excluded.mam_id, torrents.mam_id),
+            name = excluded.name,
+            state = excluded.state,
+            seeding_time_secs = excluded.seeding_time_secs,
+            downloaded_bytes = excluded.downloaded_bytes,
+            seen_at = excluded.seen_at
+        "#,
+        record.hash.0,
+        book_id,
+        mam_id,
+        record.name,
+        state,
+        record.seeding_time_secs,
+        record.downloaded_bytes,
+        record.seen_at
+    )
+    .execute(pool.inner())
+    .await
+    .map_err(|e| DbFailure {
+        operation: "UpsertTorrent".to_string(),
+        message: e.to_string(),
+        retryable: true,
+    })?;
+    Ok(())
+}
+
+async fn enqueue_download(
+    pool: &DbPool,
+    record: windlass_db_core::DownloadQueueRecord,
+) -> Result<DownloadId, DbFailure> {
+    let mam_id = i64::try_from(record.mam_id.0).unwrap_or(i64::MAX);
+    let book_id = record.book_id.map(|id| id.0);
+    let status = download_status_str(&record.status);
+    let row = sqlx::query!(
+        r#"
+        INSERT INTO download_queue (book_id, mam_id, status)
+        VALUES ($1, $2, $3)
+        RETURNING id
+        "#,
+        book_id,
+        mam_id,
+        status
+    )
+    .fetch_one(pool.inner())
+    .await
+    .map_err(|e| DbFailure {
+        operation: "EnqueueDownload".to_string(),
+        message: e.to_string(),
+        retryable: true,
+    })?;
+    Ok(DownloadId(row.id))
+}
+
+async fn mark_download_state(
+    pool: &DbPool,
+    change: windlass_db_core::DownloadStateChange,
+) -> Result<DownloadId, DbFailure> {
+    let mam_id = i64::try_from(change.mam_id.0).unwrap_or(i64::MAX);
+    let status = download_status_str(&change.status);
+    if let Some(row) = sqlx::query!(
+        r#"
+        UPDATE download_queue
+        SET status = $1, updated_at = now()
+        WHERE mam_id = $2
+        RETURNING id
+        "#,
+        status,
+        mam_id
+    )
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| DbFailure {
+        operation: "MarkDownloadState".to_string(),
+        message: e.to_string(),
+        retryable: true,
+    })? {
+        return Ok(DownloadId(row.id));
+    }
+
+    let row = sqlx::query!(
+        r#"
+        INSERT INTO download_queue (mam_id, status)
+        VALUES ($1, $2)
+        RETURNING id
+        "#,
+        mam_id,
+        status
+    )
+    .fetch_one(pool.inner())
+    .await
+    .map_err(|e| DbFailure {
+        operation: "MarkDownloadState".to_string(),
+        message: e.to_string(),
+        retryable: true,
+    })?;
+    Ok(DownloadId(row.id))
+}
+
 const fn activity_source_str(source: &ActivitySource) -> &'static str {
     match source {
         ActivitySource::Shell => "shell",
@@ -130,17 +264,45 @@ const fn activity_source_str(source: &ActivitySource) -> &'static str {
     }
 }
 
+const fn torrent_state_str(state: &TorrentStateRecord) -> &str {
+    match state {
+        TorrentStateRecord::Downloading => "downloading",
+        TorrentStateRecord::Uploading => "uploading",
+        TorrentStateRecord::ForcedUpload => "forcedUP",
+        TorrentStateRecord::PausedDownloading => "pausedDL",
+        TorrentStateRecord::PausedUploading => "pausedUP",
+        TorrentStateRecord::StalledDownloading => "stalledDL",
+        TorrentStateRecord::StalledUploading => "stalledUP",
+        TorrentStateRecord::Checking => "checking",
+        TorrentStateRecord::Error => "error",
+        TorrentStateRecord::Unknown(value) => value.as_str(),
+    }
+}
+
+const fn download_status_str(status: &DownloadStatus) -> &'static str {
+    match status {
+        DownloadStatus::Pending => "pending",
+        DownloadStatus::Downloading => "downloading",
+        DownloadStatus::Seeding => "seeding",
+        DownloadStatus::Satisfied => "satisfied",
+        DownloadStatus::Complete => "complete",
+        DownloadStatus::Failed => "failed",
+        DownloadStatus::Blacklisted => "blacklisted",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use serde_json::json;
     use windlass_db_core::{
-        ActivityRecord, ActivitySource, AlertRecord, DbCommand, DbEvent, SystemSnapshotRecord,
+        ActivityRecord, ActivitySource, AlertRecord, DbCommand, DbEvent, DownloadStateChange,
+        DownloadStatus, SystemSnapshotRecord, TorrentRecord, TorrentStateRecord,
     };
-    use windlass_types::AlertPriority;
+    use windlass_types::{AlertPriority, MamTorrentId, TorrentHash};
 
     use super::PostgresDbActor;
-    use crate::{activity_log, alerts, tests::test_pool};
+    use crate::{activity_log, alerts, download_queue, tests::test_pool, torrents};
 
     #[tokio::test]
     async fn handle_record_activity_persists_activity() {
@@ -204,5 +366,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved, json!({ "vpn": "ready" }));
+    }
+
+    #[tokio::test]
+    async fn handle_upsert_torrent_persists_torrent() {
+        let pool = test_pool().await;
+        let actor = PostgresDbActor::new(pool.clone());
+
+        let event = actor
+            .handle(DbCommand::UpsertTorrent(TorrentRecord {
+                hash: TorrentHash("abc123".to_string()),
+                book_id: None,
+                mam_id: Some(MamTorrentId(42)),
+                name: "test".to_string(),
+                state: TorrentStateRecord::ForcedUpload,
+                seeding_time_secs: 120,
+                downloaded_bytes: 1_024,
+                seen_at: Utc::now(),
+            }))
+            .await;
+
+        assert!(matches!(event, DbEvent::TorrentUpserted { .. }));
+        let rows = torrents::get_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "abc123");
+        assert_eq!(rows[0].state, "forcedUP");
+    }
+
+    #[tokio::test]
+    async fn handle_mark_download_state_updates_or_inserts_queue_row() {
+        let pool = test_pool().await;
+        let actor = PostgresDbActor::new(pool.clone());
+
+        let event = actor
+            .handle(DbCommand::MarkDownloadState(DownloadStateChange {
+                mam_id: MamTorrentId(99),
+                status: DownloadStatus::Blacklisted,
+            }))
+            .await;
+
+        assert!(matches!(event, DbEvent::DownloadQueueUpdated { .. }));
+        let rows = download_queue::get_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mam_id, 99);
+        assert_eq!(rows[0].status, "blacklisted");
     }
 }

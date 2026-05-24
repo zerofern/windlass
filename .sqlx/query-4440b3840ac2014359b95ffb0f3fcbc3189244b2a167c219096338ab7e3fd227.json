@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,\n            downloaded_bytes, seen_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n        ON CONFLICT(hash) DO UPDATE SET\n            book_id = COALESCE(excluded.book_id, torrents.book_id),\n            mam_id = COALESCE(excluded.mam_id, torrents.mam_id),\n            name = excluded.name,\n            state = excluded.state,\n            seeding_time_secs = excluded.seeding_time_secs,\n            downloaded_bytes = excluded.downloaded_bytes,\n            seen_at = excluded.seen_at\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4440b3840ac2014359b95ffb0f3fcbc3189244b2a167c219096338ab7e3fd227"
+}

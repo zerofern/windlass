@@ -2,9 +2,11 @@ use chrono::Utc;
 use windlass_clients::qbit::{QbitTorrentDetails, QbitTorrentState};
 use windlass_core::events::Event;
 use windlass_core::torrent::{TorrentRecord, TorrentState};
-use windlass_db::TorrentRow;
 use windlass_db::actor::PostgresDbActor;
-use windlass_db_core::{ActivityRecord, ActivitySource, BookId, DbCommand, DbEvent};
+use windlass_db_core::{
+    ActivityRecord, ActivitySource, BookId, DbCommand, DbEvent, DownloadStateChange,
+    DownloadStatus, TorrentStateRecord,
+};
 use windlass_debug::CausalTx;
 use windlass_types::{AuthCookie, MamTorrentId, TorrentHash};
 
@@ -70,35 +72,43 @@ impl ShellContext<'_> {
     }
 
     pub(super) fn upsert_torrent_records(&self, records: Vec<TorrentRecord>) {
-        let pool = self.db_pool.clone();
+        let actor = PostgresDbActor::new(self.db_pool.clone());
         tokio::spawn(async move {
             for record in records {
-                let row = TorrentRow {
-                    hash: record.hash.0,
-                    book_id: None,
-                    mam_id: record.mam_id.map(|id| {
-                        // MAM IDs are u64 but the column is i64; clamp to i64::MAX on overflow.
-                        i64::try_from(id.0).unwrap_or(i64::MAX)
-                    }),
-                    name: record.name.0,
-                    state: record.state.as_db_str().to_string(),
-                    seeding_time_secs: i64::try_from(record.seeding_time_secs).unwrap_or(i64::MAX),
-                    downloaded_bytes: i64::try_from(record.downloaded_bytes).unwrap_or(i64::MAX),
-                    seen_at: record.seen_at.to_rfc3339(),
-                    added_at: String::new(),
-                };
-                if let Err(e) = windlass_db::torrents::upsert(&pool, &row).await {
-                    tracing::warn!("Failed to upsert torrent {}: {e}", row.hash);
+                let hash = record.hash.clone();
+                let state = torrent_state_record(&record.state);
+                let event = actor
+                    .handle(DbCommand::UpsertTorrent(windlass_db_core::TorrentRecord {
+                        hash: record.hash,
+                        book_id: None,
+                        mam_id: record.mam_id,
+                        name: record.name.0,
+                        state,
+                        seeding_time_secs: i64::try_from(record.seeding_time_secs)
+                            .unwrap_or(i64::MAX),
+                        downloaded_bytes: i64::try_from(record.downloaded_bytes)
+                            .unwrap_or(i64::MAX),
+                        seen_at: record.seen_at,
+                    }))
+                    .await;
+                if let DbEvent::Failed(error) = event {
+                    tracing::warn!("Failed to upsert torrent {}: {}", hash.0, error.message);
                 }
             }
         });
     }
 
     pub(super) fn blacklist_mam_id(&self, mam_id: MamTorrentId) {
-        let pool = self.db_pool.clone();
+        let actor = PostgresDbActor::new(self.db_pool.clone());
         tokio::spawn(async move {
-            if let Err(e) = windlass_db::download_queue::blacklist(&pool, mam_id).await {
-                tracing::warn!("Failed to blacklist mam_id {}: {e}", mam_id.0);
+            let event = actor
+                .handle(DbCommand::MarkDownloadState(DownloadStateChange {
+                    mam_id,
+                    status: DownloadStatus::Blacklisted,
+                }))
+                .await;
+            if let DbEvent::Failed(error) = event {
+                tracing::warn!("Failed to blacklist mam_id {}: {}", mam_id.0, error.message);
             }
         });
     }
@@ -130,6 +140,20 @@ impl ShellContext<'_> {
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
+
+fn torrent_state_record(state: &TorrentState) -> TorrentStateRecord {
+    match state {
+        TorrentState::Downloading => TorrentStateRecord::Downloading,
+        TorrentState::StalledDownloading => TorrentStateRecord::StalledDownloading,
+        TorrentState::Uploading => TorrentStateRecord::Uploading,
+        TorrentState::StalledUploading => TorrentStateRecord::StalledUploading,
+        TorrentState::ForcedUpload => TorrentStateRecord::ForcedUpload,
+        TorrentState::PausedDownloading => TorrentStateRecord::PausedDownloading,
+        TorrentState::PausedUploading => TorrentStateRecord::PausedUploading,
+        TorrentState::Error => TorrentStateRecord::Error,
+        TorrentState::Other => TorrentStateRecord::Unknown("other".to_string()),
+    }
+}
 
 fn qbit_details_to_record(d: QbitTorrentDetails) -> TorrentRecord {
     TorrentRecord {

@@ -88,6 +88,7 @@ pub struct SystemSnapshotRecord {
 pub enum TorrentStateRecord {
     Downloading,
     Uploading,
+    ForcedUpload,
     PausedDownloading,
     PausedUploading,
     StalledDownloading,
