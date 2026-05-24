@@ -1,41 +1,41 @@
 {
-  "db_name": "SQLite",
-  "query": "SELECT id, priority, title, body, read, created_at\n         FROM alerts ORDER BY created_at DESC LIMIT 200",
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, priority, title, body, read, created_at::text AS \"created_at!\"\n        FROM alerts ORDER BY created_at DESC LIMIT 200\n        ",
   "describe": {
     "columns": [
       {
-        "name": "id",
         "ordinal": 0,
-        "type_info": "Integer"
+        "name": "id",
+        "type_info": "Int8"
       },
       {
-        "name": "priority",
         "ordinal": 1,
+        "name": "priority",
         "type_info": "Text"
       },
       {
-        "name": "title",
         "ordinal": 2,
+        "name": "title",
         "type_info": "Text"
       },
       {
-        "name": "body",
         "ordinal": 3,
+        "name": "body",
         "type_info": "Text"
       },
       {
-        "name": "read",
         "ordinal": 4,
-        "type_info": "Integer"
+        "name": "read",
+        "type_info": "Bool"
       },
       {
-        "name": "created_at",
         "ordinal": 5,
+        "name": "created_at!",
         "type_info": "Text"
       }
     ],
     "parameters": {
-      "Right": 0
+      "Left": []
     },
     "nullable": [
       false,
@@ -43,8 +43,8 @@
       false,
       false,
       false,
-      false
+      null
     ]
   },
-  "hash": "d74149e06ea8ab83d4dad92af0699e0feff852b9afa1642ec084b634df93ba54"
+  "hash": "e639bde7ad65da9bec1c5e6f5111df015cac9a567ca14bedcc5f96d51ed0e379"
 }

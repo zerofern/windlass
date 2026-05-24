@@ -54,9 +54,9 @@ pub(super) async fn init_shell(
 
     let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone(), tx.clone()).await?;
 
-    let db_pool = DbPool::connect(&config.db_path)
+    let db_pool = DbPool::connect(&config.database_url)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to open SQLite database: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to open Postgres database: {e}"))?;
     db_pool
         .migrate()
         .await

@@ -1,5 +1,4 @@
 use crate::{ActivityRow, DbError, DbPool};
-use sqlx::Row;
 
 /// Inserts an activity record.
 ///
@@ -12,13 +11,15 @@ pub async fn insert(
     book_id: Option<i64>,
     detail: Option<&str>,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO activity_log (source, action, book_id, detail) VALUES (?, ?, ?, ?)")
-        .bind(source)
-        .bind(action)
-        .bind(book_id)
-        .bind(detail)
-        .execute(pool.inner())
-        .await?;
+    sqlx::query!(
+        "INSERT INTO activity_log (source, action, book_id, detail) VALUES ($1, $2, $3, $4)",
+        source,
+        action,
+        book_id,
+        detail
+    )
+    .execute(pool.inner())
+    .await?;
     Ok(())
 }
 
@@ -27,24 +28,17 @@ pub async fn insert(
 /// # Errors
 /// Returns `DbError` if the database query fails.
 pub async fn get_recent(pool: &DbPool, limit: i64) -> Result<Vec<ActivityRow>, DbError> {
-    let rows = sqlx::query(
-        "SELECT id, source, action, book_id, detail, created_at
-         FROM activity_log ORDER BY created_at DESC LIMIT ?",
+    let rows = sqlx::query_as!(
+        ActivityRow,
+        r#"
+        SELECT id, source, action, book_id, detail, created_at::text AS "created_at!"
+        FROM activity_log ORDER BY created_at DESC LIMIT $1
+        "#,
+        limit
     )
-    .bind(limit)
     .fetch_all(pool.inner())
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| ActivityRow {
-            id: r.get("id"),
-            source: r.get("source"),
-            action: r.get("action"),
-            book_id: r.get("book_id"),
-            detail: r.get("detail"),
-            created_at: r.get("created_at"),
-        })
-        .collect())
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -54,7 +48,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_and_get_recent_roundtrip() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         insert(&pool, "shell", "SyncPort", None, Some("ok"))
             .await
             .unwrap();
@@ -68,7 +62,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_recent_respects_limit() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         for i in 0..5_i32 {
             insert(&pool, "s", &format!("a{i}"), None, None)
                 .await

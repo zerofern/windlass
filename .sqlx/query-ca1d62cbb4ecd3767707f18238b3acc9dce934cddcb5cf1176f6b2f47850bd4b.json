@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO download_queue (mam_id, book_id, status) VALUES ($1, $2, 'pending')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ca1d62cbb4ecd3767707f18238b3acc9dce934cddcb5cf1176f6b2f47850bd4b"
+}

@@ -18,44 +18,34 @@ pub enum DbError {
     Query(#[from] sqlx::Error),
 }
 
-/// Typed handle over the underlying `SQLite` connection pool.
-///
-/// WAL mode is mandatory: it allows concurrent readers alongside the single
-/// writer, which is the correct model for Windlass — the shell writes (action
-/// execution) and the web handlers read (API responses) concurrently.
-/// sqlx serializes writers internally; no channel actor is needed.
+/// Typed handle over the underlying Postgres connection pool.
 #[derive(Clone)]
-pub struct DbPool(sqlx::SqlitePool);
+pub struct DbPool(sqlx::PgPool);
 
 impl DbPool {
-    /// Opens (or creates) the `SQLite` database at `path` in WAL mode.
+    /// Opens a Postgres connection pool.
     ///
     /// # Errors
     /// Returns `DbError::Connect` if the database cannot be opened.
-    pub async fn connect(path: &str) -> Result<Self, DbError> {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(path)
-                .create_if_missing(true)
-                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
-        )
-        .await
-        .map_err(DbError::Connect)?;
-        Ok(Self(pool))
+    pub async fn connect(database_url: &str) -> Result<Self, DbError> {
+        sqlx::PgPool::connect(database_url)
+            .await
+            .map(Self)
+            .map_err(DbError::Connect)
     }
 
-    /// Runs all pending migrations from the embedded `migrations/` directory.
+    /// Runs all pending Postgres migrations.
     ///
     /// # Errors
     /// Returns `DbError::Migrate` if any migration fails.
     pub async fn migrate(&self) -> Result<(), DbError> {
-        sqlx::migrate!()
+        sqlx::migrate!("./postgres/migrations")
             .run(&self.0)
             .await
             .map_err(DbError::Migrate)
     }
 
-    pub(crate) const fn inner(&self) -> &sqlx::SqlitePool {
+    pub(crate) const fn inner(&self) -> &sqlx::PgPool {
         &self.0
     }
 }
@@ -133,22 +123,40 @@ pub const fn alert_priority_str(p: AlertPriority) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub async fn test_pool() -> (DbPool, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.db");
-        let pool = DbPool::connect(path.to_str().unwrap()).await.unwrap();
+    static TEST_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
+
+    pub async fn test_pool() -> DbPool {
+        let admin_url = std::env::var("DATABASE_URL").expect("DATABASE_URL required for DB tests");
+        let schema = format!(
+            "windlass_test_{}",
+            TEST_SCHEMA_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();
+        let quoted_schema = format!(r#""{schema}""#);
+        sqlx::query(&format!("CREATE SCHEMA {quoted_schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+
+        let separator = if admin_url.contains('?') { '&' } else { '?' };
+        let db_url = format!("{admin_url}{separator}options=-csearch_path%3D{schema}");
+        let pool = DbPool::connect(&db_url).await.unwrap();
         pool.migrate().await.unwrap();
-        (pool, dir)
+        pool
     }
 
     #[tokio::test]
     async fn migrations_create_all_tables() {
-        let (pool, _dir) = test_pool().await;
-        // Use runtime query — sqlite_master is a system table not in the sqlx cache.
-        let tables: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_sqlx_%' ORDER BY name"
+        let pool = test_pool().await;
+        let tables: Vec<String> = sqlx::query_scalar!(
+            r#"
+            SELECT table_name AS "table_name!"
+            FROM information_schema.tables
+            WHERE table_schema = current_schema()
+            ORDER BY table_name
+            "#
         )
         .fetch_all(pool.inner())
         .await
@@ -170,6 +178,10 @@ mod tests {
             tables.contains(&"alerts".to_string()),
             "alerts table missing"
         );
+        assert!(
+            tables.contains(&"system_snapshots".to_string()),
+            "system_snapshots table missing"
+        );
     }
 
     #[test]
@@ -177,11 +189,5 @@ mod tests {
         assert_eq!(alert_priority_str(AlertPriority::Info), "info");
         assert_eq!(alert_priority_str(AlertPriority::Warning), "warning");
         assert_eq!(alert_priority_str(AlertPriority::Critical), "critical");
-    }
-
-    #[tokio::test]
-    async fn connect_fails_on_bad_path() {
-        let result = DbPool::connect("/nonexistent/path/db.db").await;
-        assert!(result.is_err(), "expected connect to fail");
     }
 }

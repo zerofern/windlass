@@ -7,6 +7,8 @@ ENV SQLX_OFFLINE=true
 COPY Cargo.toml Cargo.lock ./
 COPY .sqlx/            .sqlx/
 COPY windlass-types/   windlass-types/
+COPY windlass-machine/ windlass-machine/
+COPY windlass-db-core/ windlass-db-core/
 COPY windlass-core/    windlass-core/
 COPY windlass-debug/   windlass-debug/
 COPY windlass-local/   windlass-local/

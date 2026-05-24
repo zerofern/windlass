@@ -67,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_events_empty_db_returns_empty_array() {
-        let (state, _dir) = crate::test_helpers::test_state().await;
+        let state = crate::test_helpers::test_state().await;
         let app = router(state);
         let response = app
             .oneshot(
@@ -88,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_events_limit_param_is_respected() {
-        let (state, _dir) = crate::test_helpers::test_state().await;
+        let state = crate::test_helpers::test_state().await;
         for i in 0..10_i32 {
             windlass_db::activity_log::insert(
                 &state.db_pool,

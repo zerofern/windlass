@@ -1,41 +1,41 @@
 {
-  "db_name": "SQLite",
-  "query": "SELECT id, mam_id, title, author, status, created_at FROM books ORDER BY created_at DESC",
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, mam_id, title, author, status, created_at::text AS \"created_at!\"\n        FROM books ORDER BY created_at DESC\n        ",
   "describe": {
     "columns": [
       {
-        "name": "id",
         "ordinal": 0,
-        "type_info": "Integer"
+        "name": "id",
+        "type_info": "Int8"
       },
       {
-        "name": "mam_id",
         "ordinal": 1,
-        "type_info": "Integer"
+        "name": "mam_id",
+        "type_info": "Int8"
       },
       {
-        "name": "title",
         "ordinal": 2,
+        "name": "title",
         "type_info": "Text"
       },
       {
-        "name": "author",
         "ordinal": 3,
+        "name": "author",
         "type_info": "Text"
       },
       {
-        "name": "status",
         "ordinal": 4,
+        "name": "status",
         "type_info": "Text"
       },
       {
-        "name": "created_at",
         "ordinal": 5,
+        "name": "created_at!",
         "type_info": "Text"
       }
     ],
     "parameters": {
-      "Right": 0
+      "Left": []
     },
     "nullable": [
       false,
@@ -43,8 +43,8 @@
       true,
       true,
       false,
-      false
+      null
     ]
   },
-  "hash": "3ab9e408e1b6be8a3047f7ede2bbf4801ed32455abb1d21b17b751d81dbb6ac9"
+  "hash": "55c4b48ebe72167f81bc1aaffc3014f8e12b9989f82821b4429e6d20ae42b9ff"
 }

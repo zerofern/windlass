@@ -89,7 +89,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_torrents_empty_db_returns_empty_array() {
-        let (state, _dir) = crate::test_helpers::test_state().await;
+        let state = crate::test_helpers::test_state().await;
         let app = router(state);
         let response = app
             .oneshot(

@@ -12,7 +12,7 @@ build:
     cargo build
 
 test:
-    cargo test
+    DATABASE_URL=postgres://windlass:windlass@localhost:15432/windlass cargo test
 
 test-all:
     cargo test -- --include-ignored
@@ -37,7 +37,11 @@ integration-qbit:
 
 # Bring up only Postgres for DB development.
 db-up:
-    docker compose -f docker-compose.dev.yml up -d postgres
+    docker compose -f docker-compose.dev.yml up --wait -d postgres
+
+# Apply the Postgres schema used for SQLx compile-time checking.
+db-migrate:
+    docker compose -f docker-compose.dev.yml exec -T postgres psql -U windlass -d windlass -f /migrations/0001_initial.sql
 
 # Tear down the dev stack and remove the Postgres volume.
 db-down:
@@ -75,7 +79,7 @@ fmt-check:
     cargo fmt -- --check
 
 clippy:
-    cargo clippy -- -W clippy::pedantic -W clippy::nursery
+    DATABASE_URL=postgres://windlass:windlass@localhost:15432/windlass cargo clippy -- -W clippy::pedantic -W clippy::nursery
 
 coverage:
     cargo tarpaulin \
@@ -94,4 +98,4 @@ audit:
 outdated:
     cargo outdated --workspace
 
-check: fmt-check clippy test
+check: db-up db-migrate fmt-check clippy test

@@ -1,16 +1,16 @@
 {
-  "db_name": "SQLite",
+  "db_name": "PostgreSQL",
   "query": "SELECT mam_id FROM download_queue WHERE status = 'blacklisted'",
   "describe": {
     "columns": [
       {
-        "name": "mam_id",
         "ordinal": 0,
-        "type_info": "Integer"
+        "name": "mam_id",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
-      "Right": 0
+      "Left": []
     },
     "nullable": [
       false

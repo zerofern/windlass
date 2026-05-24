@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO books (mam_id) VALUES ($1)\n        ON CONFLICT(mam_id) DO UPDATE SET mam_id = excluded.mam_id\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bf96fe3f8d9e71b7626f67ff71f7d14abfaeb9a49b08b8bec0dc5cb12d6fc117"
+}

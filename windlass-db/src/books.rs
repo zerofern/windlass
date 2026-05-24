@@ -1,5 +1,4 @@
 use crate::{BookRow, DbError, DbPool};
-use sqlx::Row;
 use windlass_types::MamTorrentId;
 
 /// Upserts a book record by `mam_id`. Returns the book's primary key `id`.
@@ -9,17 +8,17 @@ use windlass_types::MamTorrentId;
 ///
 pub async fn upsert(pool: &DbPool, mam_id: MamTorrentId) -> Result<i64, DbError> {
     let mam = i64::try_from(mam_id.0).unwrap_or(i64::MAX);
-    sqlx::query(
-        "INSERT INTO books (mam_id) VALUES (?) ON CONFLICT(mam_id) DO UPDATE SET mam_id = excluded.mam_id",
+    let record = sqlx::query!(
+        r#"
+        INSERT INTO books (mam_id) VALUES ($1)
+        ON CONFLICT(mam_id) DO UPDATE SET mam_id = excluded.mam_id
+        RETURNING id
+        "#,
+        mam
     )
-    .bind(mam)
-    .execute(pool.inner())
+    .fetch_one(pool.inner())
     .await?;
-    let id = sqlx::query_scalar::<_, i64>("SELECT id FROM books WHERE mam_id = ?")
-        .bind(mam)
-        .fetch_one(pool.inner())
-        .await?;
-    Ok(id)
+    Ok(record.id)
 }
 
 /// Returns all books ordered by creation time descending.
@@ -28,22 +27,16 @@ pub async fn upsert(pool: &DbPool, mam_id: MamTorrentId) -> Result<i64, DbError>
 /// Returns `DbError` if the database query fails.
 ///
 pub async fn get_all(pool: &DbPool) -> Result<Vec<BookRow>, DbError> {
-    let rows = sqlx::query(
-        "SELECT id, mam_id, title, author, status, created_at FROM books ORDER BY created_at DESC",
+    let rows = sqlx::query_as!(
+        BookRow,
+        r#"
+        SELECT id, mam_id, title, author, status, created_at::text AS "created_at!"
+        FROM books ORDER BY created_at DESC
+        "#
     )
     .fetch_all(pool.inner())
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| BookRow {
-            id: r.get("id"),
-            mam_id: r.get("mam_id"),
-            title: r.get("title"),
-            author: r.get("author"),
-            status: r.get("status"),
-            created_at: r.get("created_at"),
-        })
-        .collect())
+    Ok(rows)
 }
 
 ///
@@ -55,20 +48,17 @@ pub async fn get_by_mam_id(
     mam_id: MamTorrentId,
 ) -> Result<Option<BookRow>, DbError> {
     let id = i64::try_from(mam_id.0).unwrap_or(i64::MAX);
-    let row = sqlx::query(
-        "SELECT id, mam_id, title, author, status, created_at FROM books WHERE mam_id = ?",
+    let row = sqlx::query_as!(
+        BookRow,
+        r#"
+        SELECT id, mam_id, title, author, status, created_at::text AS "created_at!"
+        FROM books WHERE mam_id = $1
+        "#,
+        id
     )
-    .bind(id)
     .fetch_optional(pool.inner())
     .await?;
-    Ok(row.map(|r| BookRow {
-        id: r.get("id"),
-        mam_id: r.get("mam_id"),
-        title: r.get("title"),
-        author: r.get("author"),
-        status: r.get("status"),
-        created_at: r.get("created_at"),
-    }))
+    Ok(row)
 }
 
 #[cfg(test)]
@@ -79,7 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_returns_id_and_is_idempotent() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         let mam_id = MamTorrentId(42);
         let id1 = upsert(&pool, mam_id).await.unwrap();
         let id2 = upsert(&pool, mam_id).await.unwrap();
@@ -89,14 +79,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_by_mam_id_returns_none_when_missing() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         let row = get_by_mam_id(&pool, MamTorrentId(999)).await.unwrap();
         assert!(row.is_none());
     }
 
     #[tokio::test]
     async fn get_by_mam_id_returns_row_after_upsert() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         let mam_id = MamTorrentId(7);
         upsert(&pool, mam_id).await.unwrap();
         let row = get_by_mam_id(&pool, mam_id).await.unwrap().unwrap();
@@ -106,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_all_returns_all_books() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         upsert(&pool, MamTorrentId(1)).await.unwrap();
         upsert(&pool, MamTorrentId(2)).await.unwrap();
         let rows = get_all(&pool).await.unwrap();

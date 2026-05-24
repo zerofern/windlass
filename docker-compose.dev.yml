@@ -105,6 +105,7 @@ services:
       POSTGRES_DB: windlass
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./windlass-db/postgres/migrations:/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U windlass -d windlass"]
       interval: 3s
@@ -146,7 +147,6 @@ services:
       VPN_PORT_FILE: /tmp/gluetun/forwarded_port
       WINDLASS_BIND: 0.0.0.0:5010
       CHAOS_URL: http://localhost:9000
-      DB_PATH: /tmp/windlass.db
       DATABASE_URL: postgres://windlass:windlass@postgres:5432/windlass
       RUST_LOG: windlass=debug,info
 volumes:

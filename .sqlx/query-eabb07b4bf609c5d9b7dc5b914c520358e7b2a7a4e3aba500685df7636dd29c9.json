@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT hash, book_id, mam_id, name, state, seeding_time_secs,\n            downloaded_bytes, seen_at::text AS \"seen_at!\", added_at::text AS \"added_at!\"\n        FROM torrents ORDER BY added_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "book_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "mam_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "seeding_time_secs",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "downloaded_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "seen_at!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "added_at!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "eabb07b4bf609c5d9b7dc5b914c520358e7b2a7a4e3aba500685df7636dd29c9"
+}

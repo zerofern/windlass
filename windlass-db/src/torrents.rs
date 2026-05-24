@@ -1,5 +1,4 @@
 use crate::{DbError, DbPool, TorrentRow};
-use sqlx::Row;
 
 /// Inserts or updates a torrent record keyed by `hash`.
 ///
@@ -9,27 +8,29 @@ use sqlx::Row;
 /// # Errors
 /// Returns `DbError` if the database query fails.
 pub async fn upsert(pool: &DbPool, r: &TorrentRow) -> Result<(), DbError> {
-    sqlx::query(
-        r"INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,
-           downloaded_bytes, seen_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(hash) DO UPDATE SET
-             book_id = COALESCE(excluded.book_id, torrents.book_id),
-             mam_id = COALESCE(excluded.mam_id, torrents.mam_id),
-             name = excluded.name,
-             state = excluded.state,
-             seeding_time_secs = excluded.seeding_time_secs,
-             downloaded_bytes = excluded.downloaded_bytes,
-             seen_at = excluded.seen_at",
+    sqlx::query!(
+        r#"
+        INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,
+            downloaded_bytes, seen_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::timestamptz)
+        ON CONFLICT(hash) DO UPDATE SET
+            book_id = COALESCE(excluded.book_id, torrents.book_id),
+            mam_id = COALESCE(excluded.mam_id, torrents.mam_id),
+            name = excluded.name,
+            state = excluded.state,
+            seeding_time_secs = excluded.seeding_time_secs,
+            downloaded_bytes = excluded.downloaded_bytes,
+            seen_at = excluded.seen_at
+        "#,
+        r.hash,
+        r.book_id,
+        r.mam_id,
+        r.name,
+        r.state,
+        r.seeding_time_secs,
+        r.downloaded_bytes,
+        r.seen_at
     )
-    .bind(&r.hash)
-    .bind(r.book_id)
-    .bind(r.mam_id)
-    .bind(&r.name)
-    .bind(&r.state)
-    .bind(r.seeding_time_secs)
-    .bind(r.downloaded_bytes)
-    .bind(&r.seen_at)
     .execute(pool.inner())
     .await?;
     Ok(())
@@ -41,26 +42,17 @@ pub async fn upsert(pool: &DbPool, r: &TorrentRow) -> Result<(), DbError> {
 /// Returns `DbError` if the database query fails.
 ///
 pub async fn get_all(pool: &DbPool) -> Result<Vec<TorrentRow>, DbError> {
-    let rows = sqlx::query(
-        "SELECT hash, book_id, mam_id, name, state, seeding_time_secs,
-         downloaded_bytes, seen_at, added_at FROM torrents ORDER BY added_at DESC",
+    let rows = sqlx::query_as!(
+        TorrentRow,
+        r#"
+        SELECT hash, book_id, mam_id, name, state, seeding_time_secs,
+            downloaded_bytes, seen_at::text AS "seen_at!", added_at::text AS "added_at!"
+        FROM torrents ORDER BY added_at DESC
+        "#
     )
     .fetch_all(pool.inner())
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| TorrentRow {
-            hash: r.get("hash"),
-            book_id: r.get("book_id"),
-            mam_id: r.get("mam_id"),
-            name: r.get("name"),
-            state: r.get("state"),
-            seeding_time_secs: r.get("seeding_time_secs"),
-            downloaded_bytes: r.get("downloaded_bytes"),
-            seen_at: r.get("seen_at"),
-            added_at: r.get("added_at"),
-        })
-        .collect())
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -78,14 +70,14 @@ mod tests {
             state: "downloading".to_string(),
             seeding_time_secs: 0,
             downloaded_bytes: 0,
-            seen_at: "2024-01-01T00:00:00".to_string(),
-            added_at: "2024-01-01T00:00:00".to_string(),
+            seen_at: "2024-01-01T00:00:00Z".to_string(),
+            added_at: "2024-01-01T00:00:00Z".to_string(),
         }
     }
 
     #[tokio::test]
     async fn upsert_and_get_all_roundtrip() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         upsert(&pool, &sample_row("abc123")).await.unwrap();
         let rows = get_all(&pool).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -95,7 +87,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_preserves_book_id_on_conflict() {
-        let (pool, _dir) = test_pool().await;
+        let pool = test_pool().await;
         // Create a valid book first to satisfy the foreign key constraint.
         let book_id = crate::books::upsert(&pool, MamTorrentId(42)).await.unwrap();
 
