@@ -3207,6 +3207,7 @@ dependencies = [
  "windlass-clients",
  "windlass-core",
  "windlass-db",
+ "windlass-db-core",
  "windlass-debug",
  "windlass-local",
  "windlass-types",
@@ -3254,6 +3255,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "windlass-db-core",
  "windlass-types",
 ]
 

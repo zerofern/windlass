@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 sqlx           = { workspace = true }
+windlass-db-core = { workspace = true }
 windlass-types = { workspace = true }
 tokio          = { workspace = true }
 tracing        = { workspace = true }

@@ -1,6 +1,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 pub mod activity_log;
+pub mod actor;
 pub mod alerts;
 pub mod books;
 pub mod download_queue;
