@@ -6,6 +6,7 @@ members = [
     "windlass-core",
     "windlass-debug",
     "windlass-db-core",
+    "windlass-qbit-core",
     "windlass-vpn-core",
     "windlass-local",
     "windlass-clients",
@@ -46,6 +47,7 @@ sqlx             = { version = "0.8", features = ["postgres", "runtime-tokio-rus
 windlass-debug   = { path = "windlass-debug" }
 windlass-db-core = { path = "windlass-db-core" }
 windlass-machine = { path = "windlass-machine" }
+windlass-qbit-core = { path = "windlass-qbit-core" }
 windlass-types   = { path = "windlass-types" }
 windlass-vpn-core = { path = "windlass-vpn-core" }
 windlass-core    = { path = "windlass-core" }

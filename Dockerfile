@@ -9,6 +9,7 @@ COPY .sqlx/            .sqlx/
 COPY windlass-types/   windlass-types/
 COPY windlass-machine/ windlass-machine/
 COPY windlass-db-core/ windlass-db-core/
+COPY windlass-qbit-core/ windlass-qbit-core/
 COPY windlass-vpn-core/ windlass-vpn-core/
 COPY windlass-core/    windlass-core/
 COPY windlass-debug/   windlass-debug/
