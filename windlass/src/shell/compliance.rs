@@ -3,6 +3,8 @@ use windlass_clients::qbit::{QbitTorrentDetails, QbitTorrentState};
 use windlass_core::events::Event;
 use windlass_core::torrent::{TorrentRecord, TorrentState};
 use windlass_db::TorrentRow;
+use windlass_db::actor::PostgresDbActor;
+use windlass_db_core::{ActivityRecord, ActivitySource, BookId, DbCommand, DbEvent};
 use windlass_debug::CausalTx;
 use windlass_types::{AuthCookie, MamTorrentId, TorrentHash};
 
@@ -108,18 +110,20 @@ impl ShellContext<'_> {
         book_id: Option<i64>,
         detail: Option<String>,
     ) {
-        let pool = self.db_pool.clone();
+        let actor = PostgresDbActor::new(self.db_pool.clone());
         tokio::spawn(async move {
-            if let Err(e) = windlass_db::activity_log::insert(
-                &pool,
-                &source,
-                &action,
-                book_id,
-                detail.as_deref(),
-            )
-            .await
-            {
-                tracing::warn!("Failed to write activity {action}: {e}");
+            let event = actor
+                .handle(DbCommand::RecordActivity(ActivityRecord {
+                    at: Utc::now(),
+                    source: ActivitySource::Shell,
+                    action,
+                    book_id: book_id.map(BookId),
+                    detail,
+                    metadata: serde_json::json!({ "legacy_source": source }),
+                }))
+                .await;
+            if let DbEvent::Failed(error) = event {
+                tracing::warn!("Failed to write activity to DB: {}", error.message);
             }
         });
     }

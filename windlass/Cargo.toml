@@ -28,6 +28,4 @@ secrecy          = { workspace = true }
 reqwest          = { workspace = true }
 uom              = { workspace = true }
 uuid             = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
