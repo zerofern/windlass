@@ -1,0 +1,333 @@
+#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use windlass_db_core::{DbCommand, SystemSnapshotRecord};
+use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome};
+use windlass_mam_core::{MamCommand, MamPublish};
+use windlass_qbit_core::{QbitCommand, QbitPublish};
+use windlass_types::VpnPort;
+use windlass_vpn_core::{VpnCommand, VpnPublish};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindlassConfig {
+    pub snapshot_interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindlassEvent {
+    Init,
+    Vpn(VpnPublish),
+    Qbit(QbitPublish),
+    Mam(MamPublish),
+    DbFailed { operation: String, message: String },
+    TimerFired(WindlassTimer),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindlassTimer {
+    Snapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindlassAction {
+    Vpn(VpnCommand),
+    Qbit(QbitCommand),
+    Mam(MamCommand),
+    Db(DbCommand),
+    ScheduleTimer {
+        timer: WindlassTimer,
+        after: Duration,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindlassPublish {
+    SystemState(SystemStateView),
+    Activity { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindlassTopic {
+    SystemState,
+    Activity,
+}
+
+impl HasTopic<WindlassTopic> for WindlassPublish {
+    fn topic(&self) -> WindlassTopic {
+        match self {
+            Self::SystemState(_) => WindlassTopic::SystemState,
+            Self::Activity { .. } => WindlassTopic::Activity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindlassCommand {
+    Refresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindlassResponse {
+    Accepted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceStatus {
+    Unknown,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemStateView {
+    pub vpn: ServiceStatus,
+    pub qbit: ServiceStatus,
+    pub mam: ServiceStatus,
+    pub forwarded_port: Option<VpnPort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindlassMachine {
+    config: WindlassConfig,
+    state: SystemStateView,
+}
+
+impl WindlassMachine {
+    #[must_use]
+    pub const fn state(&self) -> &SystemStateView {
+        &self.state
+    }
+
+    fn snapshot_action(&self) -> WindlassAction {
+        WindlassAction::Db(DbCommand::SaveSystemSnapshot(SystemSnapshotRecord {
+            at: Utc::now(),
+            state: json!(self.state),
+        }))
+    }
+}
+
+impl Machine for WindlassMachine {
+    type Config = WindlassConfig;
+    type Event = WindlassEvent;
+    type Action = WindlassAction;
+    type Publish = WindlassPublish;
+    type Topic = WindlassTopic;
+    type Command = WindlassCommand;
+    type Response = WindlassResponse;
+
+    fn new(config: Self::Config, _now: Instant) -> Self {
+        Self {
+            config,
+            state: SystemStateView {
+                vpn: ServiceStatus::Unknown,
+                qbit: ServiceStatus::Unknown,
+                mam: ServiceStatus::Unknown,
+                forwarded_port: None,
+            },
+        }
+    }
+
+    fn handle(
+        &mut self,
+        _now: Instant,
+        event: Self::Event,
+    ) -> Outcome<Self::Action, Self::Publish> {
+        match event {
+            WindlassEvent::Init => Outcome {
+                actions: vec![
+                    WindlassAction::Vpn(VpnCommand::StartMonitoring),
+                    WindlassAction::Qbit(QbitCommand::EnsureAuthenticated),
+                    WindlassAction::Mam(MamCommand::EnsureAuthenticated),
+                    WindlassAction::ScheduleTimer {
+                        timer: WindlassTimer::Snapshot,
+                        after: self.config.snapshot_interval,
+                    },
+                ],
+                publish: Vec::new(),
+            },
+            WindlassEvent::Vpn(VpnPublish::Connected) => {
+                self.state.vpn = ServiceStatus::Ready;
+                self.publish_state()
+            }
+            WindlassEvent::Vpn(VpnPublish::Disconnected) => {
+                self.state.vpn = ServiceStatus::Degraded;
+                self.state.forwarded_port = None;
+                self.publish_state()
+            }
+            WindlassEvent::Vpn(VpnPublish::PortReady { port }) => {
+                self.state.forwarded_port = Some(port);
+                Outcome {
+                    actions: vec![
+                        WindlassAction::Qbit(QbitCommand::EnsureListenPort { port }),
+                        WindlassAction::Mam(MamCommand::EnsureSeedboxPort { port }),
+                        self.snapshot_action(),
+                    ],
+                    publish: vec![WindlassPublish::SystemState(self.state.clone())],
+                }
+            }
+            WindlassEvent::Vpn(VpnPublish::PortUnavailable) => {
+                self.state.forwarded_port = None;
+                self.publish_state()
+            }
+            WindlassEvent::Qbit(QbitPublish::Ready) => {
+                self.state.qbit = ServiceStatus::Ready;
+                self.publish_state()
+            }
+            WindlassEvent::Qbit(QbitPublish::Unavailable { reason }) => {
+                self.state.qbit = ServiceStatus::Degraded;
+                self.publish_state_with_activity(reason)
+            }
+            WindlassEvent::Qbit(
+                QbitPublish::ListenPortReady { .. } | QbitPublish::TorrentsUpdated { .. },
+            )
+            | WindlassEvent::Mam(
+                MamPublish::Connectable { .. } | MamPublish::SeedboxPortReady { .. },
+            ) => Outcome::none(),
+            WindlassEvent::Mam(MamPublish::Ready) => {
+                self.state.mam = ServiceStatus::Ready;
+                self.publish_state()
+            }
+            WindlassEvent::Mam(
+                MamPublish::Unavailable { reason } | MamPublish::NotConnectable { reason },
+            ) => {
+                self.state.mam = ServiceStatus::Degraded;
+                self.publish_state_with_activity(reason)
+            }
+            WindlassEvent::Mam(MamPublish::RateLimited { retry_after }) => {
+                self.state.mam = ServiceStatus::Degraded;
+                self.publish_state_with_activity(format!(
+                    "MAM rate limited for {}s",
+                    retry_after.as_secs()
+                ))
+            }
+            WindlassEvent::DbFailed { operation, message } => Outcome {
+                actions: Vec::new(),
+                publish: vec![WindlassPublish::Activity {
+                    message: format!("DB {operation} failed: {message}"),
+                }],
+            },
+            WindlassEvent::TimerFired(WindlassTimer::Snapshot) => Outcome {
+                actions: vec![
+                    self.snapshot_action(),
+                    WindlassAction::ScheduleTimer {
+                        timer: WindlassTimer::Snapshot,
+                        after: self.config.snapshot_interval,
+                    },
+                ],
+                publish: Vec::new(),
+            },
+        }
+    }
+
+    fn handle_command(
+        &mut self,
+        _now: Instant,
+        cmd: Self::Command,
+    ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
+        let actions = match cmd {
+            WindlassCommand::Refresh => vec![
+                WindlassAction::Vpn(VpnCommand::RefreshState),
+                WindlassAction::Qbit(QbitCommand::RefreshTorrents),
+                WindlassAction::Mam(MamCommand::RefreshStatus),
+            ],
+        };
+        Self::outcome(actions, WindlassResponse::Accepted)
+    }
+}
+
+impl WindlassMachine {
+    fn publish_state(&self) -> Outcome<WindlassAction, WindlassPublish> {
+        Outcome {
+            actions: vec![self.snapshot_action()],
+            publish: vec![WindlassPublish::SystemState(self.state.clone())],
+        }
+    }
+
+    fn publish_state_with_activity(
+        &self,
+        message: String,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        Outcome {
+            actions: vec![self.snapshot_action()],
+            publish: vec![
+                WindlassPublish::SystemState(self.state.clone()),
+                WindlassPublish::Activity { message },
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use windlass_machine::Machine;
+    use windlass_mam_core::MamCommand;
+    use windlass_qbit_core::QbitCommand;
+    use windlass_types::VpnPort;
+    use windlass_vpn_core::VpnPublish;
+
+    use crate::{
+        ServiceStatus, WindlassAction, WindlassConfig, WindlassEvent, WindlassMachine,
+        WindlassPublish,
+    };
+
+    fn machine() -> WindlassMachine {
+        WindlassMachine::new(
+            WindlassConfig {
+                snapshot_interval: Duration::from_secs(60),
+            },
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn vpn_port_ready_converges_qbit_and_mam() {
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+
+        let out = machine.handle(
+            Instant::now(),
+            WindlassEvent::Vpn(VpnPublish::PortReady { port }),
+        );
+
+        assert_eq!(machine.state().forwarded_port, Some(port));
+        assert!(
+            out.actions
+                .contains(&WindlassAction::Qbit(QbitCommand::EnsureListenPort {
+                    port
+                }))
+        );
+        assert!(
+            out.actions
+                .contains(&WindlassAction::Mam(MamCommand::EnsureSeedboxPort { port }))
+        );
+        assert!(matches!(
+            out.publish.as_slice(),
+            [WindlassPublish::SystemState(_)]
+        ));
+    }
+
+    #[test]
+    fn vpn_disconnected_degrades_vpn_and_clears_port() {
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+        machine.handle(
+            Instant::now(),
+            WindlassEvent::Vpn(VpnPublish::PortReady { port }),
+        );
+
+        let out = machine.handle(Instant::now(), WindlassEvent::Vpn(VpnPublish::Disconnected));
+
+        assert_eq!(machine.state().vpn, ServiceStatus::Degraded);
+        assert_eq!(machine.state().forwarded_port, None);
+        assert!(matches!(
+            out.publish.as_slice(),
+            [WindlassPublish::SystemState(_)]
+        ));
+    }
+}

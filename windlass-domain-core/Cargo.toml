@@ -1,0 +1,15 @@
+[package]
+name = "windlass-domain-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono             = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+windlass-db-core   = { workspace = true }
+windlass-machine   = { workspace = true }
+windlass-mam-core  = { workspace = true }
+windlass-qbit-core = { workspace = true }
+windlass-types     = { workspace = true }
+windlass-vpn-core  = { workspace = true }

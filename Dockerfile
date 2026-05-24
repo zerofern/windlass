@@ -13,6 +13,7 @@ COPY windlass-mam-core/ windlass-mam-core/
 COPY windlass-qbit-core/ windlass-qbit-core/
 COPY windlass-vpn-core/ windlass-vpn-core/
 COPY windlass-core/    windlass-core/
+COPY windlass-domain-core/ windlass-domain-core/
 COPY windlass-debug/   windlass-debug/
 COPY windlass-local/   windlass-local/
 COPY windlass-clients/ windlass-clients/

@@ -3286,6 +3286,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-domain-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "windlass-db-core",
+ "windlass-machine",
+ "windlass-mam-core",
+ "windlass-qbit-core",
+ "windlass-types",
+ "windlass-vpn-core",
+]
+
+[[package]]
 name = "windlass-local"
 version = "0.1.0"
 dependencies = [
