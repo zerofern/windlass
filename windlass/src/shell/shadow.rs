@@ -189,7 +189,8 @@ fn suppress_bootstrap_probe_actions(event: &Event, actions: &mut Vec<ShadowActio
     actions.retain(|action| {
         !matches!(
             action,
-            ShadowAction::Mam(MamAction::FetchStatus) | ShadowAction::Vpn(VpnAction::ReadPortFiles)
+            ShadowAction::Mam(MamAction::FetchStatus)
+                | ShadowAction::Vpn(VpnAction::InspectContainer | VpnAction::ReadPortFiles)
         )
     });
 }
@@ -393,6 +394,13 @@ mod tests {
             actions
                 .iter()
                 .filter(|action| matches!(action, ShadowAction::Vpn(VpnAction::ReadPortFiles)))
+                .count(),
+            0
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, ShadowAction::Vpn(VpnAction::InspectContainer)))
                 .count(),
             0
         );
