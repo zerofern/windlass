@@ -30,17 +30,20 @@ impl ShellContext<'_> {
     pub(super) fn fetch_qbit_preferences(&self, cookie: AuthCookie, causal_tx: CausalTx) {
         let qbit = self.qbit.clone();
         tokio::spawn(causal_tx.run(move |causal_tx| async move {
-            if let Some(prefs) = qbit.get_preferences(&cookie).await {
-                causal_tx
-                    .send(Event::QbitPreferencesReceived {
-                        at: Utc::now(),
-                        max_active_torrents: prefs.torrents,
-                        max_active_downloads: prefs.downloads,
-                        max_active_uploads: prefs.uploads,
-                        listen_port: prefs.listen_port,
-                    })
-                    .await;
-            }
+            let event = qbit.get_preferences(&cookie).await.map_or_else(
+                || Event::QbitPreferencesFailed {
+                    at: Utc::now(),
+                    reason: "qBittorrent preferences unavailable".to_string(),
+                },
+                |prefs| Event::QbitPreferencesReceived {
+                    at: Utc::now(),
+                    max_active_torrents: prefs.torrents,
+                    max_active_downloads: prefs.downloads,
+                    max_active_uploads: prefs.uploads,
+                    listen_port: prefs.listen_port,
+                },
+            );
+            causal_tx.send(event).await;
         }));
     }
 

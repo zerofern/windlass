@@ -168,6 +168,7 @@ pub const fn event_variant(event: &Event) -> &'static str {
         Event::MamRateLimitViolation { .. } => "MamRateLimitViolation",
         Event::QbitTorrentDetailsReceived { .. } => "QbitTorrentDetailsReceived",
         Event::QbitPreferencesReceived { .. } => "QbitPreferencesReceived",
+        Event::QbitPreferencesFailed { .. } => "QbitPreferencesFailed",
         Event::DeleteTorrentRequested { .. } => "DeleteTorrentRequested",
         Event::ManualDownloadRequested { .. } => "ManualDownloadRequested",
         Event::TorrentAddedToQbit { .. } => "TorrentAddedToQbit",

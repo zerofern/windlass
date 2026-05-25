@@ -292,6 +292,11 @@ fn legacy_to_shadow_events(event: &Event, forwarded_port: Option<VpnPort>) -> Ve
                 listen_port: *listen_port,
             })]
         }
+        Event::QbitPreferencesFailed { reason, .. } => {
+            vec![ShadowEvent::Qbit(QbitEvent::PreferencesFailed {
+                reason: reason.clone(),
+            })]
+        }
         Event::DiskSpaceObserved { .. }
         | Event::NewTorrentsObserved { .. }
         | Event::LogsDumped { .. }

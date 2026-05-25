@@ -135,6 +135,10 @@ pub enum Event {
         max_active_uploads: u32,
         listen_port: Option<VpnPort>,
     },
+    QbitPreferencesFailed {
+        at: DateTime<Utc>,
+        reason: String,
+    },
 
     /// User-initiated torrent deletion (wired from web UI in Step 6).
     DeleteTorrentRequested {
@@ -187,6 +191,7 @@ impl Event {
             | Self::MamRateLimitViolation { at }
             | Self::QbitTorrentDetailsReceived { at, .. }
             | Self::QbitPreferencesReceived { at, .. }
+            | Self::QbitPreferencesFailed { at, .. }
             | Self::DeleteTorrentRequested { at, .. }
             | Self::ManualDownloadRequested { at, .. }
             | Self::TorrentAddedToQbit { at, .. }

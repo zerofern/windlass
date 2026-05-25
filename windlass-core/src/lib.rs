@@ -95,6 +95,7 @@ impl SystemState {
                 max_active_torrents,
                 ..
             } => self.on_qbit_preferences_received(max_active_torrents),
+            Event::QbitPreferencesFailed { .. } => Vec::new(),
             Event::DeleteTorrentRequested { hash, .. } => self.on_delete_torrent_requested(hash),
 
             // ── Manual download ───────────────────────────────────────────────
