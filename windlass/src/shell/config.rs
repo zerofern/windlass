@@ -29,6 +29,9 @@ pub struct Config {
     pub compliance_poll_interval_secs: u64,
     /// Maximum unsatisfied torrents before alerting (default: 50).
     pub unsatisfied_quota_limit: u32,
+    /// Executes service actions produced by the new shadow cores. Disabled by
+    /// default while legacy orchestration remains authoritative.
+    pub execute_shadow_actions: bool,
 }
 
 impl Config {
@@ -67,6 +70,8 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
+            execute_shadow_actions: var("WINDLASS_EXECUTE_SHADOW_ACTIONS")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         })
     }
 }

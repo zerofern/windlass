@@ -57,6 +57,7 @@ pub async fn run(
         causal_debug_tx,
         mut causal_rx,
         mut shadow_cores,
+        execute_shadow_actions,
     } = init_shell(&debug_ctrl, debug_owned).await?;
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
 
@@ -93,8 +94,9 @@ pub async fn run(
 
         debug!(?event, "←");
 
-        for action in shadow_cores.observe(&event) {
-            dispatch_shadow_action(&db_pool, action);
+        let shadow_actions = shadow_cores.observe(&event);
+        for action in &shadow_actions {
+            dispatch_shadow_db_action(&db_pool, action);
         }
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {
@@ -119,6 +121,8 @@ pub async fn run(
             db_pool: &db_pool,
         };
 
+        execute_shadow_actions_if_enabled(execute_shadow_actions, shadow_actions, &tx, &mut ctx);
+
         dispatch_event(
             outcome.actions,
             event_id,
@@ -136,10 +140,11 @@ pub async fn run(
     Ok(())
 }
 
-fn dispatch_shadow_action(db_pool: &DbPool, action: ShadowAction) {
+fn dispatch_shadow_db_action(db_pool: &DbPool, action: &ShadowAction) {
     match action {
         ShadowAction::Db(command) => {
             let actor = PostgresDbActor::new(db_pool.clone());
+            let command = command.clone();
             tokio::spawn(async move {
                 let event = actor.handle(command).await;
                 if let DbEvent::Failed(error) = event {
@@ -155,6 +160,21 @@ fn dispatch_shadow_action(db_pool: &DbPool, action: ShadowAction) {
         | ShadowAction::Qbit(_)
         | ShadowAction::Mam(_)
         | ShadowAction::ScheduleTimer { .. } => {}
+    }
+}
+
+fn execute_shadow_actions_if_enabled(
+    enabled: bool,
+    actions: Vec<ShadowAction>,
+    tx: &mpsc::Sender<Event>,
+    ctx: &mut ShellContext<'_>,
+) {
+    if !enabled {
+        return;
+    }
+    for action in actions {
+        let causal = CausalTx::plain(uuid::Uuid::new_v4(), tx.clone());
+        ctx.execute_shadow_action(action, causal);
     }
 }
 

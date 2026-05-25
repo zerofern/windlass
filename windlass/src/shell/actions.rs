@@ -7,9 +7,12 @@ use windlass_db::actor::PostgresDbActor;
 use windlass_db_core::{AlertRecord, DbCommand, DbEvent};
 use windlass_debug::CausalTx;
 use windlass_local::{monitors, vpn_files};
+use windlass_mam_core::{MamAction, MamTimer};
+use windlass_qbit_core::{QbitAction, QbitTimer};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
+use windlass_vpn_core::{VpnAction, VpnTimer};
 
-use super::ShellContext;
+use super::{ShellContext, shadow::ShadowAction};
 
 impl ShellContext<'_> {
     // ── Timers ────────────────────────────────────────────────────────────────
@@ -25,6 +28,61 @@ impl ShellContext<'_> {
             let _ = tx.send(Event::Wakeup { at: Utc::now(), id }).await;
         });
         self.wakeups.insert(id, handle);
+    }
+
+    pub(super) fn execute_shadow_action(&mut self, action: ShadowAction, causal_tx: CausalTx) {
+        match action {
+            ShadowAction::Db(_) | ShadowAction::ScheduleTimer { .. } => {}
+            ShadowAction::Vpn(action) => self.execute_shadow_vpn_action(&action, causal_tx),
+            ShadowAction::Qbit(action) => self.execute_shadow_qbit_action(action, causal_tx),
+            ShadowAction::Mam(action) => self.execute_shadow_mam_action(&action, causal_tx),
+        }
+    }
+
+    fn execute_shadow_vpn_action(&mut self, action: &VpnAction, causal_tx: CausalTx) {
+        match action {
+            VpnAction::InspectContainer => self.inspect_gluetun(causal_tx),
+            VpnAction::ReadPortFiles => self.read_port_files(causal_tx),
+            VpnAction::StartMonitoring => {}
+            VpnAction::ScheduleTimer { timer, after } => match timer {
+                VpnTimer::HealthPoll => {}
+                VpnTimer::PortReadRetry => self.schedule_wakeup(WakeupId::RetryPortRead, *after),
+            },
+        }
+    }
+
+    fn execute_shadow_qbit_action(&mut self, action: QbitAction, causal_tx: CausalTx) {
+        match action {
+            QbitAction::Login => self.authenticate_qbit(causal_tx),
+            QbitAction::ReadPreferences { cookie } => {
+                self.fetch_qbit_preferences(cookie, causal_tx);
+            }
+            QbitAction::SetListenPort { cookie, port } => {
+                self.sync_qbit_port(cookie, port, causal_tx);
+            }
+            QbitAction::ListTorrents { cookie } => self.check_new_torrents(cookie, causal_tx),
+            QbitAction::PauseTorrent { cookie, hash } => self.pause_torrent(hash, cookie),
+            QbitAction::ResumeTorrent { cookie, hash } => self.force_resume_torrent(hash, cookie),
+            QbitAction::ScheduleTimer { timer, after } => match timer {
+                QbitTimer::AuthRetry => self.schedule_wakeup(WakeupId::QbitAuthRetry, after),
+                QbitTimer::SyncRetry => self.schedule_wakeup(WakeupId::QbitSyncRetry, after),
+                QbitTimer::TorrentRefresh => self.schedule_wakeup(WakeupId::TorrentCheck, after),
+            },
+        }
+    }
+
+    fn execute_shadow_mam_action(&mut self, action: &MamAction, causal_tx: CausalTx) {
+        match action {
+            MamAction::FetchStatus => self.check_mam_connectability(causal_tx),
+            MamAction::UpdateSeedboxPort { .. } => {
+                self.update_mam(VpnIp(std::net::Ipv4Addr::UNSPECIFIED), causal_tx);
+            }
+            MamAction::ScheduleTimer { timer, after } => match timer {
+                MamTimer::StatusRetry | MamTimer::RateLimitExpired => {
+                    self.schedule_wakeup(WakeupId::Heartbeat, *after);
+                }
+            },
+        }
     }
 
     // ── Port files ────────────────────────────────────────────────────────────
@@ -45,6 +103,18 @@ impl ShellContext<'_> {
                     result,
                 })
                 .await;
+        }));
+    }
+
+    fn inspect_gluetun(&self, causal_tx: CausalTx) {
+        let docker = self.docker.clone();
+        tokio::spawn(causal_tx.run(|causal_tx| async move {
+            let event = if docker.is_gluetun_healthy().await {
+                Event::DockerGluetunHealthy { at: Utc::now() }
+            } else {
+                Event::DockerGluetunDied { at: Utc::now() }
+            };
+            causal_tx.send(event).await;
         }));
     }
 

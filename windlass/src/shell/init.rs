@@ -42,6 +42,7 @@ pub(super) struct ShellRuntime {
     pub(super) causal_debug_tx: mpsc::Sender<(Event, uuid::Uuid)>,
     pub(super) causal_rx: mpsc::Receiver<(Event, uuid::Uuid)>,
     pub(super) shadow_cores: ShadowCores,
+    pub(super) execute_shadow_actions: bool,
 }
 
 /// Bootstraps all infrastructure and returns the runtime bundle.
@@ -125,6 +126,7 @@ pub(super) async fn init_shell(
         )
         .with_blacklisted_ids(blacklisted);
     let shadow_cores = ShadowCores::new(Duration::from_secs(config.compliance_poll_interval_secs));
+    let execute_shadow_actions = config.execute_shadow_actions;
     let history = DebugHistory::new(SystemState::initial());
     let cmd_rx = debug_owned.cmd_rx;
     let log_rx = debug_owned.log_rx;
@@ -169,6 +171,7 @@ pub(super) async fn init_shell(
         causal_debug_tx,
         causal_rx,
         shadow_cores,
+        execute_shadow_actions,
     })
 }
 
