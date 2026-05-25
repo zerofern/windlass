@@ -14,8 +14,9 @@ wording below. The current implementation has moved on:
   cores.
 - The runtime feeds legacy events into those cores and executes the service-core
   actions by default.
-- `WINDLASS_EXECUTE_SHADOW_ACTIONS=false` is the rollback switch for
-  legacy-only service orchestration.
+- `WINDLASS_EXECUTE_SERVICE_ACTIONS=false` is the rollback switch for
+  legacy-only service orchestration. `WINDLASS_EXECUTE_SHADOW_ACTIONS` remains
+  accepted as a deprecated alias.
 - `just check` and `just integration` pass with service-core action execution
   enabled by default.
 

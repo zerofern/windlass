@@ -30,7 +30,7 @@ pub struct Config {
     /// Maximum unsatisfied torrents before alerting (default: 50).
     pub unsatisfied_quota_limit: u32,
     /// Executes service actions produced by the new service cores. Enabled by
-    /// default; set `WINDLASS_EXECUTE_SHADOW_ACTIONS=false` to fall back to
+    /// default; set `WINDLASS_EXECUTE_SERVICE_ACTIONS=false` to fall back to
     /// legacy-only orchestration.
     pub execute_service_actions: bool,
 }
@@ -71,10 +71,16 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
-            execute_service_actions: var("WINDLASS_EXECUTE_SHADOW_ACTIONS")
-                .map_or(true, |v| parse_execute_service_actions(&v)),
+            execute_service_actions: execute_service_actions_setting(
+                var("WINDLASS_EXECUTE_SERVICE_ACTIONS").ok().as_deref(),
+                var("WINDLASS_EXECUTE_SHADOW_ACTIONS").ok().as_deref(),
+            ),
         })
     }
+}
+
+fn execute_service_actions_setting(current: Option<&str>, legacy: Option<&str>) -> bool {
+    current.or(legacy).is_none_or(parse_execute_service_actions)
 }
 
 fn parse_execute_service_actions(value: &str) -> bool {
@@ -83,7 +89,7 @@ fn parse_execute_service_actions(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_execute_service_actions;
+    use super::{execute_service_actions_setting, parse_execute_service_actions};
 
     #[test]
     fn parse_execute_service_actions_accepts_enabled_values() {
@@ -100,5 +106,20 @@ mod tests {
         assert!(!parse_execute_service_actions("FALSE"));
         assert!(!parse_execute_service_actions("no"));
         assert!(!parse_execute_service_actions("NO"));
+    }
+
+    #[test]
+    fn execute_service_actions_prefers_current_env_name() {
+        assert!(execute_service_actions_setting(Some("true"), Some("false")));
+        assert!(!execute_service_actions_setting(
+            Some("false"),
+            Some("true")
+        ));
+    }
+
+    #[test]
+    fn execute_service_actions_accepts_legacy_env_name() {
+        assert!(!execute_service_actions_setting(None, Some("false")));
+        assert!(execute_service_actions_setting(None, None));
     }
 }
