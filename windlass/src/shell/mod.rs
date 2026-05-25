@@ -20,7 +20,8 @@ use windlass_db::actor::PostgresDbActor;
 use windlass_db_core::DbEvent;
 use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory};
 use windlass_local::docker;
-use windlass_types::WakeupId;
+use windlass_types::{VpnIp, WakeupId};
+use windlass_vpn_core::VpnTimer;
 
 use dequeue::dequeue_debug;
 use init::{ShellRuntime, init_shell};
@@ -121,13 +122,13 @@ pub async fn run(
             db_pool: &db_pool,
         };
 
-        execute_shadow_actions_if_enabled(execute_shadow_actions, shadow_actions, &tx, &mut ctx);
-
         let legacy_actions =
             legacy_actions_for_shadow_mode(execute_shadow_actions, outcome.actions);
 
         dispatch_event(
             legacy_actions,
+            shadow_actions,
+            execute_shadow_actions,
             event_id,
             &state,
             &mut history,
@@ -240,6 +241,8 @@ fn drain_channels(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_event(
     outcome_actions: Vec<Action>,
+    shadow_actions: Vec<ShadowAction>,
+    execute_shadow_actions: bool,
     event_id: Option<uuid::Uuid>,
     state: &SystemState,
     history: &mut DebugHistory,
@@ -251,8 +254,18 @@ async fn dispatch_event(
 ) {
     if let Some(eid) = event_id {
         let plain_tx = tx.clone();
-        history.actions_ready(&outcome_actions);
+        let mut debug_actions = shadow_debug_actions(&shadow_actions);
+        debug_actions.extend(outcome_actions.iter().cloned());
+        history.actions_ready(&debug_actions);
         debug_ctrl.publish(history);
+        execute_shadow_actions_debug(
+            execute_shadow_actions,
+            shadow_actions,
+            eid,
+            history,
+            causal_debug_tx,
+            ctx,
+        );
         debug_dispatcher
             .dispatch(outcome_actions, |action| {
                 let action_id = history.action_started(&action, eid);
@@ -265,12 +278,95 @@ async fn dispatch_event(
         drop(plain_tx);
     } else {
         let plain_tx = tx.clone();
+        execute_shadow_actions_if_enabled(execute_shadow_actions, shadow_actions, tx, ctx);
         debug_dispatcher
             .dispatch(outcome_actions, |action| {
                 let causal = CausalTx::plain(uuid::Uuid::new_v4(), plain_tx.clone());
                 ctx.execute(action, causal);
             })
             .await;
+    }
+}
+
+fn execute_shadow_actions_debug(
+    enabled: bool,
+    actions: Vec<ShadowAction>,
+    parent_event_id: uuid::Uuid,
+    history: &mut DebugHistory,
+    causal_debug_tx: &mpsc::Sender<(Event, uuid::Uuid)>,
+    ctx: &mut ShellContext<'_>,
+) {
+    if !enabled {
+        return;
+    }
+    for action in actions {
+        let action_id = shadow_action_to_debug_action(&action)
+            .map_or_else(uuid::Uuid::new_v4, |debug_action| {
+                history.action_started(&debug_action, parent_event_id)
+            });
+        let causal = CausalTx::debug(action_id, causal_debug_tx.clone());
+        ctx.execute_shadow_action(action, causal);
+    }
+}
+
+fn shadow_debug_actions(actions: &[ShadowAction]) -> Vec<Action> {
+    actions
+        .iter()
+        .filter_map(shadow_action_to_debug_action)
+        .collect()
+}
+
+fn shadow_action_to_debug_action(action: &ShadowAction) -> Option<Action> {
+    match action {
+        ShadowAction::Qbit(action) => match action {
+            windlass_qbit_core::QbitAction::Login => Some(Action::AuthenticateQbit),
+            windlass_qbit_core::QbitAction::ReadPreferences { cookie } => {
+                Some(Action::FetchQbitPreferences(cookie.clone()))
+            }
+            windlass_qbit_core::QbitAction::SetListenPort { cookie, port } => {
+                Some(Action::SyncQbitPort(cookie.clone(), *port))
+            }
+            windlass_qbit_core::QbitAction::ListTorrents { cookie } => {
+                Some(Action::CheckNewTorrents(cookie.clone()))
+            }
+            windlass_qbit_core::QbitAction::PauseTorrent { cookie, hash } => {
+                Some(Action::PauseTorrent(hash.clone(), cookie.clone()))
+            }
+            windlass_qbit_core::QbitAction::ResumeTorrent { cookie, hash } => {
+                Some(Action::ForceResumeTorrent(hash.clone(), cookie.clone()))
+            }
+            windlass_qbit_core::QbitAction::ScheduleTimer { timer, after } => {
+                let wakeup = match timer {
+                    windlass_qbit_core::QbitTimer::AuthRetry => WakeupId::QbitAuthRetry,
+                    windlass_qbit_core::QbitTimer::SyncRetry => WakeupId::QbitSyncRetry,
+                    windlass_qbit_core::QbitTimer::TorrentRefresh => WakeupId::TorrentCheck,
+                };
+                Some(Action::ScheduleWakeup(wakeup, *after))
+            }
+        },
+        ShadowAction::Mam(action) => match action {
+            windlass_mam_core::MamAction::FetchStatus => Some(Action::CheckMamConnectability),
+            windlass_mam_core::MamAction::UpdateSeedboxPort { .. } => {
+                Some(Action::UpdateMam(VpnIp(std::net::Ipv4Addr::UNSPECIFIED)))
+            }
+            windlass_mam_core::MamAction::ScheduleTimer { after, .. } => {
+                Some(Action::ScheduleWakeup(WakeupId::Heartbeat, *after))
+            }
+        },
+        ShadowAction::Vpn(action) => match action {
+            windlass_vpn_core::VpnAction::ReadPortFiles => Some(Action::ReadPortFiles),
+            windlass_vpn_core::VpnAction::ScheduleTimer {
+                timer: VpnTimer::PortReadRetry,
+                after,
+            } => Some(Action::ScheduleWakeup(WakeupId::RetryPortRead, *after)),
+            windlass_vpn_core::VpnAction::InspectContainer
+            | windlass_vpn_core::VpnAction::StartMonitoring
+            | windlass_vpn_core::VpnAction::ScheduleTimer {
+                timer: VpnTimer::HealthPoll,
+                ..
+            } => None,
+        },
+        ShadowAction::Db(_) | ShadowAction::ScheduleTimer { .. } => None,
     }
 }
 
@@ -342,9 +438,12 @@ impl ShellContext<'_> {
 mod tests {
     use std::time::Duration;
 
-    use windlass_types::{AuthCookie, MamTorrentId, WakeupId};
+    use windlass_types::{AuthCookie, MamTorrentId, VpnPort, WakeupId};
 
-    use super::{Action, legacy_actions_for_shadow_mode, shadow_replaces_legacy_action};
+    use super::{
+        Action, ShadowAction, legacy_actions_for_shadow_mode, shadow_action_to_debug_action,
+        shadow_replaces_legacy_action,
+    };
 
     #[test]
     fn shadow_mode_filters_only_service_orchestration_actions() {
@@ -383,5 +482,33 @@ mod tests {
         assert!(shadow_replaces_legacy_action(
             &Action::FetchQbitPreferences(AuthCookie("sid".to_string()))
         ));
+    }
+
+    #[test]
+    fn shadow_qbit_set_port_maps_to_debug_action() {
+        let cookie = AuthCookie("sid".to_string());
+        let port = VpnPort::try_new(51_820).unwrap();
+
+        let mapped = shadow_action_to_debug_action(&ShadowAction::Qbit(
+            windlass_qbit_core::QbitAction::SetListenPort {
+                cookie: cookie.clone(),
+                port,
+            },
+        ));
+
+        assert!(matches!(
+            mapped,
+            Some(Action::SyncQbitPort(mapped_cookie, mapped_port))
+                if mapped_cookie == cookie && mapped_port == port
+        ));
+    }
+
+    #[test]
+    fn shadow_mam_fetch_status_maps_to_debug_action() {
+        let mapped = shadow_action_to_debug_action(&ShadowAction::Mam(
+            windlass_mam_core::MamAction::FetchStatus,
+        ));
+
+        assert!(matches!(mapped, Some(Action::CheckMamConnectability)));
     }
 }
