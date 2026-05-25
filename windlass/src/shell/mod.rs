@@ -123,8 +123,11 @@ pub async fn run(
 
         execute_shadow_actions_if_enabled(execute_shadow_actions, shadow_actions, &tx, &mut ctx);
 
+        let legacy_actions =
+            legacy_actions_for_shadow_mode(execute_shadow_actions, outcome.actions);
+
         dispatch_event(
-            outcome.actions,
+            legacy_actions,
             event_id,
             &state,
             &mut history,
@@ -138,6 +141,39 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn legacy_actions_for_shadow_mode(
+    execute_shadow_actions: bool,
+    actions: Vec<Action>,
+) -> Vec<Action> {
+    if !execute_shadow_actions {
+        return actions;
+    }
+    actions
+        .into_iter()
+        .filter(|action| !shadow_replaces_legacy_action(action))
+        .collect()
+}
+
+const fn shadow_replaces_legacy_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ReadPortFiles
+            | Action::AuthenticateQbit
+            | Action::SyncQbitPort(_, _)
+            | Action::UpdateMam(_)
+            | Action::CheckMamConnectability
+            | Action::CheckNewTorrents(_)
+            | Action::FetchQbitPreferences(_)
+            | Action::ScheduleWakeup(
+                WakeupId::QbitAuthRetry
+                    | WakeupId::QbitSyncRetry
+                    | WakeupId::Heartbeat
+                    | WakeupId::RetryPortRead,
+                _
+            )
+    )
 }
 
 fn dispatch_shadow_db_action(db_pool: &DbPool, action: &ShadowAction) {
@@ -299,5 +335,53 @@ impl ShellContext<'_> {
                 self.fetch_and_add_torrent(mam_id, cookie, causal_tx);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use windlass_types::{AuthCookie, MamTorrentId, WakeupId};
+
+    use super::{Action, legacy_actions_for_shadow_mode, shadow_replaces_legacy_action};
+
+    #[test]
+    fn shadow_mode_filters_only_service_orchestration_actions() {
+        let actions = vec![
+            Action::AuthenticateQbit,
+            Action::ScheduleWakeup(WakeupId::QbitAuthRetry, Duration::from_secs(1)),
+            Action::ScheduleWakeup(WakeupId::DiskCheck, Duration::from_secs(1)),
+            Action::FetchAndAddTorrent {
+                mam_id: MamTorrentId(1),
+                cookie: AuthCookie("sid".to_string()),
+            },
+        ];
+
+        let filtered = legacy_actions_for_shadow_mode(true, actions);
+
+        assert_eq!(filtered.len(), 2);
+        assert!(matches!(
+            filtered[0],
+            Action::ScheduleWakeup(WakeupId::DiskCheck, _)
+        ));
+        assert!(matches!(filtered[1], Action::FetchAndAddTorrent { .. }));
+    }
+
+    #[test]
+    fn shadow_mode_keeps_legacy_actions_when_disabled() {
+        let actions = vec![Action::AuthenticateQbit];
+
+        let filtered = legacy_actions_for_shadow_mode(false, actions);
+
+        assert_eq!(filtered.len(), 1);
+        assert!(matches!(filtered[0], Action::AuthenticateQbit));
+    }
+
+    #[test]
+    fn shadow_replaces_qbit_preference_fetches() {
+        assert!(shadow_replaces_legacy_action(
+            &Action::FetchQbitPreferences(AuthCookie("sid".to_string()))
+        ));
     }
 }
