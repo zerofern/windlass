@@ -84,17 +84,19 @@ Apple's servers see a tap on the device at a timestamp — nothing else.
 
 ## 3. Data Persistence
 
-Windlass uses a **hybrid database architecture** matched to the access patterns of each tier:
+Windlass uses **PostgreSQL as the single durable database**. Earlier drafts split
+candidate pre-filter storage into DuckDB; the current implementation direction is to keep
+that data in PostgreSQL too, using SQL migrations and SQLx compile-time checking for all
+runtime persistence.
 
 | Engine | Tables | Reason |
 |---|---|---|
-| **PostgreSQL + pgvector** (Docker on NUC) | All operational tables — `books`, `profile_signals`, `mood_state`, `active_queue`, `download_queue`, `reading_ledger`, `reviews`, `series`, `torrents`, `tags`, `alerts`, `events`, `playback_sessions`, `metadata_cache`, `sync_artifacts`, `context_chunks` | MVCC concurrency (worker writes + server reads simultaneously without locking), `pgvector` native `sparsevec(500)` for exact dot-product scoring, mature ACID guarantees |
-| **DuckDB** (in-process library, no separate server) | `book_candidates` | Columnar vectorised execution for batch pre-filter scans across millions of rows; native `ARRAY` types + GIN-equivalent zone maps; zero server overhead on the NUC |
+| **PostgreSQL + pgvector** (Docker on NUC) | All operational and librarian tables — `book_candidates`, `books`, `profile_signals`, `mood_state`, `active_queue`, `download_queue`, `reading_ledger`, `reviews`, `series`, `torrents`, `tags`, `alerts`, `events`, `playback_sessions`, `metadata_cache`, `sync_artifacts`, `context_chunks` | MVCC concurrency (worker writes + server reads simultaneously without locking), `pgvector` native `sparsevec(500)` for exact dot-product scoring, mature ACID guarantees, one migration system |
 
 PostgreSQL is deployed as a Docker container on the NUC alongside Home Assistant. Memory
-usage is bounded via `shared_buffers` tuning. The `book_candidates` DuckDB file lives at
-`windlass_data/candidates.db` and is written by discovery workers, read by the daily
-pre-filter batch job that promotes candidates into the PostgreSQL `books` table.
+usage is bounded via `shared_buffers` tuning. Discovery workers insert into
+`book_candidates`; the pre-filter batch promotes survivors into `books` in the same
+database transaction boundary.
 
 Large per-book artifacts are stored as flat files under `windlass_data/` rather than as
 database blobs, keeping the databases lean and making per-book deletion trivial:
@@ -113,7 +115,7 @@ best torrent to download. Everything else hangs off `books`.
 
 | Table                 | Contents                                                                                                                                                                                                                                                                     |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `book_candidates`     | **DuckDB only.** Pre-filter pool — potentially millions of lightweight rows sourced from discovery workers before any enrichment cost is incurred. Columns: `isbn13` (unique dedup key), `title`, `author`, `language_code`, `bisac_codes` (native `TEXT[]` array — GIN-indexed for fast genre lookup), `publication_year`, `word_count` (nullable), `rating_count`, `avg_rating` (stored for display only — never used as a filter), `source`, `discovered_at`, `status` (`candidate` / `promoted` / `rejected`), `rejection_reason` (which pre-filter gate dropped it: `language` / `bisac` / `rating_count` / `word_count`), `books_id` FK (set when promoted to PostgreSQL `books` table). Rejected rows are never deleted — they serve as the permanent dedup blacklist so a re-discovered ISBN is silently skipped. |
+| `book_candidates`     | PostgreSQL pre-filter pool — potentially millions of lightweight rows sourced from discovery workers before any enrichment cost is incurred. Columns: `isbn13` (unique dedup key), `title`, `author`, `language_code`, `bisac_codes` (`TEXT[]` array with a GIN index for fast genre lookup), `publication_year`, `word_count` (nullable), `rating_count`, `avg_rating` (stored for display only — never used as a filter), `source`, `discovered_at`, `status` (`candidate` / `promoted` / `rejected`), `rejection_reason` (which pre-filter gate dropped it: `language` / `bisac` / `rating_count` / `word_count`), `books_id` FK (set when promoted to `books`). Rejected rows are never deleted — they serve as the permanent dedup blacklist so a re-discovered ISBN is silently skipped. |
 | `books`               | Canonical library record for every title Windlass knows about. **One row per work — not per edition.** Library status lifecycle: `pending_s1 → known → epub_pending → enriching → watchlist → monitoring → downloading → seeding → completed` (plus `rejected_s2` terminal state for Stage 1 or Stage 2 failures). Source (`manual_abs`, `windlass_download`, `ai_suggestion`, `freeleech`). Audnexus ASIN, Hardcover ID, ABS item ID. `epub_status` (`searching` / `found` / `not_found`). **`tag_vector sparsevec(500)`** — a single sparse vector storing all tag intensity scores (-100→+100) using a stable application-level index dictionary (e.g. index 0 = `hard_scifi`, index 1 = `space_opera`, …). Sparse format stores only non-zero entries; declaring 500 dimensions provides headroom for future tags without schema migration. S1 tag indices are populated at discovery time; S2 indices (style, arc, narrative) are filled in when Stage 2 enrichment completes. Dot-product queue scoring uses `tag_vector <#> subprofile_vector` — always computed live (sub-5 ms for thousands of rows); no cached score columns. `enrichment_stage` (`discovery` / `post_download_lite` / `post_download_full`). `enrichment_summary_path` (path to `windlass_data/enrichment/{book_id}.json` — raw NLP arrays, smoothed arcs, LIX score, prose summary; null until Stage 2). `reason` (LLM Decide blurb; overwritten on re-evaluation). A book record survives disk deletion. |
 | `metadata_cache`      | Read-through cache for external API responses. Keyed by `(source, external_id)` where `source` is `audnexus` or `hardcover` and `external_id` is the ASIN or Hardcover ID. Stores the raw `response_json` and `fetched_at` timestamp. TTL: Audnexus 30 days (stable data), Hardcover 7 days (community reviews change frequently). Eliminates redundant API calls across Stage 1, Stage 2, and all LLM context assembly. |
 | `tags`                | Canonical tag registry. `id` (slug), `canonical_name`, `category` (`genre` / `mood` / `tone` / `style` / `arc` / `arc_relation` / `narrative` / `preference` / `content_warning` / `length` / `format` / `protagonist`), `description`, `source` (`audnexus` / `hardcover` / `llm_mint`), `status` (`active` / `deprecated`). Controls the tag vocabulary — see §7.6. |
@@ -148,11 +150,11 @@ the RAG payload before any LLM call.
 
 ### Database Schemas
 
-#### Table A — `book_candidates` (DuckDB)
+#### Table A — `book_candidates` (PostgreSQL)
 
 ```sql
 CREATE TABLE book_candidates (
-    id               INTEGER PRIMARY KEY,
+    id               SERIAL PRIMARY KEY,
     isbn13           TEXT UNIQUE,
     isbn10           TEXT,
     openlibrary_key  TEXT,
@@ -161,7 +163,7 @@ CREATE TABLE book_candidates (
 
     -- Pre-filter columns (all indexed)
     language_code    TEXT NOT NULL,
-    bisac_codes      TEXT[],          -- native array; GIN-equivalent zone map in DuckDB
+    bisac_codes      TEXT[],          -- GIN-indexed for fast genre lookup
     publication_year INTEGER,
     word_count       INTEGER,         -- nullable; unknown books pass through
     rating_count     INTEGER DEFAULT 0,
@@ -173,13 +175,11 @@ CREATE TABLE book_candidates (
     status           TEXT NOT NULL DEFAULT 'candidate'
                      CHECK(status IN ('candidate','promoted','rejected')),
     rejection_reason TEXT,            -- 'language' | 'bisac' | 'rating_count' | 'word_count'
-    books_id         INTEGER          -- set when promoted to PostgreSQL books table
+    books_id         INTEGER REFERENCES books(id)
 );
 
--- Physical sort order — DuckDB uses zone maps; clustering on these columns
--- lets the pre-filter skip entire data blocks
--- ORDER BY (status, language_code, rating_count DESC) at load time
 CREATE INDEX idx_candidates_filter ON book_candidates(language_code, status, rating_count);
+CREATE INDEX idx_candidates_bisac ON book_candidates USING GIN (bisac_codes);
 CREATE UNIQUE INDEX idx_candidates_isbn ON book_candidates(isbn13);
 ```
 
@@ -190,7 +190,7 @@ WHERE language_code = 'en'
   AND status = 'candidate'
   AND rating_count >= 30
   AND (word_count >= 20000 OR word_count IS NULL)
-  AND list_has_any(bisac_codes, ['FIC028000','FIC009000','FIC010000','FIC002000'])
+  AND bisac_codes && ARRAY['FIC028000','FIC009000','FIC010000','FIC002000']
 ORDER BY rating_count DESC
 LIMIT 500;
 ```
@@ -209,7 +209,7 @@ CREATE TYPE epub_state   AS ENUM ('searching','found','not_found');
 
 CREATE TABLE books (
     id               SERIAL PRIMARY KEY,
-    candidate_id     INTEGER,          -- FK to DuckDB book_candidates.id (soft reference)
+    candidate_id     INTEGER REFERENCES book_candidates(id),
 
     -- External IDs
     audnexus_asin    TEXT,
@@ -566,7 +566,7 @@ All scoring data comes directly from the MAM search API response fields.
 
 #### Discovery Sources
 
-Windlass pulls candidates from multiple sources. All feed into `book_candidates` (DuckDB)
+Windlass pulls candidates from multiple sources. All feed into `book_candidates` (PostgreSQL)
 and share the same pre-filter → Stage 1 → epub queue pipeline.
 
 | Source | Mechanism | Cadence |
@@ -624,9 +624,8 @@ acts (approves or rejects a result).
 #### Pre-filter Layer
 
 Before any enrichment cost is incurred, every discovered candidate passes through a
-lightweight DuckDB query that eliminates obviously irrelevant titles. This gate runs as a
-daily batch job, promoting survivors into the PostgreSQL `books` table as `library_status:
-known`.
+lightweight PostgreSQL query that eliminates obviously irrelevant titles. This gate runs as
+a daily batch job, promoting survivors into `books` as `library_status: known`.
 
 **Gates (applied in order — first failure sets `rejection_reason` and marks `rejected`):**
 
@@ -644,12 +643,12 @@ underrated by mainstream audiences.
 #### Book Lifecycle
 
 ```
-book_candidates (DuckDB)
+book_candidates (PostgreSQL)
    candidate ──[pre-filter]──► promoted
                               └──► rejected (permanent blacklist; dedup shield)
 
 books (PostgreSQL)
-   pending_s1   ← promoted from DuckDB; awaiting Stage 1 scoring
+   pending_s1   ← promoted from PostgreSQL `book_candidates`; awaiting Stage 1 scoring
    known        ← passed Stage 1; in epub queue
    epub_pending ← epub fetch in progress
    enriching    ← Stage 2 running on worker
@@ -676,7 +675,7 @@ Runs on every candidate that passes ingestion. No LLM calls — uses only free p
 
 **Scoring:** Dot-product using the normalized API tags against the Stratified Portfolio (all subprofiles × historical frequency weights). Only tag indices populated by API data are used — no imputation for missing dimensions.
 
-**Gate:** Score below a low floor → discard (DuckDB `status: rejected`). The bar is intentionally low — Stage 0.5 only eliminates books with zero profile relevance, not borderline cases. Those go to Stage 1.
+**Gate:** Score below a low floor → discard (`book_candidates.status: rejected`). The bar is intentionally low — Stage 0.5 only eliminates books with zero profile relevance, not borderline cases. Those go to Stage 1.
 
 **Output:** ~50–100 survivors/day promoted to PostgreSQL `library_status: pending_s1`.
 
@@ -688,7 +687,7 @@ Runs on every candidate promoted from the pre-filter. Fast and cheap — many bo
 through here.
 
 **Input:**
-- Already-normalized Stage 0.5 API tags (no re-fetch needed — cached in DuckDB)
+- Already-normalized Stage 0.5 API tags (no re-fetch needed — cached in PostgreSQL)
 - Book description
 - Up to 5 Hardcover community review excerpts
 - Current Stratified Portfolio subprofile vectors (for scoring output)

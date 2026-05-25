@@ -47,7 +47,11 @@ in qBittorrent.
 
 ---
 
-## Step 1: SQLite Foundation — `windlass-db` crate
+## Step 1: Historical SQLite Foundation — superseded by Postgres
+
+This section is retained as implementation history. The active code uses
+PostgreSQL, SQL migrations, and SQLx query checking; do not implement new work
+against the SQLite snippets below.
 
 **Goal:** A new `windlass-db` crate owns all SQL: migrations, the pool type, and
 typed query functions. The shell and web handlers call these functions; no raw
