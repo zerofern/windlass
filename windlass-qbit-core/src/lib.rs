@@ -103,6 +103,7 @@ pub struct QbitMachine {
     config: QbitConfig,
     cookie: Option<AuthCookie>,
     listen_port: Option<VpnPort>,
+    desired_listen_port: Option<VpnPort>,
 }
 
 impl QbitMachine {
@@ -114,6 +115,40 @@ impl QbitMachine {
     #[must_use]
     pub const fn listen_port(&self) -> Option<VpnPort> {
         self.listen_port
+    }
+
+    fn retry_listen_port_or_read_preferences(&self) -> Vec<QbitAction> {
+        let Some(cookie) = self.cookie.clone() else {
+            return vec![QbitAction::Login];
+        };
+        match self.desired_listen_port {
+            None => vec![QbitAction::ReadPreferences { cookie }],
+            Some(port) => vec![QbitAction::SetListenPort { cookie, port }],
+        }
+    }
+
+    fn converge_listen_port(&self) -> Vec<QbitAction> {
+        let Some(port) = self.desired_listen_port else {
+            return Vec::new();
+        };
+        if self.listen_port == Some(port) {
+            return Vec::new();
+        }
+        self.cookie.clone().map_or_else(
+            || vec![QbitAction::Login],
+            |cookie| vec![QbitAction::SetListenPort { cookie, port }],
+        )
+    }
+
+    fn listen_port_publish(&self, listen_port: Option<VpnPort>) -> Vec<QbitPublish> {
+        listen_port
+            .filter(|port| {
+                self.desired_listen_port
+                    .is_none_or(|desired_port| desired_port == *port)
+            })
+            .map(|port| QbitPublish::ListenPortReady { port })
+            .into_iter()
+            .collect()
     }
 }
 
@@ -131,6 +166,7 @@ impl Machine for QbitMachine {
             config,
             cookie: None,
             listen_port: None,
+            desired_listen_port: None,
         }
     }
 
@@ -161,14 +197,12 @@ impl Machine for QbitMachine {
             QbitEvent::PreferencesRead { listen_port } => {
                 self.listen_port = listen_port;
                 Outcome {
-                    actions: Vec::new(),
-                    publish: listen_port
-                        .map(|port| QbitPublish::ListenPortReady { port })
-                        .into_iter()
-                        .collect(),
+                    actions: self.converge_listen_port(),
+                    publish: self.listen_port_publish(listen_port),
                 }
             }
-            QbitEvent::PreferencesFailed { reason } => Outcome {
+            QbitEvent::PreferencesFailed { reason }
+            | QbitEvent::ListenPortSetFailed { reason, .. } => Outcome {
                 actions: vec![QbitAction::ScheduleTimer {
                     timer: QbitTimer::SyncRetry,
                     after: self.config.sync_retry,
@@ -182,22 +216,12 @@ impl Machine for QbitMachine {
                     publish: vec![QbitPublish::ListenPortReady { port }],
                 }
             }
-            QbitEvent::ListenPortSetFailed { port, .. } => Outcome {
-                actions: vec![QbitAction::ScheduleTimer {
-                    timer: QbitTimer::SyncRetry,
-                    after: self.config.sync_retry,
-                }],
-                publish: vec![QbitPublish::ListenPortReady { port }],
-            },
             QbitEvent::TorrentsListed { hashes } => Outcome {
                 actions: Vec::new(),
                 publish: vec![QbitPublish::TorrentsUpdated { hashes }],
             },
             QbitEvent::TimerFired(QbitTimer::SyncRetry) => Outcome {
-                actions: self.cookie.clone().map_or_else(
-                    || vec![QbitAction::Login],
-                    |cookie| vec![QbitAction::ReadPreferences { cookie }],
-                ),
+                actions: self.retry_listen_port_or_read_preferences(),
                 publish: Vec::new(),
             },
             QbitEvent::TimerFired(QbitTimer::TorrentRefresh) => Outcome {
@@ -217,10 +241,20 @@ impl Machine for QbitMachine {
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         let actions = match cmd {
             QbitCommand::EnsureAuthenticated => vec![QbitAction::Login],
-            QbitCommand::EnsureListenPort { port } => self.cookie.clone().map_or_else(
-                || vec![QbitAction::Login],
-                |cookie| vec![QbitAction::SetListenPort { cookie, port }],
-            ),
+            QbitCommand::EnsureListenPort { port } => {
+                self.desired_listen_port = Some(port);
+                if self.listen_port == Some(port) {
+                    return Self::outcome_with_publish(
+                        Vec::new(),
+                        vec![QbitPublish::ListenPortReady { port }],
+                        QbitResponse::Accepted,
+                    );
+                }
+                self.cookie.clone().map_or_else(
+                    || vec![QbitAction::Login],
+                    |cookie| vec![QbitAction::SetListenPort { cookie, port }],
+                )
+            }
             QbitCommand::RefreshTorrents => self
                 .cookie
                 .clone()
@@ -247,7 +281,9 @@ mod tests {
     use windlass_machine::Machine;
     use windlass_types::{AuthCookie, VpnPort};
 
-    use crate::{QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish};
+    use crate::{
+        QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish, QbitTimer,
+    };
 
     fn machine() -> QbitMachine {
         QbitMachine::new(
@@ -313,6 +349,95 @@ mod tests {
             out.actions,
             vec![QbitAction::SetListenPort { cookie, port }]
         );
+    }
+
+    #[test]
+    fn preference_mismatch_sets_desired_port_without_publishing_ready() {
+        let mut machine = machine();
+        let cookie = AuthCookie("sid".to_string());
+        let desired = VpnPort::try_new(51_820).unwrap();
+        let observed = VpnPort::try_new(42_000).unwrap();
+        let _ = machine.handle(
+            Instant::now(),
+            QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            },
+        );
+        let _ = machine.handle_command(
+            Instant::now(),
+            QbitCommand::EnsureListenPort { port: desired },
+        );
+
+        let out = machine.handle(
+            Instant::now(),
+            QbitEvent::PreferencesRead {
+                listen_port: Some(observed),
+            },
+        );
+
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::SetListenPort {
+                cookie,
+                port: desired,
+            }]
+        );
+        assert!(out.publish.is_empty());
+    }
+
+    #[test]
+    fn set_failure_publishes_unavailable_and_retries_desired_port() {
+        let mut machine = machine();
+        let cookie = AuthCookie("sid".to_string());
+        let port = VpnPort::try_new(51_820).unwrap();
+        let _ = machine.handle(
+            Instant::now(),
+            QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            },
+        );
+        let _ = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
+
+        let failed = machine.handle(
+            Instant::now(),
+            QbitEvent::ListenPortSetFailed {
+                port,
+                reason: "forbidden".to_string(),
+            },
+        );
+
+        assert_eq!(
+            failed.actions,
+            vec![QbitAction::ScheduleTimer {
+                timer: QbitTimer::SyncRetry,
+                after: Duration::from_secs(2),
+            }]
+        );
+        assert_eq!(
+            failed.publish,
+            vec![QbitPublish::Unavailable {
+                reason: "forbidden".to_string(),
+            }]
+        );
+
+        let retry = machine.handle(Instant::now(), QbitEvent::TimerFired(QbitTimer::SyncRetry));
+
+        assert_eq!(
+            retry.actions,
+            vec![QbitAction::SetListenPort { cookie, port }]
+        );
+    }
+
+    #[test]
+    fn ensure_listen_port_publishes_when_already_converged() {
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+        let _ = machine.handle(Instant::now(), QbitEvent::ListenPortSet { port });
+
+        let out = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
+
+        assert!(out.actions.is_empty());
+        assert_eq!(out.publish, vec![QbitPublish::ListenPortReady { port }]);
     }
 
     #[test]
