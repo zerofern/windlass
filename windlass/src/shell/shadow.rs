@@ -186,7 +186,12 @@ fn suppress_bootstrap_probe_actions(event: &Event, actions: &mut Vec<ShadowActio
     if !matches!(event, Event::Init { .. }) {
         return;
     }
-    actions.retain(|action| !matches!(action, ShadowAction::Mam(MamAction::FetchStatus)));
+    actions.retain(|action| {
+        !matches!(
+            action,
+            ShadowAction::Mam(MamAction::FetchStatus) | ShadowAction::Vpn(VpnAction::ReadPortFiles)
+        )
+    });
 }
 
 enum ShadowEvent {
@@ -334,6 +339,7 @@ mod tests {
     use windlass_mam_core::MamAction;
     use windlass_qbit_core::QbitAction;
     use windlass_types::{AuthCookie, MamStatus, VpnIp, VpnPort};
+    use windlass_vpn_core::VpnAction;
 
     use windlass_core::events::Event;
     use windlass_domain_core::ServiceStatus;
@@ -380,6 +386,13 @@ mod tests {
             actions
                 .iter()
                 .filter(|action| matches!(action, ShadowAction::Mam(MamAction::FetchStatus)))
+                .count(),
+            0
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, ShadowAction::Vpn(VpnAction::ReadPortFiles)))
                 .count(),
             0
         );
