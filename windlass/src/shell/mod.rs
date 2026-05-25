@@ -262,6 +262,7 @@ async fn dispatch_event(
             shadow_actions,
             eid,
             history,
+            tx,
             causal_debug_tx,
             ctx,
         );
@@ -292,6 +293,7 @@ fn execute_shadow_actions_debug(
     actions: Vec<ShadowAction>,
     parent_event_id: uuid::Uuid,
     history: &mut DebugHistory,
+    tx: &mpsc::Sender<Event>,
     causal_debug_tx: &mpsc::Sender<(Event, uuid::Uuid)>,
     ctx: &mut ShellContext<'_>,
 ) {
@@ -299,12 +301,13 @@ fn execute_shadow_actions_debug(
         return;
     }
     for action in actions {
-        let action_id = action
-            .debug_action()
-            .map_or_else(uuid::Uuid::new_v4, |debug_action| {
-                history.action_started(&debug_action, parent_event_id)
-            });
-        let causal = CausalTx::debug(action_id, causal_debug_tx.clone());
+        let causal = action.debug_action().map_or_else(
+            || CausalTx::plain(uuid::Uuid::new_v4(), tx.clone()),
+            |debug_action| {
+                let action_id = history.action_started(&debug_action, parent_event_id);
+                CausalTx::debug(action_id, causal_debug_tx.clone())
+            },
+        );
         ctx.execute_shadow_action(action, causal);
     }
 }
