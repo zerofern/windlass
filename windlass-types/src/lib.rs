@@ -132,6 +132,7 @@ pub enum WakeupId {
     QbitSyncRetry,
     RetryPortRead,
     CompliancePoll,
+    DomainSnapshot,
 }
 
 // ── Alert priority ───────────────────────────────────────────────────────────

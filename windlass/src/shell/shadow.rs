@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use windlass_core::{actions::Action, events::Event};
 use windlass_db_core::DbCommand;
-use windlass_domain_core::{WindlassConfig, WindlassEvent, WindlassMachine};
+use windlass_domain_core::{WindlassConfig, WindlassEvent, WindlassMachine, WindlassTimer};
 use windlass_machine::Machine;
 use windlass_mam_core::{MamAction, MamConfig, MamEvent, MamMachine, MamPublish};
 use windlass_qbit_core::{QbitAction, QbitConfig, QbitEvent, QbitMachine, QbitPublish};
@@ -84,8 +84,17 @@ impl ShadowAction {
                     ..
                 } => None,
             },
-            Self::Db(_) | Self::ScheduleTimer { .. } => None,
+            Self::Db(_) => None,
+            Self::ScheduleTimer { timer, after } => {
+                Some(Action::ScheduleWakeup(shadow_timer_wakeup(*timer), *after))
+            }
         }
+    }
+}
+
+pub(super) const fn shadow_timer_wakeup(timer: WindlassTimer) -> WakeupId {
+    match timer {
+        WindlassTimer::Snapshot => WakeupId::DomainSnapshot,
     }
 }
 
@@ -373,6 +382,9 @@ fn legacy_to_shadow_events(event: &Event, forwarded_port: Option<VpnPort>) -> Ve
             WakeupId::RetryPortRead => vec![ShadowEvent::Vpn(VpnEvent::TimerFired(
                 windlass_vpn_core::VpnTimer::PortReadRetry,
             ))],
+            WakeupId::DomainSnapshot => vec![ShadowEvent::Domain(WindlassEvent::TimerFired(
+                WindlassTimer::Snapshot,
+            ))],
             WakeupId::DiskCheck | WakeupId::TorrentCheck | WakeupId::CompliancePoll => Vec::new(),
         },
         Event::QbitPreferencesReceived { listen_port, .. } => {
@@ -402,11 +414,11 @@ mod tests {
 
     use windlass_mam_core::MamAction;
     use windlass_qbit_core::QbitAction;
-    use windlass_types::{AuthCookie, MamStatus, VpnIp, VpnPort};
+    use windlass_types::{AuthCookie, MamStatus, VpnIp, VpnPort, WakeupId};
     use windlass_vpn_core::VpnAction;
 
     use windlass_core::events::Event;
-    use windlass_domain_core::ServiceStatus;
+    use windlass_domain_core::{ServiceStatus, WindlassTimer};
 
     use super::{ShadowAction, ShadowCores};
 
@@ -517,6 +529,45 @@ mod tests {
             mapped,
             Some(windlass_core::actions::Action::CheckMamConnectability)
         ));
+    }
+
+    #[test]
+    fn domain_snapshot_timer_round_trips_through_wakeup() {
+        let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
+        let actions = cores.observe(&Event::Init {
+            at: chrono::Utc::now(),
+            is_gluetun_healthy: false,
+            port_files: Err("missing".to_string()),
+        });
+
+        assert!(actions.contains(&ShadowAction::ScheduleTimer {
+            timer: WindlassTimer::Snapshot,
+            after: std::time::Duration::from_secs(60),
+        }));
+
+        let mapped = ShadowAction::ScheduleTimer {
+            timer: WindlassTimer::Snapshot,
+            after: std::time::Duration::from_secs(60),
+        }
+        .debug_action();
+        assert!(matches!(
+            mapped,
+            Some(windlass_core::actions::Action::ScheduleWakeup(
+                WakeupId::DomainSnapshot,
+                duration
+            )) if duration == std::time::Duration::from_secs(60)
+        ));
+
+        let actions = cores.observe(&Event::Wakeup {
+            at: chrono::Utc::now(),
+            id: WakeupId::DomainSnapshot,
+        });
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                ShadowAction::Db(windlass_db_core::DbCommand::SaveSystemSnapshot(_))
+            )
+        }));
     }
 
     #[test]

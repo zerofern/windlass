@@ -68,6 +68,7 @@ impl SystemState {
                 }
             }
             WakeupId::RetryPortRead => vec![Action::ReadPortFiles],
+            WakeupId::DomainSnapshot => vec![],
         }
     }
 }

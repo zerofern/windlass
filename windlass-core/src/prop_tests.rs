@@ -42,6 +42,7 @@ fn any_wakeup_id() -> impl Strategy<Value = WakeupId> {
         Just(WakeupId::QbitSyncRetry),
         Just(WakeupId::RetryPortRead),
         Just(WakeupId::CompliancePoll),
+        Just(WakeupId::DomainSnapshot),
     ]
 }
 

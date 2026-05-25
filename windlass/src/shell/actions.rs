@@ -12,7 +12,10 @@ use windlass_qbit_core::{QbitAction, QbitTimer};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 use windlass_vpn_core::{VpnAction, VpnTimer};
 
-use super::{ShellContext, shadow::ShadowAction};
+use super::{
+    ShellContext,
+    shadow::{ShadowAction, shadow_timer_wakeup},
+};
 
 impl ShellContext<'_> {
     // ── Timers ────────────────────────────────────────────────────────────────
@@ -32,7 +35,10 @@ impl ShellContext<'_> {
 
     pub(super) fn execute_shadow_action(&mut self, action: ShadowAction, causal_tx: CausalTx) {
         match action {
-            ShadowAction::Db(_) | ShadowAction::ScheduleTimer { .. } => {}
+            ShadowAction::Db(_) => {}
+            ShadowAction::ScheduleTimer { timer, after } => {
+                self.schedule_wakeup(shadow_timer_wakeup(timer), after);
+            }
             ShadowAction::Vpn(action) => self.execute_shadow_vpn_action(&action, causal_tx),
             ShadowAction::Qbit(action) => self.execute_shadow_qbit_action(action, causal_tx),
             ShadowAction::Mam(action) => self.execute_shadow_mam_action(&action, causal_tx),
