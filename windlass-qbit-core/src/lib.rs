@@ -183,7 +183,19 @@ impl Machine for QbitMachine {
             QbitEvent::AuthSucceeded { cookie } => {
                 self.cookie = Some(cookie.clone());
                 Outcome {
-                    actions: vec![QbitAction::ReadPreferences { cookie }],
+                    actions: self.desired_listen_port.map_or_else(
+                        || {
+                            vec![QbitAction::ReadPreferences {
+                                cookie: cookie.clone(),
+                            }]
+                        },
+                        |port| {
+                            vec![QbitAction::SetListenPort {
+                                cookie: cookie.clone(),
+                                port,
+                            }]
+                        },
+                    ),
                     publish: vec![QbitPublish::Ready],
                 }
             }
@@ -329,6 +341,27 @@ mod tests {
         let out = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
 
         assert_eq!(out.actions, vec![QbitAction::Login]);
+    }
+
+    #[test]
+    fn auth_success_sets_desired_port_after_pre_auth_request() {
+        let mut machine = machine();
+        let cookie = AuthCookie("sid".to_string());
+        let port = VpnPort::try_new(51_820).unwrap();
+        let _ = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
+
+        let out = machine.handle(
+            Instant::now(),
+            QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            },
+        );
+
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::SetListenPort { cookie, port }]
+        );
+        assert_eq!(out.publish, vec![QbitPublish::Ready]);
     }
 
     #[test]
