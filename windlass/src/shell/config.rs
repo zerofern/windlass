@@ -29,8 +29,9 @@ pub struct Config {
     pub compliance_poll_interval_secs: u64,
     /// Maximum unsatisfied torrents before alerting (default: 50).
     pub unsatisfied_quota_limit: u32,
-    /// Executes service actions produced by the new shadow cores. Disabled by
-    /// default while legacy orchestration remains authoritative.
+    /// Executes service actions produced by the new shadow cores. Enabled by
+    /// default; set `WINDLASS_EXECUTE_SHADOW_ACTIONS=false` to fall back to
+    /// legacy-only orchestration.
     pub execute_shadow_actions: bool,
 }
 
@@ -71,7 +72,33 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
             execute_shadow_actions: var("WINDLASS_EXECUTE_SHADOW_ACTIONS")
-                .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+                .map_or(true, |v| parse_execute_shadow_actions(&v)),
         })
+    }
+}
+
+fn parse_execute_shadow_actions(value: &str) -> bool {
+    !matches!(value, "0" | "false" | "FALSE" | "no" | "NO")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_execute_shadow_actions;
+
+    #[test]
+    fn parse_execute_shadow_actions_accepts_enabled_values() {
+        assert!(parse_execute_shadow_actions("1"));
+        assert!(parse_execute_shadow_actions("true"));
+        assert!(parse_execute_shadow_actions("yes"));
+        assert!(parse_execute_shadow_actions("anything-else"));
+    }
+
+    #[test]
+    fn parse_execute_shadow_actions_accepts_disabled_values() {
+        assert!(!parse_execute_shadow_actions("0"));
+        assert!(!parse_execute_shadow_actions("false"));
+        assert!(!parse_execute_shadow_actions("FALSE"));
+        assert!(!parse_execute_shadow_actions("no"));
+        assert!(!parse_execute_shadow_actions("NO"));
     }
 }
