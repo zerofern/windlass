@@ -2,6 +2,27 @@
 
 copilot --resume=b3c8c23b-65b7-4ca4-b012-bd1d32d3f50e
 
+## Current Implementation Status
+
+This document started as the original M1 plan and still contains older SQLite
+wording below. The current implementation has moved on:
+
+- Runtime persistence is PostgreSQL, with schema in SQL files and SQLx
+  compile-time checking.
+- Database writes flow through the sans-I/O DB command core and Postgres actor.
+- VPN, qBittorrent, MAM, and the top-level Windlass domain each have sans-I/O
+  cores.
+- The runtime feeds legacy events into those cores and executes the service-core
+  actions by default.
+- `WINDLASS_EXECUTE_SHADOW_ACTIONS=false` is the rollback switch for
+  legacy-only service orchestration.
+- `just check` and `just integration` pass with service-core action execution
+  enabled by default.
+
+The remaining refactor work is to retire duplicated legacy service orchestration
+once the domain/service cores own the corresponding decisions directly, while
+keeping the download and compliance workflows covered by their existing tests.
+
 ## Goal
 
 A fully working, MAM-compliant, safe audiobook downloader with a web UI.
