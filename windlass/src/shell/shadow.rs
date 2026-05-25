@@ -67,6 +67,7 @@ impl ShadowCores {
         for event in legacy_to_shadow_events(event, self.domain.state().forwarded_port) {
             actions.extend(self.apply(now, event));
         }
+        dedup_shadow_actions(&mut actions);
         actions
     }
 
@@ -168,6 +169,16 @@ impl ShadowCores {
         }
         shadow_actions
     }
+}
+
+fn dedup_shadow_actions(actions: &mut Vec<ShadowAction>) {
+    let mut deduped = Vec::with_capacity(actions.len());
+    for action in actions.drain(..) {
+        if !deduped.contains(&action) {
+            deduped.push(action);
+        }
+    }
+    *actions = deduped;
 }
 
 enum ShadowEvent {
@@ -338,6 +349,32 @@ mod tests {
         assert_eq!(cores.state().vpn, ServiceStatus::Ready);
         assert_eq!(cores.state().forwarded_port, Some(port()));
         assert!(!db_commands.is_empty());
+    }
+
+    #[test]
+    fn init_deduplicates_bootstrap_service_actions() {
+        let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
+
+        let actions = cores.observe(&Event::Init {
+            at: Utc::now(),
+            is_gluetun_healthy: true,
+            port_files: Ok((VpnIp(Ipv4Addr::new(10, 8, 0, 1)), port())),
+        });
+
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, ShadowAction::Qbit(QbitAction::Login)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, ShadowAction::Mam(MamAction::FetchStatus)))
+                .count(),
+            1
+        );
     }
 
     #[test]
