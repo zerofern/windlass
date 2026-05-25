@@ -1,13 +1,13 @@
 use std::time::{Duration, Instant};
 
-use windlass_core::events::Event;
+use windlass_core::{actions::Action, events::Event};
 use windlass_db_core::DbCommand;
 use windlass_domain_core::{WindlassConfig, WindlassEvent, WindlassMachine};
 use windlass_machine::Machine;
 use windlass_mam_core::{MamAction, MamConfig, MamEvent, MamMachine, MamPublish};
 use windlass_qbit_core::{QbitAction, QbitConfig, QbitEvent, QbitMachine, QbitPublish};
-use windlass_types::{MamStatus, VpnPort, WakeupId};
-use windlass_vpn_core::{VpnAction, VpnConfig, VpnEvent, VpnMachine, VpnPublish};
+use windlass_types::{MamStatus, VpnIp, VpnPort, WakeupId};
+use windlass_vpn_core::{VpnAction, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
 
 /// Runs the new sans-I/O cores beside the legacy core without executing actions.
 ///
@@ -31,6 +31,69 @@ pub(super) enum ShadowAction {
         timer: windlass_domain_core::WindlassTimer,
         after: Duration,
     },
+}
+
+impl ShadowAction {
+    pub(super) fn debug_action(&self) -> Option<Action> {
+        match self {
+            Self::Qbit(action) => match action {
+                QbitAction::Login => Some(Action::AuthenticateQbit),
+                QbitAction::ReadPreferences { cookie } => {
+                    Some(Action::FetchQbitPreferences(cookie.clone()))
+                }
+                QbitAction::SetListenPort { cookie, port } => {
+                    Some(Action::SyncQbitPort(cookie.clone(), *port))
+                }
+                QbitAction::ListTorrents { cookie } => {
+                    Some(Action::CheckNewTorrents(cookie.clone()))
+                }
+                QbitAction::PauseTorrent { cookie, hash } => {
+                    Some(Action::PauseTorrent(hash.clone(), cookie.clone()))
+                }
+                QbitAction::ResumeTorrent { cookie, hash } => {
+                    Some(Action::ForceResumeTorrent(hash.clone(), cookie.clone()))
+                }
+                QbitAction::ScheduleTimer { timer, after } => {
+                    let wakeup = match timer {
+                        windlass_qbit_core::QbitTimer::AuthRetry => WakeupId::QbitAuthRetry,
+                        windlass_qbit_core::QbitTimer::SyncRetry => WakeupId::QbitSyncRetry,
+                        windlass_qbit_core::QbitTimer::TorrentRefresh => WakeupId::TorrentCheck,
+                    };
+                    Some(Action::ScheduleWakeup(wakeup, *after))
+                }
+            },
+            Self::Mam(action) => match action {
+                MamAction::FetchStatus => Some(Action::CheckMamConnectability),
+                MamAction::UpdateSeedboxPort { .. } => {
+                    Some(Action::UpdateMam(VpnIp(std::net::Ipv4Addr::UNSPECIFIED)))
+                }
+                MamAction::ScheduleTimer { after, .. } => {
+                    Some(Action::ScheduleWakeup(WakeupId::Heartbeat, *after))
+                }
+            },
+            Self::Vpn(action) => match action {
+                VpnAction::ReadPortFiles => Some(Action::ReadPortFiles),
+                VpnAction::ScheduleTimer {
+                    timer: VpnTimer::PortReadRetry,
+                    after,
+                } => Some(Action::ScheduleWakeup(WakeupId::RetryPortRead, *after)),
+                VpnAction::InspectContainer
+                | VpnAction::StartMonitoring
+                | VpnAction::ScheduleTimer {
+                    timer: VpnTimer::HealthPoll,
+                    ..
+                } => None,
+            },
+            Self::Db(_) | Self::ScheduleTimer { .. } => None,
+        }
+    }
+}
+
+pub(super) fn shadow_debug_actions(actions: &[ShadowAction]) -> Vec<Action> {
+    actions
+        .iter()
+        .filter_map(ShadowAction::debug_action)
+        .collect()
 }
 
 impl ShadowCores {
@@ -426,6 +489,34 @@ mod tests {
 
         assert_eq!(cores.state().qbit, ServiceStatus::Ready);
         assert_eq!(cores.state().mam, ServiceStatus::Ready);
+    }
+
+    #[test]
+    fn qbit_set_port_maps_to_debug_action() {
+        let cookie = AuthCookie("sid".to_string());
+        let port = VpnPort::try_new(51_820).unwrap();
+
+        let mapped = ShadowAction::Qbit(QbitAction::SetListenPort {
+            cookie: cookie.clone(),
+            port,
+        })
+        .debug_action();
+
+        assert!(matches!(
+            mapped,
+            Some(windlass_core::actions::Action::SyncQbitPort(mapped_cookie, mapped_port))
+                if mapped_cookie == cookie && mapped_port == port
+        ));
+    }
+
+    #[test]
+    fn mam_fetch_status_maps_to_debug_action() {
+        let mapped = ShadowAction::Mam(MamAction::FetchStatus).debug_action();
+
+        assert!(matches!(
+            mapped,
+            Some(windlass_core::actions::Action::CheckMamConnectability)
+        ));
     }
 
     #[test]
