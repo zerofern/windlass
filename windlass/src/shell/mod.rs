@@ -5,6 +5,7 @@ mod dequeue;
 mod download;
 mod init;
 mod service;
+mod service_debug;
 
 use std::collections::HashMap;
 
@@ -24,7 +25,8 @@ use windlass_types::WakeupId;
 
 use dequeue::dequeue_debug;
 use init::{ShellRuntime, init_shell};
-use service::{ServiceAction, service_debug_actions};
+use service::ServiceAction;
+use service_debug::service_debug_actions;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
 /// then runs the event loop forever.

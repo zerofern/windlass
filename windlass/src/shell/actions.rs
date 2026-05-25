@@ -12,10 +12,7 @@ use windlass_qbit_core::{QbitAction, QbitTimer};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 use windlass_vpn_core::{VpnAction, VpnTimer};
 
-use super::{
-    ShellContext,
-    service::{ServiceAction, service_timer_wakeup},
-};
+use super::{ShellContext, service::ServiceAction, service_debug::service_timer_wakeup};
 
 impl ShellContext<'_> {
     // ── Timers ────────────────────────────────────────────────────────────────
