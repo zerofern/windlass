@@ -68,6 +68,7 @@ impl ShadowCores {
             actions.extend(self.apply(now, event));
         }
         dedup_shadow_actions(&mut actions);
+        suppress_bootstrap_probe_actions(event, &mut actions);
         actions
     }
 
@@ -179,6 +180,13 @@ fn dedup_shadow_actions(actions: &mut Vec<ShadowAction>) {
         }
     }
     *actions = deduped;
+}
+
+fn suppress_bootstrap_probe_actions(event: &Event, actions: &mut Vec<ShadowAction>) {
+    if !matches!(event, Event::Init { .. }) {
+        return;
+    }
+    actions.retain(|action| !matches!(action, ShadowAction::Mam(MamAction::FetchStatus)));
 }
 
 enum ShadowEvent {
@@ -352,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn init_deduplicates_bootstrap_service_actions() {
+    fn init_deduplicates_bootstrap_service_actions_without_mam_probe() {
         let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
 
         let actions = cores.observe(&Event::Init {
@@ -373,7 +381,7 @@ mod tests {
                 .iter()
                 .filter(|action| matches!(action, ShadowAction::Mam(MamAction::FetchStatus)))
                 .count(),
-            1
+            0
         );
     }
 
