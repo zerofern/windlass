@@ -4,7 +4,7 @@ mod config;
 mod dequeue;
 mod download;
 mod init;
-mod shadow;
+mod service;
 
 use std::collections::HashMap;
 
@@ -24,7 +24,7 @@ use windlass_types::WakeupId;
 
 use dequeue::dequeue_debug;
 use init::{ShellRuntime, init_shell};
-use shadow::{ShadowAction, shadow_debug_actions};
+use service::{ServiceAction, service_debug_actions};
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
 /// then runs the event loop forever.
@@ -56,8 +56,8 @@ pub async fn run(
         mut exchange_rx,
         causal_debug_tx,
         mut causal_rx,
-        mut shadow_cores,
-        execute_shadow_actions,
+        mut service_cores,
+        execute_service_actions,
     } = init_shell(&debug_ctrl, debug_owned).await?;
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
 
@@ -94,9 +94,9 @@ pub async fn run(
 
         debug!(?event, "←");
 
-        let shadow_actions = shadow_cores.observe(&event);
-        for action in &shadow_actions {
-            dispatch_shadow_db_action(&db_pool, action);
+        let service_actions = service_cores.observe(&event);
+        for action in &service_actions {
+            dispatch_service_db_action(&db_pool, action);
         }
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {
@@ -122,12 +122,12 @@ pub async fn run(
         };
 
         let legacy_actions =
-            legacy_actions_for_shadow_mode(execute_shadow_actions, outcome.actions);
+            legacy_actions_for_service_mode(execute_service_actions, outcome.actions);
 
         dispatch_event(
             legacy_actions,
-            shadow_actions,
-            execute_shadow_actions,
+            service_actions,
+            execute_service_actions,
             event_id,
             &state,
             &mut history,
@@ -143,20 +143,20 @@ pub async fn run(
     Ok(())
 }
 
-fn legacy_actions_for_shadow_mode(
-    execute_shadow_actions: bool,
+fn legacy_actions_for_service_mode(
+    execute_service_actions: bool,
     actions: Vec<Action>,
 ) -> Vec<Action> {
-    if !execute_shadow_actions {
+    if !execute_service_actions {
         return actions;
     }
     actions
         .into_iter()
-        .filter(|action| !shadow_replaces_legacy_action(action))
+        .filter(|action| !service_replaces_legacy_action(action))
         .collect()
 }
 
-const fn shadow_replaces_legacy_action(action: &Action) -> bool {
+const fn service_replaces_legacy_action(action: &Action) -> bool {
     matches!(
         action,
         Action::ReadPortFiles
@@ -176,9 +176,9 @@ const fn shadow_replaces_legacy_action(action: &Action) -> bool {
     )
 }
 
-fn dispatch_shadow_db_action(db_pool: &DbPool, action: &ShadowAction) {
+fn dispatch_service_db_action(db_pool: &DbPool, action: &ServiceAction) {
     match action {
-        ShadowAction::Db(command) => {
+        ServiceAction::Db(command) => {
             let actor = PostgresDbActor::new(db_pool.clone());
             let command = command.clone();
             tokio::spawn(async move {
@@ -186,22 +186,22 @@ fn dispatch_shadow_db_action(db_pool: &DbPool, action: &ShadowAction) {
                 if let DbEvent::Failed(error) = event {
                     tracing::warn!(
                         operation = %error.operation,
-                        "Shadow domain DB command failed: {}",
+                        "Service domain DB command failed: {}",
                         error.message
                     );
                 }
             });
         }
-        ShadowAction::Vpn(_)
-        | ShadowAction::Qbit(_)
-        | ShadowAction::Mam(_)
-        | ShadowAction::ScheduleTimer { .. } => {}
+        ServiceAction::Vpn(_)
+        | ServiceAction::Qbit(_)
+        | ServiceAction::Mam(_)
+        | ServiceAction::ScheduleTimer { .. } => {}
     }
 }
 
-fn execute_shadow_actions_if_enabled(
+fn execute_service_actions_if_enabled(
     enabled: bool,
-    actions: Vec<ShadowAction>,
+    actions: Vec<ServiceAction>,
     tx: &mpsc::Sender<Event>,
     ctx: &mut ShellContext<'_>,
 ) {
@@ -210,7 +210,7 @@ fn execute_shadow_actions_if_enabled(
     }
     for action in actions {
         let causal = CausalTx::plain(uuid::Uuid::new_v4(), tx.clone());
-        ctx.execute_shadow_action(action, causal);
+        ctx.execute_service_action(action, causal);
     }
 }
 
@@ -240,8 +240,8 @@ fn drain_channels(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_event(
     outcome_actions: Vec<Action>,
-    shadow_actions: Vec<ShadowAction>,
-    execute_shadow_actions: bool,
+    service_actions: Vec<ServiceAction>,
+    execute_service_actions: bool,
     event_id: Option<uuid::Uuid>,
     state: &SystemState,
     history: &mut DebugHistory,
@@ -253,13 +253,13 @@ async fn dispatch_event(
 ) {
     if let Some(eid) = event_id {
         let plain_tx = tx.clone();
-        let mut debug_actions = shadow_debug_actions(&shadow_actions);
+        let mut debug_actions = service_debug_actions(&service_actions);
         debug_actions.extend(outcome_actions.iter().cloned());
         history.actions_ready(&debug_actions);
         debug_ctrl.publish(history);
-        execute_shadow_actions_debug(
-            execute_shadow_actions,
-            shadow_actions,
+        execute_service_actions_debug(
+            execute_service_actions,
+            service_actions,
             eid,
             history,
             tx,
@@ -278,7 +278,7 @@ async fn dispatch_event(
         drop(plain_tx);
     } else {
         let plain_tx = tx.clone();
-        execute_shadow_actions_if_enabled(execute_shadow_actions, shadow_actions, tx, ctx);
+        execute_service_actions_if_enabled(execute_service_actions, service_actions, tx, ctx);
         debug_dispatcher
             .dispatch(outcome_actions, |action| {
                 let causal = CausalTx::plain(uuid::Uuid::new_v4(), plain_tx.clone());
@@ -288,9 +288,9 @@ async fn dispatch_event(
     }
 }
 
-fn execute_shadow_actions_debug(
+fn execute_service_actions_debug(
     enabled: bool,
-    actions: Vec<ShadowAction>,
+    actions: Vec<ServiceAction>,
     parent_event_id: uuid::Uuid,
     history: &mut DebugHistory,
     tx: &mpsc::Sender<Event>,
@@ -308,7 +308,7 @@ fn execute_shadow_actions_debug(
                 CausalTx::debug(action_id, causal_debug_tx.clone())
             },
         );
-        ctx.execute_shadow_action(action, causal);
+        ctx.execute_service_action(action, causal);
     }
 }
 
@@ -382,10 +382,10 @@ mod tests {
 
     use windlass_types::{AuthCookie, MamTorrentId, WakeupId};
 
-    use super::{Action, legacy_actions_for_shadow_mode, shadow_replaces_legacy_action};
+    use super::{Action, legacy_actions_for_service_mode, service_replaces_legacy_action};
 
     #[test]
-    fn shadow_mode_filters_only_service_orchestration_actions() {
+    fn service_mode_filters_only_service_orchestration_actions() {
         let actions = vec![
             Action::AuthenticateQbit,
             Action::ScheduleWakeup(WakeupId::QbitAuthRetry, Duration::from_secs(1)),
@@ -396,7 +396,7 @@ mod tests {
             },
         ];
 
-        let filtered = legacy_actions_for_shadow_mode(true, actions);
+        let filtered = legacy_actions_for_service_mode(true, actions);
 
         assert_eq!(filtered.len(), 2);
         assert!(matches!(
@@ -407,18 +407,18 @@ mod tests {
     }
 
     #[test]
-    fn shadow_mode_keeps_legacy_actions_when_disabled() {
+    fn service_mode_keeps_legacy_actions_when_disabled() {
         let actions = vec![Action::AuthenticateQbit];
 
-        let filtered = legacy_actions_for_shadow_mode(false, actions);
+        let filtered = legacy_actions_for_service_mode(false, actions);
 
         assert_eq!(filtered.len(), 1);
         assert!(matches!(filtered[0], Action::AuthenticateQbit));
     }
 
     #[test]
-    fn shadow_replaces_qbit_preference_fetches() {
-        assert!(shadow_replaces_legacy_action(
+    fn service_replaces_qbit_preference_fetches() {
+        assert!(service_replaces_legacy_action(
             &Action::FetchQbitPreferences(AuthCookie("sid".to_string()))
         ));
     }

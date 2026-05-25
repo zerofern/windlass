@@ -29,10 +29,10 @@ pub struct Config {
     pub compliance_poll_interval_secs: u64,
     /// Maximum unsatisfied torrents before alerting (default: 50).
     pub unsatisfied_quota_limit: u32,
-    /// Executes service actions produced by the new shadow cores. Enabled by
+    /// Executes service actions produced by the new service cores. Enabled by
     /// default; set `WINDLASS_EXECUTE_SHADOW_ACTIONS=false` to fall back to
     /// legacy-only orchestration.
-    pub execute_shadow_actions: bool,
+    pub execute_service_actions: bool,
 }
 
 impl Config {
@@ -71,34 +71,34 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
-            execute_shadow_actions: var("WINDLASS_EXECUTE_SHADOW_ACTIONS")
-                .map_or(true, |v| parse_execute_shadow_actions(&v)),
+            execute_service_actions: var("WINDLASS_EXECUTE_SHADOW_ACTIONS")
+                .map_or(true, |v| parse_execute_service_actions(&v)),
         })
     }
 }
 
-fn parse_execute_shadow_actions(value: &str) -> bool {
+fn parse_execute_service_actions(value: &str) -> bool {
     !matches!(value, "0" | "false" | "FALSE" | "no" | "NO")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_execute_shadow_actions;
+    use super::parse_execute_service_actions;
 
     #[test]
-    fn parse_execute_shadow_actions_accepts_enabled_values() {
-        assert!(parse_execute_shadow_actions("1"));
-        assert!(parse_execute_shadow_actions("true"));
-        assert!(parse_execute_shadow_actions("yes"));
-        assert!(parse_execute_shadow_actions("anything-else"));
+    fn parse_execute_service_actions_accepts_enabled_values() {
+        assert!(parse_execute_service_actions("1"));
+        assert!(parse_execute_service_actions("true"));
+        assert!(parse_execute_service_actions("yes"));
+        assert!(parse_execute_service_actions("anything-else"));
     }
 
     #[test]
-    fn parse_execute_shadow_actions_accepts_disabled_values() {
-        assert!(!parse_execute_shadow_actions("0"));
-        assert!(!parse_execute_shadow_actions("false"));
-        assert!(!parse_execute_shadow_actions("FALSE"));
-        assert!(!parse_execute_shadow_actions("no"));
-        assert!(!parse_execute_shadow_actions("NO"));
+    fn parse_execute_service_actions_accepts_disabled_values() {
+        assert!(!parse_execute_service_actions("0"));
+        assert!(!parse_execute_service_actions("false"));
+        assert!(!parse_execute_service_actions("FALSE"));
+        assert!(!parse_execute_service_actions("no"));
+        assert!(!parse_execute_service_actions("NO"));
     }
 }

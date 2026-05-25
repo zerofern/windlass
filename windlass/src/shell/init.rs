@@ -17,7 +17,7 @@ use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
 use super::config::Config;
-use super::shadow::ShadowCores;
+use super::service::ServiceCores;
 
 /// All runtime state extracted from `init_shell` so `run` stays concise.
 pub(super) struct ShellRuntime {
@@ -41,8 +41,8 @@ pub(super) struct ShellRuntime {
     pub(super) exchange_rx: mpsc::Receiver<(uuid::Uuid, windlass_types::HttpExchange)>,
     pub(super) causal_debug_tx: mpsc::Sender<(Event, uuid::Uuid)>,
     pub(super) causal_rx: mpsc::Receiver<(Event, uuid::Uuid)>,
-    pub(super) shadow_cores: ShadowCores,
-    pub(super) execute_shadow_actions: bool,
+    pub(super) service_cores: ServiceCores,
+    pub(super) execute_service_actions: bool,
 }
 
 /// Bootstraps all infrastructure and returns the runtime bundle.
@@ -125,8 +125,9 @@ pub(super) async fn init_shell(
             config.compliance_poll_interval_secs,
         )
         .with_blacklisted_ids(blacklisted);
-    let shadow_cores = ShadowCores::new(Duration::from_secs(config.compliance_poll_interval_secs));
-    let execute_shadow_actions = config.execute_shadow_actions;
+    let service_cores =
+        ServiceCores::new(Duration::from_secs(config.compliance_poll_interval_secs));
+    let execute_service_actions = config.execute_service_actions;
     let history = DebugHistory::new(SystemState::initial());
     let cmd_rx = debug_owned.cmd_rx;
     let log_rx = debug_owned.log_rx;
@@ -170,8 +171,8 @@ pub(super) async fn init_shell(
         exchange_rx,
         causal_debug_tx,
         causal_rx,
-        shadow_cores,
-        execute_shadow_actions,
+        service_cores,
+        execute_service_actions,
     })
 }
 

@@ -9,12 +9,12 @@ use windlass_qbit_core::{QbitAction, QbitConfig, QbitEvent, QbitMachine, QbitPub
 use windlass_types::{MamStatus, VpnIp, VpnPort, WakeupId};
 use windlass_vpn_core::{VpnAction, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
 
-/// Runs the new sans-I/O cores beside the legacy core without executing actions.
+/// Runs the new sans-I/O service cores beside the legacy core.
 ///
-/// This is a migration bridge: it lets the runtime feed real events into the new
-/// service/domain boundaries and compare behavior in tests before those cores
-/// become authoritative.
-pub(super) struct ShadowCores {
+/// This is a migration bridge: it lets the runtime feed real events into the
+/// service/domain boundaries while legacy-only orchestration remains available
+/// as a rollback path.
+pub(super) struct ServiceCores {
     domain: WindlassMachine,
     vpn: VpnMachine,
     qbit: QbitMachine,
@@ -22,7 +22,7 @@ pub(super) struct ShadowCores {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ShadowAction {
+pub(super) enum ServiceAction {
     Db(DbCommand),
     Vpn(VpnAction),
     Qbit(QbitAction),
@@ -33,7 +33,7 @@ pub(super) enum ShadowAction {
     },
 }
 
-impl ShadowAction {
+impl ServiceAction {
     pub(super) fn debug_action(&self) -> Option<Action> {
         match self {
             Self::Qbit(action) => match action {
@@ -86,26 +86,26 @@ impl ShadowAction {
             },
             Self::Db(_) => None,
             Self::ScheduleTimer { timer, after } => {
-                Some(Action::ScheduleWakeup(shadow_timer_wakeup(*timer), *after))
+                Some(Action::ScheduleWakeup(service_timer_wakeup(*timer), *after))
             }
         }
     }
 }
 
-pub(super) const fn shadow_timer_wakeup(timer: WindlassTimer) -> WakeupId {
+pub(super) const fn service_timer_wakeup(timer: WindlassTimer) -> WakeupId {
     match timer {
         WindlassTimer::Snapshot => WakeupId::DomainSnapshot,
     }
 }
 
-pub(super) fn shadow_debug_actions(actions: &[ShadowAction]) -> Vec<Action> {
+pub(super) fn service_debug_actions(actions: &[ServiceAction]) -> Vec<Action> {
     actions
         .iter()
-        .filter_map(ShadowAction::debug_action)
+        .filter_map(ServiceAction::debug_action)
         .collect()
 }
 
-impl ShadowCores {
+impl ServiceCores {
     #[must_use]
     pub fn new(snapshot_interval: Duration) -> Self {
         let now = Instant::now();
@@ -133,13 +133,13 @@ impl ShadowCores {
         }
     }
 
-    pub fn observe(&mut self, event: &Event) -> Vec<ShadowAction> {
+    pub fn observe(&mut self, event: &Event) -> Vec<ServiceAction> {
         let now = Instant::now();
         let mut actions = Vec::new();
-        for event in legacy_to_shadow_events(event, self.domain.state().forwarded_port) {
+        for event in legacy_to_service_events(event, self.domain.state().forwarded_port) {
             actions.extend(self.apply(now, event));
         }
-        dedup_shadow_actions(&mut actions);
+        dedup_service_actions(&mut actions);
         suppress_bootstrap_probe_actions(event, &mut actions);
         actions
     }
@@ -149,37 +149,43 @@ impl ShadowCores {
         self.domain.state()
     }
 
-    fn apply(&mut self, now: Instant, event: ShadowEvent) -> Vec<ShadowAction> {
+    fn apply(&mut self, now: Instant, event: ServiceEvent) -> Vec<ServiceAction> {
         match event {
-            ShadowEvent::Domain(event) => {
+            ServiceEvent::Domain(event) => {
                 let outcome = self.domain.handle(now, event);
                 self.actions_from_domain_actions(now, outcome.actions)
             }
-            ShadowEvent::Vpn(event) => {
+            ServiceEvent::Vpn(event) => {
                 let outcome = self.vpn.handle(now, event);
-                let mut actions: Vec<ShadowAction> =
-                    outcome.actions.into_iter().map(ShadowAction::Vpn).collect();
+                let mut actions: Vec<ServiceAction> = outcome
+                    .actions
+                    .into_iter()
+                    .map(ServiceAction::Vpn)
+                    .collect();
                 for publish in outcome.publish {
                     actions.extend(self.publish_vpn(now, publish));
                 }
                 actions
             }
-            ShadowEvent::Qbit(event) => {
+            ServiceEvent::Qbit(event) => {
                 let outcome = self.qbit.handle(now, event);
-                let mut actions: Vec<ShadowAction> = outcome
+                let mut actions: Vec<ServiceAction> = outcome
                     .actions
                     .into_iter()
-                    .map(ShadowAction::Qbit)
+                    .map(ServiceAction::Qbit)
                     .collect();
                 for publish in outcome.publish {
                     actions.extend(self.publish_qbit(now, publish));
                 }
                 actions
             }
-            ShadowEvent::Mam(event) => {
+            ServiceEvent::Mam(event) => {
                 let outcome = self.mam.handle(now, event);
-                let mut actions: Vec<ShadowAction> =
-                    outcome.actions.into_iter().map(ShadowAction::Mam).collect();
+                let mut actions: Vec<ServiceAction> = outcome
+                    .actions
+                    .into_iter()
+                    .map(ServiceAction::Mam)
+                    .collect();
                 for publish in outcome.publish {
                     actions.extend(self.publish_mam(now, publish));
                 }
@@ -188,17 +194,17 @@ impl ShadowCores {
         }
     }
 
-    fn publish_vpn(&mut self, now: Instant, publish: VpnPublish) -> Vec<ShadowAction> {
+    fn publish_vpn(&mut self, now: Instant, publish: VpnPublish) -> Vec<ServiceAction> {
         let outcome = self.domain.handle(now, WindlassEvent::Vpn(publish));
         self.actions_from_domain_actions(now, outcome.actions)
     }
 
-    fn publish_qbit(&mut self, now: Instant, publish: QbitPublish) -> Vec<ShadowAction> {
+    fn publish_qbit(&mut self, now: Instant, publish: QbitPublish) -> Vec<ServiceAction> {
         let outcome = self.domain.handle(now, WindlassEvent::Qbit(publish));
         self.actions_from_domain_actions(now, outcome.actions)
     }
 
-    fn publish_mam(&mut self, now: Instant, publish: MamPublish) -> Vec<ShadowAction> {
+    fn publish_mam(&mut self, now: Instant, publish: MamPublish) -> Vec<ServiceAction> {
         let outcome = self.domain.handle(now, WindlassEvent::Mam(publish));
         self.actions_from_domain_actions(now, outcome.actions)
     }
@@ -207,44 +213,44 @@ impl ShadowCores {
         &mut self,
         now: Instant,
         actions: Vec<windlass_domain_core::WindlassAction>,
-    ) -> Vec<ShadowAction> {
-        let mut shadow_actions = Vec::new();
+    ) -> Vec<ServiceAction> {
+        let mut service_actions = Vec::new();
         for action in actions {
             match action {
                 windlass_domain_core::WindlassAction::Db(command) => {
-                    shadow_actions.push(ShadowAction::Db(command));
+                    service_actions.push(ServiceAction::Db(command));
                 }
                 windlass_domain_core::WindlassAction::Vpn(command) => {
                     let outcome = self.vpn.handle_command(now, command);
-                    shadow_actions.extend(outcome.actions.into_iter().map(ShadowAction::Vpn));
+                    service_actions.extend(outcome.actions.into_iter().map(ServiceAction::Vpn));
                     for publish in outcome.publish {
-                        shadow_actions.extend(self.publish_vpn(now, publish));
+                        service_actions.extend(self.publish_vpn(now, publish));
                     }
                 }
                 windlass_domain_core::WindlassAction::Qbit(command) => {
                     let outcome = self.qbit.handle_command(now, command);
-                    shadow_actions.extend(outcome.actions.into_iter().map(ShadowAction::Qbit));
+                    service_actions.extend(outcome.actions.into_iter().map(ServiceAction::Qbit));
                     for publish in outcome.publish {
-                        shadow_actions.extend(self.publish_qbit(now, publish));
+                        service_actions.extend(self.publish_qbit(now, publish));
                     }
                 }
                 windlass_domain_core::WindlassAction::Mam(command) => {
                     let outcome = self.mam.handle_command(now, command);
-                    shadow_actions.extend(outcome.actions.into_iter().map(ShadowAction::Mam));
+                    service_actions.extend(outcome.actions.into_iter().map(ServiceAction::Mam));
                     for publish in outcome.publish {
-                        shadow_actions.extend(self.publish_mam(now, publish));
+                        service_actions.extend(self.publish_mam(now, publish));
                     }
                 }
                 windlass_domain_core::WindlassAction::ScheduleTimer { timer, after } => {
-                    shadow_actions.push(ShadowAction::ScheduleTimer { timer, after });
+                    service_actions.push(ServiceAction::ScheduleTimer { timer, after });
                 }
             }
         }
-        shadow_actions
+        service_actions
     }
 }
 
-fn dedup_shadow_actions(actions: &mut Vec<ShadowAction>) {
+fn dedup_service_actions(actions: &mut Vec<ServiceAction>) {
     let mut deduped = Vec::with_capacity(actions.len());
     for action in actions.drain(..) {
         if !deduped.contains(&action) {
@@ -254,20 +260,20 @@ fn dedup_shadow_actions(actions: &mut Vec<ShadowAction>) {
     *actions = deduped;
 }
 
-fn suppress_bootstrap_probe_actions(event: &Event, actions: &mut Vec<ShadowAction>) {
+fn suppress_bootstrap_probe_actions(event: &Event, actions: &mut Vec<ServiceAction>) {
     if !matches!(event, Event::Init { .. }) {
         return;
     }
     actions.retain(|action| {
         !matches!(
             action,
-            ShadowAction::Mam(MamAction::FetchStatus)
-                | ShadowAction::Vpn(VpnAction::InspectContainer | VpnAction::ReadPortFiles)
+            ServiceAction::Mam(MamAction::FetchStatus)
+                | ServiceAction::Vpn(VpnAction::InspectContainer | VpnAction::ReadPortFiles)
         )
     });
 }
 
-enum ShadowEvent {
+enum ServiceEvent {
     Domain(WindlassEvent),
     Vpn(VpnEvent),
     Qbit(QbitEvent),
@@ -275,7 +281,7 @@ enum ShadowEvent {
 }
 
 #[allow(clippy::too_many_lines)]
-fn legacy_to_shadow_events(event: &Event, forwarded_port: Option<VpnPort>) -> Vec<ShadowEvent> {
+fn legacy_to_service_events(event: &Event, forwarded_port: Option<VpnPort>) -> Vec<ServiceEvent> {
     match event {
         Event::Init {
             is_gluetun_healthy,
@@ -283,86 +289,86 @@ fn legacy_to_shadow_events(event: &Event, forwarded_port: Option<VpnPort>) -> Ve
             ..
         } => {
             let mut events = vec![
-                ShadowEvent::Domain(WindlassEvent::Init),
-                ShadowEvent::Vpn(VpnEvent::Init),
-                ShadowEvent::Qbit(QbitEvent::Init),
-                ShadowEvent::Mam(MamEvent::Init),
+                ServiceEvent::Domain(WindlassEvent::Init),
+                ServiceEvent::Vpn(VpnEvent::Init),
+                ServiceEvent::Qbit(QbitEvent::Init),
+                ServiceEvent::Mam(MamEvent::Init),
             ];
             if *is_gluetun_healthy {
-                events.push(ShadowEvent::Vpn(VpnEvent::ContainerHealthy));
+                events.push(ServiceEvent::Vpn(VpnEvent::ContainerHealthy));
             }
             if let Ok((_, port)) = port_files {
-                events.push(ShadowEvent::Vpn(VpnEvent::PortFileChanged { port: *port }));
+                events.push(ServiceEvent::Vpn(VpnEvent::PortFileChanged { port: *port }));
             }
             events
         }
-        Event::DockerGluetunHealthy { .. } => vec![ShadowEvent::Vpn(VpnEvent::ContainerHealthy)],
-        Event::DockerGluetunDied { .. } => vec![ShadowEvent::Vpn(VpnEvent::ContainerUnhealthy)],
+        Event::DockerGluetunHealthy { .. } => vec![ServiceEvent::Vpn(VpnEvent::ContainerHealthy)],
+        Event::DockerGluetunDied { .. } => vec![ServiceEvent::Vpn(VpnEvent::ContainerUnhealthy)],
         Event::PortFileReadResult { result, .. } => result.as_ref().map_or_else(
             |_| {
-                vec![ShadowEvent::Vpn(VpnEvent::StateReadFailed {
+                vec![ServiceEvent::Vpn(VpnEvent::StateReadFailed {
                     reason: "port files unavailable".to_string(),
                 })]
             },
-            |(_, port)| vec![ShadowEvent::Vpn(VpnEvent::PortFileChanged { port: *port })],
+            |(_, port)| vec![ServiceEvent::Vpn(VpnEvent::PortFileChanged { port: *port })],
         ),
         Event::QbitAuthSuccess { cookie, .. } => {
-            vec![ShadowEvent::Qbit(QbitEvent::AuthSucceeded {
+            vec![ServiceEvent::Qbit(QbitEvent::AuthSucceeded {
                 cookie: cookie.clone(),
             })]
         }
-        Event::QbitAuthFailed { .. } => vec![ShadowEvent::Qbit(QbitEvent::AuthFailed {
+        Event::QbitAuthFailed { .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {
             reason: "qBittorrent rejected credentials".to_string(),
         })],
-        Event::QbitConnectionRefused { .. } => vec![ShadowEvent::Qbit(QbitEvent::AuthFailed {
+        Event::QbitConnectionRefused { .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {
             reason: "qBittorrent connection refused".to_string(),
         })],
-        Event::QbitApiError { code, .. } => vec![ShadowEvent::Qbit(QbitEvent::AuthFailed {
+        Event::QbitApiError { code, .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {
             reason: format!("qBittorrent API error {}", code.0),
         })],
         Event::QbitPortSyncSuccess { .. } => forwarded_port.map_or_else(Vec::new, |port| {
-            vec![ShadowEvent::Qbit(QbitEvent::ListenPortSet { port })]
+            vec![ServiceEvent::Qbit(QbitEvent::ListenPortSet { port })]
         }),
         Event::QbitPortSyncFailed { code, .. } => forwarded_port.map_or_else(
             || {
-                vec![ShadowEvent::Qbit(QbitEvent::PreferencesFailed {
+                vec![ServiceEvent::Qbit(QbitEvent::PreferencesFailed {
                     reason: format!("qBittorrent port sync failed {}", code.0),
                 })]
             },
             |port| {
-                vec![ShadowEvent::Qbit(QbitEvent::ListenPortSetFailed {
+                vec![ServiceEvent::Qbit(QbitEvent::ListenPortSetFailed {
                     port,
                     reason: format!("qBittorrent port sync failed {}", code.0),
                 })]
             },
         ),
         Event::MamUpdateSuccess { .. } => forwarded_port.map_or_else(Vec::new, |port| {
-            vec![ShadowEvent::Mam(MamEvent::SeedboxUpdated { port })]
+            vec![ServiceEvent::Mam(MamEvent::SeedboxUpdated { port })]
         }),
-        Event::MamAsnMismatch { ip, .. } => vec![ShadowEvent::Mam(MamEvent::StatusFailed {
+        Event::MamAsnMismatch { ip, .. } => vec![ServiceEvent::Mam(MamEvent::StatusFailed {
             reason: format!("MAM ASN mismatch for {}", ip.0),
         })],
         Event::MamStatusObserved { status, .. } => match status {
             MamStatus::Connectable => vec![
-                ShadowEvent::Mam(MamEvent::AuthSucceeded),
-                ShadowEvent::Mam(MamEvent::StatusFetched {
+                ServiceEvent::Mam(MamEvent::AuthSucceeded),
+                ServiceEvent::Mam(MamEvent::StatusFetched {
                     connectable: true,
                     seedbox_port: forwarded_port,
                 }),
             ],
-            MamStatus::NotConnectable => vec![ShadowEvent::Mam(MamEvent::StatusFetched {
+            MamStatus::NotConnectable => vec![ServiceEvent::Mam(MamEvent::StatusFetched {
                 connectable: false,
                 seedbox_port: forwarded_port,
             })],
-            MamStatus::Unreachable => vec![ShadowEvent::Mam(MamEvent::StatusFailed {
+            MamStatus::Unreachable => vec![ServiceEvent::Mam(MamEvent::StatusFailed {
                 reason: "MAM unreachable".to_string(),
             })],
         },
-        Event::MamRateLimitViolation { .. } => vec![ShadowEvent::Mam(MamEvent::RateLimited {
+        Event::MamRateLimitViolation { .. } => vec![ServiceEvent::Mam(MamEvent::RateLimited {
             retry_after: Duration::from_secs(1),
         })],
         Event::QbitTorrentDetailsReceived { torrents, .. } => {
-            vec![ShadowEvent::Qbit(QbitEvent::TorrentsListed {
+            vec![ServiceEvent::Qbit(QbitEvent::TorrentsListed {
                 hashes: torrents
                     .iter()
                     .map(|torrent| torrent.hash.clone())
@@ -370,30 +376,30 @@ fn legacy_to_shadow_events(event: &Event, forwarded_port: Option<VpnPort>) -> Ve
             })]
         }
         Event::Wakeup { id, .. } => match id {
-            WakeupId::QbitAuthRetry => vec![ShadowEvent::Qbit(QbitEvent::TimerFired(
+            WakeupId::QbitAuthRetry => vec![ServiceEvent::Qbit(QbitEvent::TimerFired(
                 windlass_qbit_core::QbitTimer::AuthRetry,
             ))],
-            WakeupId::QbitSyncRetry => vec![ShadowEvent::Qbit(QbitEvent::TimerFired(
+            WakeupId::QbitSyncRetry => vec![ServiceEvent::Qbit(QbitEvent::TimerFired(
                 windlass_qbit_core::QbitTimer::SyncRetry,
             ))],
-            WakeupId::Heartbeat => vec![ShadowEvent::Mam(MamEvent::TimerFired(
+            WakeupId::Heartbeat => vec![ServiceEvent::Mam(MamEvent::TimerFired(
                 windlass_mam_core::MamTimer::StatusRetry,
             ))],
-            WakeupId::RetryPortRead => vec![ShadowEvent::Vpn(VpnEvent::TimerFired(
+            WakeupId::RetryPortRead => vec![ServiceEvent::Vpn(VpnEvent::TimerFired(
                 windlass_vpn_core::VpnTimer::PortReadRetry,
             ))],
-            WakeupId::DomainSnapshot => vec![ShadowEvent::Domain(WindlassEvent::TimerFired(
+            WakeupId::DomainSnapshot => vec![ServiceEvent::Domain(WindlassEvent::TimerFired(
                 WindlassTimer::Snapshot,
             ))],
             WakeupId::DiskCheck | WakeupId::TorrentCheck | WakeupId::CompliancePoll => Vec::new(),
         },
         Event::QbitPreferencesReceived { listen_port, .. } => {
-            vec![ShadowEvent::Qbit(QbitEvent::PreferencesRead {
+            vec![ServiceEvent::Qbit(QbitEvent::PreferencesRead {
                 listen_port: *listen_port,
             })]
         }
         Event::QbitPreferencesFailed { reason, .. } => {
-            vec![ShadowEvent::Qbit(QbitEvent::PreferencesFailed {
+            vec![ServiceEvent::Qbit(QbitEvent::PreferencesFailed {
                 reason: reason.clone(),
             })]
         }
@@ -420,7 +426,7 @@ mod tests {
     use windlass_core::events::Event;
     use windlass_domain_core::{ServiceStatus, WindlassTimer};
 
-    use super::{ShadowAction, ShadowCores};
+    use super::{ServiceAction, ServiceCores};
 
     fn port() -> VpnPort {
         VpnPort::try_new(51_820).unwrap()
@@ -428,7 +434,7 @@ mod tests {
 
     #[test]
     fn init_with_healthy_vpn_updates_domain_port() {
-        let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
+        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
 
         let db_commands = cores.observe(&Event::Init {
             at: Utc::now(),
@@ -443,7 +449,7 @@ mod tests {
 
     #[test]
     fn init_deduplicates_bootstrap_service_actions_without_mam_probe() {
-        let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
+        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
 
         let actions = cores.observe(&Event::Init {
             at: Utc::now(),
@@ -454,28 +460,28 @@ mod tests {
         assert_eq!(
             actions
                 .iter()
-                .filter(|action| matches!(action, ShadowAction::Qbit(QbitAction::Login)))
+                .filter(|action| matches!(action, ServiceAction::Qbit(QbitAction::Login)))
                 .count(),
             1
         );
         assert_eq!(
             actions
                 .iter()
-                .filter(|action| matches!(action, ShadowAction::Mam(MamAction::FetchStatus)))
+                .filter(|action| matches!(action, ServiceAction::Mam(MamAction::FetchStatus)))
                 .count(),
             0
         );
         assert_eq!(
             actions
                 .iter()
-                .filter(|action| matches!(action, ShadowAction::Vpn(VpnAction::ReadPortFiles)))
+                .filter(|action| matches!(action, ServiceAction::Vpn(VpnAction::ReadPortFiles)))
                 .count(),
             0
         );
         assert_eq!(
             actions
                 .iter()
-                .filter(|action| matches!(action, ShadowAction::Vpn(VpnAction::InspectContainer)))
+                .filter(|action| matches!(action, ServiceAction::Vpn(VpnAction::InspectContainer)))
                 .count(),
             0
         );
@@ -483,7 +489,7 @@ mod tests {
 
     #[test]
     fn qbit_and_mam_events_update_domain_services() {
-        let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
+        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
 
         let _ = cores.observe(&Event::Init {
             at: Utc::now(),
@@ -508,7 +514,7 @@ mod tests {
         let cookie = AuthCookie("sid".to_string());
         let port = VpnPort::try_new(51_820).unwrap();
 
-        let mapped = ShadowAction::Qbit(QbitAction::SetListenPort {
+        let mapped = ServiceAction::Qbit(QbitAction::SetListenPort {
             cookie: cookie.clone(),
             port,
         })
@@ -523,7 +529,7 @@ mod tests {
 
     #[test]
     fn mam_fetch_status_maps_to_debug_action() {
-        let mapped = ShadowAction::Mam(MamAction::FetchStatus).debug_action();
+        let mapped = ServiceAction::Mam(MamAction::FetchStatus).debug_action();
 
         assert!(matches!(
             mapped,
@@ -533,19 +539,19 @@ mod tests {
 
     #[test]
     fn domain_snapshot_timer_round_trips_through_wakeup() {
-        let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
+        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
         let actions = cores.observe(&Event::Init {
             at: chrono::Utc::now(),
             is_gluetun_healthy: false,
             port_files: Err("missing".to_string()),
         });
 
-        assert!(actions.contains(&ShadowAction::ScheduleTimer {
+        assert!(actions.contains(&ServiceAction::ScheduleTimer {
             timer: WindlassTimer::Snapshot,
             after: std::time::Duration::from_secs(60),
         }));
 
-        let mapped = ShadowAction::ScheduleTimer {
+        let mapped = ServiceAction::ScheduleTimer {
             timer: WindlassTimer::Snapshot,
             after: std::time::Duration::from_secs(60),
         }
@@ -565,14 +571,14 @@ mod tests {
         assert!(actions.iter().any(|action| {
             matches!(
                 action,
-                ShadowAction::Db(windlass_db_core::DbCommand::SaveSystemSnapshot(_))
+                ServiceAction::Db(windlass_db_core::DbCommand::SaveSystemSnapshot(_))
             )
         }));
     }
 
     #[test]
     fn forwarded_port_becomes_service_actions() {
-        let mut cores = ShadowCores::new(std::time::Duration::from_secs(60));
+        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
         let cookie = AuthCookie("sid".to_string());
         let _ = cores.observe(&Event::QbitAuthSuccess {
             at: Utc::now(),
@@ -585,13 +591,13 @@ mod tests {
         });
 
         assert!(
-            actions.contains(&ShadowAction::Qbit(QbitAction::SetListenPort {
+            actions.contains(&ServiceAction::Qbit(QbitAction::SetListenPort {
                 cookie,
                 port: port(),
             }))
         );
         assert!(
-            actions.contains(&ShadowAction::Mam(MamAction::UpdateSeedboxPort {
+            actions.contains(&ServiceAction::Mam(MamAction::UpdateSeedboxPort {
                 port: port(),
             }))
         );

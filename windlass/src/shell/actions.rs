@@ -14,7 +14,7 @@ use windlass_vpn_core::{VpnAction, VpnTimer};
 
 use super::{
     ShellContext,
-    shadow::{ShadowAction, shadow_timer_wakeup},
+    service::{ServiceAction, service_timer_wakeup},
 };
 
 impl ShellContext<'_> {
@@ -33,19 +33,19 @@ impl ShellContext<'_> {
         self.wakeups.insert(id, handle);
     }
 
-    pub(super) fn execute_shadow_action(&mut self, action: ShadowAction, causal_tx: CausalTx) {
+    pub(super) fn execute_service_action(&mut self, action: ServiceAction, causal_tx: CausalTx) {
         match action {
-            ShadowAction::Db(_) => {}
-            ShadowAction::ScheduleTimer { timer, after } => {
-                self.schedule_wakeup(shadow_timer_wakeup(timer), after);
+            ServiceAction::Db(_) => {}
+            ServiceAction::ScheduleTimer { timer, after } => {
+                self.schedule_wakeup(service_timer_wakeup(timer), after);
             }
-            ShadowAction::Vpn(action) => self.execute_shadow_vpn_action(&action, causal_tx),
-            ShadowAction::Qbit(action) => self.execute_shadow_qbit_action(action, causal_tx),
-            ShadowAction::Mam(action) => self.execute_shadow_mam_action(&action, causal_tx),
+            ServiceAction::Vpn(action) => self.execute_service_vpn_action(&action, causal_tx),
+            ServiceAction::Qbit(action) => self.execute_service_qbit_action(action, causal_tx),
+            ServiceAction::Mam(action) => self.execute_service_mam_action(&action, causal_tx),
         }
     }
 
-    fn execute_shadow_vpn_action(&mut self, action: &VpnAction, causal_tx: CausalTx) {
+    fn execute_service_vpn_action(&mut self, action: &VpnAction, causal_tx: CausalTx) {
         match action {
             VpnAction::InspectContainer => self.inspect_gluetun(causal_tx),
             VpnAction::ReadPortFiles => self.read_port_files(causal_tx),
@@ -57,7 +57,7 @@ impl ShellContext<'_> {
         }
     }
 
-    fn execute_shadow_qbit_action(&mut self, action: QbitAction, causal_tx: CausalTx) {
+    fn execute_service_qbit_action(&mut self, action: QbitAction, causal_tx: CausalTx) {
         match action {
             QbitAction::Login => self.authenticate_qbit(causal_tx),
             QbitAction::ReadPreferences { cookie } => {
@@ -77,7 +77,7 @@ impl ShellContext<'_> {
         }
     }
 
-    fn execute_shadow_mam_action(&mut self, action: &MamAction, causal_tx: CausalTx) {
+    fn execute_service_mam_action(&mut self, action: &MamAction, causal_tx: CausalTx) {
         match action {
             MamAction::FetchStatus => self.check_mam_connectability(causal_tx),
             MamAction::UpdateSeedboxPort { .. } => {
