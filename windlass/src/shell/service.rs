@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use windlass_core::{actions::Action, events::Event};
-use windlass_db_core::DbCommand;
+use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand};
 use windlass_domain_core::{WindlassConfig, WindlassEvent, WindlassMachine, WindlassTimer};
-use windlass_machine::Machine;
+use windlass_machine::{Machine, Outcome};
 use windlass_mam_core::{MamAction, MamConfig, MamEvent, MamMachine, MamPublish};
 use windlass_qbit_core::{QbitAction, QbitConfig, QbitEvent, QbitMachine, QbitPublish};
 use windlass_types::{MamStatus, VpnIp, VpnPort, WakeupId};
@@ -153,7 +153,7 @@ impl ServiceCores {
         match event {
             ServiceEvent::Domain(event) => {
                 let outcome = self.domain.handle(now, event);
-                self.actions_from_domain_actions(now, outcome.actions)
+                self.actions_from_domain_outcome(now, outcome)
             }
             ServiceEvent::Vpn(event) => {
                 let outcome = self.vpn.handle(now, event);
@@ -196,17 +196,46 @@ impl ServiceCores {
 
     fn publish_vpn(&mut self, now: Instant, publish: VpnPublish) -> Vec<ServiceAction> {
         let outcome = self.domain.handle(now, WindlassEvent::Vpn(publish));
-        self.actions_from_domain_actions(now, outcome.actions)
+        self.actions_from_domain_outcome(now, outcome)
     }
 
     fn publish_qbit(&mut self, now: Instant, publish: QbitPublish) -> Vec<ServiceAction> {
         let outcome = self.domain.handle(now, WindlassEvent::Qbit(publish));
-        self.actions_from_domain_actions(now, outcome.actions)
+        self.actions_from_domain_outcome(now, outcome)
     }
 
     fn publish_mam(&mut self, now: Instant, publish: MamPublish) -> Vec<ServiceAction> {
         let outcome = self.domain.handle(now, WindlassEvent::Mam(publish));
-        self.actions_from_domain_actions(now, outcome.actions)
+        self.actions_from_domain_outcome(now, outcome)
+    }
+
+    fn actions_from_domain_outcome(
+        &mut self,
+        now: Instant,
+        outcome: Outcome<
+            windlass_domain_core::WindlassAction,
+            windlass_domain_core::WindlassPublish,
+        >,
+    ) -> Vec<ServiceAction> {
+        let mut service_actions = self.actions_from_domain_actions(now, outcome.actions);
+        for publish in outcome.publish {
+            match publish {
+                windlass_domain_core::WindlassPublish::SystemState(_) => {}
+                windlass_domain_core::WindlassPublish::Activity { message } => {
+                    service_actions.push(ServiceAction::Db(DbCommand::RecordActivity(
+                        ActivityRecord {
+                            at: chrono::Utc::now(),
+                            source: ActivitySource::Domain,
+                            action: "service_activity".to_string(),
+                            book_id: None,
+                            detail: Some(message),
+                            metadata: serde_json::Value::Null,
+                        },
+                    )));
+                }
+            }
+        }
+        service_actions
     }
 
     fn actions_from_domain_actions(
@@ -507,6 +536,24 @@ mod tests {
 
         assert_eq!(cores.state().qbit, ServiceStatus::Ready);
         assert_eq!(cores.state().mam, ServiceStatus::Ready);
+    }
+
+    #[test]
+    fn domain_activity_publish_becomes_db_command() {
+        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+
+        let actions = cores.observe(&Event::QbitAuthFailed { at: Utc::now() });
+
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                ServiceAction::Db(windlass_db_core::DbCommand::RecordActivity(record))
+                    if record.source == windlass_db_core::ActivitySource::Domain
+                        && record.action == "service_activity"
+                        && record.detail.as_deref()
+                            == Some("qBittorrent rejected credentials")
+            )
+        }));
     }
 
     #[test]
