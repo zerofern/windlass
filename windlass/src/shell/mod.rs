@@ -8,6 +8,7 @@ mod service;
 mod service_db;
 mod service_debug;
 mod service_events;
+mod vpn_shell;
 
 use std::collections::HashMap;
 
@@ -124,6 +125,12 @@ pub async fn run(
             data_path: &data_path,
             db_pool: &db_pool,
         };
+
+        let vpn_pub_actions = service_cores.drain_vpn_publishes();
+        for action in &vpn_pub_actions {
+            dispatch_service_db_action(&db_pool, action, &service_event_tx);
+        }
+        execute_service_actions_if_enabled(execute_service_actions, vpn_pub_actions, &tx, &mut ctx);
 
         dispatch_event(
             outcome.actions,

@@ -1,12 +1,13 @@
 use std::time::{Duration, Instant};
 
+use tokio::sync::{mpsc, oneshot};
 use windlass_core::events::Event;
 use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand};
 use windlass_domain_core::{WindlassConfig, WindlassEvent, WindlassMachine};
-use windlass_machine::{Machine, Outcome, Timed};
+use windlass_machine::{Machine, Outcome, ServiceHandles, Timed};
 use windlass_mam_core::{MamAction, MamConfig, MamMachine, MamPublish};
 use windlass_qbit_core::{QbitAction, QbitConfig, QbitMachine, QbitPublish};
-use windlass_vpn_core::{VpnAction, VpnConfig, VpnMachine, VpnPublish};
+use windlass_vpn_core::{VpnMachine, VpnPublish, VpnResponse};
 
 use super::service_events::{ServiceEvent, legacy_to_service_events};
 
@@ -17,7 +18,8 @@ use super::service_events::{ServiceEvent, legacy_to_service_events};
 /// as a rollback path.
 pub(super) struct ServiceCores {
     domain: WindlassMachine,
-    vpn: VpnMachine,
+    vpn: ServiceHandles<VpnMachine>,
+    vpn_pub_rx: mpsc::Receiver<VpnPublish>,
     qbit: QbitMachine,
     mam: MamMachine,
 }
@@ -25,7 +27,6 @@ pub(super) struct ServiceCores {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ServiceAction {
     Db(DbCommand),
-    Vpn(VpnAction),
     Qbit(QbitAction),
     Mam(MamAction),
     ScheduleTimer {
@@ -36,16 +37,16 @@ pub(super) enum ServiceAction {
 
 impl ServiceCores {
     #[must_use]
-    pub fn new(snapshot_interval: Duration) -> Self {
+    pub fn new(
+        snapshot_interval: Duration,
+        vpn: ServiceHandles<VpnMachine>,
+        vpn_pub_rx: mpsc::Receiver<VpnPublish>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             domain: WindlassMachine::new(WindlassConfig { snapshot_interval }, now),
-            vpn: VpnMachine::new(
-                VpnConfig {
-                    health_poll_interval: Duration::from_secs(30),
-                },
-                now,
-            ),
+            vpn,
+            vpn_pub_rx,
             qbit: QbitMachine::new(
                 QbitConfig {
                     auth_retry: Duration::from_secs(5),
@@ -80,6 +81,21 @@ impl ServiceCores {
         actions
     }
 
+    /// Drains any VPN publish messages that arrived asynchronously from the VPN
+    /// runtime and feeds them into the domain machine.
+    pub fn drain_vpn_publishes(&mut self) -> Vec<ServiceAction> {
+        let mut actions = Vec::new();
+        while let Ok(publish) = self.vpn_pub_rx.try_recv() {
+            let now = Instant::now();
+            let outcome = self
+                .domain
+                .handle(now, Timed::new(now, WindlassEvent::Vpn(publish)));
+            actions.extend(self.actions_from_domain_outcome(now, outcome));
+        }
+        dedup_service_actions(&mut actions);
+        actions
+    }
+
     #[cfg(test)]
     const fn state(&self) -> &windlass_domain_core::SystemStateView {
         self.domain.state()
@@ -92,16 +108,8 @@ impl ServiceCores {
                 self.actions_from_domain_outcome(now, outcome)
             }
             ServiceEvent::Vpn(event) => {
-                let outcome = self.vpn.handle(now, Timed::new(now, event));
-                let mut actions: Vec<ServiceAction> = outcome
-                    .actions
-                    .into_iter()
-                    .map(ServiceAction::Vpn)
-                    .collect();
-                for publish in outcome.publish {
-                    actions.extend(self.publish_vpn(now, publish));
-                }
-                actions
+                let _ = self.vpn.events.send(Timed::now(event));
+                Vec::new()
             }
             ServiceEvent::Qbit(event) => {
                 let outcome = self.qbit.handle(now, Timed::new(now, event));
@@ -128,13 +136,6 @@ impl ServiceCores {
                 actions
             }
         }
-    }
-
-    fn publish_vpn(&mut self, now: Instant, publish: VpnPublish) -> Vec<ServiceAction> {
-        let outcome = self
-            .domain
-            .handle(now, Timed::new(now, WindlassEvent::Vpn(publish)));
-        self.actions_from_domain_outcome(now, outcome)
     }
 
     fn publish_qbit(&mut self, now: Instant, publish: QbitPublish) -> Vec<ServiceAction> {
@@ -192,11 +193,8 @@ impl ServiceCores {
                     service_actions.push(ServiceAction::Db(command));
                 }
                 windlass_domain_core::WindlassAction::Vpn(command) => {
-                    let outcome = self.vpn.handle_command(now, command);
-                    service_actions.extend(outcome.actions.into_iter().map(ServiceAction::Vpn));
-                    for publish in outcome.publish {
-                        service_actions.extend(self.publish_vpn(now, publish));
-                    }
+                    let (reply_tx, _reply_rx) = oneshot::channel::<VpnResponse>();
+                    let _ = self.vpn.commands.send((command, reply_tx));
                 }
                 windlass_domain_core::WindlassAction::Qbit(command) => {
                     let outcome = self.qbit.handle_command(now, command);
@@ -239,7 +237,6 @@ fn suppress_bootstrap_probe_actions(event: &Event, actions: &mut Vec<ServiceActi
         !matches!(
             action,
             ServiceAction::Mam(MamAction::FetchStatus)
-                | ServiceAction::Vpn(VpnAction::InspectContainer | VpnAction::ReadPortFiles)
         )
     });
 }
@@ -252,10 +249,10 @@ mod tests {
     use windlass_mam_core::MamAction;
     use windlass_qbit_core::QbitAction;
     use windlass_types::{AuthCookie, MamStatus, VpnIp, VpnPort, WakeupId};
-    use windlass_vpn_core::VpnAction;
 
     use windlass_core::events::Event;
     use windlass_domain_core::{ServiceStatus, WindlassTimer};
+    use windlass_vpn_core::{VpnPublish, VpnTopic};
 
     use super::{ServiceAction, ServiceCores};
 
@@ -263,24 +260,49 @@ mod tests {
         VpnPort::try_new(51_820).unwrap()
     }
 
-    #[test]
-    fn init_with_healthy_vpn_updates_domain_port() {
-        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+    fn cores() -> ServiceCores {
+        use tokio::sync::mpsc;
+        use windlass_machine::{ServiceHandles, pubsub::TopicFanout};
+        use windlass_vpn_core::{VpnEvent, VpnMachine};
+        use windlass_machine::Command;
 
-        let db_commands = cores.observe(&Event::Init {
-            at: Utc::now(),
-            is_gluetun_healthy: true,
-            port_files: Ok((VpnIp(Ipv4Addr::new(10, 8, 0, 1)), port())),
-        });
+        let (event_tx, _) = mpsc::unbounded_channel::<windlass_machine::Timed<VpnEvent>>();
+        let (cmd_tx, _) = mpsc::unbounded_channel::<Command<VpnMachine>>();
+        let (sub_tx, _) = mpsc::unbounded_channel();
+        let vpn_handles = ServiceHandles {
+            events: event_tx,
+            commands: cmd_tx,
+            subscribe: sub_tx,
+        };
+        let (_, pub_rx) = mpsc::channel::<VpnPublish>(1);
+        ServiceCores::new(std::time::Duration::from_secs(60), vpn_handles, pub_rx)
+    }
+
+    #[test]
+    fn vpn_publish_connected_updates_domain_vpn_status() {
+        let mut cores = cores();
+
+        let _ =
+            cores.observe_domain_event(windlass_domain_core::WindlassEvent::Vpn(VpnPublish::Connected));
 
         assert_eq!(cores.state().vpn, ServiceStatus::Ready);
+    }
+
+    #[test]
+    fn vpn_publish_port_ready_updates_forwarded_port() {
+        let mut cores = cores();
+        let _ = cores.observe_domain_event(windlass_domain_core::WindlassEvent::Vpn(VpnPublish::Connected));
+
+        let _ = cores.observe_domain_event(windlass_domain_core::WindlassEvent::Vpn(
+            VpnPublish::PortReady { port: port() },
+        ));
+
         assert_eq!(cores.state().forwarded_port, Some(port()));
-        assert!(!db_commands.is_empty());
     }
 
     #[test]
     fn init_deduplicates_bootstrap_service_actions_without_mam_probe() {
-        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+        let mut cores = cores();
 
         let actions = cores.observe(&Event::Init {
             at: Utc::now(),
@@ -302,25 +324,11 @@ mod tests {
                 .count(),
             0
         );
-        assert_eq!(
-            actions
-                .iter()
-                .filter(|action| matches!(action, ServiceAction::Vpn(VpnAction::ReadPortFiles)))
-                .count(),
-            0
-        );
-        assert_eq!(
-            actions
-                .iter()
-                .filter(|action| matches!(action, ServiceAction::Vpn(VpnAction::InspectContainer)))
-                .count(),
-            0
-        );
     }
 
     #[test]
     fn qbit_and_mam_events_update_domain_services() {
-        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+        let mut cores = cores();
 
         let _ = cores.observe(&Event::Init {
             at: Utc::now(),
@@ -342,7 +350,7 @@ mod tests {
 
     #[test]
     fn domain_activity_publish_becomes_db_command() {
-        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+        let mut cores = cores();
 
         let actions = cores.observe(&Event::QbitAuthFailed { at: Utc::now() });
 
@@ -354,26 +362,6 @@ mod tests {
                         && record.action == "service_activity"
                         && record.detail.as_deref()
                             == Some("qBittorrent rejected credentials")
-            )
-        }));
-    }
-
-    #[test]
-    fn db_failure_domain_event_becomes_activity_command() {
-        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
-
-        let actions = cores.observe_domain_event(windlass_domain_core::WindlassEvent::DbFailed {
-            operation: "SaveSystemSnapshot".to_string(),
-            message: "database unavailable".to_string(),
-        });
-
-        assert!(actions.iter().any(|action| {
-            matches!(
-                action,
-                ServiceAction::Db(windlass_db_core::DbCommand::RecordActivity(record))
-                    if record.source == windlass_db_core::ActivitySource::Domain
-                        && record.detail.as_deref()
-                            == Some("DB SaveSystemSnapshot failed: database unavailable")
             )
         }));
     }
@@ -408,7 +396,7 @@ mod tests {
 
     #[test]
     fn domain_snapshot_timer_round_trips_through_wakeup() {
-        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+        let mut cores = cores();
         let actions = cores.observe(&Event::Init {
             at: chrono::Utc::now(),
             is_gluetun_healthy: false,
@@ -447,17 +435,17 @@ mod tests {
 
     #[test]
     fn forwarded_port_becomes_service_actions() {
-        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+        let mut cores = cores();
         let cookie = AuthCookie("sid".to_string());
         let _ = cores.observe(&Event::QbitAuthSuccess {
             at: Utc::now(),
             cookie: cookie.clone(),
         });
 
-        let actions = cores.observe(&Event::PortFileReadResult {
-            at: Utc::now(),
-            result: Ok((VpnIp(Ipv4Addr::new(10, 8, 0, 1)), port())),
-        });
+        // Simulate VPN publishing port ready via domain directly
+        let actions = cores.observe_domain_event(windlass_domain_core::WindlassEvent::Vpn(
+            VpnPublish::PortReady { port: port() },
+        ));
 
         assert!(
             actions.contains(&ServiceAction::Qbit(QbitAction::SetListenPort {
@@ -470,5 +458,25 @@ mod tests {
                 port: port(),
             }))
         );
+    }
+
+    #[test]
+    fn db_failure_domain_event_becomes_activity_command() {
+        let mut cores = cores();
+
+        let actions = cores.observe_domain_event(windlass_domain_core::WindlassEvent::DbFailed {
+            operation: "SaveSystemSnapshot".to_string(),
+            message: "database unavailable".to_string(),
+        });
+
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                ServiceAction::Db(windlass_db_core::DbCommand::RecordActivity(record))
+                    if record.source == windlass_db_core::ActivitySource::Domain
+                        && record.detail.as_deref()
+                            == Some("DB SaveSystemSnapshot failed: database unavailable")
+            )
+        }));
     }
 }

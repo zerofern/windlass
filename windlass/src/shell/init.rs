@@ -16,8 +16,11 @@ use windlass_debug::{
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
+use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
+
 use super::config::Config;
 use super::service::ServiceCores;
+use super::vpn_shell::{VpnShell, VpnShellConfig};
 
 /// All runtime state extracted from `init_shell` so `run` stays concise.
 pub(super) struct ShellRuntime {
@@ -125,8 +128,28 @@ pub(super) async fn init_shell(
             config.compliance_poll_interval_secs,
         )
         .with_blacklisted_ids(blacklisted);
-    let service_cores =
-        ServiceCores::new(Duration::from_secs(config.compliance_poll_interval_secs));
+    let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
+        VpnConfig {
+            health_poll_interval: Duration::from_secs(30),
+        },
+        VpnShellConfig {
+            docker: docker.clone(),
+            vpn_ip_file: config.vpn_ip_file.clone(),
+            vpn_port_file: config.vpn_port_file.clone(),
+        },
+    )
+    .await;
+    let (vpn_pub_tx, vpn_pub_rx) = mpsc::channel::<VpnPublish>(128);
+    vpn_handles
+        .subscribe
+        .send((vec![VpnTopic::Connectivity, VpnTopic::Port], vpn_pub_tx))
+        .expect("vpn pub subscription");
+
+    let service_cores = ServiceCores::new(
+        Duration::from_secs(config.compliance_poll_interval_secs),
+        vpn_handles,
+        vpn_pub_rx,
+    );
     let execute_service_actions = config.execute_service_actions;
     let history = DebugHistory::new(SystemState::initial());
     let cmd_rx = debug_owned.cmd_rx;

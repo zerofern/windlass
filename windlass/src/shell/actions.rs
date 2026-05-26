@@ -10,8 +10,6 @@ use windlass_local::{monitors, vpn_files};
 use windlass_mam_core::{MamAction, MamTimer};
 use windlass_qbit_core::{QbitAction, QbitTimer};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
-use windlass_vpn_core::{VpnAction, VpnTimer};
-
 use super::{ShellContext, service::ServiceAction, service_debug::service_timer_wakeup};
 
 impl ShellContext<'_> {
@@ -36,21 +34,8 @@ impl ShellContext<'_> {
             ServiceAction::ScheduleTimer { timer, after } => {
                 self.schedule_wakeup(service_timer_wakeup(timer), after);
             }
-            ServiceAction::Vpn(action) => self.execute_service_vpn_action(&action, causal_tx),
             ServiceAction::Qbit(action) => self.execute_service_qbit_action(action, causal_tx),
             ServiceAction::Mam(action) => self.execute_service_mam_action(&action, causal_tx),
-        }
-    }
-
-    fn execute_service_vpn_action(&mut self, action: &VpnAction, causal_tx: CausalTx) {
-        match action {
-            VpnAction::InspectContainer => self.inspect_gluetun(causal_tx),
-            VpnAction::ReadPortFiles => self.read_port_files(causal_tx),
-            VpnAction::StartMonitoring => {}
-            VpnAction::ScheduleTimer { timer, after } => match timer {
-                VpnTimer::HealthPoll => {}
-                VpnTimer::PortReadRetry => self.schedule_wakeup(WakeupId::RetryPortRead, *after),
-            },
         }
     }
 

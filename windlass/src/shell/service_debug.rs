@@ -3,7 +3,6 @@ use windlass_domain_core::WindlassTimer;
 use windlass_mam_core::MamAction;
 use windlass_qbit_core::QbitAction;
 use windlass_types::{VpnIp, WakeupId};
-use windlass_vpn_core::{VpnAction, VpnTimer};
 
 use super::service::ServiceAction;
 
@@ -44,19 +43,6 @@ impl ServiceAction {
                 MamAction::ScheduleTimer { after, .. } => {
                     Some(Action::ScheduleWakeup(WakeupId::Heartbeat, *after))
                 }
-            },
-            Self::Vpn(action) => match action {
-                VpnAction::ReadPortFiles => Some(Action::ReadPortFiles),
-                VpnAction::ScheduleTimer {
-                    timer: VpnTimer::PortReadRetry,
-                    after,
-                } => Some(Action::ScheduleWakeup(WakeupId::RetryPortRead, *after)),
-                VpnAction::InspectContainer
-                | VpnAction::StartMonitoring
-                | VpnAction::ScheduleTimer {
-                    timer: VpnTimer::HealthPoll,
-                    ..
-                } => None,
             },
             Self::Db(_) => None,
             Self::ScheduleTimer { timer, after } => {
