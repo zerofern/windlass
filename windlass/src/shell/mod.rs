@@ -4,6 +4,7 @@ mod config;
 mod dequeue;
 mod download;
 mod init;
+mod qbit_shell;
 mod service;
 mod service_db;
 mod service_debug;
@@ -131,6 +132,17 @@ pub async fn run(
             dispatch_service_db_action(&db_pool, action, &service_event_tx);
         }
         execute_service_actions_if_enabled(execute_service_actions, vpn_pub_actions, &tx, &mut ctx);
+
+        let qbit_pub_actions = service_cores.drain_qbit_publishes();
+        for action in &qbit_pub_actions {
+            dispatch_service_db_action(&db_pool, action, &service_event_tx);
+        }
+        execute_service_actions_if_enabled(
+            execute_service_actions,
+            qbit_pub_actions,
+            &tx,
+            &mut ctx,
+        );
 
         dispatch_event(
             outcome.actions,

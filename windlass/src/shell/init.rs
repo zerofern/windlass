@@ -16,9 +16,11 @@ use windlass_debug::{
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
+use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
+use super::qbit_shell::QbitShell;
 use super::service::ServiceCores;
 use super::vpn_shell::{VpnShell, VpnShellConfig};
 
@@ -145,10 +147,33 @@ pub(super) async fn init_shell(
         .send((vec![VpnTopic::Connectivity, VpnTopic::Port], vpn_pub_tx))
         .expect("vpn pub subscription");
 
+    let (qbit_handles, _qbit_join) = windlass_machine::spawn::<QbitMachine, QbitShell>(
+        QbitConfig {
+            auth_retry: Duration::from_secs(5),
+            sync_retry: Duration::from_secs(2),
+        },
+        qbit.clone(),
+    )
+    .await;
+    let (qbit_pub_tx, qbit_pub_rx) = mpsc::channel::<QbitPublish>(128);
+    qbit_handles
+        .subscribe
+        .send((
+            vec![
+                QbitTopic::Availability,
+                QbitTopic::ListenPort,
+                QbitTopic::Torrents,
+            ],
+            qbit_pub_tx,
+        ))
+        .expect("qbit pub subscription");
+
     let service_cores = ServiceCores::new(
         Duration::from_secs(config.compliance_poll_interval_secs),
         vpn_handles,
         vpn_pub_rx,
+        qbit_handles,
+        qbit_pub_rx,
     );
     let execute_service_actions = config.execute_service_actions;
     let history = DebugHistory::new(SystemState::initial());
