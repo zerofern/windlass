@@ -1,11 +1,11 @@
 use chrono::Utc;
+use tokio::sync::oneshot;
 use windlass_clients::qbit::{QbitTorrentDetails, QbitTorrentState};
 use windlass_core::events::Event;
 use windlass_core::torrent::{TorrentRecord, TorrentState};
-use windlass_db::actor::PostgresDbActor;
 use windlass_db_core::{
-    ActivityRecord, ActivitySource, BookId, DbCommand, DbEvent, DownloadStateChange,
-    DownloadStatus, TorrentStateRecord,
+    ActivityRecord, ActivitySource, BookId, DbCommand, DownloadStateChange, DownloadStatus,
+    TorrentStateRecord,
 };
 use windlass_debug::CausalTx;
 use windlass_types::{AuthCookie, MamTorrentId, TorrentHash};
@@ -76,45 +76,37 @@ impl ShellContext<'_> {
     }
 
     pub(super) fn upsert_torrent_records(&self, records: Vec<TorrentRecord>) {
-        let actor = PostgresDbActor::new(self.db_pool.clone());
-        tokio::spawn(async move {
-            for record in records {
-                let hash = record.hash.clone();
-                let state = torrent_state_record(&record.state);
-                let event = actor
-                    .handle(DbCommand::UpsertTorrent(windlass_db_core::TorrentRecord {
-                        hash: record.hash,
-                        book_id: None,
-                        mam_id: record.mam_id,
-                        name: record.name.0,
-                        state,
-                        seeding_time_secs: i64::try_from(record.seeding_time_secs)
-                            .unwrap_or(i64::MAX),
-                        downloaded_bytes: i64::try_from(record.downloaded_bytes)
-                            .unwrap_or(i64::MAX),
-                        seen_at: record.seen_at,
-                    }))
-                    .await;
-                if let DbEvent::Failed(error) = event {
-                    tracing::warn!("Failed to upsert torrent {}: {}", hash.0, error.message);
-                }
-            }
-        });
+        for record in records {
+            let hash = record.hash.clone();
+            let state = torrent_state_record(&record.state);
+            let (reply_tx, _reply_rx) = oneshot::channel();
+            let _ = self.db_command_tx.send((
+                DbCommand::UpsertTorrent(windlass_db_core::TorrentRecord {
+                    hash,
+                    book_id: None,
+                    mam_id: record.mam_id,
+                    name: record.name.0,
+                    state,
+                    seeding_time_secs: i64::try_from(record.seeding_time_secs)
+                        .unwrap_or(i64::MAX),
+                    downloaded_bytes: i64::try_from(record.downloaded_bytes)
+                        .unwrap_or(i64::MAX),
+                    seen_at: record.seen_at,
+                }),
+                reply_tx,
+            ));
+        }
     }
 
     pub(super) fn blacklist_mam_id(&self, mam_id: MamTorrentId) {
-        let actor = PostgresDbActor::new(self.db_pool.clone());
-        tokio::spawn(async move {
-            let event = actor
-                .handle(DbCommand::MarkDownloadState(DownloadStateChange {
-                    mam_id,
-                    status: DownloadStatus::Blacklisted,
-                }))
-                .await;
-            if let DbEvent::Failed(error) = event {
-                tracing::warn!("Failed to blacklist mam_id {}: {}", mam_id.0, error.message);
-            }
-        });
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = self.db_command_tx.send((
+            DbCommand::MarkDownloadState(DownloadStateChange {
+                mam_id,
+                status: DownloadStatus::Blacklisted,
+            }),
+            reply_tx,
+        ));
     }
 
     pub(super) fn write_activity(
@@ -124,22 +116,18 @@ impl ShellContext<'_> {
         book_id: Option<i64>,
         detail: Option<String>,
     ) {
-        let actor = PostgresDbActor::new(self.db_pool.clone());
-        tokio::spawn(async move {
-            let event = actor
-                .handle(DbCommand::RecordActivity(ActivityRecord {
-                    at: Utc::now(),
-                    source: ActivitySource::Shell,
-                    action,
-                    book_id: book_id.map(BookId),
-                    detail,
-                    metadata: serde_json::json!({ "legacy_source": source }),
-                }))
-                .await;
-            if let DbEvent::Failed(error) = event {
-                tracing::warn!("Failed to write activity to DB: {}", error.message);
-            }
-        });
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = self.db_command_tx.send((
+            DbCommand::RecordActivity(ActivityRecord {
+                at: Utc::now(),
+                source: ActivitySource::Shell,
+                action,
+                book_id: book_id.map(BookId),
+                detail,
+                metadata: serde_json::json!({ "legacy_source": source }),
+            }),
+            reply_tx,
+        ));
     }
 }
 

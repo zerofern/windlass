@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use tokio::sync::oneshot;
 use uom::si::information::byte;
 use windlass_core::events::Event;
-use windlass_db::actor::PostgresDbActor;
-use windlass_db_core::{AlertRecord, DbCommand, DbEvent};
+use windlass_db_core::{AlertRecord, DbCommand};
 use windlass_debug::CausalTx;
 use windlass_local::{monitors, vpn_files};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
@@ -172,19 +172,15 @@ impl ShellContext<'_> {
     // ── Alerts ────────────────────────────────────────────────────────────────
 
     pub(super) fn send_alert(&self, priority: AlertPriority, title: String, body: String) {
-        let actor = PostgresDbActor::new(self.db_pool.clone());
-        tokio::spawn(async move {
-            let event = actor
-                .handle(DbCommand::RecordAlert(AlertRecord {
-                    at: Utc::now(),
-                    priority,
-                    title,
-                    body,
-                }))
-                .await;
-            if let DbEvent::Failed(error) = event {
-                tracing::warn!("Failed to write alert to DB: {}", error.message);
-            }
-        });
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = self.db_command_tx.send((
+            DbCommand::RecordAlert(AlertRecord {
+                at: Utc::now(),
+                priority,
+                title,
+                body,
+            }),
+            reply_tx,
+        ));
     }
 }

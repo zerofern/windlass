@@ -1,6 +1,7 @@
 mod actions;
 mod compliance;
 mod config;
+mod db_shell;
 mod dequeue;
 mod download;
 mod init;
@@ -23,15 +24,16 @@ use windlass_clients::{mam, qbit};
 use windlass_core::{
     EventOutcome, Observation, actions::Action, events::Event, types::SystemState,
 };
-use windlass_db::DbPool;
+use windlass_db_core::DbMachine;
 use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory};
 use windlass_local::docker;
+use windlass_machine::Command;
 use windlass_types::WakeupId;
 
 use dequeue::dequeue_debug;
 use init::{ShellRuntime, init_shell};
 use service::ServiceAction;
-use service_db::{dispatch_service_db_action, drain_service_events, service_domain_event_channel};
+use service_db::dispatch_service_db_action;
 use service_debug::service_debug_actions;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
@@ -49,7 +51,6 @@ pub async fn run(
         dependents,
         qbit,
         mam,
-        db_pool,
         obs_tx,
         tx,
         vpn_ip_file,
@@ -68,15 +69,9 @@ pub async fn run(
         execute_service_actions,
     } = init_shell(&debug_ctrl, debug_owned).await?;
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
-    let (service_event_tx, mut service_event_rx) = service_domain_event_channel();
+    let db_command_tx = service_cores.db_command_tx().clone();
 
     'main: loop {
-        drain_service_events(
-            &mut service_cores,
-            &mut service_event_rx,
-            &db_pool,
-            &service_event_tx,
-        );
         drain_channels(
             &mut history,
             &debug_ctrl,
@@ -111,7 +106,7 @@ pub async fn run(
 
         let service_actions = service_cores.observe(&event);
         for action in &service_actions {
-            dispatch_service_db_action(&db_pool, action, &service_event_tx);
+            dispatch_service_db_action(&db_command_tx, action);
         }
         let outcome = process_legacy_event(event, &mut state, &obs_tx, &debug_ctrl);
 
@@ -125,18 +120,24 @@ pub async fn run(
             vpn_ip_file: &vpn_ip_file,
             vpn_port_file: &vpn_port_file,
             data_path: &data_path,
-            db_pool: &db_pool,
+            db_command_tx: &db_command_tx,
         };
+
+        let db_pub_actions = service_cores.drain_db_publishes();
+        for action in &db_pub_actions {
+            dispatch_service_db_action(&db_command_tx, action);
+        }
+        execute_service_actions_if_enabled(execute_service_actions, db_pub_actions, &tx, &mut ctx);
 
         let vpn_pub_actions = service_cores.drain_vpn_publishes();
         for action in &vpn_pub_actions {
-            dispatch_service_db_action(&db_pool, action, &service_event_tx);
+            dispatch_service_db_action(&db_command_tx, action);
         }
         execute_service_actions_if_enabled(execute_service_actions, vpn_pub_actions, &tx, &mut ctx);
 
         let qbit_pub_actions = service_cores.drain_qbit_publishes();
         for action in &qbit_pub_actions {
-            dispatch_service_db_action(&db_pool, action, &service_event_tx);
+            dispatch_service_db_action(&db_command_tx, action);
         }
         execute_service_actions_if_enabled(
             execute_service_actions,
@@ -147,7 +148,7 @@ pub async fn run(
 
         let mam_pub_actions = service_cores.drain_mam_publishes();
         for action in &mam_pub_actions {
-            dispatch_service_db_action(&db_pool, action, &service_event_tx);
+            dispatch_service_db_action(&db_command_tx, action);
         }
         execute_service_actions_if_enabled(
             execute_service_actions,
@@ -316,7 +317,7 @@ struct ShellContext<'a> {
     vpn_ip_file: &'a str,
     vpn_port_file: &'a str,
     data_path: &'a str,
-    db_pool: &'a DbPool,
+    db_command_tx: &'a mpsc::UnboundedSender<Command<DbMachine>>,
 }
 
 impl ShellContext<'_> {

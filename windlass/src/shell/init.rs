@@ -16,11 +16,13 @@ use windlass_debug::{
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
+use windlass_db_core::{DbMachine, DbPublish, DbTopic};
 use windlass_mam_core::{MamConfig, MamMachine, MamPublish, MamTopic};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
+use super::db_shell::DbShell;
 use super::mam_shell::MamShell;
 use super::qbit_shell::QbitShell;
 use super::service::ServiceCores;
@@ -33,7 +35,6 @@ pub(super) struct ShellRuntime {
     pub(super) dependents: Vec<String>,
     pub(super) qbit: qbit::QbitClient,
     pub(super) mam: mam::MamClient,
-    pub(super) db_pool: DbPool,
     pub(super) obs_tx: broadcast::Sender<windlass_core::Observation>,
     pub(super) tx: mpsc::Sender<Event>,
     pub(super) vpn_ip_file: String,
@@ -132,6 +133,14 @@ pub(super) async fn init_shell(
             config.compliance_poll_interval_secs,
         )
         .with_blacklisted_ids(blacklisted);
+    let (db_handles, _db_join) =
+        windlass_machine::spawn::<DbMachine, DbShell>((), db_pool).await;
+    let (db_pub_tx, db_pub_rx) = mpsc::channel::<DbPublish>(128);
+    db_handles
+        .subscribe
+        .send((vec![DbTopic::Failures, DbTopic::Results], db_pub_tx))
+        .expect("db pub subscription");
+
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         VpnConfig {
             health_poll_interval: Duration::from_secs(30),
@@ -192,6 +201,8 @@ pub(super) async fn init_shell(
 
     let service_cores = ServiceCores::new(
         Duration::from_secs(config.compliance_poll_interval_secs),
+        db_handles,
+        db_pub_rx,
         vpn_handles,
         vpn_pub_rx,
         qbit_handles,
@@ -228,7 +239,6 @@ pub(super) async fn init_shell(
         dependents: boot.dependents,
         qbit,
         mam,
-        db_pool,
         obs_tx,
         tx,
         vpn_ip_file,

@@ -138,7 +138,7 @@ cores can reason about timer slack and event-queue lag without doing I/O.
 
 ## Story: Move DB Core Onto Service Runtime
 
-Status: To Do
+Status: Done
 
 ### Problem
 

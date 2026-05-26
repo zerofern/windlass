@@ -1,97 +1,75 @@
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use windlass_db::DbPool;
-use windlass_db::actor::PostgresDbActor;
-use windlass_db_core::{DbEvent, DbFailure};
-use windlass_domain_core::WindlassEvent;
+use windlass_db_core::DbMachine;
+use windlass_machine::Command;
 
-use super::service::{ServiceAction, ServiceCores};
-
-pub(super) fn service_domain_event_channel()
--> (mpsc::Sender<WindlassEvent>, mpsc::Receiver<WindlassEvent>) {
-    mpsc::channel(128)
-}
-
-pub(super) fn drain_service_events(
-    service_cores: &mut ServiceCores,
-    service_event_rx: &mut mpsc::Receiver<WindlassEvent>,
-    db_pool: &DbPool,
-    service_event_tx: &mpsc::Sender<WindlassEvent>,
-) {
-    while let Ok(event) = service_event_rx.try_recv() {
-        for action in service_cores.observe_domain_event(event) {
-            dispatch_service_db_action(db_pool, &action, service_event_tx);
-        }
-    }
-}
+use super::service::ServiceAction;
 
 pub(super) fn dispatch_service_db_action(
-    db_pool: &DbPool,
+    db_command_tx: &mpsc::UnboundedSender<Command<DbMachine>>,
     action: &ServiceAction,
-    service_event_tx: &mpsc::Sender<WindlassEvent>,
 ) {
     if let ServiceAction::Db(command) = action {
-        let actor = PostgresDbActor::new(db_pool.clone());
-        let command = command.clone();
-        let service_event_tx = service_event_tx.clone();
-        tokio::spawn(async move {
-            let event = actor.handle(command).await;
-            if let DbEvent::Failed(error) = event {
-                tracing::warn!(
-                    operation = %error.operation,
-                    "Service domain DB command failed: {}",
-                    error.message
-                );
-                if let Some(event) = db_failure_to_domain_event(error) {
-                    let _ = service_event_tx.send(event).await;
-                }
-            }
-        });
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = db_command_tx.send((command.clone(), reply_tx));
     }
-}
-
-fn db_failure_to_domain_event(error: DbFailure) -> Option<WindlassEvent> {
-    if error.operation == "RecordActivity" {
-        return None;
-    }
-    Some(WindlassEvent::DbFailed {
-        operation: error.operation,
-        message: error.message,
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use windlass_db_core::DbFailure;
-    use windlass_domain_core::WindlassEvent;
+    use windlass_db_core::{DbCommand, DbFailure, DbMachine};
+    use windlass_machine::Command;
+    use windlass_db_core::ActivityRecord;
+    use chrono::Utc;
+    use serde_json::json;
 
-    use super::db_failure_to_domain_event;
+    use super::{ServiceAction, dispatch_service_db_action};
+
+    fn make_channel() -> (
+        tokio::sync::mpsc::UnboundedSender<Command<DbMachine>>,
+        tokio::sync::mpsc::UnboundedReceiver<Command<DbMachine>>,
+    ) {
+        tokio::sync::mpsc::unbounded_channel()
+    }
 
     #[test]
-    fn db_failure_becomes_domain_event() {
-        let event = db_failure_to_domain_event(DbFailure {
-            operation: "SaveSystemSnapshot".to_string(),
-            message: "database unavailable".to_string(),
-            retryable: true,
-        });
+    fn db_service_action_is_forwarded_to_db_runtime() {
+        let (tx, mut rx) = make_channel();
 
-        assert_eq!(
-            event,
-            Some(WindlassEvent::DbFailed {
-                operation: "SaveSystemSnapshot".to_string(),
-                message: "database unavailable".to_string(),
-            })
+        let action = ServiceAction::Db(DbCommand::RecordActivity(ActivityRecord {
+            at: Utc::now(),
+            source: windlass_db_core::ActivitySource::Domain,
+            action: "test".to_string(),
+            book_id: None,
+            detail: None,
+            metadata: json!({}),
+        }));
+
+        dispatch_service_db_action(&tx, &action);
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "DB command should be forwarded to the DB runtime channel"
         );
     }
 
     #[test]
-    fn activity_log_failure_does_not_recurse() {
-        let event = db_failure_to_domain_event(DbFailure {
-            operation: "RecordActivity".to_string(),
-            message: "database unavailable".to_string(),
-            retryable: true,
-        });
+    fn non_db_service_action_does_not_send_to_db_runtime() {
+        use std::time::Duration;
+        use windlass_domain_core::WindlassTimer;
 
-        assert_eq!(event, None);
+        let (tx, mut rx) = make_channel();
+
+        let action = ServiceAction::ScheduleTimer {
+            timer: WindlassTimer::Snapshot,
+            after: Duration::from_secs(60),
+        };
+
+        dispatch_service_db_action(&tx, &action);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "non-DB action must not touch the DB runtime channel"
+        );
     }
 }
