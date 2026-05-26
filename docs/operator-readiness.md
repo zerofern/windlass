@@ -73,6 +73,8 @@ These are candidate stories to spec next:
 - Move the DB core onto the service runtime.
 - Replace the direct publish bridge with typed subscriptions.
 - Use `Timed<Event>` end to end.
+- Add property-based tests for operator invariants.
+- Automatically donate to the pot on every pot cycle.
 - Make the dashboard and chaos page use one shared state display model.
 - Keep route state and background data fresh when tabs/pages are not active.
 - Improve debug page event/action queue visibility.
@@ -313,3 +315,87 @@ cores can reason about timer slack and event-queue lag without doing I/O.
 - I/O completion events use `Instant::now()` at the point the external result
   is observed.
 - Machine tests cover timer events with explicit logical timestamps.
+
+## Story: Add Property-Based Tests For Operator Invariants
+
+Status: To Do
+
+### Problem
+
+The operator is becoming a set of small state machines connected by typed
+messages. Example-based tests cover specific workflows, but they do not explore
+large event sequences, repeated retries, duplicated publishes, timer races, or
+unusual interleavings between VPN, qBit, MAM, DB, and domain events.
+
+Property-based tests are needed to prove core invariants stay true across many
+generated event sequences.
+
+### User Story
+
+As the maintainer, I want property-based tests for the operator cores and
+runtime, so large refactors do not accidentally break safety invariants.
+
+### Acceptance Criteria
+
+- Add property-based tests for each external-system machine: VPN, qBit, MAM,
+  DB, and domain.
+- Add property-based tests for the generic service runtime once it exists.
+- Generated event sequences must never panic.
+- Generated event sequences must keep machines in valid states.
+- qBit and MAM convergence commands are eventually re-issued after retryable
+  failures while desired state is still known.
+- Domain policy never commands qBit or MAM to converge on a port when VPN has
+  no forwarded port.
+- DB failure handling does not recurse indefinitely.
+- Debug-mode replay/step behavior preserves machine determinism once debug mode
+  is integrated into the runtime.
+- Property tests run as part of `just check` unless they become too slow; if so,
+  add a separate explicit recipe and document when to run it.
+
+### Implementation Notes
+
+- Use focused state/event generators instead of arbitrary JSON payloads.
+- Keep properties tied to operator safety: no unsafe deletes, no port sync
+  without VPN port, no retry storms, no invalid service state transitions.
+- Prefer shrinking-friendly event enums and small sequence lengths at first.
+
+## Story: Automatically Donate To The Pot On Every Pot Cycle
+
+Status: To Do
+
+### Problem
+
+The operator should handle recurring MAM housekeeping tasks that are easy to
+forget. One desired behavior is automatic donation to the pot on every pot
+cycle.
+
+Assumption: "pot" refers to the MAM millionaire's/vault pot. The exact endpoint,
+cycle detection rule, and donation amount still need to be confirmed before
+implementation.
+
+### User Story
+
+As the operator user, I want Windlass to automatically donate to the pot every
+pot cycle, so I do not need to remember this recurring tracker task manually.
+
+### Acceptance Criteria
+
+- Add MAM-core state for pot-cycle observation and donation eligibility.
+- Add configuration for enabling/disabling automatic pot donation.
+- Add configuration for the donation amount or policy.
+- Windlass detects a new pot cycle without donating more than once per cycle.
+- Donation attempts go through the MAM service core and shell, not ad hoc web
+  handler code.
+- Donation success and failure are recorded in activity log.
+- Donation failures retry conservatively and never create a tight loop.
+- The UI exposes current pot donation status and last donation result.
+- Integration tests use a mocked MAM pot endpoint/scenario.
+- Property-based tests cover the no-double-donation-per-cycle invariant.
+
+### Implementation Notes
+
+- Treat this as MAM operator automation, not recommendation/librarian work.
+- The MAM core should own the decision: whether a cycle is new, whether
+  donation is enabled, whether donation was already attempted, and whether a
+  retry is allowed.
+- The MAM shell should own only HTTP details and return typed events.
