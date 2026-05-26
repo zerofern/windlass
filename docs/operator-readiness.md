@@ -19,9 +19,33 @@ Windlass should be usable soon as an operator:
 - Make the web UI reflect current state immediately after opening.
 - Preserve enough event/action history to debug operator behavior.
 
+## Implementation Order
+
+Implement these stories one at a time, in this order:
+
+1. Fix initial UI state snapshot on SSE connect.
+2. Introduce the generic service runtime for `Machine + Shell + TopicFanout`.
+3. Use `Timed<Event>` end to end.
+4. Move the DB core onto the service runtime.
+5. Move the VPN core onto the service runtime.
+6. Move the qBittorrent core onto the service runtime.
+7. Move the MAM core onto the service runtime.
+8. Move the domain core onto the service runtime.
+9. Replace the direct publish bridge with typed subscriptions.
+10. Add property-based tests for operator invariants.
+11. Automatically donate to the pot on every pot cycle.
+12. Make the dashboard and chaos page use one shared state display model.
+13. Keep route state and background data fresh when tabs/pages are not active.
+14. Improve debug page event/action queue visibility.
+15. Allow clicking an event or action in debug view to set a breakpoint for that
+    variant.
+16. Clarify the manual download happy path and blocked states in the UI.
+17. Make HnR/compliance risk visible enough that unsafe manual deletion is hard
+    to miss.
+
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
-Status: To Do
+Status: Done
 
 ### Problem
 
@@ -60,30 +84,6 @@ waiting for a new event.
 - Use the existing latest-state source rather than inventing a second UI state
   cache.
 - Preserve the broadcast stream for live observations.
-
-## Implementation Order
-
-Implement these stories one at a time, in this order:
-
-1. Fix initial UI state snapshot on SSE connect.
-2. Introduce the generic service runtime for `Machine + Shell + TopicFanout`.
-3. Use `Timed<Event>` end to end.
-4. Move the DB core onto the service runtime.
-5. Move the VPN core onto the service runtime.
-6. Move the qBittorrent core onto the service runtime.
-7. Move the MAM core onto the service runtime.
-8. Move the domain core onto the service runtime.
-9. Replace the direct publish bridge with typed subscriptions.
-10. Add property-based tests for operator invariants.
-11. Automatically donate to the pot on every pot cycle.
-12. Make the dashboard and chaos page use one shared state display model.
-13. Keep route state and background data fresh when tabs/pages are not active.
-14. Improve debug page event/action queue visibility.
-15. Allow clicking an event or action in debug view to set a breakpoint for that
-    variant.
-16. Clarify the manual download happy path and blocked states in the UI.
-17. Make HnR/compliance risk visible enough that unsafe manual deletion is hard
-    to miss.
 
 ## Story: Introduce Generic Service Runtime
 
