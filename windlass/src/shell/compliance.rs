@@ -87,10 +87,8 @@ impl ShellContext<'_> {
                     mam_id: record.mam_id,
                     name: record.name.0,
                     state,
-                    seeding_time_secs: i64::try_from(record.seeding_time_secs)
-                        .unwrap_or(i64::MAX),
-                    downloaded_bytes: i64::try_from(record.downloaded_bytes)
-                        .unwrap_or(i64::MAX),
+                    seeding_time_secs: i64::try_from(record.seeding_time_secs).unwrap_or(i64::MAX),
+                    downloaded_bytes: i64::try_from(record.downloaded_bytes).unwrap_or(i64::MAX),
                     seen_at: record.seen_at,
                 }),
                 reply_tx,

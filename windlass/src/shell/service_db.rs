@@ -17,11 +17,11 @@ pub(super) fn dispatch_service_db_action(
 
 #[cfg(test)]
 mod tests {
-    use windlass_db_core::{DbCommand, DbFailure, DbMachine};
-    use windlass_machine::Command;
-    use windlass_db_core::ActivityRecord;
     use chrono::Utc;
     use serde_json::json;
+    use windlass_db_core::ActivityRecord;
+    use windlass_db_core::{DbCommand, DbFailure, DbMachine};
+    use windlass_machine::Command;
 
     use super::{ServiceAction, dispatch_service_db_action};
 

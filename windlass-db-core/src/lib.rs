@@ -220,24 +220,24 @@ impl Machine for DbMachine {
     ) -> Outcome<Self::Action, Self::Publish> {
         let publish = match event.inner {
             DbEvent::Failed(failure) => DbPublish::Failed(failure),
-            DbEvent::ActivityRecorded { .. } => {
-                DbPublish::Succeeded { operation: "RecordActivity".to_string() }
-            }
-            DbEvent::AlertRecorded { .. } => {
-                DbPublish::Succeeded { operation: "RecordAlert".to_string() }
-            }
-            DbEvent::SystemSnapshotSaved { .. } => {
-                DbPublish::Succeeded { operation: "SaveSystemSnapshot".to_string() }
-            }
-            DbEvent::TorrentUpserted { .. } => {
-                DbPublish::Succeeded { operation: "UpsertTorrent".to_string() }
-            }
-            DbEvent::BookUpserted { .. } => {
-                DbPublish::Succeeded { operation: "UpsertBook".to_string() }
-            }
-            DbEvent::DownloadQueueUpdated { .. } => {
-                DbPublish::Succeeded { operation: "DownloadQueueUpdated".to_string() }
-            }
+            DbEvent::ActivityRecorded { .. } => DbPublish::Succeeded {
+                operation: "RecordActivity".to_string(),
+            },
+            DbEvent::AlertRecorded { .. } => DbPublish::Succeeded {
+                operation: "RecordAlert".to_string(),
+            },
+            DbEvent::SystemSnapshotSaved { .. } => DbPublish::Succeeded {
+                operation: "SaveSystemSnapshot".to_string(),
+            },
+            DbEvent::TorrentUpserted { .. } => DbPublish::Succeeded {
+                operation: "UpsertTorrent".to_string(),
+            },
+            DbEvent::BookUpserted { .. } => DbPublish::Succeeded {
+                operation: "UpsertBook".to_string(),
+            },
+            DbEvent::DownloadQueueUpdated { .. } => DbPublish::Succeeded {
+                operation: "DownloadQueueUpdated".to_string(),
+            },
         };
         Outcome {
             actions: Vec::new(),

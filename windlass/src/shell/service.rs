@@ -346,8 +346,9 @@ mod tests {
     fn vpn_publish_connected_updates_domain_vpn_status() {
         let mut cores = cores();
 
-        let _ =
-            cores.observe_domain_event(windlass_domain_core::WindlassEvent::Vpn(VpnPublish::Connected));
+        let _ = cores.observe_domain_event(windlass_domain_core::WindlassEvent::Vpn(
+            VpnPublish::Connected,
+        ));
 
         assert_eq!(cores.state().vpn, ServiceStatus::Ready);
     }
@@ -356,8 +357,9 @@ mod tests {
     fn qbit_publish_ready_updates_domain_qbit_status() {
         let mut cores = cores();
 
-        let _ =
-            cores.observe_domain_event(windlass_domain_core::WindlassEvent::Qbit(QbitPublish::Ready));
+        let _ = cores.observe_domain_event(windlass_domain_core::WindlassEvent::Qbit(
+            QbitPublish::Ready,
+        ));
 
         assert_eq!(cores.state().qbit, ServiceStatus::Ready);
     }
@@ -479,8 +481,7 @@ mod tests {
         assert_eq!(cores.state().mam, ServiceStatus::Degraded);
     }
 
-    fn cores_with_db_pub_tx()
-    -> (ServiceCores, tokio::sync::mpsc::Sender<DbPublish>) {
+    fn cores_with_db_pub_tx() -> (ServiceCores, tokio::sync::mpsc::Sender<DbPublish>) {
         use tokio::sync::mpsc;
         use windlass_db_core::{DbEvent, DbMachine};
         use windlass_machine::{Command, ServiceHandles};
@@ -501,27 +502,43 @@ mod tests {
         let (vev_tx, _) = mpsc::unbounded_channel::<windlass_machine::Timed<VpnEvent>>();
         let (vcmd_tx, _) = mpsc::unbounded_channel::<Command<VpnMachine>>();
         let (vsub_tx, _) = mpsc::unbounded_channel();
-        let vpn_handles = ServiceHandles { events: vev_tx, commands: vcmd_tx, subscribe: vsub_tx };
+        let vpn_handles = ServiceHandles {
+            events: vev_tx,
+            commands: vcmd_tx,
+            subscribe: vsub_tx,
+        };
         let (_, vpn_pub_rx) = mpsc::channel::<VpnPublish>(1);
 
         let (qev_tx, _) = mpsc::unbounded_channel::<windlass_machine::Timed<QbitEvent>>();
         let (qcmd_tx, _) = mpsc::unbounded_channel::<Command<QbitMachine>>();
         let (qsub_tx, _) = mpsc::unbounded_channel();
-        let qbit_handles = ServiceHandles { events: qev_tx, commands: qcmd_tx, subscribe: qsub_tx };
+        let qbit_handles = ServiceHandles {
+            events: qev_tx,
+            commands: qcmd_tx,
+            subscribe: qsub_tx,
+        };
         let (_, qbit_pub_rx) = mpsc::channel::<QbitPublish>(1);
 
         let (mev_tx, _) = mpsc::unbounded_channel::<windlass_machine::Timed<MamEvent>>();
         let (mcmd_tx, _) = mpsc::unbounded_channel::<Command<MamMachine>>();
         let (msub_tx, _) = mpsc::unbounded_channel();
-        let mam_handles = ServiceHandles { events: mev_tx, commands: mcmd_tx, subscribe: msub_tx };
+        let mam_handles = ServiceHandles {
+            events: mev_tx,
+            commands: mcmd_tx,
+            subscribe: msub_tx,
+        };
         let (_, mam_pub_rx) = mpsc::channel::<MamPublish>(1);
 
         let cores = ServiceCores::new(
             std::time::Duration::from_secs(60),
-            db_handles, db_pub_rx,
-            vpn_handles, vpn_pub_rx,
-            qbit_handles, qbit_pub_rx,
-            mam_handles, mam_pub_rx,
+            db_handles,
+            db_pub_rx,
+            vpn_handles,
+            vpn_pub_rx,
+            qbit_handles,
+            qbit_pub_rx,
+            mam_handles,
+            mam_pub_rx,
         );
         (cores, db_pub_tx)
     }
@@ -569,6 +586,9 @@ mod tests {
 
         let actions = cores.drain_db_publishes();
 
-        assert!(actions.is_empty(), "RecordActivity failure must not recurse");
+        assert!(
+            actions.is_empty(),
+            "RecordActivity failure must not recurse"
+        );
     }
 }

@@ -28,9 +28,11 @@ impl Shell for QbitShell {
                         windlass_core::events::Event::QbitAuthSuccess { cookie, .. } => {
                             QbitEvent::AuthSucceeded { cookie }
                         }
-                        windlass_core::events::Event::QbitAuthFailed { .. } => QbitEvent::AuthFailed {
-                            reason: "credentials rejected".to_string(),
-                        },
+                        windlass_core::events::Event::QbitAuthFailed { .. } => {
+                            QbitEvent::AuthFailed {
+                                reason: "credentials rejected".to_string(),
+                            }
+                        }
                         windlass_core::events::Event::QbitConnectionRefused { .. } => {
                             QbitEvent::AuthFailed {
                                 reason: "connection refused".to_string(),
@@ -85,8 +87,7 @@ impl Shell for QbitShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let details = client.list_torrent_details(&cookie).await;
-                    let hashes: Vec<TorrentHash> =
-                        details.into_iter().map(|d| d.hash).collect();
+                    let hashes: Vec<TorrentHash> = details.into_iter().map(|d| d.hash).collect();
                     let _ = tx.send(Timed::now(QbitEvent::TorrentsListed { hashes }));
                 });
             }

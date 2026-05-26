@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use super::{ShellContext, service::ServiceAction, service_debug::service_timer_wakeup};
 use chrono::Utc;
 use tokio::sync::oneshot;
 use uom::si::information::byte;
@@ -8,7 +9,6 @@ use windlass_db_core::{AlertRecord, DbCommand};
 use windlass_debug::CausalTx;
 use windlass_local::{monitors, vpn_files};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
-use super::{ShellContext, service::ServiceAction, service_debug::service_timer_wakeup};
 
 impl ShellContext<'_> {
     // ── Timers ────────────────────────────────────────────────────────────────

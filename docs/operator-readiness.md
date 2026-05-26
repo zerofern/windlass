@@ -176,7 +176,7 @@ traffic exactly like VPN, qBit, and MAM traffic.
 
 ## Story: Move VPN Core Onto Service Runtime
 
-Status: To Do
+Status: Done
 
 ### Problem
 

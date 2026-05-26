@@ -133,8 +133,7 @@ pub(super) async fn init_shell(
             config.compliance_poll_interval_secs,
         )
         .with_blacklisted_ids(blacklisted);
-    let (db_handles, _db_join) =
-        windlass_machine::spawn::<DbMachine, DbShell>((), db_pool).await;
+    let (db_handles, _db_join) = windlass_machine::spawn::<DbMachine, DbShell>((), db_pool).await;
     let (db_pub_tx, db_pub_rx) = mpsc::channel::<DbPublish>(128);
     db_handles
         .subscribe
@@ -144,6 +143,7 @@ pub(super) async fn init_shell(
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         VpnConfig {
             health_poll_interval: Duration::from_secs(30),
+            port_read_retry_interval: Duration::from_millis(500),
         },
         VpnShellConfig {
             docker: docker.clone(),

@@ -10,6 +10,7 @@ use windlass_types::VpnPort;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnConfig {
     pub health_poll_interval: Duration,
+    pub port_read_retry_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,8 +176,8 @@ impl Machine for VpnMachine {
             }
             VpnEvent::StateReadFailed { .. } => Outcome {
                 actions: vec![VpnAction::ScheduleTimer {
-                    timer: VpnTimer::HealthPoll,
-                    after: self.config.health_poll_interval,
+                    timer: VpnTimer::PortReadRetry,
+                    after: self.config.port_read_retry_interval,
                 }],
                 publish: Vec::new(),
             },
@@ -226,6 +227,7 @@ mod tests {
         VpnMachine::new(
             VpnConfig {
                 health_poll_interval: Duration::from_secs(2),
+                port_read_retry_interval: Duration::from_millis(500),
             },
             Instant::now(),
         )
@@ -294,5 +296,36 @@ mod tests {
 
         assert_eq!(machine.port(), Some(port));
         assert_eq!(out.publish, vec![VpnPublish::PortReady { port }]);
+    }
+
+    #[test]
+    fn state_read_failed_schedules_port_read_retry() {
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            VpnEvent::StateReadFailed {
+                reason: "files not ready".to_string(),
+            },
+        );
+
+        assert_eq!(
+            out.actions,
+            vec![VpnAction::ScheduleTimer {
+                timer: VpnTimer::PortReadRetry,
+                after: Duration::from_millis(500),
+            }]
+        );
+        assert!(out.publish.is_empty());
+    }
+
+    #[test]
+    fn port_read_retry_timer_fires_read_port_files() {
+        let mut machine = machine();
+
+        let out = handle(&mut machine, VpnEvent::TimerFired(VpnTimer::PortReadRetry));
+
+        assert_eq!(out.actions, vec![VpnAction::ReadPortFiles]);
+        assert!(out.publish.is_empty());
     }
 }

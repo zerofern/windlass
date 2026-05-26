@@ -150,12 +150,7 @@ pub async fn run(
         for action in &mam_pub_actions {
             dispatch_service_db_action(&db_command_tx, action);
         }
-        execute_service_actions_if_enabled(
-            execute_service_actions,
-            mam_pub_actions,
-            &tx,
-            &mut ctx,
-        );
+        execute_service_actions_if_enabled(execute_service_actions, mam_pub_actions, &tx, &mut ctx);
 
         dispatch_event(
             outcome.actions,
