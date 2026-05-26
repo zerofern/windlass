@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome};
+use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_types::{AuthCookie, TorrentHash, VpnPort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,9 +173,9 @@ impl Machine for QbitMachine {
     fn handle(
         &mut self,
         _now: Instant,
-        event: Self::Event,
+        event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
-        match event {
+        match event.inner {
             QbitEvent::Init | QbitEvent::TimerFired(QbitTimer::AuthRetry) => Outcome {
                 actions: vec![QbitAction::Login],
                 publish: Vec::new(),
@@ -290,7 +290,7 @@ impl Machine for QbitMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::Machine;
+    use windlass_machine::{Machine, Outcome, Timed};
     use windlass_types::{AuthCookie, VpnPort};
 
     use crate::{
@@ -307,11 +307,15 @@ mod tests {
         )
     }
 
+    fn handle(machine: &mut QbitMachine, event: QbitEvent) -> Outcome<QbitAction, QbitPublish> {
+        machine.handle(Instant::now(), Timed::now(event))
+    }
+
     #[test]
     fn init_logs_in() {
         let mut machine = machine();
 
-        let out = machine.handle(Instant::now(), QbitEvent::Init);
+        let out = handle(&mut machine, QbitEvent::Init);
 
         assert_eq!(out.actions, vec![QbitAction::Login]);
     }
@@ -321,8 +325,8 @@ mod tests {
         let mut machine = machine();
 
         let cookie = AuthCookie("sid".to_string());
-        let out = machine.handle(
-            Instant::now(),
+        let out = handle(
+            &mut machine,
             QbitEvent::AuthSucceeded {
                 cookie: cookie.clone(),
             },
@@ -350,8 +354,8 @@ mod tests {
         let port = VpnPort::try_new(51_820).unwrap();
         let _ = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
 
-        let out = machine.handle(
-            Instant::now(),
+        let out = handle(
+            &mut machine,
             QbitEvent::AuthSucceeded {
                 cookie: cookie.clone(),
             },
@@ -369,8 +373,8 @@ mod tests {
         let mut machine = machine();
         let cookie = AuthCookie("sid".to_string());
         let port = VpnPort::try_new(51_820).unwrap();
-        let _ = machine.handle(
-            Instant::now(),
+        let _ = handle(
+            &mut machine,
             QbitEvent::AuthSucceeded {
                 cookie: cookie.clone(),
             },
@@ -390,8 +394,8 @@ mod tests {
         let cookie = AuthCookie("sid".to_string());
         let desired = VpnPort::try_new(51_820).unwrap();
         let observed = VpnPort::try_new(42_000).unwrap();
-        let _ = machine.handle(
-            Instant::now(),
+        let _ = handle(
+            &mut machine,
             QbitEvent::AuthSucceeded {
                 cookie: cookie.clone(),
             },
@@ -401,8 +405,8 @@ mod tests {
             QbitCommand::EnsureListenPort { port: desired },
         );
 
-        let out = machine.handle(
-            Instant::now(),
+        let out = handle(
+            &mut machine,
             QbitEvent::PreferencesRead {
                 listen_port: Some(observed),
             },
@@ -423,16 +427,16 @@ mod tests {
         let mut machine = machine();
         let cookie = AuthCookie("sid".to_string());
         let port = VpnPort::try_new(51_820).unwrap();
-        let _ = machine.handle(
-            Instant::now(),
+        let _ = handle(
+            &mut machine,
             QbitEvent::AuthSucceeded {
                 cookie: cookie.clone(),
             },
         );
         let _ = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
 
-        let failed = machine.handle(
-            Instant::now(),
+        let failed = handle(
+            &mut machine,
             QbitEvent::ListenPortSetFailed {
                 port,
                 reason: "forbidden".to_string(),
@@ -453,7 +457,7 @@ mod tests {
             }]
         );
 
-        let retry = machine.handle(Instant::now(), QbitEvent::TimerFired(QbitTimer::SyncRetry));
+        let retry = handle(&mut machine, QbitEvent::TimerFired(QbitTimer::SyncRetry));
 
         assert_eq!(
             retry.actions,
@@ -465,7 +469,7 @@ mod tests {
     fn ensure_listen_port_publishes_when_already_converged() {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
-        let _ = machine.handle(Instant::now(), QbitEvent::ListenPortSet { port });
+        let _ = handle(&mut machine, QbitEvent::ListenPortSet { port });
 
         let out = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
 
@@ -478,7 +482,7 @@ mod tests {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
 
-        let out = machine.handle(Instant::now(), QbitEvent::ListenPortSet { port });
+        let out = handle(&mut machine, QbitEvent::ListenPortSet { port });
 
         assert_eq!(machine.listen_port(), Some(port));
         assert_eq!(out.publish, vec![QbitPublish::ListenPortReady { port }]);

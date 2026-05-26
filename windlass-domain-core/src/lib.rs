@@ -6,7 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use windlass_db_core::{DbCommand, SystemSnapshotRecord};
-use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome};
+use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
 use windlass_types::VpnPort;
@@ -134,9 +134,9 @@ impl Machine for WindlassMachine {
     fn handle(
         &mut self,
         _now: Instant,
-        event: Self::Event,
+        event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
-        match event {
+        match event.inner {
             WindlassEvent::Init => Outcome {
                 actions: vec![
                     WindlassAction::Vpn(VpnCommand::StartMonitoring),
@@ -265,7 +265,7 @@ impl WindlassMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::Machine;
+    use windlass_machine::{Machine, Outcome, Timed};
     use windlass_mam_core::MamCommand;
     use windlass_qbit_core::QbitCommand;
     use windlass_types::VpnPort;
@@ -285,13 +285,20 @@ mod tests {
         )
     }
 
+    fn handle(
+        machine: &mut WindlassMachine,
+        event: WindlassEvent,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        machine.handle(Instant::now(), Timed::now(event))
+    }
+
     #[test]
     fn vpn_port_ready_converges_qbit_and_mam() {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
 
-        let out = machine.handle(
-            Instant::now(),
+        let out = handle(
+            &mut machine,
             WindlassEvent::Vpn(VpnPublish::PortReady { port }),
         );
 
@@ -316,12 +323,12 @@ mod tests {
     fn vpn_disconnected_degrades_vpn_and_clears_port() {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
-        machine.handle(
-            Instant::now(),
+        handle(
+            &mut machine,
             WindlassEvent::Vpn(VpnPublish::PortReady { port }),
         );
 
-        let out = machine.handle(Instant::now(), WindlassEvent::Vpn(VpnPublish::Disconnected));
+        let out = handle(&mut machine, WindlassEvent::Vpn(VpnPublish::Disconnected));
 
         assert_eq!(machine.state().vpn, ServiceStatus::Degraded);
         assert_eq!(machine.state().forwarded_port, None);

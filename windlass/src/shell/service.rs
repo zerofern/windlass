@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use windlass_core::events::Event;
 use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand};
 use windlass_domain_core::{WindlassConfig, WindlassEvent, WindlassMachine};
-use windlass_machine::{Machine, Outcome};
+use windlass_machine::{Machine, Outcome, Timed};
 use windlass_mam_core::{MamAction, MamConfig, MamMachine, MamPublish};
 use windlass_qbit_core::{QbitAction, QbitConfig, QbitMachine, QbitPublish};
 use windlass_vpn_core::{VpnAction, VpnConfig, VpnMachine, VpnPublish};
@@ -88,11 +88,11 @@ impl ServiceCores {
     fn apply(&mut self, now: Instant, event: ServiceEvent) -> Vec<ServiceAction> {
         match event {
             ServiceEvent::Domain(event) => {
-                let outcome = self.domain.handle(now, event);
+                let outcome = self.domain.handle(now, Timed::new(now, event));
                 self.actions_from_domain_outcome(now, outcome)
             }
             ServiceEvent::Vpn(event) => {
-                let outcome = self.vpn.handle(now, event);
+                let outcome = self.vpn.handle(now, Timed::new(now, event));
                 let mut actions: Vec<ServiceAction> = outcome
                     .actions
                     .into_iter()
@@ -104,7 +104,7 @@ impl ServiceCores {
                 actions
             }
             ServiceEvent::Qbit(event) => {
-                let outcome = self.qbit.handle(now, event);
+                let outcome = self.qbit.handle(now, Timed::new(now, event));
                 let mut actions: Vec<ServiceAction> = outcome
                     .actions
                     .into_iter()
@@ -116,7 +116,7 @@ impl ServiceCores {
                 actions
             }
             ServiceEvent::Mam(event) => {
-                let outcome = self.mam.handle(now, event);
+                let outcome = self.mam.handle(now, Timed::new(now, event));
                 let mut actions: Vec<ServiceAction> = outcome
                     .actions
                     .into_iter()
@@ -131,17 +131,23 @@ impl ServiceCores {
     }
 
     fn publish_vpn(&mut self, now: Instant, publish: VpnPublish) -> Vec<ServiceAction> {
-        let outcome = self.domain.handle(now, WindlassEvent::Vpn(publish));
+        let outcome = self
+            .domain
+            .handle(now, Timed::new(now, WindlassEvent::Vpn(publish)));
         self.actions_from_domain_outcome(now, outcome)
     }
 
     fn publish_qbit(&mut self, now: Instant, publish: QbitPublish) -> Vec<ServiceAction> {
-        let outcome = self.domain.handle(now, WindlassEvent::Qbit(publish));
+        let outcome = self
+            .domain
+            .handle(now, Timed::new(now, WindlassEvent::Qbit(publish)));
         self.actions_from_domain_outcome(now, outcome)
     }
 
     fn publish_mam(&mut self, now: Instant, publish: MamPublish) -> Vec<ServiceAction> {
-        let outcome = self.domain.handle(now, WindlassEvent::Mam(publish));
+        let outcome = self
+            .domain
+            .handle(now, Timed::new(now, WindlassEvent::Mam(publish)));
         self.actions_from_domain_outcome(now, outcome)
     }
 

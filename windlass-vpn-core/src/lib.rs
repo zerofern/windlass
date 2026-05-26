@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome};
+use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_types::VpnPort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,9 +121,9 @@ impl Machine for VpnMachine {
     fn handle(
         &mut self,
         _now: Instant,
-        event: Self::Event,
+        event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
-        match event {
+        match event.inner {
             VpnEvent::Init => Outcome {
                 actions: vec![
                     VpnAction::StartMonitoring,
@@ -217,7 +217,7 @@ impl Machine for VpnMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::Machine;
+    use windlass_machine::{Machine, Outcome, Timed};
     use windlass_types::VpnPort;
 
     use crate::{VpnAction, VpnCommand, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
@@ -231,11 +231,15 @@ mod tests {
         )
     }
 
+    fn handle(machine: &mut VpnMachine, event: VpnEvent) -> Outcome<VpnAction, VpnPublish> {
+        machine.handle(Instant::now(), Timed::now(event))
+    }
+
     #[test]
     fn init_starts_monitoring_and_health_poll() {
         let mut machine = machine();
 
-        let out = machine.handle(Instant::now(), VpnEvent::Init);
+        let out = handle(&mut machine, VpnEvent::Init);
 
         assert_eq!(
             out.actions,
@@ -274,7 +278,7 @@ mod tests {
     fn healthy_container_publishes_connected_and_reads_port_files() {
         let mut machine = machine();
 
-        let out = machine.handle(Instant::now(), VpnEvent::ContainerHealthy);
+        let out = handle(&mut machine, VpnEvent::ContainerHealthy);
 
         assert!(machine.is_connected());
         assert_eq!(out.actions, vec![VpnAction::ReadPortFiles]);
@@ -286,7 +290,7 @@ mod tests {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
 
-        let out = machine.handle(Instant::now(), VpnEvent::PortFileChanged { port });
+        let out = handle(&mut machine, VpnEvent::PortFileChanged { port });
 
         assert_eq!(machine.port(), Some(port));
         assert_eq!(out.publish, vec![VpnPublish::PortReady { port }]);

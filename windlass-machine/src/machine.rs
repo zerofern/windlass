@@ -16,6 +16,27 @@ pub struct Timed<E> {
     pub inner: E,
 }
 
+impl<E> Timed<E> {
+    /// Pairs `inner` with an explicit logical time.
+    #[must_use]
+    pub const fn new(at: Instant, inner: E) -> Self {
+        Self { at, inner }
+    }
+
+    /// Pairs `inner` with the current wall-clock instant.
+    ///
+    /// Use this for I/O completion events, where "when it happened" is the
+    /// moment the external result was observed. Timers should prefer
+    /// [`Timed::new`] with the scheduled fire time.
+    #[must_use]
+    pub fn now(inner: E) -> Self {
+        Self {
+            at: Instant::now(),
+            inner,
+        }
+    }
+}
+
 /// The side-effect requests and publish messages produced by one event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome<A, P> {
@@ -56,7 +77,16 @@ pub trait Machine: Sized {
 
     fn new(config: Self::Config, now: Instant) -> Self;
 
-    fn handle(&mut self, now: Instant, event: Self::Event) -> Outcome<Self::Action, Self::Publish>;
+    /// Handles one observed event.
+    ///
+    /// `now` is a fresh `Instant::now()` captured when the runtime dequeued the
+    /// event; `event.at` is the logical time the event happened. The difference
+    /// lets a machine reason about queue lag and timer slack without doing I/O.
+    fn handle(
+        &mut self,
+        now: Instant,
+        event: Timed<Self::Event>,
+    ) -> Outcome<Self::Action, Self::Publish>;
 
     fn handle_command(
         &mut self,
