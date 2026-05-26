@@ -1,0 +1,151 @@
+use std::time::Duration;
+
+use windlass_core::events::Event;
+use windlass_domain_core::{WindlassEvent, WindlassTimer};
+use windlass_mam_core::MamEvent;
+use windlass_qbit_core::QbitEvent;
+use windlass_types::{MamStatus, VpnPort, WakeupId};
+use windlass_vpn_core::VpnEvent;
+
+pub(super) enum ServiceEvent {
+    Domain(WindlassEvent),
+    Vpn(VpnEvent),
+    Qbit(QbitEvent),
+    Mam(MamEvent),
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn legacy_to_service_events(
+    event: &Event,
+    forwarded_port: Option<VpnPort>,
+) -> Vec<ServiceEvent> {
+    match event {
+        Event::Init {
+            is_gluetun_healthy,
+            port_files,
+            ..
+        } => {
+            let mut events = vec![
+                ServiceEvent::Domain(WindlassEvent::Init),
+                ServiceEvent::Vpn(VpnEvent::Init),
+                ServiceEvent::Qbit(QbitEvent::Init),
+                ServiceEvent::Mam(MamEvent::Init),
+            ];
+            if *is_gluetun_healthy {
+                events.push(ServiceEvent::Vpn(VpnEvent::ContainerHealthy));
+            }
+            if let Ok((_, port)) = port_files {
+                events.push(ServiceEvent::Vpn(VpnEvent::PortFileChanged { port: *port }));
+            }
+            events
+        }
+        Event::DockerGluetunHealthy { .. } => vec![ServiceEvent::Vpn(VpnEvent::ContainerHealthy)],
+        Event::DockerGluetunDied { .. } => vec![ServiceEvent::Vpn(VpnEvent::ContainerUnhealthy)],
+        Event::PortFileReadResult { result, .. } => result.as_ref().map_or_else(
+            |_| {
+                vec![ServiceEvent::Vpn(VpnEvent::StateReadFailed {
+                    reason: "port files unavailable".to_string(),
+                })]
+            },
+            |(_, port)| vec![ServiceEvent::Vpn(VpnEvent::PortFileChanged { port: *port })],
+        ),
+        Event::QbitAuthSuccess { cookie, .. } => {
+            vec![ServiceEvent::Qbit(QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            })]
+        }
+        Event::QbitAuthFailed { .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {
+            reason: "qBittorrent rejected credentials".to_string(),
+        })],
+        Event::QbitConnectionRefused { .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {
+            reason: "qBittorrent connection refused".to_string(),
+        })],
+        Event::QbitApiError { code, .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {
+            reason: format!("qBittorrent API error {}", code.0),
+        })],
+        Event::QbitPortSyncSuccess { .. } => forwarded_port.map_or_else(Vec::new, |port| {
+            vec![ServiceEvent::Qbit(QbitEvent::ListenPortSet { port })]
+        }),
+        Event::QbitPortSyncFailed { code, .. } => forwarded_port.map_or_else(
+            || {
+                vec![ServiceEvent::Qbit(QbitEvent::PreferencesFailed {
+                    reason: format!("qBittorrent port sync failed {}", code.0),
+                })]
+            },
+            |port| {
+                vec![ServiceEvent::Qbit(QbitEvent::ListenPortSetFailed {
+                    port,
+                    reason: format!("qBittorrent port sync failed {}", code.0),
+                })]
+            },
+        ),
+        Event::MamUpdateSuccess { .. } => forwarded_port.map_or_else(Vec::new, |port| {
+            vec![ServiceEvent::Mam(MamEvent::SeedboxUpdated { port })]
+        }),
+        Event::MamAsnMismatch { ip, .. } => vec![ServiceEvent::Mam(MamEvent::StatusFailed {
+            reason: format!("MAM ASN mismatch for {}", ip.0),
+        })],
+        Event::MamStatusObserved { status, .. } => match status {
+            MamStatus::Connectable => vec![
+                ServiceEvent::Mam(MamEvent::AuthSucceeded),
+                ServiceEvent::Mam(MamEvent::StatusFetched {
+                    connectable: true,
+                    seedbox_port: forwarded_port,
+                }),
+            ],
+            MamStatus::NotConnectable => vec![ServiceEvent::Mam(MamEvent::StatusFetched {
+                connectable: false,
+                seedbox_port: forwarded_port,
+            })],
+            MamStatus::Unreachable => vec![ServiceEvent::Mam(MamEvent::StatusFailed {
+                reason: "MAM unreachable".to_string(),
+            })],
+        },
+        Event::MamRateLimitViolation { .. } => vec![ServiceEvent::Mam(MamEvent::RateLimited {
+            retry_after: Duration::from_secs(1),
+        })],
+        Event::QbitTorrentDetailsReceived { torrents, .. } => {
+            vec![ServiceEvent::Qbit(QbitEvent::TorrentsListed {
+                hashes: torrents
+                    .iter()
+                    .map(|torrent| torrent.hash.clone())
+                    .collect(),
+            })]
+        }
+        Event::Wakeup { id, .. } => match id {
+            WakeupId::QbitAuthRetry => vec![ServiceEvent::Qbit(QbitEvent::TimerFired(
+                windlass_qbit_core::QbitTimer::AuthRetry,
+            ))],
+            WakeupId::QbitSyncRetry => vec![ServiceEvent::Qbit(QbitEvent::TimerFired(
+                windlass_qbit_core::QbitTimer::SyncRetry,
+            ))],
+            WakeupId::Heartbeat => vec![ServiceEvent::Mam(MamEvent::TimerFired(
+                windlass_mam_core::MamTimer::StatusRetry,
+            ))],
+            WakeupId::RetryPortRead => vec![ServiceEvent::Vpn(VpnEvent::TimerFired(
+                windlass_vpn_core::VpnTimer::PortReadRetry,
+            ))],
+            WakeupId::DomainSnapshot => vec![ServiceEvent::Domain(WindlassEvent::TimerFired(
+                WindlassTimer::Snapshot,
+            ))],
+            WakeupId::DiskCheck | WakeupId::TorrentCheck | WakeupId::CompliancePoll => Vec::new(),
+        },
+        Event::QbitPreferencesReceived { listen_port, .. } => {
+            vec![ServiceEvent::Qbit(QbitEvent::PreferencesRead {
+                listen_port: *listen_port,
+            })]
+        }
+        Event::QbitPreferencesFailed { reason, .. } => {
+            vec![ServiceEvent::Qbit(QbitEvent::PreferencesFailed {
+                reason: reason.clone(),
+            })]
+        }
+        Event::DiskSpaceObserved { .. }
+        | Event::NewTorrentsObserved { .. }
+        | Event::LogsDumped { .. }
+        | Event::DeleteTorrentRequested { .. }
+        | Event::ManualDownloadRequested { .. }
+        | Event::TorrentAddedToQbit { .. }
+        | Event::TorrentAddFailed { .. } => Vec::new(),
+    }
+}

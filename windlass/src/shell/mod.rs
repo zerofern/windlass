@@ -6,6 +6,7 @@ mod download;
 mod init;
 mod service;
 mod service_debug;
+mod service_events;
 
 use std::collections::HashMap;
 
