@@ -87,7 +87,7 @@ waiting for a new event.
 
 ## Story: Introduce Generic Service Runtime
 
-Status: To Do
+Status: Done
 
 ### Problem
 
@@ -114,7 +114,7 @@ custom orchestration.
 
 ## Story: Use `Timed<Event>` End To End
 
-Status: To Do
+Status: Done
 
 ### Problem
 
