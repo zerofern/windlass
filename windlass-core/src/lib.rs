@@ -29,7 +29,7 @@ use actions::Action;
 use chrono::{DateTime, Utc};
 use events::Event;
 use types::SystemState;
-use windlass_types::MamStatus;
+use windlass_types::{MamStatus, WakeupId};
 
 /// The pure functional core. No I/O, no async, no side effects.
 /// All state transitions and action scheduling happen here.
@@ -110,6 +110,7 @@ impl SystemState {
             }
         };
 
+        let actions = retire_service_orchestration(actions);
         let state_changed = self.version != before_version;
 
         #[cfg(debug_assertions)]
@@ -123,4 +124,31 @@ impl SystemState {
             state_changed,
         }
     }
+}
+
+fn retire_service_orchestration(actions: Vec<Action>) -> Vec<Action> {
+    actions
+        .into_iter()
+        .filter(|action| !is_service_orchestration_action(action))
+        .collect()
+}
+
+const fn is_service_orchestration_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ReadPortFiles
+            | Action::AuthenticateQbit
+            | Action::SyncQbitPort(_, _)
+            | Action::UpdateMam(_)
+            | Action::CheckMamConnectability
+            | Action::CheckNewTorrents(_)
+            | Action::ScheduleWakeup(
+                WakeupId::QbitAuthRetry
+                    | WakeupId::QbitSyncRetry
+                    | WakeupId::Heartbeat
+                    | WakeupId::RetryPortRead
+                    | WakeupId::TorrentCheck,
+                _
+            )
+    )
 }

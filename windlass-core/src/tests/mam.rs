@@ -1,7 +1,7 @@
 use super::helpers::*;
 use crate::{actions::Action, events::Event, types::*};
 use chrono::Utc;
-use windlass_types::{AlertPriority, MamStatus, RetryCount, WakeupId};
+use windlass_types::{AlertPriority, MamStatus, RetryCount};
 
 fn now() -> chrono::DateTime<Utc> {
     Utc::now()
@@ -66,7 +66,7 @@ fn mam_asn_mismatch_blocks_and_alerts_with_ip() {
 }
 
 #[test]
-fn connectable_schedules_heartbeat() {
+fn connectable_is_service_orchestration_noop() {
     let mut state = connected_state();
     let outcome = state.process_event(
         Event::MamStatusObserved {
@@ -77,15 +77,11 @@ fn connectable_schedules_heartbeat() {
     );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::Heartbeat, _)))
-    );
+    assert!(actions.is_empty());
 }
 
 #[test]
-fn soft_recovery_re_triggers_qbit_auth() {
+fn soft_recovery_marks_qbit_authenticating() {
     let mut state = connected_state();
     let outcome = state.process_event(
         Event::MamStatusObserved {
@@ -106,14 +102,14 @@ fn soft_recovery_re_triggers_qbit_auth() {
         "qBit should be Authenticating after soft recovery"
     );
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
 }
 
 #[test]
-fn soft_recovery_rearms_heartbeat() {
+fn soft_recovery_does_not_emit_legacy_heartbeat() {
     let state = connected_state();
     let mut state = state;
     let outcome = state.process_event(
@@ -125,11 +121,7 @@ fn soft_recovery_rearms_heartbeat() {
     );
     let actions = outcome.actions;
     assert!(outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::Heartbeat, _)))
-    );
+    assert!(actions.is_empty());
 }
 
 #[test]
@@ -228,7 +220,7 @@ fn asn_blocked_suppresses_recovery() {
 }
 
 #[test]
-fn soft_recovery_from_authenticated_re_auths_qbit() {
+fn soft_recovery_from_authenticated_marks_qbit_authenticating() {
     let mut state = SystemState::initial();
     state.vpn = VpnState::Connected {
         ip: ip(),
@@ -251,7 +243,7 @@ fn soft_recovery_from_authenticated_re_auths_qbit() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );

@@ -29,9 +29,9 @@ pub struct Config {
     pub compliance_poll_interval_secs: u64,
     /// Maximum unsatisfied torrents before alerting (default: 50).
     pub unsatisfied_quota_limit: u32,
-    /// Executes service actions produced by the new service cores. Enabled by
-    /// default; set `WINDLASS_EXECUTE_SERVICE_ACTIONS=false` to fall back to
-    /// legacy-only orchestration.
+    /// Executes service actions produced by the sans-I/O service cores. Enabled
+    /// by default; disabling is diagnostic only because legacy service
+    /// orchestration has been retired from `windlass-core`.
     pub execute_service_actions: bool,
 }
 

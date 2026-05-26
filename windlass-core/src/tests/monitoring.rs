@@ -79,7 +79,7 @@ fn new_torrents_sends_alert_for_unseen_names() {
         }
     )));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::TorrentCheck, _)))
     );
@@ -124,7 +124,7 @@ fn already_known_torrents_send_no_alert() {
             .any(|a| matches!(a, Action::SendAlert { .. }))
     );
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::TorrentCheck, _)))
     );
@@ -172,7 +172,7 @@ fn mixed_known_and_new_torrents_alerts_only_for_new() {
 }
 
 #[test]
-fn empty_torrent_list_sends_no_alert_but_reschedules() {
+fn empty_torrent_list_sends_no_alert() {
     let mut state = SystemState::initial();
     let outcome = state.process_event(
         Event::NewTorrentsObserved {
@@ -188,9 +188,5 @@ fn empty_torrent_list_sends_no_alert_but_reschedules() {
             .iter()
             .any(|a| matches!(a, Action::SendAlert { .. }))
     );
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::TorrentCheck, _)))
-    );
+    assert!(actions.is_empty());
 }

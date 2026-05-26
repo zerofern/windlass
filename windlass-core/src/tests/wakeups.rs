@@ -8,7 +8,7 @@ fn now() -> chrono::DateTime<Utc> {
 }
 
 #[test]
-fn wakeup_heartbeat_checks_mam_connectability() {
+fn wakeup_heartbeat_is_service_orchestration_noop() {
     let mut state = SystemState::initial();
     let outcome = state.process_event(
         Event::Wakeup {
@@ -19,11 +19,7 @@ fn wakeup_heartbeat_checks_mam_connectability() {
     );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::CheckMamConnectability))
-    );
+    assert!(actions.is_empty());
 }
 
 #[test]
@@ -42,7 +38,7 @@ fn wakeup_disk_check_checks_disk_space() {
 }
 
 #[test]
-fn wakeup_torrent_check_checks_new_torrents() {
+fn wakeup_torrent_check_is_service_orchestration_noop() {
     let mut state = connected_state();
     let outcome = state.process_event(
         Event::Wakeup {
@@ -53,11 +49,7 @@ fn wakeup_torrent_check_checks_new_torrents() {
     );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::CheckNewTorrents(_)))
-    );
+    assert!(actions.is_empty());
 }
 
 #[test]
@@ -81,7 +73,7 @@ fn wakeup_torrent_check_is_noop_when_qbit_not_ready() {
 }
 
 #[test]
-fn wakeup_qbit_auth_retry_authenticates() {
+fn wakeup_qbit_auth_retry_is_service_orchestration_noop() {
     let mut state = SystemState::initial();
     state.qbit = QbitState::Authenticating {
         attempt: RetryCount(0),
@@ -95,15 +87,11 @@ fn wakeup_qbit_auth_retry_authenticates() {
     );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::AuthenticateQbit))
-    );
+    assert!(actions.is_empty());
 }
 
 #[test]
-fn wakeup_qbit_sync_retry_syncs_when_in_syncing_state() {
+fn wakeup_qbit_sync_retry_is_service_orchestration_noop() {
     let mut state = SystemState::initial();
     state.qbit = QbitState::SyncingPort {
         attempt: RetryCount(1),
@@ -119,11 +107,7 @@ fn wakeup_qbit_sync_retry_syncs_when_in_syncing_state() {
     );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SyncQbitPort(_, _)))
-    );
+    assert!(actions.is_empty());
 }
 
 #[test]
@@ -143,7 +127,7 @@ fn wakeup_qbit_sync_retry_is_noop_when_not_syncing() {
 }
 
 #[test]
-fn wakeup_retry_port_read_reads_port_files() {
+fn wakeup_retry_port_read_is_service_orchestration_noop() {
     let mut state = SystemState::initial();
     let outcome = state.process_event(
         Event::Wakeup {
@@ -154,5 +138,5 @@ fn wakeup_retry_port_read_reads_port_files() {
     );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(actions.iter().any(|a| matches!(a, Action::ReadPortFiles)));
+    assert!(actions.is_empty());
 }

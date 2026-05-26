@@ -1,7 +1,6 @@
 use super::helpers::*;
 use crate::{actions::Action, events::Event, types::*};
 use chrono::Utc;
-use std::time::Duration;
 use windlass_types::{AlertPriority, HttpStatusCode, RetryCount, WakeupId};
 
 fn now() -> chrono::DateTime<Utc> {
@@ -67,7 +66,7 @@ fn qbit_auth_success_starts_port_sync_when_connected() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::SyncQbitPort(_, _)))
     );
@@ -119,7 +118,7 @@ fn qbit_auth_failed_emits_critical_alert_and_schedules_retry() {
         }
     )));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::QbitAuthRetry, _)))
     );
@@ -147,16 +146,10 @@ fn qbit_connection_refused_schedules_silent_retry() {
             .any(|a| matches!(a, Action::SendAlert { .. }))
     );
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::QbitAuthRetry, _)))
     );
-    // Fixed short delay, not exponential.
-    let delay = actions.iter().find_map(|a| match a {
-        Action::ScheduleWakeup(WakeupId::QbitAuthRetry, d) => Some(*d),
-        _ => None,
-    });
-    assert_eq!(delay, Some(Duration::from_secs(5)));
 }
 
 #[test]
@@ -181,7 +174,7 @@ fn qbit_api_error_schedules_exponential_backoff_retry() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::QbitAuthRetry, _)))
     );
@@ -202,16 +195,15 @@ fn qbit_auth_failed_when_not_authenticating_stays_at_attempt_zero() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::QbitAuthRetry, _)))
     );
 }
 
 #[test]
-fn qbit_api_error_backoff_is_exponential() {
-    // attempt 0 → base * 2^0 = 2s; attempt 1 → 4s; attempt 2 → 8s
-    for (attempt, expected_secs) in [(0u8, 2u64), (1, 4), (2, 8), (3, 16)] {
+fn qbit_api_error_increments_attempt_without_legacy_retry_action() {
+    for attempt in [0u8, 1, 2, 3] {
         let mut state = SystemState::initial();
         state.qbit = QbitState::Authenticating {
             attempt: RetryCount(attempt),
@@ -225,14 +217,16 @@ fn qbit_api_error_backoff_is_exponential() {
         );
         let actions = outcome.actions;
         assert!(outcome.state_changed);
-        let backoff = actions.iter().find_map(|a| match a {
-            Action::ScheduleWakeup(WakeupId::QbitAuthRetry, d) => Some(*d),
-            _ => None,
-        });
-        assert_eq!(
-            backoff,
-            Some(Duration::from_secs(expected_secs)),
-            "attempt {attempt} should have backoff {expected_secs}s"
+        assert!(matches!(
+            state.qbit,
+            QbitState::Authenticating {
+                attempt: RetryCount(next)
+            } if next == attempt + 1
+        ));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::QbitAuthRetry, _)))
         );
     }
 }
@@ -257,7 +251,7 @@ fn qbit_port_sync_success_updates_mam() {
         matches!(state.mam, MamState::SyncPending { .. }),
         "mam should be SyncPending while UpdateMam is in flight"
     );
-    assert!(actions.iter().any(|a| matches!(a, Action::UpdateMam(_))));
+    assert!(!actions.iter().any(|a| matches!(a, Action::UpdateMam(_))));
 }
 
 #[test]
@@ -315,7 +309,7 @@ fn qbit_port_sync_failed_retries_under_limit() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::QbitSyncRetry, _)))
     );
@@ -345,7 +339,7 @@ fn qbit_port_sync_failed_falls_back_at_limit() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );

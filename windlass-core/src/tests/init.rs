@@ -8,7 +8,7 @@ fn now() -> chrono::DateTime<Utc> {
 }
 
 #[test]
-fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
+fn init_healthy_with_files_fast_forwards_to_connected() {
     let mut state = SystemState::initial();
     let outcome = state.process_event(
         Event::Init {
@@ -28,7 +28,7 @@ fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
@@ -39,9 +39,9 @@ fn init_healthy_with_files_fast_forwards_to_connected_and_auths() {
             _ => None,
         })
         .collect();
-    assert!(wakeup_ids.contains(&&WakeupId::Heartbeat));
     assert!(wakeup_ids.contains(&&WakeupId::DiskCheck));
-    assert!(wakeup_ids.contains(&&WakeupId::TorrentCheck));
+    assert!(!wakeup_ids.contains(&&WakeupId::Heartbeat));
+    assert!(!wakeup_ids.contains(&&WakeupId::TorrentCheck));
 }
 
 #[test]

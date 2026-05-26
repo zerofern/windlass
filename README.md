@@ -120,10 +120,11 @@ Windlass is configured entirely via environment variables.
 | `VPN_IP_FILE`       |          | `/tmp/gluetun/ip`             | Gluetun IP file path                |
 | `VPN_PORT_FILE`     |          | `/tmp/gluetun/forwarded_port` | Gluetun forwarded port file path    |
 | `WINDLASS_BIND`     |          | `0.0.0.0:5010`                | Address for the embedded web server |
-| `WINDLASS_EXECUTE_SERVICE_ACTIONS` | | `true` | Execute the service-core action path; set `false` for legacy-only orchestration rollback |
+| `WINDLASS_EXECUTE_SERVICE_ACTIONS` | | `true` | Execute the sans-I/O service-core action path; disabling is diagnostic only |
 
 `WINDLASS_EXECUTE_SHADOW_ACTIONS` is still accepted as a deprecated alias for
-the service action rollback switch.
+the service action switch. Legacy service orchestration has been retired from
+`windlass-core`, so this is no longer a rollback to a complete legacy path.
 
 ## Running with Docker Compose
 

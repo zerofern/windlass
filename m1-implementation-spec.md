@@ -14,15 +14,17 @@ wording below. The current implementation has moved on:
   cores.
 - The runtime feeds legacy events into those cores and executes the service-core
   actions by default.
-- `WINDLASS_EXECUTE_SERVICE_ACTIONS=false` is the rollback switch for
-  legacy-only service orchestration. `WINDLASS_EXECUTE_SHADOW_ACTIONS` remains
-  accepted as a deprecated alias.
+- Duplicated legacy service orchestration has been retired from `windlass-core`;
+  the remaining legacy core work covers download, compliance, alerts, and audit
+  activity. `WINDLASS_EXECUTE_SERVICE_ACTIONS=false` is diagnostic only, not a
+  complete legacy rollback. `WINDLASS_EXECUTE_SHADOW_ACTIONS` remains accepted as
+  a deprecated alias.
 - `just check` and `just integration` pass with service-core action execution
   enabled by default.
 
-The remaining refactor work is to retire duplicated legacy service orchestration
-once the domain/service cores own the corresponding decisions directly, while
-keeping the download and compliance workflows covered by their existing tests.
+The remaining refactor work is to split download and compliance into narrower
+sans-I/O cores when that becomes useful; for M1 they remain in the legacy core
+with existing tests.
 
 ## Goal
 

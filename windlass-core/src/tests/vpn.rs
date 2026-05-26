@@ -130,13 +130,13 @@ fn gluetun_healthy_starts_containers() {
             .any(|a| matches!(a, Action::StartDependentContainers))
     );
     assert!(
-        actions.iter().any(|a| matches!(a, Action::ReadPortFiles)),
-        "ReadPortFiles must be included so recovery completes on same-IP/port restart"
+        !actions.iter().any(|a| matches!(a, Action::ReadPortFiles)),
+        "service core now owns explicit port-file reads"
     );
 }
 
 #[test]
-fn port_file_read_ok_authenticates_qbit() {
+fn port_file_read_ok_marks_qbit_authenticating() {
     let mut state = SystemState::initial();
     let outcome = state.process_event(
         Event::PortFileReadResult {
@@ -154,7 +154,7 @@ fn port_file_read_ok_authenticates_qbit() {
         }
     ));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
@@ -195,7 +195,7 @@ fn port_file_read_new_port_triggers_reauth() {
     assert!(outcome.state_changed);
     assert!(matches!(state.qbit, QbitState::Authenticating { .. }));
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
@@ -215,7 +215,7 @@ fn port_file_read_err_schedules_retry() {
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::RetryPortRead, _)))
     );

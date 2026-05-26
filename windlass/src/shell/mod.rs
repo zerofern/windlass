@@ -8,7 +8,6 @@ mod service;
 mod service_db;
 mod service_debug;
 mod service_events;
-mod service_legacy;
 
 use std::collections::HashMap;
 
@@ -31,7 +30,6 @@ use init::{ShellRuntime, init_shell};
 use service::ServiceAction;
 use service_db::{dispatch_service_db_action, drain_service_events, service_domain_event_channel};
 use service_debug::service_debug_actions;
-use service_legacy::legacy_actions_for_service_mode;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
 /// then runs the event loop forever.
@@ -127,11 +125,8 @@ pub async fn run(
             db_pool: &db_pool,
         };
 
-        let legacy_actions =
-            legacy_actions_for_service_mode(execute_service_actions, outcome.actions);
-
         dispatch_event(
-            legacy_actions,
+            outcome.actions,
             service_actions,
             execute_service_actions,
             event_id,
