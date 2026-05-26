@@ -7,7 +7,6 @@ use windlass_db::actor::PostgresDbActor;
 use windlass_db_core::{AlertRecord, DbCommand, DbEvent};
 use windlass_debug::CausalTx;
 use windlass_local::{monitors, vpn_files};
-use windlass_mam_core::{MamAction, MamTimer};
 use windlass_types::{AlertPriority, AuthCookie, VpnIp, VpnPort, WakeupId};
 use super::{ShellContext, service::ServiceAction, service_debug::service_timer_wakeup};
 
@@ -27,27 +26,12 @@ impl ShellContext<'_> {
         self.wakeups.insert(id, handle);
     }
 
-    pub(super) fn execute_service_action(&mut self, action: ServiceAction, causal_tx: CausalTx) {
+    pub(super) fn execute_service_action(&mut self, action: ServiceAction, _causal_tx: CausalTx) {
         match action {
             ServiceAction::Db(_) => {}
             ServiceAction::ScheduleTimer { timer, after } => {
                 self.schedule_wakeup(service_timer_wakeup(timer), after);
             }
-            ServiceAction::Mam(action) => self.execute_service_mam_action(&action, causal_tx),
-        }
-    }
-
-    fn execute_service_mam_action(&mut self, action: &MamAction, causal_tx: CausalTx) {
-        match action {
-            MamAction::FetchStatus => self.check_mam_connectability(causal_tx),
-            MamAction::UpdateSeedboxPort { .. } => {
-                self.update_mam(VpnIp(std::net::Ipv4Addr::UNSPECIFIED), causal_tx);
-            }
-            MamAction::ScheduleTimer { timer, after } => match timer {
-                MamTimer::StatusRetry | MamTimer::RateLimitExpired => {
-                    self.schedule_wakeup(WakeupId::Heartbeat, *after);
-                }
-            },
         }
     }
 

@@ -1,22 +1,12 @@
 use windlass_core::actions::Action;
 use windlass_domain_core::WindlassTimer;
-use windlass_mam_core::MamAction;
-use windlass_types::{VpnIp, WakeupId};
+use windlass_types::WakeupId;
 
 use super::service::ServiceAction;
 
 impl ServiceAction {
     pub(super) fn debug_action(&self) -> Option<Action> {
         match self {
-            Self::Mam(action) => match action {
-                MamAction::FetchStatus => Some(Action::CheckMamConnectability),
-                MamAction::UpdateSeedboxPort { .. } => {
-                    Some(Action::UpdateMam(VpnIp(std::net::Ipv4Addr::UNSPECIFIED)))
-                }
-                MamAction::ScheduleTimer { after, .. } => {
-                    Some(Action::ScheduleWakeup(WakeupId::Heartbeat, *after))
-                }
-            },
             Self::Db(_) => None,
             Self::ScheduleTimer { timer, after } => {
                 Some(Action::ScheduleWakeup(service_timer_wakeup(*timer), *after))

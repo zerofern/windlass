@@ -4,6 +4,7 @@ mod config;
 mod dequeue;
 mod download;
 mod init;
+mod mam_shell;
 mod qbit_shell;
 mod service;
 mod service_db;
@@ -140,6 +141,17 @@ pub async fn run(
         execute_service_actions_if_enabled(
             execute_service_actions,
             qbit_pub_actions,
+            &tx,
+            &mut ctx,
+        );
+
+        let mam_pub_actions = service_cores.drain_mam_publishes();
+        for action in &mam_pub_actions {
+            dispatch_service_db_action(&db_pool, action, &service_event_tx);
+        }
+        execute_service_actions_if_enabled(
+            execute_service_actions,
+            mam_pub_actions,
             &tx,
             &mut ctx,
         );

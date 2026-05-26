@@ -16,10 +16,12 @@ use windlass_debug::{
 use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
+use windlass_mam_core::{MamConfig, MamMachine, MamPublish, MamTopic};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
+use super::mam_shell::MamShell;
 use super::qbit_shell::QbitShell;
 use super::service::ServiceCores;
 use super::vpn_shell::{VpnShell, VpnShellConfig};
@@ -168,12 +170,34 @@ pub(super) async fn init_shell(
         ))
         .expect("qbit pub subscription");
 
+    let (mam_handles, _mam_join) = windlass_machine::spawn::<MamMachine, MamShell>(
+        MamConfig {
+            status_retry: Duration::from_secs(30),
+        },
+        mam.clone(),
+    )
+    .await;
+    let (mam_pub_tx, mam_pub_rx) = mpsc::channel::<MamPublish>(128);
+    mam_handles
+        .subscribe
+        .send((
+            vec![
+                MamTopic::Availability,
+                MamTopic::Connectability,
+                MamTopic::Seedbox,
+            ],
+            mam_pub_tx,
+        ))
+        .expect("mam pub subscription");
+
     let service_cores = ServiceCores::new(
         Duration::from_secs(config.compliance_poll_interval_secs),
         vpn_handles,
         vpn_pub_rx,
         qbit_handles,
         qbit_pub_rx,
+        mam_handles,
+        mam_pub_rx,
     );
     let execute_service_actions = config.execute_service_actions;
     let history = DebugHistory::new(SystemState::initial());
