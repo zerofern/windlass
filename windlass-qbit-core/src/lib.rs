@@ -10,6 +10,7 @@ use windlass_types::{AuthCookie, TorrentHash, VpnPort};
 pub struct QbitConfig {
     pub auth_retry: Duration,
     pub sync_retry: Duration,
+    pub torrent_refresh: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +105,9 @@ pub struct QbitMachine {
     cookie: Option<AuthCookie>,
     listen_port: Option<VpnPort>,
     desired_listen_port: Option<VpnPort>,
+    /// True once the self-perpetuating TorrentRefresh timer chain has been started.
+    /// Prevents a second independent chain from being spawned on re-authentication.
+    refresh_scheduled: bool,
 }
 
 impl QbitMachine {
@@ -167,6 +171,7 @@ impl Machine for QbitMachine {
             cookie: None,
             listen_port: None,
             desired_listen_port: None,
+            refresh_scheduled: false,
         }
     }
 
@@ -182,20 +187,28 @@ impl Machine for QbitMachine {
             },
             QbitEvent::AuthSucceeded { cookie } => {
                 self.cookie = Some(cookie.clone());
+                let mut actions = self.desired_listen_port.map_or_else(
+                    || {
+                        vec![QbitAction::ReadPreferences {
+                            cookie: cookie.clone(),
+                        }]
+                    },
+                    |port| {
+                        vec![QbitAction::SetListenPort {
+                            cookie: cookie.clone(),
+                            port,
+                        }]
+                    },
+                );
+                if !self.refresh_scheduled {
+                    self.refresh_scheduled = true;
+                    actions.push(QbitAction::ScheduleTimer {
+                        timer: QbitTimer::TorrentRefresh,
+                        after: self.config.torrent_refresh,
+                    });
+                }
                 Outcome {
-                    actions: self.desired_listen_port.map_or_else(
-                        || {
-                            vec![QbitAction::ReadPreferences {
-                                cookie: cookie.clone(),
-                            }]
-                        },
-                        |port| {
-                            vec![QbitAction::SetListenPort {
-                                cookie: cookie.clone(),
-                                port,
-                            }]
-                        },
-                    ),
+                    actions,
                     publish: vec![QbitPublish::Ready],
                 }
             }
@@ -236,13 +249,20 @@ impl Machine for QbitMachine {
                 actions: self.retry_listen_port_or_read_preferences(),
                 publish: Vec::new(),
             },
-            QbitEvent::TimerFired(QbitTimer::TorrentRefresh) => Outcome {
-                actions: self
+            QbitEvent::TimerFired(QbitTimer::TorrentRefresh) => {
+                let mut actions = self
                     .cookie
                     .clone()
-                    .map_or_else(Vec::new, |cookie| vec![QbitAction::ListTorrents { cookie }]),
-                publish: Vec::new(),
-            },
+                    .map_or_else(Vec::new, |cookie| vec![QbitAction::ListTorrents { cookie }]);
+                actions.push(QbitAction::ScheduleTimer {
+                    timer: QbitTimer::TorrentRefresh,
+                    after: self.config.torrent_refresh,
+                });
+                Outcome {
+                    actions,
+                    publish: Vec::new(),
+                }
+            }
         }
     }
 
@@ -302,6 +322,7 @@ mod tests {
             QbitConfig {
                 auth_retry: Duration::from_secs(1),
                 sync_retry: Duration::from_secs(2),
+                torrent_refresh: Duration::from_secs(30),
             },
             Instant::now(),
         )
@@ -333,7 +354,16 @@ mod tests {
         );
 
         assert!(machine.is_authenticated());
-        assert_eq!(out.actions, vec![QbitAction::ReadPreferences { cookie }]);
+        assert_eq!(
+            out.actions,
+            vec![
+                QbitAction::ReadPreferences { cookie },
+                QbitAction::ScheduleTimer {
+                    timer: QbitTimer::TorrentRefresh,
+                    after: Duration::from_secs(30),
+                },
+            ]
+        );
         assert_eq!(out.publish, vec![QbitPublish::Ready]);
     }
 
@@ -363,7 +393,13 @@ mod tests {
 
         assert_eq!(
             out.actions,
-            vec![QbitAction::SetListenPort { cookie, port }]
+            vec![
+                QbitAction::SetListenPort { cookie, port },
+                QbitAction::ScheduleTimer {
+                    timer: QbitTimer::TorrentRefresh,
+                    after: Duration::from_secs(30),
+                },
+            ]
         );
         assert_eq!(out.publish, vec![QbitPublish::Ready]);
     }
@@ -486,5 +522,78 @@ mod tests {
 
         assert_eq!(machine.listen_port(), Some(port));
         assert_eq!(out.publish, vec![QbitPublish::ListenPortReady { port }]);
+    }
+
+    #[test]
+    fn torrent_refresh_timer_round_trips() {
+        // Phase 1: AuthSucceeded schedules the TorrentRefresh timer.
+        let mut machine = machine();
+        let cookie = AuthCookie("sid".to_string());
+        let auth_out = handle(
+            &mut machine,
+            QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            },
+        );
+        assert!(
+            auth_out.actions.contains(&QbitAction::ScheduleTimer {
+                timer: QbitTimer::TorrentRefresh,
+                after: Duration::from_secs(30),
+            }),
+            "AuthSucceeded must schedule TorrentRefresh timer"
+        );
+
+        // Phase 2: When the timer fires, ListTorrents is issued and the timer re-schedules.
+        let fired_out = handle(
+            &mut machine,
+            QbitEvent::TimerFired(QbitTimer::TorrentRefresh),
+        );
+        assert!(
+            fired_out
+                .actions
+                .contains(&QbitAction::ListTorrents { cookie }),
+            "TorrentRefresh timer must issue ListTorrents"
+        );
+        assert!(
+            fired_out.actions.contains(&QbitAction::ScheduleTimer {
+                timer: QbitTimer::TorrentRefresh,
+                after: Duration::from_secs(30),
+            }),
+            "TorrentRefresh timer must re-schedule itself"
+        );
+    }
+
+    #[test]
+    fn auth_succeeded_twice_schedules_refresh_timer_only_once() {
+        // Two consecutive AuthSucceeded events (e.g. from dual-Init login race) must not
+        // produce a second independent TorrentRefresh timer chain.
+        let mut machine = machine();
+        let cookie = AuthCookie("sid".to_string());
+
+        let first_out = handle(
+            &mut machine,
+            QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            },
+        );
+        let schedule_action = QbitAction::ScheduleTimer {
+            timer: QbitTimer::TorrentRefresh,
+            after: Duration::from_secs(30),
+        };
+        assert!(
+            first_out.actions.contains(&schedule_action),
+            "first AuthSucceeded must schedule TorrentRefresh"
+        );
+
+        let second_out = handle(
+            &mut machine,
+            QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            },
+        );
+        assert!(
+            !second_out.actions.contains(&schedule_action),
+            "second AuthSucceeded must NOT schedule a second TorrentRefresh chain"
+        );
     }
 }

@@ -162,6 +162,7 @@ pub(super) async fn init_shell(
         QbitConfig {
             auth_retry: Duration::from_secs(5),
             sync_retry: Duration::from_secs(2),
+            torrent_refresh: Duration::from_secs(30),
         },
         qbit.clone(),
     )

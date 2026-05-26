@@ -203,7 +203,7 @@ runtime, so Gluetun health and forwarded-port changes are handled consistently.
 
 ## Story: Move qBittorrent Core Onto Service Runtime
 
-Status: To Do
+Status: Done
 
 ### Problem
 
