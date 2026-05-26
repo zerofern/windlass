@@ -73,6 +73,13 @@ impl ServiceCores {
         actions
     }
 
+    pub fn observe_domain_event(&mut self, event: WindlassEvent) -> Vec<ServiceAction> {
+        let now = Instant::now();
+        let mut actions = self.apply(now, ServiceEvent::Domain(event));
+        dedup_service_actions(&mut actions);
+        actions
+    }
+
     #[cfg(test)]
     const fn state(&self) -> &windlass_domain_core::SystemStateView {
         self.domain.state()
@@ -341,6 +348,26 @@ mod tests {
                         && record.action == "service_activity"
                         && record.detail.as_deref()
                             == Some("qBittorrent rejected credentials")
+            )
+        }));
+    }
+
+    #[test]
+    fn db_failure_domain_event_becomes_activity_command() {
+        let mut cores = ServiceCores::new(std::time::Duration::from_secs(60));
+
+        let actions = cores.observe_domain_event(windlass_domain_core::WindlassEvent::DbFailed {
+            operation: "SaveSystemSnapshot".to_string(),
+            message: "database unavailable".to_string(),
+        });
+
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                ServiceAction::Db(windlass_db_core::DbCommand::RecordActivity(record))
+                    if record.source == windlass_db_core::ActivitySource::Domain
+                        && record.detail.as_deref()
+                            == Some("DB SaveSystemSnapshot failed: database unavailable")
             )
         }));
     }

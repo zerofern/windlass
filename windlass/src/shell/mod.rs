@@ -21,6 +21,7 @@ use windlass_db::DbPool;
 use windlass_db::actor::PostgresDbActor;
 use windlass_db_core::DbEvent;
 use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory};
+use windlass_domain_core::WindlassEvent;
 use windlass_local::docker;
 use windlass_types::WakeupId;
 
@@ -63,8 +64,15 @@ pub async fn run(
         execute_service_actions,
     } = init_shell(&debug_ctrl, debug_owned).await?;
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
+    let (service_event_tx, mut service_event_rx) = mpsc::channel::<WindlassEvent>(128);
 
     'main: loop {
+        drain_service_events(
+            &mut service_cores,
+            &mut service_event_rx,
+            &db_pool,
+            &service_event_tx,
+        );
         drain_channels(
             &mut history,
             &debug_ctrl,
@@ -99,7 +107,7 @@ pub async fn run(
 
         let service_actions = service_cores.observe(&event);
         for action in &service_actions {
-            dispatch_service_db_action(&db_pool, action);
+            dispatch_service_db_action(&db_pool, action, &service_event_tx);
         }
         let outcome = state.process_event(event, chrono::Utc::now());
         if outcome.state_changed {
@@ -179,19 +187,44 @@ const fn service_replaces_legacy_action(action: &Action) -> bool {
     )
 }
 
-fn dispatch_service_db_action(db_pool: &DbPool, action: &ServiceAction) {
+fn drain_service_events(
+    service_cores: &mut service::ServiceCores,
+    service_event_rx: &mut mpsc::Receiver<WindlassEvent>,
+    db_pool: &DbPool,
+    service_event_tx: &mpsc::Sender<WindlassEvent>,
+) {
+    while let Ok(event) = service_event_rx.try_recv() {
+        for action in service_cores.observe_domain_event(event) {
+            dispatch_service_db_action(db_pool, &action, service_event_tx);
+        }
+    }
+}
+
+fn dispatch_service_db_action(
+    db_pool: &DbPool,
+    action: &ServiceAction,
+    service_event_tx: &mpsc::Sender<WindlassEvent>,
+) {
     match action {
         ServiceAction::Db(command) => {
             let actor = PostgresDbActor::new(db_pool.clone());
             let command = command.clone();
+            let service_event_tx = service_event_tx.clone();
             tokio::spawn(async move {
                 let event = actor.handle(command).await;
                 if let DbEvent::Failed(error) = event {
+                    let operation = error.operation;
+                    let message = error.message;
                     tracing::warn!(
-                        operation = %error.operation,
+                        operation = %operation,
                         "Service domain DB command failed: {}",
-                        error.message
+                        message
                     );
+                    if operation != "RecordActivity" {
+                        let _ = service_event_tx
+                            .send(WindlassEvent::DbFailed { operation, message })
+                            .await;
+                    }
                 }
             });
         }
