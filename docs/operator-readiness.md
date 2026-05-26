@@ -231,7 +231,7 @@ are controlled by one qBit-specific core.
 
 ## Story: Move MAM Core Onto Service Runtime
 
-Status: To Do
+Status: Done
 
 ### Problem
 

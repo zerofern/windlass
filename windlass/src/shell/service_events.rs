@@ -79,9 +79,13 @@ pub(super) fn legacy_to_service_events(
                 })]
             },
         ),
-        Event::MamUpdateSuccess { .. } => forwarded_port.map_or_else(Vec::new, |port| {
-            vec![ServiceEvent::Mam(MamEvent::SeedboxUpdated { port })]
-        }),
+        Event::MamUpdateSuccess { .. } => {
+            if forwarded_port.is_some() {
+                vec![ServiceEvent::Mam(MamEvent::SeedboxUpdated)]
+            } else {
+                Vec::new()
+            }
+        }
         Event::MamAsnMismatch { ip, .. } => vec![ServiceEvent::Mam(MamEvent::StatusFailed {
             reason: format!("MAM ASN mismatch for {}", ip.0),
         })],

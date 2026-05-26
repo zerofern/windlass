@@ -54,13 +54,13 @@ impl Shell for MamShell {
                     let _ = tx.send(Timed::now(event));
                 });
             }
-            MamAction::UpdateSeedboxPort { port } => {
+            MamAction::UpdateSeedbox => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let event = match client.update_seedbox().await {
                         windlass_core::events::Event::MamUpdateSuccess { .. } => {
-                            MamEvent::SeedboxUpdated { port }
+                            MamEvent::SeedboxUpdated
                         }
                         windlass_core::events::Event::MamRateLimitViolation { .. } => {
                             MamEvent::RateLimited {
@@ -69,12 +69,10 @@ impl Shell for MamShell {
                         }
                         windlass_core::events::Event::MamAsnMismatch { ip, .. } => {
                             MamEvent::SeedboxUpdateFailed {
-                                port,
                                 reason: format!("ASN mismatch for {}", ip.0),
                             }
                         }
                         other => MamEvent::SeedboxUpdateFailed {
-                            port,
                             reason: format!("unexpected response: {:?}", other),
                         },
                     };

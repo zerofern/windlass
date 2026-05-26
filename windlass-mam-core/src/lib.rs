@@ -38,11 +38,8 @@ pub enum MamEvent {
     StatusFailed {
         reason: String,
     },
-    SeedboxUpdated {
-        port: VpnPort,
-    },
+    SeedboxUpdated,
     SeedboxUpdateFailed {
-        port: VpnPort,
         reason: String,
     },
     RateLimited {
@@ -54,7 +51,7 @@ pub enum MamEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MamAction {
     FetchStatus,
-    UpdateSeedboxPort { port: VpnPort },
+    UpdateSeedbox,
     ScheduleTimer { timer: MamTimer, after: Duration },
 }
 
@@ -112,20 +109,21 @@ impl MamMachine {
     }
 
     fn refresh_or_update_seedbox(&self) -> Vec<MamAction> {
-        self.desired_seedbox_port.map_or_else(
-            || vec![MamAction::FetchStatus],
-            |port| vec![MamAction::UpdateSeedboxPort { port }],
-        )
+        if self.desired_seedbox_port.is_some() {
+            vec![MamAction::UpdateSeedbox]
+        } else {
+            vec![MamAction::FetchStatus]
+        }
     }
 
     fn converge_seedbox(&self) -> Vec<MamAction> {
-        let Some(port) = self.desired_seedbox_port else {
+        let Some(desired) = self.desired_seedbox_port else {
             return Vec::new();
         };
-        if self.seedbox_port == Some(port) {
+        if self.seedbox_port == Some(desired) {
             Vec::new()
         } else {
-            vec![MamAction::UpdateSeedboxPort { port }]
+            vec![MamAction::UpdateSeedbox]
         }
     }
 
@@ -182,7 +180,7 @@ impl Machine for MamMachine {
             }
             MamEvent::AuthFailed { reason }
             | MamEvent::StatusFailed { reason }
-            | MamEvent::SeedboxUpdateFailed { reason, .. } => Outcome {
+            | MamEvent::SeedboxUpdateFailed { reason } => Outcome {
                 actions: vec![MamAction::ScheduleTimer {
                     timer: MamTimer::StatusRetry,
                     after: self.config.status_retry,
@@ -209,11 +207,17 @@ impl Machine for MamMachine {
                     publish,
                 }
             }
-            MamEvent::SeedboxUpdated { port } => {
-                self.seedbox_port = Some(port);
+            MamEvent::SeedboxUpdated => {
+                let port = self.desired_seedbox_port;
+                if let Some(p) = port {
+                    self.seedbox_port = Some(p);
+                }
                 Outcome {
                     actions: Vec::new(),
-                    publish: vec![MamPublish::SeedboxPortReady { port }],
+                    publish: port
+                        .map(|p| MamPublish::SeedboxPortReady { port: p })
+                        .into_iter()
+                        .collect(),
                 }
             }
             MamEvent::RateLimited { retry_after } => Outcome {
@@ -244,7 +248,7 @@ impl Machine for MamMachine {
                         MamResponse::Accepted,
                     );
                 }
-                vec![MamAction::UpdateSeedboxPort { port }]
+                vec![MamAction::UpdateSeedbox]
             }
         };
         Self::outcome(actions, MamResponse::Accepted)
@@ -314,8 +318,10 @@ mod tests {
     fn seedbox_update_publishes_ready_port() {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
+        // Set a desired port so the machine knows which port was converged.
+        let _ = machine.handle_command(Instant::now(), MamCommand::EnsureSeedboxPort { port });
 
-        let out = handle(&mut machine, MamEvent::SeedboxUpdated { port });
+        let out = handle(&mut machine, MamEvent::SeedboxUpdated);
 
         assert_eq!(machine.seedbox_port(), Some(port));
         assert_eq!(out.publish, vec![MamPublish::SeedboxPortReady { port }]);
@@ -339,10 +345,7 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            out.actions,
-            vec![MamAction::UpdateSeedboxPort { port: desired }]
-        );
+        assert_eq!(out.actions, vec![MamAction::UpdateSeedbox]);
         assert_eq!(
             out.publish,
             vec![MamPublish::Connectable {
@@ -360,7 +363,6 @@ mod tests {
         let failed = handle(
             &mut machine,
             MamEvent::SeedboxUpdateFailed {
-                port,
                 reason: "rate limited".to_string(),
             },
         );
@@ -381,14 +383,15 @@ mod tests {
 
         let retry = handle(&mut machine, MamEvent::TimerFired(MamTimer::StatusRetry));
 
-        assert_eq!(retry.actions, vec![MamAction::UpdateSeedboxPort { port }]);
+        assert_eq!(retry.actions, vec![MamAction::UpdateSeedbox]);
     }
 
     #[test]
     fn ensure_seedbox_port_publishes_when_already_converged() {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
-        let _ = handle(&mut machine, MamEvent::SeedboxUpdated { port });
+        let _ = machine.handle_command(Instant::now(), MamCommand::EnsureSeedboxPort { port });
+        let _ = handle(&mut machine, MamEvent::SeedboxUpdated);
 
         let out = machine.handle_command(Instant::now(), MamCommand::EnsureSeedboxPort { port });
 
