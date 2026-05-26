@@ -5,29 +5,30 @@ mod dequeue;
 mod download;
 mod init;
 mod service;
+mod service_db;
 mod service_debug;
 mod service_events;
 
 use std::collections::HashMap;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
 use windlass_clients::{mam, qbit};
-use windlass_core::{actions::Action, events::Event, types::SystemState};
+use windlass_core::{
+    EventOutcome, Observation, actions::Action, events::Event, types::SystemState,
+};
 use windlass_db::DbPool;
-use windlass_db::actor::PostgresDbActor;
-use windlass_db_core::DbEvent;
 use windlass_debug::{CausalTx, DebugController, DebugDispatcher, DebugHistory};
-use windlass_domain_core::WindlassEvent;
 use windlass_local::docker;
 use windlass_types::WakeupId;
 
 use dequeue::dequeue_debug;
 use init::{ShellRuntime, init_shell};
 use service::ServiceAction;
+use service_db::{dispatch_service_db_action, drain_service_events, service_domain_event_channel};
 use service_debug::service_debug_actions;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
@@ -64,7 +65,7 @@ pub async fn run(
         execute_service_actions,
     } = init_shell(&debug_ctrl, debug_owned).await?;
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
-    let (service_event_tx, mut service_event_rx) = mpsc::channel::<WindlassEvent>(128);
+    let (service_event_tx, mut service_event_rx) = service_domain_event_channel();
 
     'main: loop {
         drain_service_events(
@@ -109,15 +110,7 @@ pub async fn run(
         for action in &service_actions {
             dispatch_service_db_action(&db_pool, action, &service_event_tx);
         }
-        let outcome = state.process_event(event, chrono::Utc::now());
-        if outcome.state_changed {
-            let _ = obs_tx.send(windlass_core::Observation::StateSnapshot(Box::new(
-                state.clone(),
-            )));
-            if !debug_ctrl.is_debug_mode() {
-                debug_ctrl.update_latest_state(state.clone());
-            }
-        }
+        let outcome = process_legacy_event(event, &mut state, &obs_tx, &debug_ctrl);
 
         let mut ctx = ShellContext {
             docker: &docker,
@@ -187,52 +180,20 @@ const fn service_replaces_legacy_action(action: &Action) -> bool {
     )
 }
 
-fn drain_service_events(
-    service_cores: &mut service::ServiceCores,
-    service_event_rx: &mut mpsc::Receiver<WindlassEvent>,
-    db_pool: &DbPool,
-    service_event_tx: &mpsc::Sender<WindlassEvent>,
-) {
-    while let Ok(event) = service_event_rx.try_recv() {
-        for action in service_cores.observe_domain_event(event) {
-            dispatch_service_db_action(db_pool, &action, service_event_tx);
+fn process_legacy_event(
+    event: Event,
+    state: &mut SystemState,
+    obs_tx: &broadcast::Sender<Observation>,
+    debug_ctrl: &DebugController,
+) -> EventOutcome {
+    let outcome = state.process_event(event, chrono::Utc::now());
+    if outcome.state_changed {
+        let _ = obs_tx.send(Observation::StateSnapshot(Box::new(state.clone())));
+        if !debug_ctrl.is_debug_mode() {
+            debug_ctrl.update_latest_state(state.clone());
         }
     }
-}
-
-fn dispatch_service_db_action(
-    db_pool: &DbPool,
-    action: &ServiceAction,
-    service_event_tx: &mpsc::Sender<WindlassEvent>,
-) {
-    match action {
-        ServiceAction::Db(command) => {
-            let actor = PostgresDbActor::new(db_pool.clone());
-            let command = command.clone();
-            let service_event_tx = service_event_tx.clone();
-            tokio::spawn(async move {
-                let event = actor.handle(command).await;
-                if let DbEvent::Failed(error) = event {
-                    let operation = error.operation;
-                    let message = error.message;
-                    tracing::warn!(
-                        operation = %operation,
-                        "Service domain DB command failed: {}",
-                        message
-                    );
-                    if operation != "RecordActivity" {
-                        let _ = service_event_tx
-                            .send(WindlassEvent::DbFailed { operation, message })
-                            .await;
-                    }
-                }
-            });
-        }
-        ServiceAction::Vpn(_)
-        | ServiceAction::Qbit(_)
-        | ServiceAction::Mam(_)
-        | ServiceAction::ScheduleTimer { .. } => {}
-    }
+    outcome
 }
 
 fn execute_service_actions_if_enabled(
