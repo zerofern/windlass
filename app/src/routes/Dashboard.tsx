@@ -1,5 +1,5 @@
 import { useRef, useEffect } from 'react'
-import { useObservations } from '@/contexts/ObservationsContext'
+import { useObservations } from '@/hooks/useObservations'
 import { StateDisplay } from '@/components/StateDisplay'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'

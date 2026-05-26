@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { useObservations } from '@/hooks/useObservations'
 
 interface EventEntry {
   id: number
@@ -12,19 +13,21 @@ interface EventEntry {
 export function EventLog() {
   const [events, setEvents] = useState<EventEntry[]>([])
   const [error, setError] = useState('')
+  const { log } = useObservations()
 
-  const fetchEvents = () => {
+  const fetchEvents = useCallback(() => {
     fetch('/api/v1/events?limit=100')
       .then(r => r.json())
-      .then(setEvents)
+      .then((data: EventEntry[]) => {
+        setEvents(data)
+        setError('')
+      })
       .catch(() => setError('Failed to load events'))
-  }
+  }, [])
 
   useEffect(() => {
     fetchEvents()
-    const id = setInterval(fetchEvents, 30_000)
-    return () => clearInterval(id)
-  }, [])
+  }, [fetchEvents, log.length])
 
   return (
     <div className="space-y-4">

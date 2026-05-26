@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Badge } from '@/components/ui/badge'
+import { useObservations } from '@/hooks/useObservations'
 
 interface Torrent {
   hash: string
@@ -58,19 +59,21 @@ function fmtMb(bytes: number) {
 export function TorrentMonitor() {
   const [torrents, setTorrents] = useState<Torrent[]>([])
   const [error, setError] = useState('')
+  const { log } = useObservations()
 
-  const fetchTorrents = () => {
+  const fetchTorrents = useCallback(() => {
     fetch('/api/v1/torrents')
       .then(r => r.json())
-      .then(setTorrents)
+      .then((data: Torrent[]) => {
+        setTorrents(data)
+        setError('')
+      })
       .catch(() => setError('Failed to load torrents'))
-  }
+  }, [])
 
   useEffect(() => {
     fetchTorrents()
-    const id = setInterval(fetchTorrents, 30_000)
-    return () => clearInterval(id)
-  }, [])
+  }, [fetchTorrents, log.length])
 
   return (
     <div className="space-y-4">

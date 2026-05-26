@@ -1,23 +1,8 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { Observation, SystemState } from '@/types/api'
+import { ObservationsContext } from '@/contexts/observations-context'
 
 const MAX_LOG = 500
-
-interface ObservationsValue {
-  state: SystemState | null
-  log: Observation[]
-  connected: boolean
-  debugMode: boolean
-  clearLog: () => void
-}
-
-const ObservationsContext = createContext<ObservationsValue>({
-  state: null,
-  log: [],
-  connected: false,
-  debugMode: false,
-  clearLog: () => {},
-})
 
 export function ObservationsProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<SystemState | null>(null)
@@ -25,10 +10,6 @@ export function ObservationsProvider({ children }: { children: React.ReactNode }
   const [connected, setConnected] = useState(false)
   const [debugMode, setDebugMode] = useState(false)
   const clearLog = useCallback(() => setLog([]), [])
-
-  // Keep a ref so the SSE handler always sees the latest log length without re-subscribing
-  const logLenRef = useRef(0)
-  logLenRef.current = log.length
 
   useEffect(() => {
     const es = new EventSource('/api/v1/stream')
@@ -55,8 +36,4 @@ export function ObservationsProvider({ children }: { children: React.ReactNode }
       {children}
     </ObservationsContext.Provider>
   )
-}
-
-export function useObservations() {
-  return useContext(ObservationsContext)
 }
