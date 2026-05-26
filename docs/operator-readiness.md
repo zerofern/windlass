@@ -61,28 +61,29 @@ waiting for a new event.
   cache.
 - Preserve the broadcast stream for live observations.
 
-## Backlog
+## Implementation Order
 
-These are candidate stories to spec next:
+Implement these stories one at a time, in this order:
 
-- Introduce the generic service runtime for `Machine + Shell + TopicFanout`.
-- Move the VPN core onto the service runtime.
-- Move the qBittorrent core onto the service runtime.
-- Move the MAM core onto the service runtime.
-- Move the domain core onto the service runtime.
-- Move the DB core onto the service runtime.
-- Replace the direct publish bridge with typed subscriptions.
-- Use `Timed<Event>` end to end.
-- Add property-based tests for operator invariants.
-- Automatically donate to the pot on every pot cycle.
-- Make the dashboard and chaos page use one shared state display model.
-- Keep route state and background data fresh when tabs/pages are not active.
-- Improve debug page event/action queue visibility.
-- Allow clicking an event or action in debug view to set a breakpoint for that
-  variant.
-- Clarify the manual download happy path and blocked states in the UI.
-- Make HnR/compliance risk visible enough that unsafe manual deletion is hard
-  to miss.
+1. Fix initial UI state snapshot on SSE connect.
+2. Introduce the generic service runtime for `Machine + Shell + TopicFanout`.
+3. Use `Timed<Event>` end to end.
+4. Move the DB core onto the service runtime.
+5. Move the VPN core onto the service runtime.
+6. Move the qBittorrent core onto the service runtime.
+7. Move the MAM core onto the service runtime.
+8. Move the domain core onto the service runtime.
+9. Replace the direct publish bridge with typed subscriptions.
+10. Add property-based tests for operator invariants.
+11. Automatically donate to the pot on every pot cycle.
+12. Make the dashboard and chaos page use one shared state display model.
+13. Keep route state and background data fresh when tabs/pages are not active.
+14. Improve debug page event/action queue visibility.
+15. Allow clicking an event or action in debug view to set a breakpoint for that
+    variant.
+16. Clarify the manual download happy path and blocked states in the UI.
+17. Make HnR/compliance risk visible enough that unsafe manual deletion is hard
+    to miss.
 
 ## Story: Introduce Generic Service Runtime
 
@@ -110,6 +111,68 @@ custom orchestration.
   typed responses to the command sender.
 - Publish messages are routed through `TopicFanout`.
 - The runtime is covered by focused tests using a small fake machine and shell.
+
+## Story: Use `Timed<Event>` End To End
+
+Status: To Do
+
+### Problem
+
+The shared machine model includes `Timed<Event>`, but the current bridge mostly
+uses plain legacy events and `Instant::now()`. That loses the distinction
+between scheduled timer fire time and actual runtime wake-up time.
+
+### User Story
+
+As the maintainer, I want service events to carry logical time end to end, so
+cores can reason about timer slack and event-queue lag without doing I/O.
+
+### Acceptance Criteria
+
+- Service event channels carry `Timed<M::Event>`.
+- Timer actions compute and preserve scheduled fire time.
+- Timer wakeups send the scheduled fire time, not the actual Tokio wake time.
+- I/O completion events use `Instant::now()` at the point the external result
+  is observed.
+- Machine tests cover timer events with explicit logical timestamps.
+
+## Story: Move DB Core Onto Service Runtime
+
+Status: To Do
+
+### Problem
+
+`windlass-db-core` defines a clean `DbCommand`/`DbEvent` protocol, and
+`windlass-db` has a Postgres actor that executes commands. However, DB handling
+is currently called directly from bridge code instead of running like the other
+external-system services.
+
+Even though DB decisions are simpler than VPN/qBit/MAM decisions, treating DB
+as a full core makes the architecture uniform. That matters for debug mode:
+events, commands, actions, publishes, pauses, replay, and inspection should work
+the same way for every external system.
+
+### User Story
+
+As the maintainer, I want DB persistence to run as a full sans-I/O core on the
+same service runtime as the other external systems, so debug mode can treat DB
+traffic exactly like VPN, qBit, and MAM traffic.
+
+### Acceptance Criteria
+
+- `windlass-db-core` defines a `DbMachine` implementing `Machine`.
+- DB command handling goes through `DbMachine::handle_command`.
+- `DbMachine` emits typed DB actions for the shell/Postgres adapter to execute.
+- The DB shell owns `PostgresDbActor` or equivalent Postgres I/O adapter.
+- DB shell sends action results back as `Timed<DbEvent>`.
+- `DbMachine` publishes DB success/failure facts through topic fanout.
+- Domain subscribes to DB failures and turns them into `WindlassEvent::DbFailed`
+  or equivalent policy events.
+- Service/domain code no longer constructs a new `PostgresDbActor` per command
+  dispatch.
+- Debug mode can show DB commands, DB actions, DB events, and DB publishes using
+  the same machinery as the other service cores.
+- Existing DB unit tests and operator integration tests continue to pass.
 
 ## Story: Move VPN Core Onto Service Runtime
 
@@ -225,44 +288,6 @@ bridge code.
 - Tests cover that service publishes enter the domain runtime and produce the
   expected service commands.
 
-## Story: Move DB Core Onto Service Runtime
-
-Status: To Do
-
-### Problem
-
-`windlass-db-core` defines a clean `DbCommand`/`DbEvent` protocol, and
-`windlass-db` has a Postgres actor that executes commands. However, DB handling
-is currently called directly from bridge code instead of running like the other
-external-system services.
-
-Even though DB decisions are simpler than VPN/qBit/MAM decisions, treating DB
-as a full core makes the architecture uniform. That matters for debug mode:
-events, commands, actions, publishes, pauses, replay, and inspection should work
-the same way for every external system.
-
-### User Story
-
-As the maintainer, I want DB persistence to run as a full sans-I/O core on the
-same service runtime as the other external systems, so debug mode can treat DB
-traffic exactly like VPN, qBit, and MAM traffic.
-
-### Acceptance Criteria
-
-- `windlass-db-core` defines a `DbMachine` implementing `Machine`.
-- DB command handling goes through `DbMachine::handle_command`.
-- `DbMachine` emits typed DB actions for the shell/Postgres adapter to execute.
-- The DB shell owns `PostgresDbActor` or equivalent Postgres I/O adapter.
-- DB shell sends action results back as `Timed<DbEvent>`.
-- `DbMachine` publishes DB success/failure facts through topic fanout.
-- Domain subscribes to DB failures and turns them into `WindlassEvent::DbFailed`
-  or equivalent policy events.
-- Service/domain code no longer constructs a new `PostgresDbActor` per command
-  dispatch.
-- Debug mode can show DB commands, DB actions, DB events, and DB publishes using
-  the same machinery as the other service cores.
-- Existing DB unit tests and operator integration tests continue to pass.
-
 ## Story: Replace Direct Publish Bridge With Typed Subscriptions
 
 Status: To Do
@@ -291,30 +316,6 @@ external subscribers.
   remains in the domain core.
 - Tests cover that `VpnPublish::PortReady` causes domain commands for qBit and
   MAM through the subscription path.
-
-## Story: Use `Timed<Event>` End To End
-
-Status: To Do
-
-### Problem
-
-The shared machine model includes `Timed<Event>`, but the current bridge mostly
-uses plain legacy events and `Instant::now()`. That loses the distinction
-between scheduled timer fire time and actual runtime wake-up time.
-
-### User Story
-
-As the maintainer, I want service events to carry logical time end to end, so
-cores can reason about timer slack and event-queue lag without doing I/O.
-
-### Acceptance Criteria
-
-- Service event channels carry `Timed<M::Event>`.
-- Timer actions compute and preserve scheduled fire time.
-- Timer wakeups send the scheduled fire time, not the actual Tokio wake time.
-- I/O completion events use `Instant::now()` at the point the external result
-  is observed.
-- Machine tests cover timer events with explicit logical timestamps.
 
 ## Story: Add Property-Based Tests For Operator Invariants
 
