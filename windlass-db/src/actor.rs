@@ -145,7 +145,7 @@ async fn upsert_torrent(
     let book_id = record.book_id.map(|id| id.0);
     let mam_id = record
         .mam_id
-        .map(|id| i64::try_from(id.0).unwrap_or(i64::MAX));
+        .map(|id| i64::try_from(id.into_inner()).unwrap_or(i64::MAX));
     sqlx::query!(
         r#"
         INSERT INTO torrents (hash, book_id, mam_id, name, state, seeding_time_secs,
@@ -183,7 +183,7 @@ async fn enqueue_download(
     pool: &DbPool,
     record: windlass_db_core::DownloadQueueRecord,
 ) -> Result<DownloadId, DbFailure> {
-    let mam_id = i64::try_from(record.mam_id.0).unwrap_or(i64::MAX);
+    let mam_id = i64::try_from(record.mam_id.into_inner()).unwrap_or(i64::MAX);
     let book_id = record.book_id.map(|id| id.0);
     let status = download_status_str(&record.status);
     let row = sqlx::query!(
@@ -212,7 +212,7 @@ async fn upsert_book(
 ) -> Result<BookId, DbFailure> {
     let mam_id = record
         .mam_id
-        .map(|id| i64::try_from(id.0).unwrap_or(i64::MAX));
+        .map(|id| i64::try_from(id.into_inner()).unwrap_or(i64::MAX));
     let status = book_status_str(&record.status);
     let id = if let Some(id) = record.id {
         sqlx::query!(
@@ -267,7 +267,7 @@ async fn mark_download_state(
     pool: &DbPool,
     change: windlass_db_core::DownloadStateChange,
 ) -> Result<DownloadId, DbFailure> {
-    let mam_id = i64::try_from(change.mam_id.0).unwrap_or(i64::MAX);
+    let mam_id = i64::try_from(change.mam_id.into_inner()).unwrap_or(i64::MAX);
     let status = download_status_str(&change.status);
     if let Some(row) = sqlx::query!(
         r#"
@@ -444,7 +444,7 @@ mod tests {
             .handle(DbCommand::UpsertTorrent(TorrentRecord {
                 hash: TorrentHash("abc123".to_string()),
                 book_id: None,
-                mam_id: Some(MamTorrentId(42)),
+                mam_id: Some(MamTorrentId::try_new(42).unwrap()),
                 name: "test".to_string(),
                 state: TorrentStateRecord::ForcedUpload,
                 seeding_time_secs: 120,
@@ -468,7 +468,7 @@ mod tests {
         let event = actor
             .handle(DbCommand::UpsertBook(BookRecord {
                 id: None,
-                mam_id: Some(MamTorrentId(7)),
+                mam_id: Some(MamTorrentId::try_new(7).unwrap()),
                 title: Some("Title".to_string()),
                 author: Some("Author".to_string()),
                 status: BookStatus::Queued,
@@ -476,7 +476,7 @@ mod tests {
             .await;
 
         assert!(matches!(event, DbEvent::BookUpserted { .. }));
-        let row = books::get_by_mam_id(&pool, MamTorrentId(7))
+        let row = books::get_by_mam_id(&pool, MamTorrentId::try_new(7).unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -493,7 +493,7 @@ mod tests {
         let event = actor
             .handle(DbCommand::EnqueueDownload(DownloadQueueRecord {
                 book_id: None,
-                mam_id: MamTorrentId(123),
+                mam_id: MamTorrentId::try_new(123).unwrap(),
                 status: DownloadStatus::Pending,
             }))
             .await;
@@ -512,7 +512,7 @@ mod tests {
 
         let event = actor
             .handle(DbCommand::MarkDownloadState(DownloadStateChange {
-                mam_id: MamTorrentId(99),
+                mam_id: MamTorrentId::try_new(99).unwrap(),
                 status: DownloadStatus::Blacklisted,
             }))
             .await;

@@ -149,6 +149,7 @@ pub(super) async fn init_shell(
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         VpnConfig {
             health_poll_interval: Duration::from_secs(30),
+            unhealthy_poll_interval: Duration::from_secs(5),
             port_read_retry_interval: Duration::from_millis(500),
         },
         VpnShellConfig {

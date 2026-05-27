@@ -129,15 +129,13 @@ fn gluetun_healthy_starts_containers() {
             .iter()
             .any(|a| matches!(a, Action::StartDependentContainers))
     );
-    assert!(
-        !actions.iter().any(|a| matches!(a, Action::ReadPortFiles)),
-        "service core now owns explicit port-file reads"
-    );
+    assert!(actions.iter().any(|a| matches!(a, Action::ReadPortFiles)));
 }
 
 #[test]
 fn port_file_read_ok_marks_qbit_authenticating() {
     let mut state = SystemState::initial();
+    state.vpn = VpnState::AwaitingTunnel;
     let outcome = state.process_event(
         Event::PortFileReadResult {
             at: now(),
@@ -158,6 +156,23 @@ fn port_file_read_ok_marks_qbit_authenticating() {
             .iter()
             .any(|a| matches!(a, Action::AuthenticateQbit))
     );
+}
+
+#[test]
+fn port_file_read_ok_while_starting_waits_for_docker_healthy() {
+    let mut state = SystemState::initial();
+    state.vpn = VpnState::Starting;
+    let outcome = state.process_event(
+        Event::PortFileReadResult {
+            at: now(),
+            result: Ok((ip(), port())),
+        },
+        now(),
+    );
+
+    assert!(!outcome.state_changed);
+    assert_eq!(state.vpn, VpnState::Starting);
+    assert!(outcome.actions.is_empty());
 }
 
 #[test]
@@ -215,7 +230,7 @@ fn port_file_read_err_schedules_retry() {
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
     assert!(
-        !actions
+        actions
             .iter()
             .any(|a| matches!(a, Action::ScheduleWakeup(WakeupId::RetryPortRead, _)))
     );

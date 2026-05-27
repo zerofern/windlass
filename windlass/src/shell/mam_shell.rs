@@ -48,7 +48,7 @@ impl Shell for MamShell {
                             }
                         }
                         other => MamEvent::StatusFailed {
-                            reason: format!("unexpected response: {:?}", other),
+                            reason: format!("unexpected response: {other:?}"),
                         },
                     };
                     let _ = tx.send(Timed::now(event));
@@ -73,7 +73,7 @@ impl Shell for MamShell {
                             }
                         }
                         other => MamEvent::SeedboxUpdateFailed {
-                            reason: format!("unexpected response: {:?}", other),
+                            reason: format!("unexpected response: {other:?}"),
                         },
                     };
                     let _ = tx.send(Timed::now(event));
@@ -82,8 +82,9 @@ impl Shell for MamShell {
             MamAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
+                    let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::now(MamEvent::TimerFired(timer)));
+                    let _ = tx.send(Timed::new(scheduled_at, MamEvent::TimerFired(timer)));
                 });
             }
         }

@@ -29,10 +29,10 @@ async fn authenticate_success_extracts_sid_cookie() {
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
-    assert!(
-        matches!(&event, Event::QbitAuthSuccess { cookie: AuthCookie(s), .. } if s == "abc123"),
-        "Expected QbitAuthSuccess(abc123), got {event:?}"
-    );
+    match &event {
+        Event::QbitAuthSuccess { cookie, .. } => assert_eq!(cookie.expose_secret(), "abc123"),
+        _ => panic!("Expected QbitAuthSuccess(abc123), got {event:?}"),
+    }
 }
 
 #[tokio::test]
@@ -54,10 +54,10 @@ async fn authenticate_success_accepts_204_with_sid_cookie() {
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
-    assert!(
-        matches!(&event, Event::QbitAuthSuccess { cookie: AuthCookie(s), .. } if s == "abc123"),
-        "Expected QbitAuthSuccess(abc123), got {event:?}"
-    );
+    match &event {
+        Event::QbitAuthSuccess { cookie, .. } => assert_eq!(cookie.expose_secret(), "abc123"),
+        _ => panic!("Expected QbitAuthSuccess(abc123), got {event:?}"),
+    }
 }
 
 #[tokio::test]
@@ -80,10 +80,10 @@ async fn authenticate_success_extracts_qbt_sid_cookie() {
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
-    assert!(
-        matches!(&event, Event::QbitAuthSuccess { cookie: AuthCookie(s), .. } if s == "abc123"),
-        "Expected QbitAuthSuccess(abc123), got {event:?}"
-    );
+    match &event {
+        Event::QbitAuthSuccess { cookie, .. } => assert_eq!(cookie.expose_secret(), "abc123"),
+        _ => panic!("Expected QbitAuthSuccess(abc123), got {event:?}"),
+    }
 }
 
 #[tokio::test]
@@ -158,7 +158,7 @@ async fn sync_port_returns_success_on_200() {
         "password".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("abc123".into());
+    let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
     let event = qbit.sync_port(&cookie, port).await;
     assert!(matches!(event, Event::QbitPortSyncSuccess { .. }));
@@ -180,7 +180,7 @@ async fn sync_port_returns_failed_with_status_on_403() {
         "password".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("abc123".into());
+    let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
     let event = qbit.sync_port(&cookie, port).await;
     assert!(matches!(
@@ -213,7 +213,7 @@ async fn list_torrents_returns_names_from_json() {
         "password".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("abc123".into());
+    let cookie = AuthCookie::new("abc123".to_string());
     let names = qbit.list_torrents(&cookie).await;
     assert_eq!(
         names,
@@ -237,7 +237,7 @@ async fn list_torrents_returns_empty_on_empty_array() {
         "password".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("abc123".into());
+    let cookie = AuthCookie::new("abc123".to_string());
     let names = qbit.list_torrents(&cookie).await;
     assert!(names.is_empty());
 }
@@ -258,7 +258,7 @@ async fn list_torrents_returns_empty_on_bad_json() {
         "password".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("abc123".into());
+    let cookie = AuthCookie::new("abc123".to_string());
     let names = qbit.list_torrents(&cookie).await;
     assert!(names.is_empty());
 }
@@ -301,7 +301,7 @@ async fn sync_port_network_error_returns_failed_with_code_zero() {
         "password".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("abc123".into());
+    let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
     let event = qbit.sync_port(&cookie, port).await;
     assert!(
@@ -325,7 +325,7 @@ async fn list_torrents_network_error_returns_empty() {
         "password".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("abc123".into());
+    let cookie = AuthCookie::new("abc123".to_string());
     let names = qbit.list_torrents(&cookie).await;
     assert!(names.is_empty());
 }
@@ -365,7 +365,7 @@ async fn list_torrent_details_returns_parsed_records() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("sid".into());
+    let cookie = AuthCookie::new("sid".to_string());
     let details = qbit.list_torrent_details(&cookie).await;
     assert_eq!(details.len(), 2);
     assert_eq!(
@@ -375,7 +375,10 @@ async fn list_torrent_details_returns_parsed_records() {
     assert_eq!(details[0].state, QbitTorrentState::Uploading);
     assert_eq!(details[0].seeding_time_secs, 7200);
     assert_eq!(details[0].downloaded_bytes, 1_048_576);
-    assert_eq!(details[0].mam_id, Some(MamTorrentId(99999)));
+    assert_eq!(
+        details[0].mam_id,
+        Some(MamTorrentId::try_new(99999).unwrap())
+    );
     assert_eq!(details[1].mam_id, None);
 }
 
@@ -412,7 +415,9 @@ async fn list_torrent_details_maps_all_state_strings() {
             "p".into(),
             Arc::new(|_| {}),
         );
-        let details = qbit.list_torrent_details(&AuthCookie("s".into())).await;
+        let details = qbit
+            .list_torrent_details(&AuthCookie::new("s".to_string()))
+            .await;
         assert_eq!(&details[0].state, expected, "state={state_str}");
     }
 }
@@ -432,7 +437,9 @@ async fn list_torrent_details_returns_empty_on_bad_json() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    let details = qbit.list_torrent_details(&AuthCookie("s".into())).await;
+    let details = qbit
+        .list_torrent_details(&AuthCookie::new("s".to_string()))
+        .await;
     assert!(details.is_empty());
 }
 
@@ -445,7 +452,9 @@ async fn list_torrent_details_returns_empty_on_network_error() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    let details = qbit.list_torrent_details(&AuthCookie("s".into())).await;
+    let details = qbit
+        .list_torrent_details(&AuthCookie::new("s".to_string()))
+        .await;
     assert!(details.is_empty());
 }
 
@@ -469,7 +478,9 @@ async fn get_preferences_returns_parsed_limits() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    let prefs = qbit.get_preferences(&AuthCookie("s".into())).await;
+    let prefs = qbit
+        .get_preferences(&AuthCookie::new("s".to_string()))
+        .await;
     assert!(prefs.is_some());
     let p = prefs.unwrap();
     assert_eq!(p.torrents, 10);
@@ -496,7 +507,9 @@ async fn get_preferences_returns_none_on_bad_json() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    let prefs = qbit.get_preferences(&AuthCookie("s".into())).await;
+    let prefs = qbit
+        .get_preferences(&AuthCookie::new("s".to_string()))
+        .await;
     assert!(prefs.is_none());
 }
 
@@ -519,7 +532,7 @@ async fn add_torrent_returns_hash_from_response_body() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("sid".into());
+    let cookie = AuthCookie::new("sid".to_string());
     let result = qbit.add_torrent(&cookie, vec![0u8; 16]).await;
     assert_eq!(result, Some(TorrentHash(expected_hash)));
 }
@@ -540,7 +553,7 @@ async fn add_torrent_returns_none_on_error_response() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("sid".into());
+    let cookie = AuthCookie::new("sid".to_string());
     // Mock returns no torrent list fallback since /torrents/info isn't mocked
     let result = qbit.add_torrent(&cookie, vec![0u8; 16]).await;
     assert!(result.is_none());
@@ -566,7 +579,7 @@ async fn pause_torrent_posts_correct_form() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    let cookie = AuthCookie("sid".into());
+    let cookie = AuthCookie::new("sid".to_string());
     qbit.pause_torrent(&cookie, &TorrentHash("abc123".into()))
         .await;
     server.verify().await;
@@ -581,8 +594,11 @@ async fn pause_torrent_does_not_panic_on_network_error() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    qbit.pause_torrent(&AuthCookie("s".into()), &TorrentHash("abc".into()))
-        .await;
+    qbit.pause_torrent(
+        &AuthCookie::new("s".to_string()),
+        &TorrentHash("abc".into()),
+    )
+    .await;
     // no panic = pass
 }
 
@@ -606,8 +622,11 @@ async fn resume_torrent_posts_correct_form() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    qbit.resume_torrent(&AuthCookie("sid".into()), &TorrentHash("abc123".into()))
-        .await;
+    qbit.resume_torrent(
+        &AuthCookie::new("sid".to_string()),
+        &TorrentHash("abc123".into()),
+    )
+    .await;
     server.verify().await;
 }
 
@@ -620,8 +639,11 @@ async fn resume_torrent_does_not_panic_on_network_error() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    qbit.resume_torrent(&AuthCookie("s".into()), &TorrentHash("abc".into()))
-        .await;
+    qbit.resume_torrent(
+        &AuthCookie::new("s".to_string()),
+        &TorrentHash("abc".into()),
+    )
+    .await;
 }
 
 // ── force_resume_torrent ──────────────────────────────────────────────────────
@@ -645,8 +667,11 @@ async fn force_resume_torrent_posts_correct_form() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    qbit.force_resume_torrent(&AuthCookie("sid".into()), &TorrentHash("abc123".into()))
-        .await;
+    qbit.force_resume_torrent(
+        &AuthCookie::new("sid".to_string()),
+        &TorrentHash("abc123".into()),
+    )
+    .await;
     server.verify().await;
 }
 
@@ -659,8 +684,11 @@ async fn force_resume_torrent_does_not_panic_on_network_error() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    qbit.force_resume_torrent(&AuthCookie("s".into()), &TorrentHash("abc".into()))
-        .await;
+    qbit.force_resume_torrent(
+        &AuthCookie::new("s".to_string()),
+        &TorrentHash("abc".into()),
+    )
+    .await;
 }
 
 // ── delete_torrent ────────────────────────────────────────────────────────────
@@ -686,8 +714,11 @@ async fn delete_torrent_posts_with_delete_files_false() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    qbit.delete_torrent(&AuthCookie("sid".into()), &TorrentHash("abc123".into()))
-        .await;
+    qbit.delete_torrent(
+        &AuthCookie::new("sid".to_string()),
+        &TorrentHash("abc123".into()),
+    )
+    .await;
     server.verify().await;
 }
 
@@ -700,8 +731,11 @@ async fn delete_torrent_does_not_panic_on_network_error() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    qbit.delete_torrent(&AuthCookie("s".into()), &TorrentHash("abc".into()))
-        .await;
+    qbit.delete_torrent(
+        &AuthCookie::new("s".to_string()),
+        &TorrentHash("abc".into()),
+    )
+    .await;
 }
 
 // ── set_all_files_priority ────────────────────────────────────────────────────
@@ -725,8 +759,11 @@ async fn set_all_files_priority_posts_correct_form() {
         "pass".into(),
         Arc::new(|_| {}),
     );
-    qbit.set_all_files_priority(&AuthCookie("sid".into()), &TorrentHash("abc123".into()))
-        .await;
+    qbit.set_all_files_priority(
+        &AuthCookie::new("sid".to_string()),
+        &TorrentHash("abc123".into()),
+    )
+    .await;
     server.verify().await;
 }
 
@@ -739,6 +776,9 @@ async fn set_all_files_priority_does_not_panic_on_network_error() {
         "p".into(),
         Arc::new(|_| {}),
     );
-    qbit.set_all_files_priority(&AuthCookie("s".into()), &TorrentHash("abc".into()))
-        .await;
+    qbit.set_all_files_priority(
+        &AuthCookie::new("s".to_string()),
+        &TorrentHash("abc".into()),
+    )
+    .await;
 }

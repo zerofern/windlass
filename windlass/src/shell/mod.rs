@@ -265,7 +265,7 @@ impl ShellContext<'_> {
                 action,
                 book_id,
                 detail,
-            } => self.write_activity(source, action, book_id, detail),
+            } => self.write_activity(&source, action, book_id, detail),
             Action::FetchAndAddTorrent { mam_id, cookie } => {
                 self.fetch_and_add_torrent(mam_id, cookie, causal_tx);
             }

@@ -10,6 +10,7 @@ use windlass_types::VpnPort;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnConfig {
     pub health_poll_interval: Duration,
+    pub unhealthy_poll_interval: Duration,
     pub port_read_retry_interval: Duration,
 }
 
@@ -126,20 +127,19 @@ impl Machine for VpnMachine {
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
             VpnEvent::Init => Outcome {
-                actions: vec![
-                    VpnAction::StartMonitoring,
-                    VpnAction::InspectContainer,
-                    VpnAction::ScheduleTimer {
-                        timer: VpnTimer::HealthPoll,
-                        after: self.config.health_poll_interval,
-                    },
-                ],
+                actions: vec![VpnAction::StartMonitoring, VpnAction::InspectContainer],
                 publish: Vec::new(),
             },
             VpnEvent::ContainerHealthy => {
                 self.connected = true;
                 Outcome {
-                    actions: vec![VpnAction::ReadPortFiles],
+                    actions: vec![
+                        VpnAction::ReadPortFiles,
+                        VpnAction::ScheduleTimer {
+                            timer: VpnTimer::HealthPoll,
+                            after: self.config.health_poll_interval,
+                        },
+                    ],
                     publish: vec![VpnPublish::Connected],
                 }
             }
@@ -147,7 +147,10 @@ impl Machine for VpnMachine {
                 self.connected = false;
                 self.port = None;
                 Outcome {
-                    actions: Vec::new(),
+                    actions: vec![VpnAction::ScheduleTimer {
+                        timer: VpnTimer::HealthPoll,
+                        after: self.config.unhealthy_poll_interval,
+                    }],
                     publish: vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable],
                 }
             }
@@ -199,14 +202,9 @@ impl Machine for VpnMachine {
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         let actions = match cmd {
-            VpnCommand::StartMonitoring => vec![
-                VpnAction::StartMonitoring,
-                VpnAction::InspectContainer,
-                VpnAction::ScheduleTimer {
-                    timer: VpnTimer::HealthPoll,
-                    after: self.config.health_poll_interval,
-                },
-            ],
+            VpnCommand::StartMonitoring => {
+                vec![VpnAction::StartMonitoring, VpnAction::InspectContainer]
+            }
             VpnCommand::RefreshState => vec![VpnAction::InspectContainer],
             VpnCommand::ReadForwardedPort => vec![VpnAction::ReadPortFiles],
         };
@@ -227,6 +225,7 @@ mod tests {
         VpnMachine::new(
             VpnConfig {
                 health_poll_interval: Duration::from_secs(2),
+                unhealthy_poll_interval: Duration::from_millis(250),
                 port_read_retry_interval: Duration::from_millis(500),
             },
             Instant::now(),
@@ -245,14 +244,7 @@ mod tests {
 
         assert_eq!(
             out.actions,
-            vec![
-                VpnAction::StartMonitoring,
-                VpnAction::InspectContainer,
-                VpnAction::ScheduleTimer {
-                    timer: VpnTimer::HealthPoll,
-                    after: Duration::from_secs(2),
-                },
-            ]
+            vec![VpnAction::StartMonitoring, VpnAction::InspectContainer]
         );
         assert!(out.publish.is_empty());
     }
@@ -265,14 +257,7 @@ mod tests {
 
         assert_eq!(
             out.actions,
-            vec![
-                VpnAction::StartMonitoring,
-                VpnAction::InspectContainer,
-                VpnAction::ScheduleTimer {
-                    timer: VpnTimer::HealthPoll,
-                    after: Duration::from_secs(2),
-                },
-            ]
+            vec![VpnAction::StartMonitoring, VpnAction::InspectContainer]
         );
     }
 
@@ -283,8 +268,37 @@ mod tests {
         let out = handle(&mut machine, VpnEvent::ContainerHealthy);
 
         assert!(machine.is_connected());
-        assert_eq!(out.actions, vec![VpnAction::ReadPortFiles]);
+        assert_eq!(
+            out.actions,
+            vec![
+                VpnAction::ReadPortFiles,
+                VpnAction::ScheduleTimer {
+                    timer: VpnTimer::HealthPoll,
+                    after: Duration::from_secs(2),
+                },
+            ]
+        );
         assert_eq!(out.publish, vec![VpnPublish::Connected]);
+    }
+
+    #[test]
+    fn unhealthy_container_publishes_disconnected_and_schedules_fast_poll() {
+        let mut machine = machine();
+
+        let out = handle(&mut machine, VpnEvent::ContainerUnhealthy);
+
+        assert!(!machine.is_connected());
+        assert_eq!(
+            out.actions,
+            vec![VpnAction::ScheduleTimer {
+                timer: VpnTimer::HealthPoll,
+                after: Duration::from_millis(250),
+            }]
+        );
+        assert_eq!(
+            out.publish,
+            vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
+        );
     }
 
     #[test]
@@ -327,5 +341,90 @@ mod tests {
 
         assert_eq!(out.actions, vec![VpnAction::ReadPortFiles]);
         assert!(out.publish.is_empty());
+    }
+
+    #[test]
+    fn health_poll_timer_inspects_container() {
+        let mut machine = machine();
+
+        let out = handle(&mut machine, VpnEvent::TimerFired(VpnTimer::HealthPoll));
+
+        assert_eq!(out.actions, vec![VpnAction::InspectContainer]);
+        assert!(out.publish.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use std::net::Ipv4Addr;
+    use std::time::{Duration, Instant};
+
+    use proptest::prelude::*;
+    use windlass_machine::{Machine, Timed};
+    use windlass_types::VpnPort;
+
+    use crate::{VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
+
+    fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
+        (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
+    }
+
+    // Fully-arbitrary machine state (every `connected × port` combination,
+    // including ones a real event history would not reach). VPN-2 is a *total*
+    // invariant, so it must hold even on unreachable states.
+    fn any_vpn_machine() -> impl Strategy<Value = VpnMachine> {
+        (any::<bool>(), proptest::option::of(any_vpn_port())).prop_map(|(connected, port)| {
+            let mut machine = VpnMachine::new(
+                VpnConfig {
+                    health_poll_interval: Duration::from_secs(2),
+                    unhealthy_poll_interval: Duration::from_millis(250),
+                    port_read_retry_interval: Duration::from_millis(500),
+                },
+                Instant::now(),
+            );
+            machine.connected = connected;
+            machine.port = port;
+            machine
+        })
+    }
+
+    fn any_vpn_event() -> impl Strategy<Value = VpnEvent> {
+        prop_oneof![
+            Just(VpnEvent::Init),
+            Just(VpnEvent::ContainerHealthy),
+            Just(VpnEvent::ContainerUnhealthy),
+            any_vpn_port().prop_map(|port| VpnEvent::PortFileChanged { port }),
+            any::<[u8; 4]>().prop_map(|b| VpnEvent::PublicIpChanged {
+                ip: Ipv4Addr::from(b)
+            }),
+            (any::<bool>(), proptest::option::of(any_vpn_port()))
+                .prop_map(|(connected, port)| VpnEvent::StateRead { connected, port }),
+            any::<String>().prop_map(|reason| VpnEvent::StateReadFailed { reason }),
+            Just(VpnEvent::TimerFired(VpnTimer::HealthPoll)),
+            Just(VpnEvent::TimerFired(VpnTimer::PortReadRetry)),
+        ]
+    }
+
+    proptest! {
+        // GLOBAL-1 (no panic): handle tolerates any (state, event).
+        #[test]
+        fn handle_never_panics(mut machine in any_vpn_machine(), event in any_vpn_event()) {
+            let _ = machine.handle(Instant::now(), Timed::now(event));
+        }
+
+        // VPN-2 (Guarantee C): every published `PortReady` carries the port the
+        // machine currently holds, and is only published when a port is held.
+        #[test]
+        fn published_port_ready_matches_held_port(
+            mut machine in any_vpn_machine(),
+            event in any_vpn_event(),
+        ) {
+            let out = machine.handle(Instant::now(), Timed::now(event));
+            for publish in &out.publish {
+                if let VpnPublish::PortReady { port } = publish {
+                    prop_assert_eq!(machine.port(), Some(*port));
+                }
+            }
+        }
     }
 }

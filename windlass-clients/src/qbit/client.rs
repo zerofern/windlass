@@ -95,7 +95,7 @@ impl QbitClient {
                     debug!("qBit auth success");
                     return Event::QbitAuthSuccess {
                         at: Utc::now(),
-                        cookie: AuthCookie(cookie),
+                        cookie: AuthCookie::new(cookie),
                     };
                 }
                 if body.trim() == "Fails." {
@@ -118,7 +118,10 @@ impl QbitClient {
         match self
             .client
             .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .form(&[("json", &req_body)])
             .send()
             .await
@@ -157,7 +160,10 @@ impl QbitClient {
         match self
             .client
             .get(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .send()
             .await
         {
@@ -185,7 +191,10 @@ impl QbitClient {
         match self
             .client
             .get(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .send()
             .await
         {
@@ -228,7 +237,10 @@ impl QbitClient {
         match self
             .client
             .get(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .send()
             .await
         {

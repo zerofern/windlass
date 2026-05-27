@@ -45,7 +45,7 @@ fn resolve_mam_id(body: &AddDownloadBody) -> Option<MamTorrentId> {
     if let Some(ref url) = body.mam_url {
         return MamTorrentId::from_url_or_id(url);
     }
-    body.mam_id.filter(|&id| id > 0).map(MamTorrentId)
+    body.mam_id.and_then(|id| MamTorrentId::try_new(id).ok())
 }
 
 #[cfg(test)]
@@ -58,7 +58,10 @@ mod tests {
             mam_url: Some("https://www.myanonamouse.net/t/99".into()),
             mam_id: None,
         };
-        assert_eq!(resolve_mam_id(&body), Some(MamTorrentId(99)));
+        assert_eq!(
+            resolve_mam_id(&body),
+            Some(MamTorrentId::try_new(99).unwrap())
+        );
     }
 
     #[test]
@@ -67,7 +70,10 @@ mod tests {
             mam_url: None,
             mam_id: Some(42),
         };
-        assert_eq!(resolve_mam_id(&body), Some(MamTorrentId(42)));
+        assert_eq!(
+            resolve_mam_id(&body),
+            Some(MamTorrentId::try_new(42).unwrap())
+        );
     }
 
     #[test]
@@ -94,6 +100,9 @@ mod tests {
             mam_url: Some("https://www.myanonamouse.net/t/77".into()),
             mam_id: Some(99),
         };
-        assert_eq!(resolve_mam_id(&body), Some(MamTorrentId(77)));
+        assert_eq!(
+            resolve_mam_id(&body),
+            Some(MamTorrentId::try_new(77).unwrap())
+        );
     }
 }

@@ -127,7 +127,7 @@ fn wakeup_qbit_sync_retry_is_noop_when_not_syncing() {
 }
 
 #[test]
-fn wakeup_retry_port_read_is_service_orchestration_noop() {
+fn wakeup_retry_port_read_reads_port_files_for_legacy_state_bridge() {
     let mut state = SystemState::initial();
     let outcome = state.process_event(
         Event::Wakeup {
@@ -138,5 +138,5 @@ fn wakeup_retry_port_read_is_service_orchestration_noop() {
     );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
-    assert!(actions.is_empty());
+    assert!(actions.iter().any(|a| matches!(a, Action::ReadPortFiles)));
 }

@@ -308,7 +308,8 @@ impl MamClient {
         let current = self.session.lock().unwrap().clone();
         let url = format!(
             "{}/tor/download.php?tid={}",
-            self.torrent_base_url, mam_id.0
+            self.torrent_base_url,
+            mam_id.into_inner()
         );
         let resp = self
             .client
@@ -916,7 +917,9 @@ mod tests {
         )
         .unwrap()
         .with_torrent_base_url(base);
-        let result = mam.fetch_torrent(windlass_types::MamTorrentId(12345)).await;
+        let result = mam
+            .fetch_torrent(windlass_types::MamTorrentId::try_new(12345).unwrap())
+            .await;
         assert_eq!(result, Some(torrent_bytes));
     }
 
@@ -941,7 +944,9 @@ mod tests {
         )
         .unwrap()
         .with_torrent_base_url(base);
-        let result = mam.fetch_torrent(windlass_types::MamTorrentId(99)).await;
+        let result = mam
+            .fetch_torrent(windlass_types::MamTorrentId::try_new(99).unwrap())
+            .await;
         assert!(result.is_none());
     }
 }

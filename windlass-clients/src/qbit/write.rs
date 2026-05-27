@@ -25,7 +25,10 @@ impl QbitClient {
         match self
             .client
             .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .multipart(form)
             .send()
             .await
@@ -62,7 +65,10 @@ impl QbitClient {
         if let Err(e) = self
             .client
             .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .form(&[("hashes", hash.0.as_str())])
             .send()
             .await
@@ -77,7 +83,10 @@ impl QbitClient {
         if let Err(e) = self
             .client
             .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .form(&[("hashes", hash.0.as_str())])
             .send()
             .await
@@ -93,7 +102,10 @@ impl QbitClient {
         if let Err(e) = self
             .client
             .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .form(&[("hashes", hash.0.as_str()), ("value", "true")])
             .send()
             .await
@@ -109,7 +121,10 @@ impl QbitClient {
         if let Err(e) = self
             .client
             .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .form(&[("hashes", hash.0.as_str()), ("deleteFiles", "false")])
             .send()
             .await
@@ -127,7 +142,10 @@ impl QbitClient {
         if let Err(e) = self
             .client
             .post(&url)
-            .header(reqwest::header::COOKIE, format!("SID={}", cookie.0))
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
             .form(&[("hash", hash.0.as_str()), ("id", "all"), ("priority", "1")])
             .send()
             .await

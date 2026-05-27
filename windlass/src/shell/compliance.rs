@@ -109,7 +109,7 @@ impl ShellContext<'_> {
 
     pub(super) fn write_activity(
         &self,
-        source: String,
+        source: &str,
         action: String,
         book_id: Option<i64>,
         detail: Option<String>,

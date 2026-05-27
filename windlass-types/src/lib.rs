@@ -1,7 +1,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 use nutype::nutype;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -50,8 +50,20 @@ pub struct TorrentName(pub String);
 
 /// The SID cookie returned by qBittorrent on successful login.
 /// Always serializes as `"[redacted]"` to prevent leaking credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthCookie(pub String);
+#[derive(Debug, Clone)]
+pub struct AuthCookie(SecretString);
+
+impl AuthCookie {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(SecretString::new(value.into()))
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
 
 impl serde::Serialize for AuthCookie {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -59,9 +71,25 @@ impl serde::Serialize for AuthCookie {
     }
 }
 
+impl PartialEq for AuthCookie {
+    fn eq(&self, other: &Self) -> bool {
+        self.expose_secret() == other.expose_secret()
+    }
+}
+
+impl Eq for AuthCookie {}
+
 impl<'de> serde::Deserialize<'de> for AuthCookie {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Self(String::deserialize(d)?))
+        use serde::de::Error as _;
+
+        let value = String::deserialize(d)?;
+        if value == "[redacted]" || value.is_empty() {
+            return Err(D::Error::custom(
+                "redacted or empty auth cookie is not usable",
+            ));
+        }
+        Ok(Self::new(value))
     }
 }
 
@@ -111,7 +139,8 @@ impl Backoff {
     /// Returns `self * 2^attempt` — exponential backoff with this as the base.
     #[must_use]
     pub fn exponential(self, attempt: RetryCount) -> Duration {
-        self.0 * 2u32.pow(u32::from(attempt.0))
+        self.0
+            .saturating_mul(2u32.saturating_pow(u32::from(attempt.0)))
     }
 }
 
@@ -152,8 +181,11 @@ pub struct TorrentHash(pub String);
 
 /// A MAM torrent ID parsed from the torrent's comment field.
 /// Comment URL format: `https://www.myanonamouse.net/t/12345`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MamTorrentId(pub u64);
+#[nutype(
+    validate(greater = 0),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)
+)]
+pub struct MamTorrentId(u64);
 
 impl MamTorrentId {
     /// Parses a MAM torrent ID from a URL (`https://www.myanonamouse.net/t/12345`)
@@ -163,7 +195,7 @@ impl MamTorrentId {
         let s = s.trim();
         // Try plain numeric first.
         if let Ok(id) = s.parse::<u64>() {
-            return if id > 0 { Some(Self(id)) } else { None };
+            return Self::try_new(id).ok();
         }
         // Try URL: strip scheme + host, then accept /t/ or /tor/ prefixes.
         let path = s
@@ -174,7 +206,7 @@ impl MamTorrentId {
             .strip_prefix("/t/")
             .or_else(|| path.strip_prefix("/tor/"))?;
         let id = rest.split('/').next()?.parse::<u64>().ok()?;
-        if id > 0 { Some(Self(id)) } else { None }
+        Self::try_new(id).ok()
     }
 }
 
@@ -238,7 +270,7 @@ mod tests {
 
     #[test]
     fn auth_cookie_serializes_as_redacted() {
-        let c = AuthCookie("my-secret-cookie".to_string());
+        let c = AuthCookie::new("my-secret-cookie".to_string());
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(json, r#""[redacted]""#);
     }
@@ -246,27 +278,33 @@ mod tests {
     #[test]
     fn auth_cookie_deserializes_from_string() {
         let c: AuthCookie = serde_json::from_str(r#""some-value""#).unwrap();
-        assert_eq!(c.0, "some-value");
+        assert_eq!(c.expose_secret(), "some-value");
     }
 
     #[test]
     fn mam_torrent_id_from_numeric_string() {
         assert_eq!(
             MamTorrentId::from_url_or_id("12345"),
-            Some(MamTorrentId(12345))
+            MamTorrentId::try_new(12345).ok()
         );
     }
 
     #[test]
     fn mam_torrent_id_from_t_url() {
         let url = "https://www.myanonamouse.net/t/12345";
-        assert_eq!(MamTorrentId::from_url_or_id(url), Some(MamTorrentId(12345)));
+        assert_eq!(
+            MamTorrentId::from_url_or_id(url),
+            MamTorrentId::try_new(12345).ok()
+        );
     }
 
     #[test]
     fn mam_torrent_id_from_tor_url() {
         let url = "https://www.myanonamouse.net/tor/12345";
-        assert_eq!(MamTorrentId::from_url_or_id(url), Some(MamTorrentId(12345)));
+        assert_eq!(
+            MamTorrentId::from_url_or_id(url),
+            MamTorrentId::try_new(12345).ok()
+        );
     }
 
     #[test]

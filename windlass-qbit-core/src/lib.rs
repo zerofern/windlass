@@ -105,7 +105,7 @@ pub struct QbitMachine {
     cookie: Option<AuthCookie>,
     listen_port: Option<VpnPort>,
     desired_listen_port: Option<VpnPort>,
-    /// True once the self-perpetuating TorrentRefresh timer chain has been started.
+    /// True once the self-perpetuating `TorrentRefresh` timer chain has been started.
     /// Prevents a second independent chain from being spawned on re-authentication.
     refresh_scheduled: bool,
 }
@@ -345,7 +345,7 @@ mod tests {
     fn auth_success_publishes_ready_and_reads_preferences() {
         let mut machine = machine();
 
-        let cookie = AuthCookie("sid".to_string());
+        let cookie = AuthCookie::new("sid".to_string());
         let out = handle(
             &mut machine,
             QbitEvent::AuthSucceeded {
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn auth_success_sets_desired_port_after_pre_auth_request() {
         let mut machine = machine();
-        let cookie = AuthCookie("sid".to_string());
+        let cookie = AuthCookie::new("sid".to_string());
         let port = VpnPort::try_new(51_820).unwrap();
         let _ = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
 
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn ensure_listen_port_carries_cookie_when_authenticated() {
         let mut machine = machine();
-        let cookie = AuthCookie("sid".to_string());
+        let cookie = AuthCookie::new("sid".to_string());
         let port = VpnPort::try_new(51_820).unwrap();
         let _ = handle(
             &mut machine,
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn preference_mismatch_sets_desired_port_without_publishing_ready() {
         let mut machine = machine();
-        let cookie = AuthCookie("sid".to_string());
+        let cookie = AuthCookie::new("sid".to_string());
         let desired = VpnPort::try_new(51_820).unwrap();
         let observed = VpnPort::try_new(42_000).unwrap();
         let _ = handle(
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn set_failure_publishes_unavailable_and_retries_desired_port() {
         let mut machine = machine();
-        let cookie = AuthCookie("sid".to_string());
+        let cookie = AuthCookie::new("sid".to_string());
         let port = VpnPort::try_new(51_820).unwrap();
         let _ = handle(
             &mut machine,
@@ -528,7 +528,7 @@ mod tests {
     fn torrent_refresh_timer_round_trips() {
         // Phase 1: AuthSucceeded schedules the TorrentRefresh timer.
         let mut machine = machine();
-        let cookie = AuthCookie("sid".to_string());
+        let cookie = AuthCookie::new("sid".to_string());
         let auth_out = handle(
             &mut machine,
             QbitEvent::AuthSucceeded {
@@ -568,7 +568,7 @@ mod tests {
         // Two consecutive AuthSucceeded events (e.g. from dual-Init login race) must not
         // produce a second independent TorrentRefresh timer chain.
         let mut machine = machine();
-        let cookie = AuthCookie("sid".to_string());
+        let cookie = AuthCookie::new("sid".to_string());
 
         let first_out = handle(
             &mut machine,

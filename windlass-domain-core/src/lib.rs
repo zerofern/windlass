@@ -2,13 +2,12 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use windlass_db_core::{DbCommand, SystemSnapshotRecord};
+use windlass_db_core::DbCommand;
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
+use windlass_types::AlertPriority;
 use windlass_types::VpnPort;
 use windlass_vpn_core::{VpnCommand, VpnPublish};
 
@@ -38,6 +37,12 @@ pub enum WindlassAction {
     Qbit(QbitCommand),
     Mam(MamCommand),
     Db(DbCommand),
+    SaveSystemSnapshot(SystemStateView),
+    SendAlert {
+        priority: AlertPriority,
+        title: String,
+        body: String,
+    },
     ScheduleTimer {
         timer: WindlassTimer,
         after: Duration,
@@ -103,10 +108,7 @@ impl WindlassMachine {
     }
 
     fn snapshot_action(&self) -> WindlassAction {
-        WindlassAction::Db(DbCommand::SaveSystemSnapshot(SystemSnapshotRecord {
-            at: Utc::now(),
-            state: json!(self.state),
-        }))
+        WindlassAction::SaveSystemSnapshot(self.state.clone())
     }
 }
 
@@ -184,9 +186,15 @@ impl Machine for WindlassMachine {
             WindlassEvent::Qbit(
                 QbitPublish::ListenPortReady { .. } | QbitPublish::TorrentsUpdated { .. },
             )
-            | WindlassEvent::Mam(
-                MamPublish::Connectable { .. } | MamPublish::SeedboxPortReady { .. },
-            ) => Outcome::none(),
+            | WindlassEvent::Mam(MamPublish::Connectable { .. }) => Outcome::none(),
+            WindlassEvent::Mam(MamPublish::SeedboxPortReady { port }) => Outcome {
+                actions: vec![WindlassAction::SendAlert {
+                    priority: AlertPriority::Info,
+                    title: "MAM seedbox updated".to_string(),
+                    body: format!("MAM seedbox registered with port {}.", port.into_inner()),
+                }],
+                publish: Vec::new(),
+            },
             WindlassEvent::Mam(MamPublish::Ready) => {
                 self.state.mam = ServiceStatus::Ready;
                 self.publish_state()
@@ -267,6 +275,7 @@ mod tests {
 
     use windlass_machine::{Machine, Outcome, Timed};
     use windlass_mam_core::MamCommand;
+    use windlass_mam_core::MamPublish;
     use windlass_qbit_core::QbitCommand;
     use windlass_types::VpnPort;
     use windlass_vpn_core::VpnPublish;
@@ -336,5 +345,22 @@ mod tests {
             out.publish.as_slice(),
             [WindlassPublish::SystemState(_)]
         ));
+    }
+
+    #[test]
+    fn mam_seedbox_port_ready_records_boot_alert() {
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::SeedboxPortReady { port }),
+        );
+
+        assert!(matches!(
+            out.actions.as_slice(),
+            [WindlassAction::SendAlert { title, .. }] if title == "MAM seedbox updated"
+        ));
+        assert!(out.publish.is_empty());
     }
 }

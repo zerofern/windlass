@@ -38,7 +38,7 @@ pub(super) struct ServiceCores {
 
 impl ServiceCores {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         domain: ServiceHandles<WindlassMachine>,
         db: ServiceHandles<DbMachine>,
         vpn: ServiceHandles<VpnMachine>,
@@ -57,7 +57,7 @@ impl ServiceCores {
     }
 
     /// Returns the sender for issuing DB commands to the DB runtime.
-    pub fn db_command_tx(&self) -> &mpsc::UnboundedSender<Command<DbMachine>> {
+    pub const fn db_command_tx(&self) -> &mpsc::UnboundedSender<Command<DbMachine>> {
         &self.db.commands
     }
 

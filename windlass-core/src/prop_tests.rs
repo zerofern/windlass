@@ -26,7 +26,7 @@ fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
 fn any_auth_cookie() -> impl Strategy<Value = AuthCookie> {
     proptest::string::string_regex("[a-zA-Z0-9]{8,32}")
         .unwrap()
-        .prop_map(AuthCookie)
+        .prop_map(AuthCookie::new)
 }
 
 fn any_retry_count() -> impl Strategy<Value = RetryCount> {
@@ -76,7 +76,7 @@ fn any_qbit_state() -> impl Strategy<Value = QbitState> {
         ),
         any_vpn_port().prop_map(|port| QbitState::Ready {
             port,
-            cookie: AuthCookie("prop".into())
+            cookie: AuthCookie::new("prop".to_string())
         }),
     ]
 }
@@ -117,7 +117,7 @@ fn any_synced_state() -> impl Strategy<Value = SystemState> {
             },
             qbit: QbitState::Ready {
                 port: q_port,
-                cookie: AuthCookie("prop".into()),
+                cookie: AuthCookie::new("prop".to_string()),
             },
             mam: MamState::Synced {
                 ip: mam_ip,

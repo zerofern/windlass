@@ -22,7 +22,7 @@ fn make_torrent(
         state,
         seeding_time_secs: seeding_secs,
         downloaded_bytes: downloaded,
-        mam_id: mam_id.map(MamTorrentId),
+        mam_id: mam_id.and_then(|id| MamTorrentId::try_new(id).ok()),
         seen_at: Utc::now(),
     }
 }
@@ -71,7 +71,7 @@ fn stalled_zero_bytes_emits_delete_and_blacklist() {
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::BlacklistMamId(m) if m.0 == 99))
+            .any(|a| matches!(a, Action::BlacklistMamId(m) if m.into_inner() == 99))
     );
     assert!(
         actions.iter().any(

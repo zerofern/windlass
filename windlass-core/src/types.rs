@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn cookie() -> AuthCookie {
-        AuthCookie("sid".to_string())
+        AuthCookie::new("sid".to_string())
     }
 
     #[test]

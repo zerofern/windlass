@@ -77,7 +77,7 @@ async fn add_torrent_then_list_returns_record_with_mam_id() {
 
     let found = details
         .iter()
-        .find(|d| d.mam_id == Some(MamTorrentId(99999)));
+        .find(|d| d.mam_id == Some(MamTorrentId::try_new(99999).unwrap()));
     assert!(found.is_some(), "expected torrent with mam_id=99999");
 
     let t = found.unwrap();

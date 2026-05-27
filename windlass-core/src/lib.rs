@@ -136,8 +136,7 @@ fn retire_service_orchestration(actions: Vec<Action>) -> Vec<Action> {
 const fn is_service_orchestration_action(action: &Action) -> bool {
     matches!(
         action,
-        Action::ReadPortFiles
-            | Action::AuthenticateQbit
+        Action::AuthenticateQbit
             | Action::SyncQbitPort(_, _)
             | Action::UpdateMam(_)
             | Action::CheckMamConnectability
@@ -146,7 +145,6 @@ const fn is_service_orchestration_action(action: &Action) -> bool {
                 WakeupId::QbitAuthRetry
                     | WakeupId::QbitSyncRetry
                     | WakeupId::Heartbeat
-                    | WakeupId::RetryPortRead
                     | WakeupId::TorrentCheck,
                 _
             )

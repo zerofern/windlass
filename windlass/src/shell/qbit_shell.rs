@@ -39,7 +39,7 @@ impl Shell for QbitShell {
                             }
                         }
                         other => QbitEvent::AuthFailed {
-                            reason: format!("unexpected response: {:?}", other),
+                            reason: format!("unexpected response: {other:?}"),
                         },
                     };
                     let _ = tx.send(Timed::now(event));
@@ -49,14 +49,14 @@ impl Shell for QbitShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    let event = match client.get_preferences(&cookie).await {
-                        Some(prefs) => QbitEvent::PreferencesRead {
-                            listen_port: prefs.listen_port,
-                        },
-                        None => QbitEvent::PreferencesFailed {
+                    let event = client.get_preferences(&cookie).await.map_or_else(
+                        || QbitEvent::PreferencesFailed {
                             reason: "failed to fetch preferences".to_string(),
                         },
-                    };
+                        |prefs| QbitEvent::PreferencesRead {
+                            listen_port: prefs.listen_port,
+                        },
+                    );
                     let _ = tx.send(Timed::now(event));
                 });
             }
@@ -76,7 +76,7 @@ impl Shell for QbitShell {
                         }
                         other => QbitEvent::ListenPortSetFailed {
                             port,
-                            reason: format!("unexpected response: {:?}", other),
+                            reason: format!("unexpected response: {other:?}"),
                         },
                     };
                     let _ = tx.send(Timed::now(event));
@@ -106,8 +106,9 @@ impl Shell for QbitShell {
             QbitAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
+                    let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::now(QbitEvent::TimerFired(timer)));
+                    let _ = tx.send(Timed::new(scheduled_at, QbitEvent::TimerFired(timer)));
                 });
             }
         }

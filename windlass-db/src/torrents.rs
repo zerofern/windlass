@@ -89,7 +89,9 @@ mod tests {
     async fn upsert_preserves_book_id_on_conflict() {
         let pool = test_pool().await;
         // Create a valid book first to satisfy the foreign key constraint.
-        let book_id = crate::books::upsert(&pool, MamTorrentId(42)).await.unwrap();
+        let book_id = crate::books::upsert(&pool, MamTorrentId::try_new(42).unwrap())
+            .await
+            .unwrap();
 
         let mut r = sample_row("def456");
         r.book_id = Some(book_id);

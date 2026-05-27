@@ -18,7 +18,7 @@ impl SystemState {
                 book_id: None,
                 detail: Some(format!(
                     "{{\"mam_id\":{},\"reason\":\"blacklisted\"}}",
-                    mam_id.0
+                    mam_id.into_inner()
                 )),
             }];
         }
@@ -69,7 +69,7 @@ pub fn on_torrent_added_to_qbit(
     // immediately; the compliance monitor overwrites it on the next poll.
     let record = TorrentRecord {
         hash: hash.clone(),
-        name: TorrentName(format!("mam-{}", mam_id.0)),
+        name: TorrentName(format!("mam-{}", mam_id.into_inner())),
         state: TorrentState::Downloading,
         seeding_time_secs: 0,
         downloaded_bytes: 0,
@@ -80,7 +80,7 @@ pub fn on_torrent_added_to_qbit(
         Action::SendAlert {
             priority: AlertPriority::Info,
             title: "Download started".into(),
-            body: format!("MAM torrent {} added to qBittorrent.", mam_id.0),
+            body: format!("MAM torrent {} added to qBittorrent.", mam_id.into_inner()),
         },
         Action::WriteActivity {
             source: "download".into(),
@@ -88,7 +88,8 @@ pub fn on_torrent_added_to_qbit(
             book_id: None,
             detail: Some(format!(
                 "{{\"mam_id\":{},\"hash\":\"{}\"}}",
-                mam_id.0, hash.0
+                mam_id.into_inner(),
+                hash.0
             )),
         },
         Action::UpsertTorrentRecords(vec![record]),
@@ -102,7 +103,10 @@ pub fn on_torrent_add_failed(mam_id: MamTorrentId, reason: &str) -> Vec<Action> 
         Action::SendAlert {
             priority: AlertPriority::Warning,
             title: "Download failed".into(),
-            body: format!("Failed to add MAM torrent {}: {reason}", mam_id.0),
+            body: format!(
+                "Failed to add MAM torrent {}: {reason}",
+                mam_id.into_inner()
+            ),
         },
         Action::WriteActivity {
             source: "download".into(),
@@ -110,7 +114,7 @@ pub fn on_torrent_add_failed(mam_id: MamTorrentId, reason: &str) -> Vec<Action> 
             book_id: None,
             detail: Some(format!(
                 "{{\"mam_id\":{},\"reason\":\"{reason}\"}}",
-                mam_id.0
+                mam_id.into_inner()
             )),
         },
     ]
@@ -136,7 +140,7 @@ mod tests {
             },
             qbit: QbitState::Ready {
                 port: port(),
-                cookie: AuthCookie("sid".into()),
+                cookie: AuthCookie::new("sid".to_string()),
             },
             mam: MamState::Synced {
                 port: port(),
@@ -147,7 +151,7 @@ mod tests {
     }
 
     fn mam_id() -> MamTorrentId {
-        MamTorrentId(12345)
+        MamTorrentId::try_new(12345).unwrap()
     }
 
     fn hash(s: &str) -> TorrentHash {
@@ -207,11 +211,9 @@ mod tests {
     fn happy_path_emits_fetch_and_add_torrent() {
         let state = ready_state();
         let actions = state.on_manual_download_requested(mam_id());
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::FetchAndAddTorrent { mam_id: m, .. } if m.0 == 12345))
-        );
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::FetchAndAddTorrent { mam_id: m, .. } if m.into_inner() == 12345)
+        ));
     }
 
     #[test]

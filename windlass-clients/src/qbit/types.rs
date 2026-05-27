@@ -97,7 +97,7 @@ pub fn parse_mam_id(comment: &str) -> Option<MamTorrentId> {
             .next()?
             .parse::<u64>()
             .ok()
-            .map(MamTorrentId)
+            .and_then(|id| MamTorrentId::try_new(id).ok())
     } else {
         None
     }
@@ -111,7 +111,7 @@ mod tests {
     fn parse_mam_id_t_format() {
         assert_eq!(
             parse_mam_id("https://www.myanonamouse.net/t/12345"),
-            Some(MamTorrentId(12345))
+            Some(MamTorrentId::try_new(12345).unwrap())
         );
     }
 
@@ -119,7 +119,7 @@ mod tests {
     fn parse_mam_id_tor_format() {
         assert_eq!(
             parse_mam_id("https://www.myanonamouse.net/tor/99999"),
-            Some(MamTorrentId(99999))
+            Some(MamTorrentId::try_new(99999).unwrap())
         );
     }
 
@@ -127,7 +127,7 @@ mod tests {
     fn parse_mam_id_http() {
         assert_eq!(
             parse_mam_id("http://www.myanonamouse.net/t/1"),
-            Some(MamTorrentId(1))
+            Some(MamTorrentId::try_new(1).unwrap())
         );
     }
 

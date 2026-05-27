@@ -64,8 +64,9 @@ impl Shell for VpnShell {
             VpnAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
+                    let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::now(VpnEvent::TimerFired(timer)));
+                    let _ = tx.send(Timed::new(scheduled_at, VpnEvent::TimerFired(timer)));
                 });
             }
         }

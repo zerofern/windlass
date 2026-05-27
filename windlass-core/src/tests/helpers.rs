@@ -11,7 +11,7 @@ pub fn port() -> VpnPort {
 }
 
 pub fn cookie() -> AuthCookie {
-    AuthCookie("sid=abc".into())
+    AuthCookie::new("sid=abc".to_string())
 }
 
 pub fn connected_state() -> SystemState {

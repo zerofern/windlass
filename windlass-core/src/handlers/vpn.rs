@@ -122,9 +122,17 @@ impl SystemState {
                 "VPN reconnected with new address"
             );
             true
-        } else {
+        } else if matches!(self.vpn, VpnState::AwaitingTunnel) {
             info!(ip = %ip.0, port = port.into_inner(), "VPN tunnel established");
             false
+        } else {
+            debug!(
+                vpn = %self.vpn,
+                ip = %ip.0,
+                port = port.into_inner(),
+                "Ignoring VPN files until Docker reports Gluetun healthy"
+            );
+            return vec![];
         };
         self.vpn = VpnState::Connected { ip, port };
         self.qbit = QbitState::Authenticating {

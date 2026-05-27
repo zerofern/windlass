@@ -3,7 +3,9 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
-use windlass_db_core::{DbMachine, DbResponse};
+use chrono::Utc;
+use serde_json::json;
+use windlass_db_core::{AlertRecord, DbCommand, DbMachine, DbResponse, SystemSnapshotRecord};
 use windlass_domain_core::{WindlassAction, WindlassEvent};
 use windlass_machine::{Command, Shell, Timed};
 use windlass_mam_core::{MamMachine, MamResponse};
@@ -55,6 +57,28 @@ impl Shell for DomainShell {
         match action {
             WindlassAction::Db(cmd) => {
                 let (reply_tx, _reply_rx) = oneshot::channel::<DbResponse>();
+                let _ = self.db.send((cmd, reply_tx));
+            }
+            WindlassAction::SaveSystemSnapshot(state) => {
+                let (reply_tx, _reply_rx) = oneshot::channel::<DbResponse>();
+                let cmd = DbCommand::SaveSystemSnapshot(SystemSnapshotRecord {
+                    at: Utc::now(),
+                    state: json!(state),
+                });
+                let _ = self.db.send((cmd, reply_tx));
+            }
+            WindlassAction::SendAlert {
+                priority,
+                title,
+                body,
+            } => {
+                let (reply_tx, _reply_rx) = oneshot::channel::<DbResponse>();
+                let cmd = DbCommand::RecordAlert(AlertRecord {
+                    at: Utc::now(),
+                    priority,
+                    title,
+                    body,
+                });
                 let _ = self.db.send((cmd, reply_tx));
             }
             WindlassAction::Vpn(cmd) => {

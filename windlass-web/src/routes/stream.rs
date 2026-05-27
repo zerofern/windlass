@@ -31,9 +31,9 @@ fn initial_observations(ctrl: &DebugController) -> [Observation; 2] {
     ]
 }
 
-fn obs_to_sse(obs: Observation) -> Result<SseEvent, std::convert::Infallible> {
+fn obs_to_sse(obs: &Observation) -> SseEvent {
     let json = serde_json::to_string(&obs).unwrap_or_default();
-    Ok(SseEvent::default().event("observation").data(json))
+    SseEvent::default().event("observation").data(json)
 }
 
 async fn stream_handler(
@@ -44,9 +44,17 @@ async fn stream_handler(
     // client may receive a duplicate StateSnapshot, which is harmless.
     let rx = app.observations.subscribe();
 
-    let initial = stream::iter(initial_observations(&app.debug_ctrl).map(obs_to_sse));
+    let initial = stream::iter(
+        initial_observations(&app.debug_ctrl)
+            .into_iter()
+            .map(|obs| obs_to_sse(&obs))
+            .map(Ok),
+    );
 
-    let live = BroadcastStream::new(rx).filter_map(|msg| async move { msg.ok().map(obs_to_sse) });
+    let live = BroadcastStream::new(rx).filter_map(|msg| async move {
+        msg.ok()
+            .map(|obs| Ok::<_, std::convert::Infallible>(obs_to_sse(&obs)))
+    });
 
     Sse::new(initial.chain(live)).keep_alive(KeepAlive::default())
 }
