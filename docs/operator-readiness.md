@@ -259,7 +259,7 @@ MAM-specific core.
 
 ## Story: Move Domain Core Onto Service Runtime
 
-Status: To Do
+Status: Done
 
 ### Problem
 

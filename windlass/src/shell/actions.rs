@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{ShellContext, service::ServiceAction, service_debug::service_timer_wakeup};
+use super::{ShellContext, service::ServiceAction};
 use chrono::Utc;
 use tokio::sync::oneshot;
 use uom::si::information::byte;
@@ -29,9 +29,6 @@ impl ShellContext<'_> {
     pub(super) fn execute_service_action(&mut self, action: ServiceAction, _causal_tx: CausalTx) {
         match action {
             ServiceAction::Db(_) => {}
-            ServiceAction::ScheduleTimer { timer, after } => {
-                self.schedule_wakeup(service_timer_wakeup(timer), after);
-            }
         }
     }
 

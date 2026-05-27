@@ -3,6 +3,7 @@ mod compliance;
 mod config;
 mod db_shell;
 mod dequeue;
+mod domain_shell;
 mod download;
 mod init;
 mod mam_shell;
@@ -123,34 +124,21 @@ pub async fn run(
             db_command_tx: &db_command_tx,
         };
 
-        let db_pub_actions = service_cores.drain_db_publishes();
-        for action in &db_pub_actions {
-            dispatch_service_db_action(&db_command_tx, action);
-        }
-        execute_service_actions_if_enabled(execute_service_actions, db_pub_actions, &tx, &mut ctx);
+        service_cores.drain_db_publishes();
+        service_cores.drain_vpn_publishes();
+        service_cores.drain_qbit_publishes();
+        service_cores.drain_mam_publishes();
 
-        let vpn_pub_actions = service_cores.drain_vpn_publishes();
-        for action in &vpn_pub_actions {
-            dispatch_service_db_action(&db_command_tx, action);
-        }
-        execute_service_actions_if_enabled(execute_service_actions, vpn_pub_actions, &tx, &mut ctx);
-
-        let qbit_pub_actions = service_cores.drain_qbit_publishes();
-        for action in &qbit_pub_actions {
+        let domain_pub_actions = service_cores.drain_domain_publishes();
+        for action in &domain_pub_actions {
             dispatch_service_db_action(&db_command_tx, action);
         }
         execute_service_actions_if_enabled(
             execute_service_actions,
-            qbit_pub_actions,
+            domain_pub_actions,
             &tx,
             &mut ctx,
         );
-
-        let mam_pub_actions = service_cores.drain_mam_publishes();
-        for action in &mam_pub_actions {
-            dispatch_service_db_action(&db_command_tx, action);
-        }
-        execute_service_actions_if_enabled(execute_service_actions, mam_pub_actions, &tx, &mut ctx);
 
         dispatch_event(
             outcome.actions,

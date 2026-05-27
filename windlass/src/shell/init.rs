@@ -17,12 +17,14 @@ use windlass_local::{docker, vpn_files};
 use windlass_types::WakeupId;
 
 use windlass_db_core::{DbMachine, DbPublish, DbTopic};
+use windlass_domain_core::{WindlassConfig, WindlassMachine, WindlassPublish, WindlassTopic};
 use windlass_mam_core::{MamConfig, MamMachine, MamPublish, MamTopic};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
 use super::db_shell::DbShell;
+use super::domain_shell::{DomainShell, DomainShellConfig};
 use super::mam_shell::MamShell;
 use super::qbit_shell::QbitShell;
 use super::service::ServiceCores;
@@ -200,8 +202,30 @@ pub(super) async fn init_shell(
         ))
         .expect("mam pub subscription");
 
+    let (domain_handles, _domain_join) = windlass_machine::spawn::<WindlassMachine, DomainShell>(
+        WindlassConfig {
+            snapshot_interval: Duration::from_secs(config.compliance_poll_interval_secs),
+        },
+        DomainShellConfig {
+            db: db_handles.commands.clone(),
+            vpn: vpn_handles.commands.clone(),
+            qbit: qbit_handles.commands.clone(),
+            mam: mam_handles.commands.clone(),
+        },
+    )
+    .await;
+    let (domain_pub_tx, domain_pub_rx) = mpsc::channel::<WindlassPublish>(128);
+    domain_handles
+        .subscribe
+        .send((
+            vec![WindlassTopic::SystemState, WindlassTopic::Activity],
+            domain_pub_tx,
+        ))
+        .expect("domain pub subscription");
+
     let service_cores = ServiceCores::new(
-        Duration::from_secs(config.compliance_poll_interval_secs),
+        domain_handles,
+        domain_pub_rx,
         db_handles,
         db_pub_rx,
         vpn_handles,
