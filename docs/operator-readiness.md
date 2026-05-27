@@ -56,6 +56,7 @@ Implement these stories one at a time, in this order:
 29. Enforce fail-closed download admission control (composite gate).
 30. Block MAM automation on VPN IP non-compliance.
 31. Make dependent-container orchestration safe under Gluetun.
+32. Fully port legacy `windlass-core` to the per-system cores and remove it.
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -1110,3 +1111,70 @@ isolation.
   restart window counter, and incident identity).
 - The static VPN IP compliance gate is its own story (§30); this story consumes
   the compliance signal but does not own it.
+
+## Story: Fully Port Legacy `windlass-core` To Per-System Cores And Remove It
+
+Status: To Do
+
+### Problem
+
+The operator's live decision-maker is still the legacy monolith
+`windlass-core::SystemState`. The new per-system `Machine` cores
+(`VpnMachine`, `QbitMachine`, `MamMachine`, `DbMachine`, `WindlassMachine`)
+exist and were each moved onto the generic service runtime (stories 2-9), but
+they currently run in **shadow**: the shell loop calls
+`service_cores.observe(&event)` for them while it dispatches the *legacy*
+`SystemState::process_event` actions as the real ones.
+
+Concretely, all of `windlass-core/src/handlers/` (`vpn`, `qbit`, `mam`,
+`monitoring`, `compliance`, `download`) still owns live behavior. The
+compliance handler in particular runs the whole torrent pass in one
+DB-persisting step (HnR lock, dead-torrent cleanup, no-partials, quota,
+active-limit, HnR-at-risk alerts) and writes the `torrents` rows that the
+`/api/v1/torrents` endpoint and the Torrent Monitor UI read. Until the live
+loop runs on the new cores and the legacy crate is deleted, the operator runs
+on un-migrated code and the new cores' invariants/property tests do not protect
+production behavior.
+
+### User Story
+
+As the maintainer, I want the live operator to run entirely on the new
+per-system cores with `windlass-core` removed from the workspace, so there is a
+single source of truth for operator behavior and the invariant/property tests
+actually guard what runs in production.
+
+### Acceptance Criteria
+
+- The shell event loop dispatches the actions produced by the new cores (the
+  domain runtime and the per-system service runtimes), not
+  `windlass-core::SystemState`.
+- Every decision in the `windlass-core` handlers (`vpn`, `qbit`, `mam`,
+  `monitoring`, `compliance`, `download`) has an equivalent in the appropriate
+  new core, each covered by tests.
+- The torrent persistence that backs `/api/v1/torrents` (and the HnR fields the
+  UI shows) is produced through the new architecture (qBit core → DB core), so
+  the Torrent Monitor keeps working after legacy removal.
+- The `service_cores.observe(...)` shadow path is replaced by the new cores
+  being the live decision-makers; no event is processed by both legacy and new
+  logic at once (no double deletes, alerts, or DB writes).
+- The `windlass-core` crate is removed from the workspace and no crate depends
+  on it.
+- Debug mode (event/action history, replay, pause, breakpoints) works against
+  the new cores.
+- `just check` passes, the frontend build passes, and `just integration`
+  passes.
+
+### Implementation Notes
+
+- This is the capstone of the per-system migration: stories 2-9 moved each core
+  onto the service runtime in shadow, and the per-feature stories (§§19-26,
+  §23, §30, §31) build the torrent/download/compliance/orchestration decisions
+  in the new cores. This story flips the live loop onto those cores and deletes
+  the legacy crate.
+- Sequence the flip *after* the per-feature decision stories have reached
+  behavior parity in the new cores, so the cutover does not regress live
+  behavior or run both paths.
+- The biggest cutover risk is the coupled compliance/torrent pass: move the
+  whole torrent-details pipeline (fetch → new core → DB upsert → UI read) in one
+  coordinated step rather than per-decision, to avoid legacy and new cores both
+  acting on the same torrent list.
