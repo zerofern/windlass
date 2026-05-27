@@ -333,7 +333,7 @@ external subscribers.
 
 ## Story: Property-Test Scaffolding And Already-Implemented Core Invariants
 
-Status: To Do
+Status: Done
 
 ### Problem
 

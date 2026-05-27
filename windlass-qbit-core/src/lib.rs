@@ -606,7 +606,9 @@ mod prop_tests {
     use windlass_machine::{Machine, Timed};
     use windlass_types::{AuthCookie, TorrentHash, VpnPort};
 
-    use crate::{QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish, QbitTimer};
+    use crate::{
+        QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish, QbitTimer,
+    };
 
     fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
         (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
@@ -629,21 +631,23 @@ mod prop_tests {
             proptest::option::of(any_vpn_port()),
             any::<bool>(),
         )
-            .prop_map(|(cookie, listen_port, desired_listen_port, refresh_scheduled)| {
-                let mut machine = QbitMachine::new(
-                    QbitConfig {
-                        auth_retry: Duration::from_secs(1),
-                        sync_retry: Duration::from_secs(2),
-                        torrent_refresh: Duration::from_secs(30),
-                    },
-                    Instant::now(),
-                );
-                machine.cookie = cookie;
-                machine.listen_port = listen_port;
-                machine.desired_listen_port = desired_listen_port;
-                machine.refresh_scheduled = refresh_scheduled;
-                machine
-            })
+            .prop_map(
+                |(cookie, listen_port, desired_listen_port, refresh_scheduled)| {
+                    let mut machine = QbitMachine::new(
+                        QbitConfig {
+                            auth_retry: Duration::from_secs(1),
+                            sync_retry: Duration::from_secs(2),
+                            torrent_refresh: Duration::from_secs(30),
+                        },
+                        Instant::now(),
+                    );
+                    machine.cookie = cookie;
+                    machine.listen_port = listen_port;
+                    machine.desired_listen_port = desired_listen_port;
+                    machine.refresh_scheduled = refresh_scheduled;
+                    machine
+                },
+            )
     }
 
     fn any_qbit_event() -> impl Strategy<Value = QbitEvent> {
