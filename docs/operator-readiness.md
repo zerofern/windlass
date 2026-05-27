@@ -32,7 +32,7 @@ Implement these stories one at a time, in this order:
 7. Move the MAM core onto the service runtime.
 8. Move the domain core onto the service runtime.
 9. Replace the direct publish bridge with typed subscriptions.
-10. Add property-based tests for operator invariants.
+10. Add property-test scaffolding and cover already-implemented core invariants.
 11. Automatically donate to the pot on every pot cycle.
 12. Make the dashboard and chaos page use one shared state display model.
 13. Keep route state and background data fresh when tabs/pages are not active.
@@ -53,6 +53,9 @@ Implement these stories one at a time, in this order:
 26. Gate new downloads on upload health (ratio and credit buffer).
 27. Keep the MAM account alive with a routine homepage heartbeat.
 28. Distinguish MAM `Unreachable` from `NotConnectable`.
+29. Enforce fail-closed download admission control (composite gate).
+30. Block MAM automation on VPN IP non-compliance.
+31. Make dependent-container orchestration safe under Gluetun.
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -328,48 +331,124 @@ external subscribers.
 - Tests cover that `VpnPublish::PortReady` causes domain commands for qBit and
   MAM through the subscription path.
 
-## Story: Add Property-Based Tests For Operator Invariants
+## Story: Property-Test Scaffolding And Already-Implemented Core Invariants
 
 Status: To Do
 
 ### Problem
 
-The operator is becoming a set of small state machines connected by typed
+The operator is a set of small `Machine` state machines connected by typed
 messages. Example-based tests cover specific workflows, but they do not explore
 large event sequences, repeated retries, duplicated publishes, timer races, or
-unusual interleavings between VPN, qBit, MAM, DB, and domain events.
+unusual interleavings.
 
-Property-based tests are needed to prove core invariants stay true across many
-generated event sequences.
+This story does two things: it establishes the reusable property-test
+scaffolding each core needs, and it backfills property tests for the invariants
+that are **already implemented** and catalogued in `docs/invariants.md`
+(VPN-1..7, QBIT-1..7, MAM-1..6, DB-1..3, DOM-1..7). Invariants added by later
+stories are tested **within those stories** using this scaffolding, not here.
 
 ### User Story
 
-As the maintainer, I want property-based tests for the operator cores and
-runtime, so large refactors do not accidentally break safety invariants.
+As the maintainer, I want property-test scaffolding plus coverage of the
+currently-implemented core invariants, so the existing machines are protected
+against regressions and future invariant stories have a harness to build on.
 
 ### Acceptance Criteria
 
-- Add property-based tests for each external-system machine: VPN, qBit, MAM,
-  DB, and domain.
-- Add property-based tests for the generic service runtime once it exists.
-- Generated event sequences must never panic.
-- Generated event sequences must keep machines in valid states.
-- qBit and MAM convergence commands are eventually re-issued after retryable
-  failures while desired state is still known.
-- Domain policy never commands qBit or MAM to converge on a port when VPN has
-  no forwarded port.
-- DB failure handling does not recurse indefinitely.
-- Debug-mode replay/step behavior preserves machine determinism once debug mode
-  is integrated into the runtime.
-- Property tests run as part of `just check` unless they become too slow; if so,
-  add a separate explicit recipe and document when to run it.
+- Add `proptest` as a dev-dependency to each core crate that gains tests
+  (`windlass-vpn-core`, `windlass-qbit-core`, `windlass-mam-core`,
+  `windlass-db-core`, `windlass-domain-core`).
+- Per crate, add inline `#[cfg(test)]` property tests next to the existing
+  example tests, with crate-local generators for that machine's `Event` and
+  `Command` (primitive strategies for shared `windlass-types` are duplicated
+  per crate — no shared strategy crate for now).
+- Primary test style is **direct `(state, event)` generation**: generate a
+  machine state (via a `#[cfg(test)]` from-parts constructor), generate an event
+  or command, run `handle` / `handle_command` once, and assert the invariants on
+  the outcome and post-state. This covers the full `(state × event)` cross-
+  product, including states a fixed event history would rarely reach.
+- Each machine exposes a test-only constructor that builds its state from parts
+  (its fields are private), plus a state `Strategy`.
+- Sequence-folding from `Machine::new` is kept as a **secondary** tool for the
+  few genuinely history-shaped properties; it is no longer the default.
+- Generic baseline per machine: no generated `(state, event)` panics.
+- Backfill property tests for every invariant currently in `docs/invariants.md`,
+  expressed as per-step output assertions where possible. The high-value targets
+  are DOM-1 (no port-converge command without a forwarded port), QBIT-1
+  (no cookie-bearing action while unauthenticated), QBIT-4 / MAM-1 (never
+  advertise a port that disagrees with the desired target), and DB-3 (DB failure
+  handling emits no action, so it cannot recurse).
+- Tests run as part of `just check` (via `cargo test`); keep proptest case
+  counts and any folded-sequence lengths modest. Add a separate recipe only if
+  they become slow.
+
+### Testing Approach
+
+**Layer.** There is no single global `SystemState` in the new architecture, so
+tests target two layers: each of the five machines individually (per-machine
+invariants on its own small state), and the **domain machine** for cross-system
+policy (it receives the other machines' publishes as events). No composed
+multi-machine harness and no tests against the legacy `SystemState` (it is
+retiring).
+
+**Three invariant classes** (every catalogued invariant is one of these):
+
+- *Hard safety* — must never be violated. Asserted on the outcome/post-state of a
+  single generated `(state, event)` step (e.g. DOM-1, QBIT-1).
+- *State-machine* — lifecycle transitions stay valid. Asserted as "this state
+  field only changes via its allowed event" (e.g. `cookie` becomes `Some` only on
+  `AuthSucceeded`).
+- *Policy* — choose the conservative action under uncertainty / fail closed
+  (e.g. no redundant write when already converged; unknown ⇒ don't act). Mostly
+  domain-machine and the future admission gate.
+
+**Total vs reachable-only — the key classification.** Direct state generation can
+produce states the machine could never actually reach, so each invariant is
+labelled:
+
+- *Total* — must hold for **any** state, even an impossible one. Most safety/
+  output invariants are total (they constrain what the handler emits, regardless
+  of history): DOM-1, QBIT-1, QBIT-4/MAM-1, DB-3. → tested against a
+  **fully-arbitrary** state generator (every field combination, including
+  unreachable ones).
+- *Reachable-only* — only meaningful on states the machine can be in (some
+  lifecycle/transition claims). → tested against a **valid-by-construction**
+  generator that emits only plausible states.
+
+When a *total* property fails only on an unreachable state, that is precisely the
+story-18 fork: either make the machine defend (keep it total) or scope the
+property to valid states because the shell guarantees reachability.
+
+**Generator tiers map onto the two generators:** Tier A (valid) and Tier B
+(messy-but-possible field combos) are the valid-by-construction generator; the
+fully-arbitrary generator extends into Tier C *state*. Genuinely malformed Tier C
+*data* (ratio NaN, unknown API enum, forbidden LLM output) stays unrepresentable
+in these `nutype`/enum-typed machines and is deferred to the parse/boundary layer
+and the later stories that add rich operator state.
 
 ### Implementation Notes
 
-- Use focused state/event generators instead of arbitrary JSON payloads.
-- Keep properties tied to operator safety: no unsafe deletes, no port sync
-  without VPN port, no retry storms, no invalid service state transitions.
-- Prefer shrinking-friendly event enums and small sequence lengths at first.
+- Direct `(state, event)` generation is the default because it covers the full
+  cross-product; the false-positive risk is handled by the total/reachable-only
+  classification above (total invariants welcome impossible states; reachable-only
+  ones use the valid-by-construction generator). Folding is reserved for the few
+  history-shaped properties.
+- Each machine needs a `#[cfg(test)]` from-parts constructor since its fields are
+  private — this is the main code change direct generation requires.
+- Small enumerable input shapes are clearer as **example unit tests** than as
+  properties — e.g. `VpnEvent::StateRead`'s four `connected × port` combinations
+  each get an explicit test asserting the exact publishes (this is also where the
+  disconnected-with-port shell-contract edge from story 18 is pinned).
+- The four external-system cores ignore `now` in `handle`, so pass a fixed
+  `Instant`; assert on output *shape*, not the `Utc::now()` timestamps embedded
+  in snapshot/DB actions.
+- Two small per-crate helpers keep property bodies readable: a one-shot
+  `run(state, event)` and, for the secondary style, a `fold(events)`.
+- Out of scope (deferred): property tests for the async `ServiceRuntime` (RT-*),
+  the liveness invariants (qBit/MAM convergence eventually re-issued), and
+  debug-mode replay/step determinism. These wait until the runtime/debug
+  integration is ready; the pure machine layer is where proptest pays off first.
 
 ## Story: Automatically Donate To The Pot On Every Pot Cycle
 
@@ -460,8 +539,8 @@ machines are robust without that assumption.
 
 ### Implementation Notes
 
-- This decision directly shapes story 10's generators: defending means
-  unconstrained generators; trusting means the generators must encode the
+- This decision directly shapes the core property-test generators: defending
+  means unconstrained generators; trusting means the generators must encode the
   contract.
 - Prefer the cheaper option unless defending removes a real class of operator
   risk.
@@ -497,9 +576,21 @@ behalf.
   for any state or event sequence.
 - The deletion decision lives in the core, not the shell; the shell only
   executes the typed delete action the core authorises.
-- Add the new invariant(s) to `docs/invariants.md` and cover them with
-  property-based tests (story 10): no generated sequence produces a delete
-  action for an HnR-unsatisfied torrent.
+- Add the new invariant(s) to `docs/invariants.md` and cover them with a
+  property test in the owning core crate (reusing the scaffolding from story 10):
+  no generated sequence produces a delete action for an HnR-unsatisfied torrent.
+
+Core invariant (property test):
+
+```
+for every known torrent t:
+  if t.downloaded_bytes > 0 and t.seed_time < 72h
+  then no emitted action is Action::DeleteTorrent { hash } with hash == t.hash
+```
+
+This must hold under *any* event, including: disk critically low, qBit queue
+full, user-requested disk cleanup, torrent stalled, VPN broken, free space
+negative, and a huge download queue.
 
 ### Implementation Notes
 
@@ -534,6 +625,16 @@ cleanup never throws away real progress or triggers HnR.
 - The decision lives in the core; the shell executes the typed action.
 - Add the invariant to `docs/invariants.md` and cover it with property tests.
 
+Core invariant (property test):
+
+```
+if an emitted action is Action::DeleteTorrent { hash } for torrent t
+then t.downloaded_bytes == 0 or t.seed_time >= required_seed_time
+```
+
+i.e. automatic deletion is allowed only for a zero-byte torrent or one that is
+already HnR-satisfied; forbidden in every other case.
+
 ## Story: Force qBittorrent To Download Every File In A Torrent
 
 Status: To Do
@@ -563,6 +664,13 @@ rules.
   priority call.
 - Add the invariant to `docs/invariants.md` and cover it with property tests.
 
+Core invariant (property test):
+
+```
+for any Action::AddTorrent { file_selection, .. } for a MAM torrent:
+  file_selection == FileSelection::All   (never FileSelection::Partial)
+```
+
 ## Story: Rank And Gate Disk Auto-Eviction By HnR-Satisfied Deletion Value
 
 Status: To Do
@@ -590,17 +698,39 @@ must keep seeding.
   + longest time since last play first); HnR-unsatisfied torrents are never
   eligible.
 - Eviction stops once free space is back above the floor (no over-deletion).
+- Deleting a torrent's media files never cascades to its history: no
+  `Action::DeleteReadingLedger` or `Action::DeleteReview` is emitted alongside a
+  media delete. Preferably this is structural (no such action exists).
 - The decision lives in the core; the shell executes deletes.
 - Add the invariant to `docs/invariants.md` and cover it with property tests:
   eviction never targets an HnR-unsatisfied torrent and never deletes more than
   needed to clear the floor.
+
+Core invariants (property test):
+
+```
+# Disk pressure never overrides the HnR lock
+if disk_free_bytes < hard_floor:
+  eviction candidates exclude every torrent where
+    downloaded_bytes > 0 and seed_time < 72h
+
+# Proactive deletion-suggestion list respects deletion-value ordering
+for any adjacent pair (left, right) in deletion_suggestions:
+  rank_class(left) <= rank_class(right)   # lower rank == more deletable
+```
+
+Deletion-value rank classes (most → least deletable): (1) completed + low
+rating (≤2★) + HnR-satisfied, (2) DNF + HnR-satisfied, (3) completed + high
+rating but long since listened + HnR-satisfied, (4) unstarted + long wait + low
+AI score.
 
 ### Implementation Notes
 
 - This depends on the HnR seed-time lock story for the satisfied/unsatisfied
   classification.
 - The user-directed (proactive) deletion-suggestion flow is separate operator-UI
-  work; this story is only the silent emergency brake.
+  work; this story is only the silent emergency brake, but the ordering
+  invariant above applies wherever the suggestion list is built.
 
 ## Story: Auto-Revert Banned qBittorrent Privacy Settings
 
@@ -697,6 +827,13 @@ my quota.
   cover it with property tests: no new automated download is started while the
   unsatisfied count is at or above the limit.
 
+Core invariant (property test):
+
+```
+if unsatisfied_count >= class_limit
+then no emitted action is Action::AddTorrent
+```
+
 ## Story: Gate New Downloads On Upload Health
 
 Status: To Do
@@ -724,6 +861,17 @@ operator never erodes my account health.
 - The gate is released when both metrics recover.
 - The decision lives in the core; add the invariant to `docs/invariants.md` and
   cover it with property tests.
+
+Core invariant (property test):
+
+```
+if candidate.freeleech == false
+and (global_ratio < 2.0 or upload_buffer_gb < 25)
+then no emitted action is Action::AddTorrent
+```
+
+Freeleech bypasses *only* the ratio portion — it never bypasses the HnR, disk,
+qBit-privacy, port-sync, VPN-IP-compliance, or freeleech-timing gates.
 
 ## Story: Keep The MAM Account Alive With A Routine Homepage Heartbeat
 
@@ -782,3 +930,179 @@ issue.
   is surfaced as a genuine connectivity problem.
 - Update `docs/invariants.md` for the refined MAM connectability model and cover
   the distinction with tests.
+
+## Story: Enforce Fail-Closed Download Admission Control
+
+Status: To Do
+
+### Problem
+
+Most operator tracker-safety rules share one shape: *do not autonomously add a
+torrent while some unsafe condition holds*. Today the operator cores have no
+`Action::AddTorrent` at all, so there is nowhere these preconditions are
+enforced. Scattering them across feature code risks one path forgetting a gate.
+
+The safe design is a single fail-closed admission predicate: an autonomous
+download is emitted **only if every gate passes**. If any gate is unknown or
+false, the default is to *not* download.
+
+### User Story
+
+As the operator user, I want autonomous downloads to be admitted only when every
+tracker-safety, network, and account condition is satisfied, so the operator
+fails closed and never snatches under an unsafe condition.
+
+### Acceptance Criteria
+
+- The core owns one admission decision that gates every autonomous
+  `Action::AddTorrent`. The decision lives in the core; the shell only executes
+  an authorised add.
+- The admission predicate is fail-closed: a gate whose input is unknown/stale
+  counts as *not satisfied*.
+- The following gates are each enforced (cross-referencing their own stories
+  where they have one):
+  - **Upload health / ratio** — non-freeleech requires `ratio ≥ 2.0` and
+    `buffer ≥ 25 GB` (§26).
+  - **Unsatisfied quota** — `unsatisfied_count < class_limit` (§25).
+  - **qBit privacy clean** — `!(dht || pex || lsd)` enabled (§23).
+  - **qBit port synced** — `qbit.listen_port == gluetun.forwarded_port`.
+  - **MAM healthy** — `mam_health == Healthy`, where `MamHealth ∈ {Healthy,
+    AuthFailed, RateLimited, Unreachable, ParseChanged, Stale}`; only `Healthy`
+    permits a snatch (composes the §27/§28 health signals).
+  - **VPN IP compliant** — `observed_vpn_ip == expected_vpn_ip` (§30); this gate
+    beats every other signal, freeleech included.
+  - **Not already-snatched** — `candidate.my_snatched == false` *(owned by
+    downloader/librarian discovery work; consumed here as an external gate)*.
+  - **Not a collection** — `numfiles <= 20` unless `source == ManualMamUrl`
+    *(owned by downloader/librarian discovery work)*.
+  - **Freeleech window fits** — `now + est_download_duration + safety_buffer <=
+    freeleech_window_end` for freeleech candidates *(owned by
+    downloader/librarian discovery work)*.
+- When a gate blocks, the allowed outcomes are limited to non-snatch actions
+  (e.g. skip, `RequestManualReview`, `RejectCandidate`, `BlockDownloads`,
+  `FixQbitPrivacy`, `FireAlert`) — never an autonomous add.
+- Add the composite invariant to `docs/invariants.md` and cover it with property
+  tests.
+
+Core invariant (property test):
+
+```
+# Composite, fail-closed: an autonomous add implies every gate held.
+if an emitted action is Action::AddTorrent(c)
+then upload_health_ok(c) and under_quota() and qbit_privacy_clean()
+ and qbit_port_synced() and mam_health == Healthy and vpn_ip_compliant()
+ and !c.my_snatched and (c.numfiles <= 20 or c.source == ManualMamUrl)
+ and freeleech_window_fits(c)
+
+# And the contrapositive: any single gate false => no autonomous add.
+```
+
+### Implementation Notes
+
+- Implement each gate in its own story (§§23, 25, 26, 30, plus the pending
+  discovery rules); this story is the composite predicate and the single
+  enforcement point that ANDs them together.
+- Manual, user-initiated downloads are out of scope for the *autonomous* gate,
+  but the UI must still warn explicitly where a gate would have blocked.
+
+## Story: Block MAM Automation On VPN IP Non-Compliance
+
+Status: To Do
+
+### Problem
+
+MAM Rule 1.2 locks Gluetun to a single static server IP registered with MAM
+staff. If the observed VPN IP drifts from the registered one, continuing MAM
+automation risks a compliance violation. The spec says Windlass monitors the IP
+and alerts, but there is no rule that *blocks* automation on a mismatch, and the
+VPN core does not yet compare observed vs expected IP.
+
+### User Story
+
+As the operator user, I want all MAM automation to stop immediately if my VPN IP
+no longer matches the IP registered with MAM, so a VPN server change can never
+put my account out of compliance.
+
+### Acceptance Criteria
+
+- The VPN core knows the expected (registered) IP and the observed public IP.
+- On mismatch, the core blocks all MAM automation — most importantly it is a
+  hard gate in download admission (§29) that beats every other signal, freeleech
+  included.
+- A mismatch fires a `Critical` alert.
+- The block clears only when the observed IP matches the expected IP again.
+- Add the invariant to `docs/invariants.md` and cover it with property tests.
+
+Core invariant (property test):
+
+```
+if observed_vpn_ip != expected_vpn_ip
+then no emitted action is Action::AddTorrent   (and a Critical alert is expected)
+```
+
+## Story: Make Dependent-Container Orchestration Safe Under Gluetun
+
+Status: To Do
+
+### Problem
+
+qBittorrent, MLM, and Mousehole share Gluetun's network namespace. Several
+orchestration hazards are not yet modelled by the operator: a dependent
+container that started before the current healthy Gluetun instance may be on a
+stale namespace; dependents must not start before the VPN is healthy and
+compliant; restart loops can storm; and a single incident can spew duplicate
+crash dumps. These are grouped because they are one orchestration concern.
+
+### User Story
+
+As the operator user, I want stack orchestration to be safe under Gluetun — no
+trusting stale namespaces, no premature starts, no restart storms, and no
+crash-dump spam — so VPN/Docker edge cases never silently break my network
+isolation.
+
+### Acceptance Criteria
+
+- **Gluetun root / stale namespace:** a dependent whose `started_at` predates the
+  current healthy Gluetun instance is treated as untrusted and a restart of that
+  dependent is eventually emitted.
+
+  ```
+  if dependent.started_at < gluetun.healthy_since
+  then dependent.network_trusted == false
+       and Action::RestartContainer(dependent) is eventually emitted
+  ```
+
+- **No premature start:** dependents are not started while Gluetun is unhealthy
+  or the VPN IP is non-compliant.
+
+  ```
+  if !gluetun.healthy or !vpn_ip_compliant
+  then no Action::StartContainer(dependent)
+       (allowed: RestartGluetun, Wait, FireAlert, WriteCrashDump)
+  ```
+
+- **Restart circuit breaker:** the stack is not restarted indefinitely.
+
+  ```
+  if restarts_in_window >= max_restarts_per_window
+  then no Action::RestartContainer and Action::FireAlert(Critical)
+  ```
+
+- **Crash dump once per incident:** at most one crash dump per incident.
+
+  ```
+  for one incident_id: count(Action::WriteCrashDump) <= 1
+  ```
+
+- All decisions live in the core; the shell performs Docker operations.
+- Add these invariants to `docs/invariants.md` and cover them with property
+  tests, including sequences that would otherwise storm restarts or duplicate
+  dumps.
+
+### Implementation Notes
+
+- This expands the VPN/Gluetun core well beyond its current connectivity + port
+  scope (it must track per-dependent start times, Gluetun `healthy_since`, a
+  restart window counter, and incident identity).
+- The static VPN IP compliance gate is its own story (§30); this story consumes
+  the compliance signal but does not own it.
