@@ -236,9 +236,11 @@ impl Machine for QbitMachine {
             },
             QbitEvent::ListenPortSet { port } => {
                 self.listen_port = Some(port);
+                // Route through the desired-port filter so QBIT-4 holds for any
+                // event, not just well-formed shell events. (Story 18.)
                 Outcome {
                     actions: Vec::new(),
-                    publish: vec![QbitPublish::ListenPortReady { port }],
+                    publish: self.listen_port_publish(Some(port)),
                 }
             }
             QbitEvent::TorrentsListed { hashes } => Outcome {
@@ -525,6 +527,34 @@ mod tests {
     }
 
     #[test]
+    fn listen_port_set_filters_mismatched_desired_port() {
+        // QBIT-4 / story 18: with desired=X, a ListenPortSet { port: Y } where Y != X
+        // must NOT publish ListenPortReady, even though it records the port. (Dishonest
+        // shell event defense — the machine filters through the desired-port gate.)
+        let mut machine = machine();
+        let desired = VpnPort::try_new(51_820).unwrap();
+        let other = VpnPort::try_new(42_000).unwrap();
+
+        // Set a desired port without authenticating (command records state regardless).
+        let _ = machine.handle_command(
+            Instant::now(),
+            QbitCommand::EnsureListenPort { port: desired },
+        );
+
+        let out = handle(&mut machine, QbitEvent::ListenPortSet { port: other });
+
+        assert_eq!(
+            machine.listen_port(),
+            Some(other),
+            "listen_port must still be recorded"
+        );
+        assert!(
+            out.publish.is_empty(),
+            "must not publish ListenPortReady when port != desired_listen_port"
+        );
+    }
+
+    #[test]
     fn torrent_refresh_timer_round_trips() {
         // Phase 1: AuthSucceeded schedules the TorrentRefresh timer.
         let mut machine = machine();
@@ -727,22 +757,13 @@ mod prop_tests {
 
         // QBIT-4 (Guarantee C): every published ListenPortReady carries a port
         // that agrees with the desired target (or there is no desired target).
-        // The ListenPortSet event is constrained to the shell contract — it only
-        // ever carries the desired port (it is the success of a SetListenPort the
-        // machine issued). See operator-readiness story 18.
+        // The machine now defends against dishonest ListenPortSet events (story
+        // 18), so the generator is fully unconstrained — no shell-contract
+        // rewrite needed.
         #[test]
         fn listen_port_ready_matches_desired(
-            (mut machine, event) in (any_qbit_machine(), any_qbit_event()).prop_map(
-                |(machine, event)| {
-                    let event = match (event, machine.desired_listen_port) {
-                        (QbitEvent::ListenPortSet { .. }, Some(port)) => {
-                            QbitEvent::ListenPortSet { port }
-                        }
-                        (other, _) => other,
-                    };
-                    (machine, event)
-                }
-            ),
+            mut machine in any_qbit_machine(),
+            event in any_qbit_event(),
         ) {
             let out = machine.handle(Instant::now(), Timed::now(event));
             for publish in &out.publish {

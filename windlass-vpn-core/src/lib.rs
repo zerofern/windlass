@@ -163,18 +163,23 @@ impl Machine for VpnMachine {
             }
             VpnEvent::StateRead { connected, port } => {
                 self.connected = connected;
-                self.port = port;
-                let mut publish = vec![if connected {
-                    VpnPublish::Connected
+                if connected {
+                    self.port = port;
+                    let port_publish = port.map_or(VpnPublish::PortUnavailable, |p| {
+                        VpnPublish::PortReady { port: p }
+                    });
+                    Outcome {
+                        actions: Vec::new(),
+                        publish: vec![VpnPublish::Connected, port_publish],
+                    }
                 } else {
-                    VpnPublish::Disconnected
-                }];
-                publish.push(port.map_or(VpnPublish::PortUnavailable, |port| {
-                    VpnPublish::PortReady { port }
-                }));
-                Outcome {
-                    actions: Vec::new(),
-                    publish,
+                    // A disconnected VPN never holds a forwarded port, regardless
+                    // of what the shell reports. Mirror ContainerUnhealthy (VPN-1).
+                    self.port = None;
+                    Outcome {
+                        actions: Vec::new(),
+                        publish: vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable],
+                    }
                 }
             }
             VpnEvent::StateReadFailed { .. } => Outcome {
@@ -351,6 +356,100 @@ mod tests {
 
         assert_eq!(out.actions, vec![VpnAction::InspectContainer]);
         assert!(out.publish.is_empty());
+    }
+
+    // StateRead four-shape tests (story 18 / VPN-4).
+
+    #[test]
+    fn state_read_connected_with_port_publishes_connected_and_port_ready() {
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+
+        let out = handle(
+            &mut machine,
+            VpnEvent::StateRead {
+                connected: true,
+                port: Some(port),
+            },
+        );
+
+        assert!(machine.is_connected());
+        assert_eq!(machine.port(), Some(port));
+        assert_eq!(
+            out.publish,
+            vec![VpnPublish::Connected, VpnPublish::PortReady { port }]
+        );
+        assert!(out.actions.is_empty());
+    }
+
+    #[test]
+    fn state_read_connected_without_port_publishes_connected_and_port_unavailable() {
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            VpnEvent::StateRead {
+                connected: true,
+                port: None,
+            },
+        );
+
+        assert!(machine.is_connected());
+        assert_eq!(machine.port(), None);
+        assert_eq!(
+            out.publish,
+            vec![VpnPublish::Connected, VpnPublish::PortUnavailable]
+        );
+        assert!(out.actions.is_empty());
+    }
+
+    #[test]
+    fn state_read_disconnected_without_port_publishes_disconnected_and_port_unavailable() {
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            VpnEvent::StateRead {
+                connected: false,
+                port: None,
+            },
+        );
+
+        assert!(!machine.is_connected());
+        assert_eq!(machine.port(), None);
+        assert_eq!(
+            out.publish,
+            vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
+        );
+        assert!(out.actions.is_empty());
+    }
+
+    #[test]
+    fn state_read_disconnected_with_port_clears_port_and_publishes_unavailable() {
+        // Dishonest shell event: connected=false but port=Some(_). The machine
+        // must defend: never advertise a port for a disconnected VPN (VPN-1/VPN-4).
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+
+        let out = handle(
+            &mut machine,
+            VpnEvent::StateRead {
+                connected: false,
+                port: Some(port),
+            },
+        );
+
+        assert!(!machine.is_connected());
+        assert_eq!(
+            machine.port(),
+            None,
+            "port must be cleared when disconnected"
+        );
+        assert_eq!(
+            out.publish,
+            vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
+        );
+        assert!(out.actions.is_empty());
     }
 }
 

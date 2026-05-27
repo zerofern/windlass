@@ -497,7 +497,7 @@ pot cycle, so I do not need to remember this recurring tracker task manually.
 
 ## Story: Decide Whether Cores Must Defend Against Dishonest Shell Events
 
-Status: To Do
+Status: Done
 
 ### Problem
 

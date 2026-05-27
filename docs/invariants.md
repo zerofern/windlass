@@ -170,11 +170,19 @@ State: `connected: bool`, `port: Option<VpnPort>`.
 
 Shell contracts:
 
-- `StateRead { connected: false, port: Some(_) }` is not expected; the shell
-  should not report a disconnected VPN that still has a port. The four valid
-  `StateRead` shapes should each be covered by an explicit **example unit test**
-  (not a property test). The defend-vs-trust decision for the disconnected-with-
-  port shape is story 18.
+- `StateRead { connected: false, port: Some(_) }` is not expected from the
+  shell, but the machine now **defends** against it regardless: a disconnected
+  `StateRead` always clears the port and publishes `PortUnavailable`, enforcing
+  VPN-1 for any event sequence. This is an enforced invariant, not a trusted
+  contract. All four `connected × port` shapes are covered by explicit example
+  unit tests. VPN-4 is accordingly strengthened: a disconnected `StateRead`
+  never publishes `PortReady`, even if the shell reports a port.
+
+  Updated **VPN-4**: `StateRead` publishes are consistent with the values written
+  to state — `Connected` iff `connected == true`, `PortReady { port }` iff
+  `connected == true` and `port.is_some()`. When `connected == false`, the port
+  is always cleared and `PortUnavailable` is published regardless of the
+  reported `port` field.
 
 ### qBit machine (`QbitMachine`)
 
@@ -199,9 +207,11 @@ State: `cookie: Option<AuthCookie>`, `listen_port: Option<VpnPort>`,
 - **QBIT-7 [liveness]** While desired ≠ current, a retry path eventually
   re-issues `SetListenPort`. → C, F
 
-Shell contract: `ListenPortSet { port }` is only delivered as the success of a
-`SetListenPort` the machine issued, so its direct `ListenPortReady` publish stays
-consistent with QBIT-4. (Story 18.)
+Shell contract: `ListenPortSet { port }` is now routed through the
+desired-port filter (`listen_port_publish`), so QBIT-4 holds for any event —
+including a dishonest `ListenPortSet` carrying a port that differs from the
+desired target. This is an enforced invariant, not a trusted contract. The
+QBIT-4 property test uses an unconstrained generator.
 
 ### MAM machine (`MamMachine`)
 
