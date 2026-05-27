@@ -290,7 +290,7 @@ bridge code.
 
 ## Story: Replace Direct Publish Bridge With Typed Subscriptions
 
-Status: To Do
+Status: Done
 
 ### Problem
 

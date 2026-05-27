@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use windlass_core::events::Event;
-use windlass_domain_core::{WindlassEvent, WindlassTimer};
+use windlass_domain_core::WindlassEvent;
 use windlass_mam_core::MamEvent;
 use windlass_qbit_core::QbitEvent;
 use windlass_types::{MamStatus, VpnPort, WakeupId};
@@ -129,10 +129,12 @@ pub(super) fn legacy_to_service_events(
             WakeupId::RetryPortRead => vec![ServiceEvent::Vpn(VpnEvent::TimerFired(
                 windlass_vpn_core::VpnTimer::PortReadRetry,
             ))],
-            WakeupId::DomainSnapshot => vec![ServiceEvent::Domain(WindlassEvent::TimerFired(
-                WindlassTimer::Snapshot,
-            ))],
-            WakeupId::DiskCheck | WakeupId::TorrentCheck | WakeupId::CompliancePoll => Vec::new(),
+            // DomainSnapshot is now scheduled internally by the DomainShell; the
+            // WakeupId variant is retained for compatibility but produces no service event.
+            WakeupId::DomainSnapshot
+            | WakeupId::DiskCheck
+            | WakeupId::TorrentCheck
+            | WakeupId::CompliancePoll => Vec::new(),
         },
         Event::QbitPreferencesReceived { listen_port, .. } => {
             vec![ServiceEvent::Qbit(QbitEvent::PreferencesRead {

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{ShellContext, service::ServiceAction};
+use super::ShellContext;
 use chrono::Utc;
 use tokio::sync::oneshot;
 use uom::si::information::byte;
@@ -24,12 +24,6 @@ impl ShellContext<'_> {
             let _ = tx.send(Event::Wakeup { at: Utc::now(), id }).await;
         });
         self.wakeups.insert(id, handle);
-    }
-
-    pub(super) fn execute_service_action(&mut self, action: ServiceAction, _causal_tx: CausalTx) {
-        match action {
-            ServiceAction::Db(_) => {}
-        }
     }
 
     // ── Port files ────────────────────────────────────────────────────────────

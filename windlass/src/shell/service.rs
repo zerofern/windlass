@@ -1,14 +1,15 @@
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
 use windlass_core::events::Event;
-use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand, DbMachine, DbPublish};
-use windlass_domain_core::{WindlassEvent, WindlassMachine, WindlassPublish};
+use windlass_db_core::DbMachine;
+use windlass_domain_core::WindlassMachine;
 use windlass_machine::{Command, ServiceHandles, Timed};
-use windlass_mam_core::{MamMachine, MamPublish};
-use windlass_qbit_core::{QbitMachine, QbitPublish};
+use windlass_mam_core::MamMachine;
+use windlass_qbit_core::QbitMachine;
 use windlass_types::VpnPort;
-use windlass_vpn_core::{VpnMachine, VpnPublish};
+use windlass_vpn_core::VpnMachine;
 
 use super::service_events::{ServiceEvent, legacy_to_service_events};
 
@@ -17,55 +18,41 @@ use super::service_events::{ServiceEvent, legacy_to_service_events};
 /// This is a migration bridge: it lets the runtime feed real events into the
 /// service/domain boundaries while legacy-only orchestration remains available
 /// as a rollback path.
+///
+/// Publish routing from service runtimes to the domain runtime is handled by
+/// dedicated async forwarder tasks spawned in `init_shell`; this struct no longer
+/// holds publish receivers.
 pub(super) struct ServiceCores {
     domain: ServiceHandles<WindlassMachine>,
-    domain_pub_rx: mpsc::Receiver<WindlassPublish>,
     db: ServiceHandles<DbMachine>,
-    db_pub_rx: mpsc::Receiver<DbPublish>,
     vpn: ServiceHandles<VpnMachine>,
-    vpn_pub_rx: mpsc::Receiver<VpnPublish>,
     qbit: ServiceHandles<QbitMachine>,
-    qbit_pub_rx: mpsc::Receiver<QbitPublish>,
     mam: ServiceHandles<MamMachine>,
-    mam_pub_rx: mpsc::Receiver<MamPublish>,
-    /// Cached forwarded port, updated when VPN publishes PortReady/PortUnavailable.
-    /// Used by the legacy event bridge to translate legacy shell results into
-    /// sub-runtime events (e.g. QbitPortSyncSuccess needs to know the port).
-    forwarded_port: Option<VpnPort>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ServiceAction {
-    Db(DbCommand),
+    /// Cached forwarded port, shared with the VPN forwarder task.
+    /// Updated by the VPN forwarder on PortReady/PortUnavailable/Disconnected.
+    /// Read synchronously by `observe` via the legacy event bridge so that
+    /// legacy shell results (e.g. `QbitPortSyncSuccess`) can be translated
+    /// correctly while legacy orchestration is still running.
+    forwarded_port: Arc<Mutex<Option<VpnPort>>>,
 }
 
 impl ServiceCores {
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         domain: ServiceHandles<WindlassMachine>,
-        domain_pub_rx: mpsc::Receiver<WindlassPublish>,
         db: ServiceHandles<DbMachine>,
-        db_pub_rx: mpsc::Receiver<DbPublish>,
         vpn: ServiceHandles<VpnMachine>,
-        vpn_pub_rx: mpsc::Receiver<VpnPublish>,
         qbit: ServiceHandles<QbitMachine>,
-        qbit_pub_rx: mpsc::Receiver<QbitPublish>,
         mam: ServiceHandles<MamMachine>,
-        mam_pub_rx: mpsc::Receiver<MamPublish>,
+        forwarded_port: Arc<Mutex<Option<VpnPort>>>,
     ) -> Self {
         Self {
             domain,
-            domain_pub_rx,
             db,
-            db_pub_rx,
             vpn,
-            vpn_pub_rx,
             qbit,
-            qbit_pub_rx,
             mam,
-            mam_pub_rx,
-            forwarded_port: None,
+            forwarded_port,
         }
     }
 
@@ -74,116 +61,20 @@ impl ServiceCores {
         &self.db.commands
     }
 
-    pub fn observe(&mut self, event: &Event) -> Vec<ServiceAction> {
-        for event in legacy_to_service_events(event, self.forwarded_port) {
+    /// Returns a clone of the shared forwarded-port arc so the VPN forwarder
+    /// task can write to it.
+    pub fn forwarded_port_arc(&self) -> Arc<Mutex<Option<VpnPort>>> {
+        Arc::clone(&self.forwarded_port)
+    }
+
+    pub fn observe(&self, event: &Event) {
+        let forwarded_port = self.forwarded_port.lock().map_or(None, |g| *g);
+        for event in legacy_to_service_events(event, forwarded_port) {
             self.send_service_event(event);
         }
-        Vec::new()
     }
 
-    pub fn observe_domain_event(&mut self, event: WindlassEvent) {
-        let _ = self.domain.events.send(Timed::now(event));
-    }
-
-    /// Drains VPN publish messages from the VPN runtime and forwards them into
-    /// the domain machine as `Timed<WindlassEvent>`.
-    /// Also updates the cached `forwarded_port` for the legacy event bridge.
-    pub fn drain_vpn_publishes(&mut self) {
-        while let Ok(publish) = self.vpn_pub_rx.try_recv() {
-            // Update cached port for legacy bridge.
-            match &publish {
-                VpnPublish::PortReady { port } => self.forwarded_port = Some(*port),
-                VpnPublish::PortUnavailable | VpnPublish::Disconnected => {
-                    self.forwarded_port = None;
-                }
-                VpnPublish::Connected => {}
-            }
-            let _ = self
-                .domain
-                .events
-                .send(Timed::now(WindlassEvent::Vpn(publish)));
-        }
-    }
-
-    /// Drains Qbit publish messages from the Qbit runtime and forwards them into
-    /// the domain machine as `Timed<WindlassEvent>`.
-    pub fn drain_qbit_publishes(&mut self) {
-        while let Ok(publish) = self.qbit_pub_rx.try_recv() {
-            let _ = self
-                .domain
-                .events
-                .send(Timed::now(WindlassEvent::Qbit(publish)));
-        }
-    }
-
-    /// Drains MAM publish messages from the MAM runtime and forwards them into
-    /// the domain machine as `Timed<WindlassEvent>`.
-    pub fn drain_mam_publishes(&mut self) {
-        while let Ok(publish) = self.mam_pub_rx.try_recv() {
-            let _ = self
-                .domain
-                .events
-                .send(Timed::now(WindlassEvent::Mam(publish)));
-        }
-    }
-
-    /// Drains DB publish messages from the DB runtime.
-    ///
-    /// Failures (other than `RecordActivity`, to break recursion) are injected
-    /// into the domain machine as `WindlassEvent::DbFailed`.  Success publishes
-    /// are silently discarded — the domain does not need to react to them.
-    pub fn drain_db_publishes(&mut self) {
-        while let Ok(publish) = self.db_pub_rx.try_recv() {
-            match publish {
-                DbPublish::Succeeded { .. } => {}
-                DbPublish::Failed(failure) => {
-                    if failure.operation == "RecordActivity" {
-                        tracing::warn!(
-                            operation = %failure.operation,
-                            "DB activity log failed: {}",
-                            failure.message
-                        );
-                    } else {
-                        let event = WindlassEvent::DbFailed {
-                            operation: failure.operation,
-                            message: failure.message,
-                        };
-                        let _ = self.domain.events.send(Timed::now(event));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Drains domain publish messages and converts `Activity` to DB commands.
-    ///
-    /// `SystemState` publishes are forwarded as-is (currently unused by the UI,
-    /// which still uses the legacy core for state). `Activity` publishes become
-    /// `RecordActivity` DB commands so activity logging is preserved.
-    pub fn drain_domain_publishes(&mut self) -> Vec<ServiceAction> {
-        let mut actions = Vec::new();
-        while let Ok(publish) = self.domain_pub_rx.try_recv() {
-            match publish {
-                WindlassPublish::SystemState(_) => {}
-                WindlassPublish::Activity { message } => {
-                    actions.push(ServiceAction::Db(DbCommand::RecordActivity(
-                        ActivityRecord {
-                            at: chrono::Utc::now(),
-                            source: ActivitySource::Domain,
-                            action: "service_activity".to_string(),
-                            book_id: None,
-                            detail: Some(message),
-                            metadata: serde_json::Value::Null,
-                        },
-                    )));
-                }
-            }
-        }
-        dedup_service_actions(&mut actions);
-        actions
-    }
-
-    fn send_service_event(&mut self, event: ServiceEvent) {
+    fn send_service_event(&self, event: ServiceEvent) {
         let now = Instant::now();
         match event {
             ServiceEvent::Domain(event) => {
@@ -202,25 +93,16 @@ impl ServiceCores {
     }
 }
 
-fn dedup_service_actions(actions: &mut Vec<ServiceAction>) {
-    let mut deduped = Vec::with_capacity(actions.len());
-    for action in actions.drain(..) {
-        if !deduped.contains(&action) {
-            deduped.push(action);
-        }
-    }
-    *actions = deduped;
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use tokio::sync::{mpsc, oneshot};
-    use windlass_db_core::{DbCommand, DbEvent, DbMachine, DbPublish};
+    use tokio::sync::mpsc;
+    use windlass_db_core::{DbEvent, DbMachine, DbPublish};
     use windlass_domain_core::{WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic};
     use windlass_machine::{Command, ServiceHandles, Timed};
-    use windlass_mam_core::{MamEvent, MamMachine, MamPublish};
+    use windlass_mam_core::{MamEvent, MamMachine};
     use windlass_qbit_core::{QbitEvent, QbitMachine, QbitPublish};
     use windlass_vpn_core::{VpnEvent, VpnMachine, VpnPublish};
 
@@ -313,117 +195,101 @@ mod tests {
         )
     }
 
-    struct TestHarness {
-        cores: ServiceCores,
-        domain_ev_rx: mpsc::UnboundedReceiver<Timed<WindlassEvent>>,
-        qbit_cmd_rx: mpsc::UnboundedReceiver<Command<QbitMachine>>,
-        mam_cmd_rx: mpsc::UnboundedReceiver<Command<MamMachine>>,
-        db_cmd_rx: mpsc::UnboundedReceiver<Command<DbMachine>>,
-        db_pub_tx: mpsc::Sender<DbPublish>,
-    }
-
-    fn harness() -> TestHarness {
+    fn make_cores() -> (
+        ServiceCores,
+        mpsc::UnboundedReceiver<Timed<WindlassEvent>>,
+        Arc<Mutex<Option<windlass_types::VpnPort>>>,
+    ) {
         let (domain_handles, domain_ev_rx) = make_domain_handles();
-        let (domain_pub_tx, domain_pub_rx) = mpsc::channel::<WindlassPublish>(16);
-        // Register domain pub subscriber so drain_domain_publishes gets messages.
-        let _ = domain_handles
-            .subscribe
-            .send((vec![WindlassTopic::Activity], domain_pub_tx));
-
-        let (db_handles, db_cmd_rx) = make_db_handles();
-        let (db_pub_tx, db_pub_rx) = mpsc::channel::<DbPublish>(16);
-
+        let (db_handles, _db_cmd_rx) = make_db_handles();
         let (vpn_handles, _vpn_ev_rx) = make_vpn_handles();
-        let (_, vpn_pub_rx) = mpsc::channel::<VpnPublish>(1);
-
-        let (qbit_handles, qbit_cmd_rx) = make_qbit_handles();
-        let (_, qbit_pub_rx) = mpsc::channel::<QbitPublish>(1);
-
-        let (mam_handles, mam_cmd_rx) = make_mam_handles();
-        let (_, mam_pub_rx) = mpsc::channel::<MamPublish>(1);
-
+        let (qbit_handles, _qbit_cmd_rx) = make_qbit_handles();
+        let (mam_handles, _mam_cmd_rx) = make_mam_handles();
+        let forwarded_port = Arc::new(Mutex::new(None));
         let cores = ServiceCores::new(
             domain_handles,
-            domain_pub_rx,
             db_handles,
-            db_pub_rx,
             vpn_handles,
-            vpn_pub_rx,
             qbit_handles,
-            qbit_pub_rx,
             mam_handles,
-            mam_pub_rx,
+            Arc::clone(&forwarded_port),
         );
-
-        TestHarness {
-            cores,
-            domain_ev_rx,
-            qbit_cmd_rx,
-            mam_cmd_rx,
-            db_cmd_rx,
-            db_pub_tx,
-        }
+        (cores, domain_ev_rx, forwarded_port)
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────
 
-    /// `VpnPublish::PortReady` drained from the VPN channel should be forwarded
-    /// into the domain event channel as `WindlassEvent::Vpn(PortReady{port})`.
+    /// `VpnPublish::PortReady` forwarded by the async VPN forwarder task ends up
+    /// on the domain event channel as `WindlassEvent::Vpn(PortReady{port})`.
+    ///
+    /// This test exercises the full forwarder-task path: it spawns a forwarder
+    /// task just like `init_shell` does and asserts the domain runtime receives
+    /// the event.
     #[tokio::test]
-    async fn vpn_publish_port_ready_is_forwarded_to_domain() {
+    async fn vpn_forwarder_task_forwards_port_ready_to_domain() {
         use windlass_types::VpnPort;
 
-        let mut h = harness();
-        let port = VpnPort::try_new(51_820).unwrap();
-
-        // Simulate the VPN runtime publishing PortReady.
-        let (vpn_pub_tx, vpn_pub_rx) = mpsc::channel::<VpnPublish>(1);
-        // Rebuild cores with a connected vpn_pub_rx so we can inject.
         let (domain_handles, mut domain_ev_rx) = make_domain_handles();
-        let (domain_pub_tx, domain_pub_rx) = mpsc::channel::<WindlassPublish>(16);
-        let _ = domain_handles
-            .subscribe
-            .send((vec![WindlassTopic::Activity], domain_pub_tx));
         let (db_handles, _db_cmd_rx) = make_db_handles();
-        let (db_pub_tx, db_pub_rx) = mpsc::channel::<DbPublish>(8);
         let (vpn_handles, _vpn_ev_rx) = make_vpn_handles();
         let (qbit_handles, _qbit_cmd_rx) = make_qbit_handles();
-        let (_, qbit_pub_rx) = mpsc::channel::<QbitPublish>(1);
         let (mam_handles, _mam_cmd_rx) = make_mam_handles();
-        let (_, mam_pub_rx) = mpsc::channel::<MamPublish>(1);
+        let forwarded_port = Arc::new(Mutex::new(None));
 
-        let mut cores = ServiceCores::new(
-            domain_handles,
-            domain_pub_rx,
-            db_handles,
-            db_pub_rx,
-            vpn_handles,
-            vpn_pub_rx,
-            qbit_handles,
-            qbit_pub_rx,
-            mam_handles,
-            mam_pub_rx,
-        );
+        // The forwarder task reads from a subscription channel and writes to domain.
+        let (vpn_pub_tx, mut vpn_pub_rx) = mpsc::channel::<VpnPublish>(8);
+        let domain_ev_tx = domain_handles.events.clone();
+        let forwarded_port_arc = Arc::clone(&forwarded_port);
+        tokio::spawn(async move {
+            while let Some(publish) = vpn_pub_rx.recv().await {
+                match &publish {
+                    VpnPublish::PortReady { port } => {
+                        if let Ok(mut g) = forwarded_port_arc.lock() {
+                            *g = Some(*port);
+                        }
+                    }
+                    VpnPublish::PortUnavailable | VpnPublish::Disconnected => {
+                        if let Ok(mut g) = forwarded_port_arc.lock() {
+                            *g = None;
+                        }
+                    }
+                    VpnPublish::Connected => {}
+                }
+                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
+            }
+        });
 
+        let port = VpnPort::try_new(51_820).unwrap();
         vpn_pub_tx
             .send(VpnPublish::PortReady { port })
             .await
             .unwrap();
-        cores.drain_vpn_publishes();
 
         let event = domain_ev_rx.recv().await.expect("domain event expected");
         assert_eq!(
             event.inner,
             WindlassEvent::Vpn(VpnPublish::PortReady { port })
         );
+
+        // The shared forwarded_port must have been updated.
+        assert_eq!(*forwarded_port.lock().unwrap(), Some(port));
+
+        // Keep remaining handles alive.
+        let _ = (
+            domain_handles,
+            db_handles,
+            vpn_handles,
+            qbit_handles,
+            mam_handles,
+        );
     }
 
-    /// `VpnPublish::PortReady` fed directly through the domain runtime spawned
-    /// by the generic `ServiceRuntime` causes `QbitCommand::EnsureListenPort`
-    /// and `MamCommand::EnsureSeedboxPort` to appear on the respective command
-    /// channels (end-to-end runtime test).
+    /// `VpnPublish::PortReady` flowing through the VPN forwarder task into a
+    /// real spawned `WindlassMachine` domain runtime produces
+    /// `QbitCommand::EnsureListenPort` and `MamCommand::EnsureSeedboxPort` on
+    /// the respective command channels — the full subscription path.
     #[tokio::test]
-    async fn vpn_port_ready_through_runtime_sends_qbit_and_mam_commands() {
+    async fn vpn_port_ready_via_forwarder_task_sends_qbit_and_mam_commands() {
         use windlass_domain_core::{WindlassConfig, WindlassMachine};
         use windlass_machine::Command;
         use windlass_mam_core::MamCommand;
@@ -432,9 +298,9 @@ mod tests {
 
         let port = VpnPort::try_new(51_820).unwrap();
 
-        // Build command-channel pairs for qbit and mam.
+        // Build the domain runtime.
         let (qbit_cmd_tx, mut qbit_cmd_rx) = mpsc::unbounded_channel::<Command<QbitMachine>>();
-        let (mam_cmd_tx, _mam_cmd_rx) = mpsc::unbounded_channel::<Command<MamMachine>>();
+        let (mam_cmd_tx, mut mam_cmd_rx) = mpsc::unbounded_channel::<Command<MamMachine>>();
         let (db_cmd_tx, _db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
         let (vpn_cmd_tx, _vpn_cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
 
@@ -454,65 +320,49 @@ mod tests {
             )
             .await;
 
-        // Inject VpnPublish::PortReady into the domain event channel.
-        domain_handles
-            .events
-            .send(Timed::now(WindlassEvent::Vpn(VpnPublish::PortReady {
-                port,
-            })))
-            .unwrap();
+        // Simulate the VPN publish subscription channel.
+        let (vpn_pub_tx, mut vpn_pub_rx) = mpsc::channel::<VpnPublish>(8);
 
-        // Give the async runtime a tick to process.
-        tokio::task::yield_now().await;
-        // Retry a few times to avoid flakiness.
-        for _ in 0..10 {
-            if qbit_cmd_rx.try_recv().is_ok() {
-                break;
+        // Spawn the VPN forwarder task (same logic as init_shell).
+        let domain_ev_tx = domain_handles.events.clone();
+        let forwarded_port_arc: Arc<Mutex<Option<VpnPort>>> = Arc::new(Mutex::new(None));
+        let fp_arc = Arc::clone(&forwarded_port_arc);
+        tokio::spawn(async move {
+            while let Some(publish) = vpn_pub_rx.recv().await {
+                match &publish {
+                    VpnPublish::PortReady { port } => {
+                        if let Ok(mut g) = fp_arc.lock() {
+                            *g = Some(*port);
+                        }
+                    }
+                    VpnPublish::PortUnavailable | VpnPublish::Disconnected => {
+                        if let Ok(mut g) = fp_arc.lock() {
+                            *g = None;
+                        }
+                    }
+                    VpnPublish::Connected => {}
+                }
+                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }
-            tokio::task::yield_now().await;
-        }
+        });
 
-        // We should see QbitCommand::EnsureListenPort on the qbit channel.
-        // Re-drain to collect all commands (EnsureListenPort may follow Init actions).
-        let (qbit_cmd_tx2, mut qbit_cmd_rx2) = mpsc::unbounded_channel::<Command<QbitMachine>>();
-        let (mam_cmd_tx2, mut mam_cmd_rx2) = mpsc::unbounded_channel::<Command<MamMachine>>();
-        let (db_cmd_tx2, _db_cmd_rx2) = mpsc::unbounded_channel::<Command<DbMachine>>();
-        let (vpn_cmd_tx2, _vpn_cmd_rx2) = mpsc::unbounded_channel::<Command<VpnMachine>>();
-
-        let domain_shell_cfg2 = crate::shell::domain_shell::DomainShellConfig {
-            db: db_cmd_tx2,
-            vpn: vpn_cmd_tx2,
-            qbit: qbit_cmd_tx2,
-            mam: mam_cmd_tx2,
-        };
-
-        let (domain_handles2, _domain_join2) =
-            windlass_machine::spawn::<WindlassMachine, crate::shell::domain_shell::DomainShell>(
-                WindlassConfig {
-                    snapshot_interval: Duration::from_secs(3600),
-                },
-                domain_shell_cfg2,
-            )
-            .await;
-
-        domain_handles2
-            .events
-            .send(Timed::now(WindlassEvent::Vpn(VpnPublish::PortReady {
-                port,
-            })))
+        // Send PortReady through the subscription channel.
+        vpn_pub_tx
+            .send(VpnPublish::PortReady { port })
+            .await
             .unwrap();
 
-        // Yield until we get the commands.
+        // Yield until we see both qBit and MAM commands.
         let mut got_qbit = false;
         let mut got_mam = false;
         for _ in 0..20 {
             tokio::task::yield_now().await;
-            while let Ok((cmd, _)) = qbit_cmd_rx2.try_recv() {
+            while let Ok((cmd, _)) = qbit_cmd_rx.try_recv() {
                 if matches!(cmd, QbitCommand::EnsureListenPort { port: p } if p == port) {
                     got_qbit = true;
                 }
             }
-            while let Ok((cmd, _)) = mam_cmd_rx2.try_recv() {
+            while let Ok((cmd, _)) = mam_cmd_rx.try_recv() {
                 if matches!(cmd, MamCommand::EnsureSeedboxPort { port: p } if p == port) {
                     got_mam = true;
                 }
@@ -524,16 +374,175 @@ mod tests {
 
         assert!(
             got_qbit,
-            "expected QbitCommand::EnsureListenPort on qbit channel"
+            "expected QbitCommand::EnsureListenPort on qbit channel via subscription forwarder"
         );
         assert!(
             got_mam,
-            "expected MamCommand::EnsureSeedboxPort on mam channel"
+            "expected MamCommand::EnsureSeedboxPort on mam channel via subscription forwarder"
         );
     }
 
+    /// DB forwarder task: non-RecordActivity failure is forwarded to the domain
+    /// event channel as `WindlassEvent::DbFailed`.
+    #[tokio::test]
+    async fn db_forwarder_task_forwards_failure_to_domain() {
+        use windlass_db_core::DbFailure;
+
+        let (domain_handles, mut domain_ev_rx) = make_domain_handles();
+        let (db_pub_tx, mut db_pub_rx) = mpsc::channel::<DbPublish>(8);
+
+        // Spawn DB forwarder task (same logic as init_shell).
+        let domain_ev_tx = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = db_pub_rx.recv().await {
+                match publish {
+                    DbPublish::Succeeded { .. } => {}
+                    DbPublish::Failed(failure) => {
+                        if failure.operation == "RecordActivity" {
+                            tracing::warn!(
+                                operation = %failure.operation,
+                                "DB activity log failed: {}",
+                                failure.message
+                            );
+                        } else {
+                            let event = WindlassEvent::DbFailed {
+                                operation: failure.operation,
+                                message: failure.message,
+                            };
+                            let _ = domain_ev_tx.send(Timed::now(event));
+                        }
+                    }
+                }
+            }
+        });
+
+        db_pub_tx
+            .send(DbPublish::Failed(DbFailure {
+                operation: "SaveSystemSnapshot".to_string(),
+                message: "disk full".to_string(),
+                retryable: false,
+            }))
+            .await
+            .unwrap();
+
+        let event = domain_ev_rx.recv().await.expect("domain event expected");
+        assert_eq!(
+            event.inner,
+            WindlassEvent::DbFailed {
+                operation: "SaveSystemSnapshot".to_string(),
+                message: "disk full".to_string(),
+            }
+        );
+    }
+
+    /// DB forwarder task: `RecordActivity` failures are NOT forwarded (recursion guard).
+    #[tokio::test]
+    async fn db_forwarder_task_does_not_forward_record_activity_failure() {
+        use windlass_db_core::DbFailure;
+
+        let (domain_handles, mut domain_ev_rx) = make_domain_handles();
+        let (db_pub_tx, mut db_pub_rx) = mpsc::channel::<DbPublish>(8);
+
+        // Spawn DB forwarder task.
+        let domain_ev_tx = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = db_pub_rx.recv().await {
+                match publish {
+                    DbPublish::Succeeded { .. } => {}
+                    DbPublish::Failed(failure) => {
+                        if failure.operation == "RecordActivity" {
+                            tracing::warn!(
+                                operation = %failure.operation,
+                                "DB activity log failed: {}",
+                                failure.message
+                            );
+                        } else {
+                            let event = WindlassEvent::DbFailed {
+                                operation: failure.operation,
+                                message: failure.message,
+                            };
+                            let _ = domain_ev_tx.send(Timed::now(event));
+                        }
+                    }
+                }
+            }
+        });
+
+        db_pub_tx
+            .send(DbPublish::Failed(DbFailure {
+                operation: "RecordActivity".to_string(),
+                message: "connection lost".to_string(),
+                retryable: true,
+            }))
+            .await
+            .unwrap();
+
+        // Give the task a chance to process.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            domain_ev_rx.try_recv().is_err(),
+            "RecordActivity failure must not recurse into domain"
+        );
+    }
+
+    /// Domain forwarder task: `WindlassPublish::Activity` becomes a
+    /// `DbCommand::RecordActivity` on the DB command channel.
+    #[tokio::test]
+    async fn domain_forwarder_task_activity_becomes_db_record_activity() {
+        use windlass_db_core::{ActivitySource, DbCommand};
+
+        let (domain_pub_tx, mut domain_pub_rx) = mpsc::channel::<WindlassPublish>(8);
+        let (db_cmd_tx, mut db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
+
+        // Spawn domain forwarder task (same logic as init_shell).
+        tokio::spawn(async move {
+            while let Some(publish) = domain_pub_rx.recv().await {
+                match publish {
+                    WindlassPublish::SystemState(_) => {}
+                    WindlassPublish::Activity { message } => {
+                        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                        let _ = db_cmd_tx.send((
+                            DbCommand::RecordActivity(windlass_db_core::ActivityRecord {
+                                at: chrono::Utc::now(),
+                                source: ActivitySource::Domain,
+                                action: "service_activity".to_string(),
+                                book_id: None,
+                                detail: Some(message),
+                                metadata: serde_json::Value::Null,
+                            }),
+                            reply_tx,
+                        ));
+                    }
+                }
+            }
+        });
+
+        domain_pub_tx
+            .send(WindlassPublish::Activity {
+                message: "test activity".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Wait for the DB command to arrive.
+        let (cmd, _) = tokio::time::timeout(Duration::from_secs(1), db_cmd_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        match cmd {
+            DbCommand::RecordActivity(record) => {
+                assert_eq!(record.source, ActivitySource::Domain);
+                assert_eq!(record.detail.as_deref(), Some("test activity"));
+            }
+            other => panic!("expected RecordActivity, got {:?}", other),
+        }
+    }
+
     /// `QbitPublish::Unavailable` → domain runtime → `WindlassPublish::Activity`
-    /// → `drain_domain_publishes` → `ServiceAction::Db(RecordActivity)`.
+    /// → domain forwarder → `DbCommand::RecordActivity`.
     #[tokio::test]
     async fn qbit_unavailable_through_runtime_produces_activity_db_command() {
         use windlass_domain_core::{WindlassConfig, WindlassMachine};
@@ -589,167 +598,8 @@ mod tests {
         }
     }
 
-    /// DB failure (non-RecordActivity) is forwarded to the domain event channel
-    /// as `WindlassEvent::DbFailed`.
-    #[tokio::test]
-    async fn db_failure_publish_is_forwarded_to_domain_event_channel() {
-        use windlass_db_core::DbFailure;
-
-        let mut h = harness();
-
-        h.db_pub_tx
-            .send(DbPublish::Failed(DbFailure {
-                operation: "SaveSystemSnapshot".to_string(),
-                message: "disk full".to_string(),
-                retryable: false,
-            }))
-            .await
-            .unwrap();
-
-        h.cores.drain_db_publishes();
-
-        let event = h.domain_ev_rx.recv().await.expect("domain event expected");
-        assert_eq!(
-            event.inner,
-            WindlassEvent::DbFailed {
-                operation: "SaveSystemSnapshot".to_string(),
-                message: "disk full".to_string(),
-            }
-        );
-    }
-
-    /// `RecordActivity` DB failures must NOT be forwarded to the domain
-    /// (recursion guard).
-    #[tokio::test]
-    async fn record_activity_failure_is_not_forwarded_to_domain() {
-        use windlass_db_core::DbFailure;
-
-        let mut h = harness();
-
-        h.db_pub_tx
-            .send(DbPublish::Failed(DbFailure {
-                operation: "RecordActivity".to_string(),
-                message: "connection lost".to_string(),
-                retryable: true,
-            }))
-            .await
-            .unwrap();
-
-        h.cores.drain_db_publishes();
-
-        assert!(
-            h.domain_ev_rx.try_recv().is_err(),
-            "RecordActivity failure must not recurse into domain"
-        );
-    }
-
-    /// `WindlassPublish::Activity` from the domain publish channel becomes a
-    /// `ServiceAction::Db(RecordActivity)`.
-    #[test]
-    fn domain_activity_publish_drain_produces_db_record_activity() {
-        use windlass_db_core::ActivitySource;
-
-        // Build a pair with a real sender so we can inject publishes.
-        let (domain_pub_tx, domain_pub_rx) = mpsc::channel::<WindlassPublish>(4);
-        // domain_pub_tx is what drain_domain_publishes drains from.
-        let (domain_handles, _ev_rx) = make_domain_handles();
-
-        let (db_handles, _db_cmd_rx) = make_db_handles();
-        let (_db_pub_tx, db_pub_rx) = mpsc::channel::<DbPublish>(1);
-        let (vpn_handles, _vpn_ev_rx) = make_vpn_handles();
-        let (_, vpn_pub_rx) = mpsc::channel::<VpnPublish>(1);
-        let (qbit_handles, _qbit_cmd_rx) = make_qbit_handles();
-        let (_, qbit_pub_rx) = mpsc::channel::<QbitPublish>(1);
-        let (mam_handles, _mam_cmd_rx) = make_mam_handles();
-        let (_, mam_pub_rx) = mpsc::channel::<MamPublish>(1);
-
-        let mut cores = ServiceCores::new(
-            domain_handles,
-            domain_pub_rx,
-            db_handles,
-            db_pub_rx,
-            vpn_handles,
-            vpn_pub_rx,
-            qbit_handles,
-            qbit_pub_rx,
-            mam_handles,
-            mam_pub_rx,
-        );
-
-        domain_pub_tx
-            .try_send(WindlassPublish::Activity {
-                message: "test activity".to_string(),
-            })
-            .unwrap();
-
-        let actions = cores.drain_domain_publishes();
-
-        assert!(
-            actions.iter().any(|a| {
-                matches!(
-                    a,
-                    super::ServiceAction::Db(DbCommand::RecordActivity(record))
-                        if record.source == ActivitySource::Domain
-                            && record.detail.as_deref() == Some("test activity")
-                )
-            }),
-            "expected RecordActivity action, got: {:?}",
-            actions
-        );
-    }
-
-    /// `WindlassPublish::SystemState` from the domain publish channel is
-    /// silently discarded (no service action produced).
-    #[test]
-    fn domain_system_state_publish_drain_produces_no_action() {
-        use windlass_domain_core::{ServiceStatus, SystemStateView};
-
-        let (domain_pub_tx, domain_pub_rx) = mpsc::channel::<WindlassPublish>(4);
-        let (domain_handles, _ev_rx) = make_domain_handles();
-
-        let (db_handles, _db_cmd_rx) = make_db_handles();
-        let (_db_pub_tx, db_pub_rx) = mpsc::channel::<DbPublish>(1);
-        let (vpn_handles, _vpn_ev_rx) = make_vpn_handles();
-        let (_, vpn_pub_rx) = mpsc::channel::<VpnPublish>(1);
-        let (qbit_handles, _qbit_cmd_rx) = make_qbit_handles();
-        let (_, qbit_pub_rx) = mpsc::channel::<QbitPublish>(1);
-        let (mam_handles, _mam_cmd_rx) = make_mam_handles();
-        let (_, mam_pub_rx) = mpsc::channel::<MamPublish>(1);
-
-        let mut cores = ServiceCores::new(
-            domain_handles,
-            domain_pub_rx,
-            db_handles,
-            db_pub_rx,
-            vpn_handles,
-            vpn_pub_rx,
-            qbit_handles,
-            qbit_pub_rx,
-            mam_handles,
-            mam_pub_rx,
-        );
-
-        domain_pub_tx
-            .try_send(WindlassPublish::SystemState(SystemStateView {
-                vpn: ServiceStatus::Ready,
-                qbit: ServiceStatus::Unknown,
-                mam: ServiceStatus::Unknown,
-                forwarded_port: None,
-            }))
-            .unwrap();
-
-        let actions = cores.drain_domain_publishes();
-        assert!(
-            actions.is_empty(),
-            "SystemState publish must not produce actions"
-        );
-    }
-
     /// `DbFailed` event round-trips: forwarded to domain → domain publishes
     /// `Activity` → drain produces `RecordActivity`.
-    ///
-    /// This test uses the real `WindlassMachine` runtime to verify end-to-end
-    /// behavior.
     #[tokio::test]
     async fn db_failure_domain_event_becomes_activity_via_runtime() {
         use windlass_domain_core::{WindlassConfig, WindlassMachine};

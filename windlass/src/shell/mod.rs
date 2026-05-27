@@ -9,8 +9,6 @@ mod init;
 mod mam_shell;
 mod qbit_shell;
 mod service;
-mod service_db;
-mod service_debug;
 mod service_events;
 mod vpn_shell;
 
@@ -33,9 +31,6 @@ use windlass_types::WakeupId;
 
 use dequeue::dequeue_debug;
 use init::{ShellRuntime, init_shell};
-use service::ServiceAction;
-use service_db::dispatch_service_db_action;
-use service_debug::service_debug_actions;
 
 /// Entry point for the imperative shell. Bootstraps all infrastructure,
 /// then runs the event loop forever.
@@ -66,8 +61,8 @@ pub async fn run(
         mut exchange_rx,
         causal_debug_tx,
         mut causal_rx,
-        mut service_cores,
-        execute_service_actions,
+        service_cores,
+        execute_service_actions: _,
     } = init_shell(&debug_ctrl, debug_owned).await?;
     let debug_dispatcher = DebugDispatcher::new(debug_ctrl.clone());
     let db_command_tx = service_cores.db_command_tx().clone();
@@ -105,13 +100,10 @@ pub async fn run(
 
         debug!(?event, "←");
 
-        let service_actions = service_cores.observe(&event);
-        for action in &service_actions {
-            dispatch_service_db_action(&db_command_tx, action);
-        }
+        service_cores.observe(&event);
         let outcome = process_legacy_event(event, &mut state, &obs_tx, &debug_ctrl);
 
-        let mut ctx = ShellContext {
+        let ctx = ShellContext {
             docker: &docker,
             qbit: &qbit,
             mam: &mam,
@@ -124,26 +116,8 @@ pub async fn run(
             db_command_tx: &db_command_tx,
         };
 
-        service_cores.drain_db_publishes();
-        service_cores.drain_vpn_publishes();
-        service_cores.drain_qbit_publishes();
-        service_cores.drain_mam_publishes();
-
-        let domain_pub_actions = service_cores.drain_domain_publishes();
-        for action in &domain_pub_actions {
-            dispatch_service_db_action(&db_command_tx, action);
-        }
-        execute_service_actions_if_enabled(
-            execute_service_actions,
-            domain_pub_actions,
-            &tx,
-            &mut ctx,
-        );
-
         dispatch_event(
             outcome.actions,
-            service_actions,
-            execute_service_actions,
             event_id,
             &state,
             &mut history,
@@ -151,7 +125,7 @@ pub async fn run(
             &debug_dispatcher,
             &causal_debug_tx,
             &tx,
-            &mut ctx,
+            ctx,
         )
         .await;
     }
@@ -173,21 +147,6 @@ fn process_legacy_event(
         }
     }
     outcome
-}
-
-fn execute_service_actions_if_enabled(
-    enabled: bool,
-    actions: Vec<ServiceAction>,
-    tx: &mpsc::Sender<Event>,
-    ctx: &mut ShellContext<'_>,
-) {
-    if !enabled {
-        return;
-    }
-    for action in actions {
-        let causal = CausalTx::plain(uuid::Uuid::new_v4(), tx.clone());
-        ctx.execute_service_action(action, causal);
-    }
 }
 
 fn drain_channels(
@@ -216,8 +175,6 @@ fn drain_channels(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_event(
     outcome_actions: Vec<Action>,
-    service_actions: Vec<ServiceAction>,
-    execute_service_actions: bool,
     event_id: Option<uuid::Uuid>,
     state: &SystemState,
     history: &mut DebugHistory,
@@ -225,23 +182,12 @@ async fn dispatch_event(
     debug_dispatcher: &DebugDispatcher,
     causal_debug_tx: &mpsc::Sender<(Event, uuid::Uuid)>,
     tx: &mpsc::Sender<Event>,
-    ctx: &mut ShellContext<'_>,
+    mut ctx: ShellContext<'_>,
 ) {
     if let Some(eid) = event_id {
         let plain_tx = tx.clone();
-        let mut debug_actions = service_debug_actions(&service_actions);
-        debug_actions.extend(outcome_actions.iter().cloned());
-        history.actions_ready(&debug_actions);
+        history.actions_ready(&outcome_actions);
         debug_ctrl.publish(history);
-        execute_service_actions_debug(
-            execute_service_actions,
-            service_actions,
-            eid,
-            history,
-            tx,
-            causal_debug_tx,
-            ctx,
-        );
         debug_dispatcher
             .dispatch(outcome_actions, |action| {
                 let action_id = history.action_started(&action, eid);
@@ -254,37 +200,12 @@ async fn dispatch_event(
         drop(plain_tx);
     } else {
         let plain_tx = tx.clone();
-        execute_service_actions_if_enabled(execute_service_actions, service_actions, tx, ctx);
         debug_dispatcher
             .dispatch(outcome_actions, |action| {
                 let causal = CausalTx::plain(uuid::Uuid::new_v4(), plain_tx.clone());
                 ctx.execute(action, causal);
             })
             .await;
-    }
-}
-
-fn execute_service_actions_debug(
-    enabled: bool,
-    actions: Vec<ServiceAction>,
-    parent_event_id: uuid::Uuid,
-    history: &mut DebugHistory,
-    tx: &mpsc::Sender<Event>,
-    causal_debug_tx: &mpsc::Sender<(Event, uuid::Uuid)>,
-    ctx: &mut ShellContext<'_>,
-) {
-    if !enabled {
-        return;
-    }
-    for action in actions {
-        let causal = action.debug_action().map_or_else(
-            || CausalTx::plain(uuid::Uuid::new_v4(), tx.clone()),
-            |debug_action| {
-                let action_id = history.action_started(&debug_action, parent_event_id);
-                CausalTx::debug(action_id, causal_debug_tx.clone())
-            },
-        );
-        ctx.execute_service_action(action, causal);
     }
 }
 

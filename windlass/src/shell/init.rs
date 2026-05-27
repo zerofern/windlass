@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use secrecy::ExposeSecret;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -14,10 +15,13 @@ use windlass_debug::{
     DebugCommand, DebugController, DebugHistory, DebuggableEventStream, LogEntry, StoredEvent,
 };
 use windlass_local::{docker, vpn_files};
-use windlass_types::WakeupId;
+use windlass_types::{VpnPort, WakeupId};
 
-use windlass_db_core::{DbMachine, DbPublish, DbTopic};
-use windlass_domain_core::{WindlassConfig, WindlassMachine, WindlassPublish, WindlassTopic};
+use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand, DbMachine, DbPublish, DbTopic};
+use windlass_domain_core::{
+    WindlassConfig, WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic,
+};
+use windlass_machine::Timed;
 use windlass_mam_core::{MamConfig, MamMachine, MamPublish, MamTopic};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
@@ -136,7 +140,7 @@ pub(super) async fn init_shell(
         )
         .with_blacklisted_ids(blacklisted);
     let (db_handles, _db_join) = windlass_machine::spawn::<DbMachine, DbShell>((), db_pool).await;
-    let (db_pub_tx, db_pub_rx) = mpsc::channel::<DbPublish>(128);
+    let (db_pub_tx, mut db_pub_rx) = mpsc::channel::<DbPublish>(128);
     db_handles
         .subscribe
         .send((vec![DbTopic::Failures, DbTopic::Results], db_pub_tx))
@@ -154,7 +158,7 @@ pub(super) async fn init_shell(
         },
     )
     .await;
-    let (vpn_pub_tx, vpn_pub_rx) = mpsc::channel::<VpnPublish>(128);
+    let (vpn_pub_tx, mut vpn_pub_rx) = mpsc::channel::<VpnPublish>(128);
     vpn_handles
         .subscribe
         .send((vec![VpnTopic::Connectivity, VpnTopic::Port], vpn_pub_tx))
@@ -169,7 +173,7 @@ pub(super) async fn init_shell(
         qbit.clone(),
     )
     .await;
-    let (qbit_pub_tx, qbit_pub_rx) = mpsc::channel::<QbitPublish>(128);
+    let (qbit_pub_tx, mut qbit_pub_rx) = mpsc::channel::<QbitPublish>(128);
     qbit_handles
         .subscribe
         .send((
@@ -189,7 +193,7 @@ pub(super) async fn init_shell(
         mam.clone(),
     )
     .await;
-    let (mam_pub_tx, mam_pub_rx) = mpsc::channel::<MamPublish>(128);
+    let (mam_pub_tx, mut mam_pub_rx) = mpsc::channel::<MamPublish>(128);
     mam_handles
         .subscribe
         .send((
@@ -214,7 +218,7 @@ pub(super) async fn init_shell(
         },
     )
     .await;
-    let (domain_pub_tx, domain_pub_rx) = mpsc::channel::<WindlassPublish>(128);
+    let (domain_pub_tx, mut domain_pub_rx) = mpsc::channel::<WindlassPublish>(128);
     domain_handles
         .subscribe
         .send((
@@ -223,17 +227,129 @@ pub(super) async fn init_shell(
         ))
         .expect("domain pub subscription");
 
+    // ── Shared forwarded-port state ───────────────────────────────────────────
+    // Written by the VPN forwarder task; read synchronously by ServiceCores::observe
+    // so the legacy event bridge can translate legacy shell results correctly.
+    let forwarded_port: Arc<Mutex<Option<VpnPort>>> = Arc::new(Mutex::new(None));
+
+    // ── VPN forwarder task ────────────────────────────────────────────────────
+    // Drains VPN publishes, updates the shared forwarded_port cache, and injects
+    // the publish into the domain event channel as Timed<WindlassEvent::Vpn(...)>.
+    {
+        let domain_ev_tx = domain_handles.events.clone();
+        let fp_arc = Arc::clone(&forwarded_port);
+        tokio::spawn(async move {
+            while let Some(publish) = vpn_pub_rx.recv().await {
+                match &publish {
+                    VpnPublish::PortReady { port } => {
+                        if let Ok(mut g) = fp_arc.lock() {
+                            *g = Some(*port);
+                        }
+                    }
+                    VpnPublish::PortUnavailable | VpnPublish::Disconnected => {
+                        if let Ok(mut g) = fp_arc.lock() {
+                            *g = None;
+                        }
+                    }
+                    VpnPublish::Connected => {}
+                }
+                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
+            }
+        });
+    }
+
+    // ── qBit forwarder task ───────────────────────────────────────────────────
+    // Drains qBit publishes and injects them into the domain event channel.
+    // qBit does NOT subscribe to VPN facts; cross-service policy stays in the domain.
+    {
+        let domain_ev_tx = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = qbit_pub_rx.recv().await {
+                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Qbit(publish)));
+            }
+        });
+    }
+
+    // ── MAM forwarder task ────────────────────────────────────────────────────
+    // Drains MAM publishes and injects them into the domain event channel.
+    // MAM does NOT subscribe to VPN facts; cross-service policy stays in the domain.
+    {
+        let domain_ev_tx = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = mam_pub_rx.recv().await {
+                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Mam(publish)));
+            }
+        });
+    }
+
+    // ── DB forwarder task ─────────────────────────────────────────────────────
+    // Drains DB publishes.  Failures other than `RecordActivity` are forwarded to
+    // the domain event channel as `WindlassEvent::DbFailed`.  `RecordActivity`
+    // failures are only logged (recursion guard: forwarding them would cause the
+    // domain to issue another RecordActivity, creating an infinite loop).
+    // `Succeeded` publishes are silently discarded.
+    {
+        let domain_ev_tx = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = db_pub_rx.recv().await {
+                match publish {
+                    DbPublish::Succeeded { .. } => {}
+                    DbPublish::Failed(failure) => {
+                        if failure.operation == "RecordActivity" {
+                            tracing::warn!(
+                                operation = %failure.operation,
+                                "DB activity log failed: {}",
+                                failure.message
+                            );
+                        } else {
+                            let event = WindlassEvent::DbFailed {
+                                operation: failure.operation,
+                                message: failure.message,
+                            };
+                            let _ = domain_ev_tx.send(Timed::now(event));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Domain Activity → DB forwarder task ───────────────────────────────────
+    // Drains domain publishes.  `Activity` publishes become `RecordActivity` DB
+    // commands so activity logging is preserved.  `SystemState` publishes are
+    // silently discarded (the UI still uses the legacy core for state).
+    {
+        let db_cmd_tx = db_handles.commands.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = domain_pub_rx.recv().await {
+                match publish {
+                    WindlassPublish::SystemState(_) => {}
+                    WindlassPublish::Activity { message } => {
+                        let (reply_tx, _reply_rx) = oneshot::channel();
+                        let _ = db_cmd_tx.send((
+                            DbCommand::RecordActivity(ActivityRecord {
+                                at: chrono::Utc::now(),
+                                source: ActivitySource::Domain,
+                                action: "service_activity".to_string(),
+                                book_id: None,
+                                detail: Some(message),
+                                metadata: serde_json::Value::Null,
+                            }),
+                            reply_tx,
+                        ));
+                    }
+                }
+            }
+        });
+    }
+
     let service_cores = ServiceCores::new(
         domain_handles,
-        domain_pub_rx,
         db_handles,
-        db_pub_rx,
         vpn_handles,
-        vpn_pub_rx,
         qbit_handles,
-        qbit_pub_rx,
         mam_handles,
-        mam_pub_rx,
+        forwarded_port,
     );
     let execute_service_actions = config.execute_service_actions;
     let history = DebugHistory::new(SystemState::initial());
