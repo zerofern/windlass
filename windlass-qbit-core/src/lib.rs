@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
-use windlass_types::{AuthCookie, TorrentHash, TorrentRecord, VpnPort};
+use windlass_types::{AuthCookie, MamTorrentId, TorrentHash, TorrentRecord, TorrentState, VpnPort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QbitConfig {
@@ -107,9 +107,22 @@ pub enum QbitAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QbitPublish {
     Ready,
-    Unavailable { reason: String },
-    ListenPortReady { port: VpnPort },
-    TorrentsUpdated { hashes: Vec<TorrentHash> },
+    Unavailable {
+        reason: String,
+    },
+    ListenPortReady {
+        port: VpnPort,
+    },
+    TorrentsUpdated {
+        hashes: Vec<TorrentHash>,
+    },
+    /// Published when the qBit core authorises and emits a delete for a dead
+    /// (zero-byte, stalled/errored/paused) torrent.  Subscribers — primarily
+    /// the domain core — use this to blacklist the MAM ID in the DB.
+    DeadTorrentRemoved {
+        hash: TorrentHash,
+        mam_id: Option<MamTorrentId>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,7 +137,9 @@ impl HasTopic<QbitTopic> for QbitPublish {
         match self {
             Self::Ready | Self::Unavailable { .. } => QbitTopic::Availability,
             Self::ListenPortReady { .. } => QbitTopic::ListenPort,
-            Self::TorrentsUpdated { .. } => QbitTopic::Torrents,
+            // `DeadTorrentRemoved` is routed on `Torrents` so the domain's
+            // existing `Torrents` subscription delivers it without a new topic.
+            Self::TorrentsUpdated { .. } | Self::DeadTorrentRemoved { .. } => QbitTopic::Torrents,
         }
     }
 }
@@ -195,6 +210,25 @@ impl QbitMachine {
             cookie,
             hash: hash.clone(),
         }]
+    }
+
+    /// Returns `true` when the torrent's state and download size classify it as
+    /// "dead" for the purposes of the zero-byte dead-torrent cleanup path
+    /// (story 20).
+    ///
+    /// A torrent is dead when:
+    /// - `downloaded_bytes == 0` (nothing was downloaded), **and**
+    /// - `state` is one of the stalled / error / paused variants.
+    const fn is_dead(record: &TorrentRecord) -> bool {
+        record.downloaded_bytes == 0
+            && matches!(
+                record.state,
+                TorrentState::StalledDownloading
+                    | TorrentState::StalledUploading
+                    | TorrentState::Error
+                    | TorrentState::PausedDownloading
+                    | TorrentState::PausedUploading
+            )
     }
 
     fn retry_listen_port_or_read_preferences(&self) -> Vec<QbitAction> {
@@ -322,11 +356,32 @@ impl Machine for QbitMachine {
             }
             QbitEvent::TorrentsListed { torrents } => {
                 let hashes: Vec<TorrentHash> = torrents.iter().map(|t| t.hash.clone()).collect();
+
+                // Collect dead-torrent metadata before the map is updated.
+                let dead: Vec<(TorrentHash, Option<MamTorrentId>)> = torrents
+                    .iter()
+                    .filter(|t| Self::is_dead(t))
+                    .map(|t| (t.hash.clone(), t.mam_id))
+                    .collect();
+
                 self.torrents = torrents.into_iter().map(|t| (t.hash.clone(), t)).collect();
-                Outcome {
-                    actions: Vec::new(),
-                    publish: vec![QbitPublish::TorrentsUpdated { hashes }],
+
+                let mut actions = Vec::new();
+                let mut publish = vec![QbitPublish::TorrentsUpdated { hashes }];
+
+                // For each dead torrent, attempt an authorised delete.  Only
+                // emit `DeadTorrentRemoved` when the delete is actually
+                // authorised (i.e. a cookie is present), so we never announce
+                // a removal that didn't happen.
+                for (hash, mam_id) in dead {
+                    let delete_actions = self.authorize_delete(&hash);
+                    if !delete_actions.is_empty() {
+                        actions.extend(delete_actions);
+                        publish.push(QbitPublish::DeadTorrentRemoved { hash, mam_id });
+                    }
                 }
+
+                Outcome { actions, publish }
             }
             QbitEvent::TimerFired(QbitTimer::SyncRetry) => Outcome {
                 actions: self.retry_listen_port_or_read_preferences(),
@@ -840,6 +895,133 @@ mod tests {
             "delete must be emitted for unknown torrent"
         );
     }
+
+    // ── Dead-torrent auto-cleanup unit tests (QBIT-9 / story 20) ─────────────
+
+    fn stalled_zero_byte_record(hash: &TorrentHash) -> TorrentRecord {
+        TorrentRecord {
+            hash: hash.clone(),
+            downloaded_bytes: 0,
+            seed_time: Duration::ZERO,
+            state: TorrentState::StalledDownloading,
+            mam_id: None,
+        }
+    }
+
+    #[test]
+    fn dead_torrent_authenticated_emits_delete_and_removed_publish() {
+        // A zero-byte StalledDownloading torrent + authenticated session →
+        // emits DeleteTorrent action AND DeadTorrentRemoved publish.
+        let (mut m, cookie) = authenticated_machine();
+        let hash = TorrentHash("a".repeat(40));
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![stalled_zero_byte_record(&hash)],
+            },
+        );
+        assert!(
+            out.actions.contains(&QbitAction::DeleteTorrent {
+                cookie,
+                hash: hash.clone(),
+            }),
+            "DeleteTorrent must be emitted for a dead zero-byte torrent"
+        );
+        assert!(
+            out.publish
+                .contains(&QbitPublish::DeadTorrentRemoved { hash, mam_id: None }),
+            "DeadTorrentRemoved must be published when delete is authorised"
+        );
+    }
+
+    #[test]
+    fn active_downloading_torrent_not_deleted() {
+        // A zero-byte Downloading torrent is active, not dead — must NOT be deleted.
+        let (mut m, _cookie) = authenticated_machine();
+        let hash = TorrentHash("b".repeat(40));
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![TorrentRecord {
+                    hash: hash.clone(),
+                    downloaded_bytes: 0,
+                    seed_time: Duration::ZERO,
+                    state: TorrentState::Downloading,
+                    mam_id: None,
+                }],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::DeleteTorrent { .. })),
+            "an active Downloading torrent must NOT trigger auto-delete"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::DeadTorrentRemoved { .. })),
+            "DeadTorrentRemoved must NOT be published for an active torrent"
+        );
+    }
+
+    #[test]
+    fn non_zero_byte_stalled_torrent_not_auto_deleted() {
+        // A non-zero-byte StalledDownloading torrent must NOT be deleted by the
+        // dead-torrent path (it falls under the HnR lock instead).
+        let (mut m, _cookie) = authenticated_machine();
+        let hash = TorrentHash("c".repeat(40));
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![TorrentRecord {
+                    hash: hash.clone(),
+                    downloaded_bytes: 1024,
+                    seed_time: Duration::ZERO,
+                    state: TorrentState::StalledDownloading,
+                    mam_id: None,
+                }],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::DeleteTorrent { .. })),
+            "a non-zero-byte stalled torrent must NOT be auto-deleted"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::DeadTorrentRemoved { .. })),
+            "DeadTorrentRemoved must NOT be published for a non-zero-byte torrent"
+        );
+    }
+
+    #[test]
+    fn dead_torrent_no_cookie_no_delete_no_publish() {
+        // Without a cookie, a dead torrent produces no delete action and no
+        // DeadTorrentRemoved publish.
+        let mut m = machine();
+        let hash = TorrentHash("d".repeat(40));
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![stalled_zero_byte_record(&hash)],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::DeleteTorrent { .. })),
+            "no delete must be emitted without a cookie"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::DeadTorrentRemoved { .. })),
+            "no DeadTorrentRemoved must be published without a cookie"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1093,6 +1275,43 @@ mod prop_tests {
                         !unsatisfied.contains(hash),
                         "DeleteTorrent emitted for HnR-unsatisfied hash {hash:?}"
                     );
+                }
+            }
+        }
+
+        // QBIT-9 [safety] (Guarantee A): every DeleteTorrent emitted by the
+        // dead-torrent listing path targets a torrent whose downloaded_bytes == 0.
+        // Because a dead torrent is defined as zero-byte, the HnR gate (QBIT-8)
+        // also allows it, so the two invariants compose.
+        // Tested against fully-arbitrary machine state (total invariant).
+        #[test]
+        fn dead_torrent_delete_targets_only_zero_byte_torrents(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            // Build a lookup of the listed torrents BEFORE they overwrite the map.
+            let listed: HashMap<TorrentHash, TorrentRecord> = torrents
+                .iter()
+                .map(|t| (t.hash.clone(), t.clone()))
+                .collect();
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            for action in &out.actions {
+                if let QbitAction::DeleteTorrent { hash, .. } = action {
+                    // The delete must target a torrent that was in the new listing
+                    // and that torrent must have downloaded_bytes == 0.
+                    if let Some(record) = listed.get(hash) {
+                        prop_assert_eq!(
+                            record.downloaded_bytes,
+                            0,
+                            "DeleteTorrent from TorrentsListed targets a non-zero-byte torrent"
+                        );
+                    }
+                    // If the hash is NOT in the listed set (shouldn't happen via
+                    // this path, but compose with QBIT-8 to be sure), the test is
+                    // vacuously satisfied.
                 }
             }
         }

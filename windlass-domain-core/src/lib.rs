@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windlass_db_core::DbCommand;
+use windlass_db_core::{DbCommand, DownloadStateChange, DownloadStatus};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
@@ -187,6 +187,9 @@ impl Machine for WindlassMachine {
                 QbitPublish::ListenPortReady { .. } | QbitPublish::TorrentsUpdated { .. },
             )
             | WindlassEvent::Mam(MamPublish::Connectable { .. }) => Outcome::none(),
+            WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { mam_id, .. }) => {
+                Self::on_dead_torrent_removed(mam_id)
+            }
             WindlassEvent::Mam(MamPublish::SeedboxPortReady { port }) => Outcome {
                 actions: vec![WindlassAction::SendAlert {
                     priority: AlertPriority::Info,
@@ -248,6 +251,30 @@ impl Machine for WindlassMachine {
 }
 
 impl WindlassMachine {
+    /// Handles the `DeadTorrentRemoved` qBit publish.
+    ///
+    /// When `mam_id` is `Some`, emits a `MarkDownloadState(Blacklisted)` DB command
+    /// and an `Activity` publish.  When `mam_id` is `None`, does nothing (no MAM
+    /// record to update).
+    fn on_dead_torrent_removed(
+        mam_id: Option<windlass_types::MamTorrentId>,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        mam_id.map_or_else(Outcome::none, |id| Outcome {
+            actions: vec![WindlassAction::Db(DbCommand::MarkDownloadState(
+                DownloadStateChange {
+                    mam_id: id,
+                    status: DownloadStatus::Blacklisted,
+                },
+            ))],
+            publish: vec![WindlassPublish::Activity {
+                message: format!(
+                    "Dead torrent blacklisted in DB (MAM ID {})",
+                    id.into_inner()
+                ),
+            }],
+        })
+    }
+
     fn publish_state(&self) -> Outcome<WindlassAction, WindlassPublish> {
         Outcome {
             actions: vec![self.snapshot_action()],
@@ -363,6 +390,69 @@ mod tests {
         ));
         assert!(out.publish.is_empty());
     }
+
+    // ── Dead-torrent blacklist tests (DOM-8 / story 20) ───────────────────────
+
+    #[test]
+    fn dead_torrent_removed_with_mam_id_emits_blacklist_command() {
+        use windlass_db_core::{DbCommand, DownloadStateChange, DownloadStatus};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::{MamTorrentId, TorrentHash};
+
+        let mut machine = machine();
+        let mam_id = MamTorrentId::try_new(12_345).unwrap();
+        let hash = TorrentHash("a".repeat(40));
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved {
+                hash,
+                mam_id: Some(mam_id),
+            }),
+        );
+
+        let expected_cmd = WindlassAction::Db(DbCommand::MarkDownloadState(DownloadStateChange {
+            mam_id,
+            status: DownloadStatus::Blacklisted,
+        }));
+        assert!(
+            out.actions.contains(&expected_cmd),
+            "MarkDownloadState(Blacklisted) must be emitted for a DeadTorrentRemoved with mam_id"
+        );
+        assert_eq!(out.actions.len(), 1, "exactly one action expected");
+        assert_eq!(
+            out.publish.len(),
+            1,
+            "exactly one publish expected (Activity)"
+        );
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
+
+    #[test]
+    fn dead_torrent_removed_without_mam_id_emits_nothing() {
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::TorrentHash;
+
+        let mut machine = machine();
+        let hash = TorrentHash("b".repeat(40));
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { hash, mam_id: None }),
+        );
+
+        assert!(
+            out.actions.is_empty(),
+            "no action must be emitted when mam_id is None"
+        );
+        assert!(
+            out.publish.is_empty(),
+            "no publish must be emitted when mam_id is None"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +520,10 @@ mod prop_tests {
         ]
     }
 
+    fn any_mam_id() -> impl Strategy<Value = windlass_types::MamTorrentId> {
+        (1u64..=1_000_000u64).prop_map(|n| windlass_types::MamTorrentId::try_new(n).unwrap())
+    }
+
     fn any_qbit_publish() -> impl Strategy<Value = QbitPublish> {
         prop_oneof![
             Just(QbitPublish::Ready),
@@ -437,6 +531,8 @@ mod prop_tests {
             any_vpn_port().prop_map(|port| QbitPublish::ListenPortReady { port }),
             prop::collection::vec(any_torrent_hash(), 0..4)
                 .prop_map(|hashes| QbitPublish::TorrentsUpdated { hashes }),
+            (any_torrent_hash(), proptest::option::of(any_mam_id()))
+                .prop_map(|(hash, mam_id)| QbitPublish::DeadTorrentRemoved { hash, mam_id }),
         ]
     }
 

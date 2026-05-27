@@ -215,6 +215,13 @@ download tracking; populated on every `TorrentsListed` event).
   — nothing was downloaded), or `seed_time >= hnr_seed_time` (fully
   `HnR`-satisfied). The machine has no cookie → no action at all. This invariant
   is total (holds for any generated machine state, including unreachable ones). → A
+- **QBIT-9 [safety]** *(Zero-byte dead-torrent deletion — §20)* Every
+  `DeleteTorrent` action emitted by the `TorrentsListed` dead-torrent path
+  targets a torrent whose `downloaded_bytes == 0`. Stalled/error/paused torrents
+  with any downloaded data are never auto-deleted by this path; they fall under
+  the HnR seed-time lock (QBIT-8) instead. A dead torrent is zero-byte by
+  definition, so QBIT-8 and QBIT-9 compose: the gate allows it whenever a
+  cookie is present. This invariant is total. → A
 
 Shell contract: `ListenPortSet { port }` is now routed through the
 desired-port filter (`listen_port_publish`), so QBIT-4 holds for any event —
@@ -274,6 +281,11 @@ Option<VpnPort> }`.
   → (mechanism)
 - **DOM-7 [safety]** Every event that changes `SystemStateView` publishes a
   `SystemState` snapshot. → G
+- **DOM-8 [safety]** *(Dead-torrent blacklist — §20)* A
+  `Qbit(DeadTorrentRemoved { mam_id: Some(id) })` event emits exactly one
+  `Db(MarkDownloadState { mam_id: id, status: Blacklisted })` action and
+  exactly one `Activity` publish. A `DeadTorrentRemoved { mam_id: None }` event
+  emits no action and no publish. → A
 
 ### Service runtime (`ServiceRuntime`)
 

@@ -605,7 +605,7 @@ negative, and a huge download queue.
 
 ## Story: Restrict Automatic Deletion And Blacklisting To Zero-Byte Dead Torrents
 
-Status: To Do
+Status: Done
 
 ### Problem
 
