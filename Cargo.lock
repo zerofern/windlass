@@ -3269,6 +3269,7 @@ name = "windlass-db-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "proptest",
  "serde",
  "serde_json",
  "windlass-machine",
@@ -3296,6 +3297,7 @@ name = "windlass-domain-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "proptest",
  "serde",
  "serde_json",
  "windlass-db-core",
@@ -3337,6 +3339,7 @@ dependencies = [
 name = "windlass-mam-core"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "serde",
  "windlass-machine",
  "windlass-types",
@@ -3346,6 +3349,7 @@ dependencies = [
 name = "windlass-qbit-core"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "serde",
  "windlass-machine",
  "windlass-types",

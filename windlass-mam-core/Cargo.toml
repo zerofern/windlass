@@ -7,3 +7,6 @@ edition = "2024"
 serde            = { workspace = true }
 windlass-machine = { workspace = true }
 windlass-types   = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

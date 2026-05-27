@@ -399,3 +399,113 @@ mod tests {
         assert_eq!(out.publish, vec![MamPublish::SeedboxPortReady { port }]);
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use std::time::{Duration, Instant};
+
+    use proptest::prelude::*;
+    use windlass_machine::{Machine, Timed};
+    use windlass_types::VpnPort;
+
+    use crate::{MamAction, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer};
+
+    fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
+        (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
+    }
+
+    // Fully-arbitrary state, including unreachable field combinations: the tested
+    // invariants are total.
+    fn any_mam_machine() -> impl Strategy<Value = MamMachine> {
+        (
+            any::<bool>(),
+            proptest::option::of(any_vpn_port()),
+            proptest::option::of(any_vpn_port()),
+        )
+            .prop_map(|(authenticated, seedbox_port, desired_seedbox_port)| {
+                let mut machine = MamMachine::new(
+                    MamConfig {
+                        status_retry: Duration::from_secs(5),
+                    },
+                    Instant::now(),
+                );
+                machine.authenticated = authenticated;
+                machine.seedbox_port = seedbox_port;
+                machine.desired_seedbox_port = desired_seedbox_port;
+                machine
+            })
+    }
+
+    fn any_mam_event() -> impl Strategy<Value = MamEvent> {
+        prop_oneof![
+            Just(MamEvent::Init),
+            Just(MamEvent::AuthSucceeded),
+            any::<String>().prop_map(|reason| MamEvent::AuthFailed { reason }),
+            (any::<bool>(), proptest::option::of(any_vpn_port())).prop_map(
+                |(connectable, seedbox_port)| MamEvent::StatusFetched {
+                    connectable,
+                    seedbox_port,
+                }
+            ),
+            any::<String>().prop_map(|reason| MamEvent::StatusFailed { reason }),
+            Just(MamEvent::SeedboxUpdated),
+            any::<String>().prop_map(|reason| MamEvent::SeedboxUpdateFailed { reason }),
+            (0u64..=3600).prop_map(|s| MamEvent::RateLimited {
+                retry_after: Duration::from_secs(s)
+            }),
+            Just(MamEvent::TimerFired(MamTimer::StatusRetry)),
+            Just(MamEvent::TimerFired(MamTimer::RateLimitExpired)),
+        ]
+    }
+
+    proptest! {
+        // GLOBAL-1 (no panic).
+        #[test]
+        fn handle_never_panics(mut machine in any_mam_machine(), event in any_mam_event()) {
+            let _ = machine.handle(Instant::now(), Timed::now(event));
+        }
+
+        // MAM-1 (Guarantee C): every published SeedboxPortReady carries a port
+        // that agrees with the desired target (or there is no desired target).
+        #[test]
+        fn seedbox_port_ready_matches_desired(
+            mut machine in any_mam_machine(),
+            event in any_mam_event(),
+        ) {
+            let out = machine.handle(Instant::now(), Timed::now(event));
+            for publish in &out.publish {
+                if let MamPublish::SeedboxPortReady { port } = publish {
+                    prop_assert!(
+                        machine.desired_seedbox_port.is_none()
+                            || machine.desired_seedbox_port == Some(*port)
+                    );
+                }
+            }
+        }
+
+        // MAM-2 (Guarantee F): a retryable failure schedules exactly one backed-off
+        // StatusRetry and publishes Unavailable — never an immediate retry action.
+        #[test]
+        fn failures_schedule_one_status_retry(
+            mut machine in any_mam_machine(),
+            reason in any::<String>(),
+        ) {
+            for event in [
+                MamEvent::AuthFailed { reason: reason.clone() },
+                MamEvent::StatusFailed { reason: reason.clone() },
+                MamEvent::SeedboxUpdateFailed { reason },
+            ] {
+                let out = machine.handle(Instant::now(), Timed::now(event));
+                prop_assert_eq!(out.actions.len(), 1);
+                let is_status_retry = matches!(
+                    out.actions[0],
+                    MamAction::ScheduleTimer { timer: MamTimer::StatusRetry, .. }
+                );
+                prop_assert!(is_status_retry);
+                prop_assert_eq!(out.publish.len(), 1);
+                let is_unavailable = matches!(out.publish[0], MamPublish::Unavailable { .. });
+                prop_assert!(is_unavailable);
+            }
+        }
+    }
+}

@@ -597,3 +597,158 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use std::time::{Duration, Instant};
+
+    use proptest::prelude::*;
+    use windlass_machine::{Machine, Timed};
+    use windlass_types::{AuthCookie, TorrentHash, VpnPort};
+
+    use crate::{QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish, QbitTimer};
+
+    fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
+        (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
+    }
+
+    fn any_auth_cookie() -> impl Strategy<Value = AuthCookie> {
+        "[a-zA-Z0-9]{8,32}".prop_map(AuthCookie::new)
+    }
+
+    fn any_torrent_hash() -> impl Strategy<Value = TorrentHash> {
+        "[a-f0-9]{40}".prop_map(TorrentHash)
+    }
+
+    // Fully-arbitrary state, including unreachable combinations: the tested
+    // invariants are total.
+    fn any_qbit_machine() -> impl Strategy<Value = QbitMachine> {
+        (
+            proptest::option::of(any_auth_cookie()),
+            proptest::option::of(any_vpn_port()),
+            proptest::option::of(any_vpn_port()),
+            any::<bool>(),
+        )
+            .prop_map(|(cookie, listen_port, desired_listen_port, refresh_scheduled)| {
+                let mut machine = QbitMachine::new(
+                    QbitConfig {
+                        auth_retry: Duration::from_secs(1),
+                        sync_retry: Duration::from_secs(2),
+                        torrent_refresh: Duration::from_secs(30),
+                    },
+                    Instant::now(),
+                );
+                machine.cookie = cookie;
+                machine.listen_port = listen_port;
+                machine.desired_listen_port = desired_listen_port;
+                machine.refresh_scheduled = refresh_scheduled;
+                machine
+            })
+    }
+
+    fn any_qbit_event() -> impl Strategy<Value = QbitEvent> {
+        prop_oneof![
+            Just(QbitEvent::Init),
+            any_auth_cookie().prop_map(|cookie| QbitEvent::AuthSucceeded { cookie }),
+            any::<String>().prop_map(|reason| QbitEvent::AuthFailed { reason }),
+            proptest::option::of(any_vpn_port())
+                .prop_map(|listen_port| QbitEvent::PreferencesRead { listen_port }),
+            any::<String>().prop_map(|reason| QbitEvent::PreferencesFailed { reason }),
+            any_vpn_port().prop_map(|port| QbitEvent::ListenPortSet { port }),
+            (any_vpn_port(), any::<String>())
+                .prop_map(|(port, reason)| QbitEvent::ListenPortSetFailed { port, reason }),
+            prop::collection::vec(any_torrent_hash(), 0..4)
+                .prop_map(|hashes| QbitEvent::TorrentsListed { hashes }),
+            Just(QbitEvent::TimerFired(QbitTimer::AuthRetry)),
+            Just(QbitEvent::TimerFired(QbitTimer::SyncRetry)),
+            Just(QbitEvent::TimerFired(QbitTimer::TorrentRefresh)),
+        ]
+    }
+
+    fn any_qbit_command() -> impl Strategy<Value = QbitCommand> {
+        prop_oneof![
+            Just(QbitCommand::EnsureAuthenticated),
+            any_vpn_port().prop_map(|port| QbitCommand::EnsureListenPort { port }),
+            Just(QbitCommand::RefreshTorrents),
+            any_torrent_hash().prop_map(|hash| QbitCommand::PauseTorrent { hash }),
+            any_torrent_hash().prop_map(|hash| QbitCommand::ResumeTorrent { hash }),
+        ]
+    }
+
+    fn carries_cookie(action: &QbitAction) -> bool {
+        matches!(
+            action,
+            QbitAction::ReadPreferences { .. }
+                | QbitAction::SetListenPort { .. }
+                | QbitAction::ListTorrents { .. }
+                | QbitAction::PauseTorrent { .. }
+                | QbitAction::ResumeTorrent { .. }
+        )
+    }
+
+    proptest! {
+        // GLOBAL-1 (no panic).
+        #[test]
+        fn handle_never_panics(mut machine in any_qbit_machine(), event in any_qbit_event()) {
+            let _ = machine.handle(Instant::now(), Timed::now(event));
+        }
+
+        // QBIT-1 (Guarantees C/D): no cookie-bearing action is emitted unless the
+        // machine is authenticated — for events and for commands.
+        #[test]
+        fn events_emit_no_cookie_action_while_unauthenticated(
+            mut machine in any_qbit_machine(),
+            event in any_qbit_event(),
+        ) {
+            let out = machine.handle(Instant::now(), Timed::now(event));
+            for action in &out.actions {
+                if carries_cookie(action) {
+                    prop_assert!(machine.is_authenticated());
+                }
+            }
+        }
+
+        #[test]
+        fn commands_emit_no_cookie_action_while_unauthenticated(
+            mut machine in any_qbit_machine(),
+            command in any_qbit_command(),
+        ) {
+            let out = machine.handle_command(Instant::now(), command);
+            for action in &out.actions {
+                if carries_cookie(action) {
+                    prop_assert!(machine.is_authenticated());
+                }
+            }
+        }
+
+        // QBIT-4 (Guarantee C): every published ListenPortReady carries a port
+        // that agrees with the desired target (or there is no desired target).
+        // The ListenPortSet event is constrained to the shell contract — it only
+        // ever carries the desired port (it is the success of a SetListenPort the
+        // machine issued). See operator-readiness story 18.
+        #[test]
+        fn listen_port_ready_matches_desired(
+            (mut machine, event) in (any_qbit_machine(), any_qbit_event()).prop_map(
+                |(machine, event)| {
+                    let event = match (event, machine.desired_listen_port) {
+                        (QbitEvent::ListenPortSet { .. }, Some(port)) => {
+                            QbitEvent::ListenPortSet { port }
+                        }
+                        (other, _) => other,
+                    };
+                    (machine, event)
+                }
+            ),
+        ) {
+            let out = machine.handle(Instant::now(), Timed::now(event));
+            for publish in &out.publish {
+                if let QbitPublish::ListenPortReady { port } = publish {
+                    prop_assert!(
+                        machine.desired_listen_port.is_none()
+                            || machine.desired_listen_port == Some(*port)
+                    );
+                }
+            }
+        }
+    }
+}

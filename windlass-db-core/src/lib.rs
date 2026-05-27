@@ -277,3 +277,137 @@ mod tests {
         assert_eq!(value["RecordActivity"]["metadata"]["port"], 51_820);
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use std::time::Instant;
+
+    use chrono::Utc;
+    use proptest::prelude::*;
+    use serde_json::json;
+    use windlass_machine::{Machine, Timed};
+    use windlass_types::{AlertPriority, MamTorrentId, TorrentHash};
+
+    use crate::{
+        ActivityId, ActivityRecord, ActivitySource, AlertId, AlertRecord, BookId, BookRecord,
+        BookStatus, DbAction, DbCommand, DbEvent, DbFailure, DbMachine, DbPublish, DbResponse,
+        DownloadId, DownloadQueueRecord, DownloadStateChange, DownloadStatus, SnapshotId,
+        SystemSnapshotRecord, TorrentRecord, TorrentStateRecord,
+    };
+
+    fn any_torrent_hash() -> impl Strategy<Value = TorrentHash> {
+        "[a-f0-9]{40}".prop_map(TorrentHash)
+    }
+
+    fn any_mam_id() -> impl Strategy<Value = MamTorrentId> {
+        (1u64..=1_000_000).prop_map(|n| MamTorrentId::try_new(n).unwrap())
+    }
+
+    fn any_db_event() -> impl Strategy<Value = DbEvent> {
+        prop_oneof![
+            any::<i64>().prop_map(|id| DbEvent::ActivityRecorded { id: ActivityId(id) }),
+            any::<i64>().prop_map(|id| DbEvent::AlertRecorded { id: AlertId(id) }),
+            any::<i64>().prop_map(|id| DbEvent::SystemSnapshotSaved { id: SnapshotId(id) }),
+            any_torrent_hash().prop_map(|hash| DbEvent::TorrentUpserted { hash }),
+            any::<i64>().prop_map(|id| DbEvent::BookUpserted { id: BookId(id) }),
+            any::<i64>().prop_map(|id| DbEvent::DownloadQueueUpdated { id: DownloadId(id) }),
+            (any::<String>(), any::<String>(), any::<bool>()).prop_map(
+                |(operation, message, retryable)| DbEvent::Failed(DbFailure {
+                    operation,
+                    message,
+                    retryable,
+                })
+            ),
+        ]
+    }
+
+    fn any_alert_priority() -> impl Strategy<Value = AlertPriority> {
+        prop_oneof![
+            Just(AlertPriority::Info),
+            Just(AlertPriority::Warning),
+            Just(AlertPriority::Critical),
+        ]
+    }
+
+    fn any_db_command() -> impl Strategy<Value = DbCommand> {
+        prop_oneof![
+            any::<String>().prop_map(|action| DbCommand::RecordActivity(ActivityRecord {
+                at: Utc::now(),
+                source: ActivitySource::System,
+                action,
+                book_id: None,
+                detail: None,
+                metadata: json!({}),
+            })),
+            (any_alert_priority(), any::<String>(), any::<String>()).prop_map(
+                |(priority, title, body)| DbCommand::RecordAlert(AlertRecord {
+                    at: Utc::now(),
+                    priority,
+                    title,
+                    body,
+                })
+            ),
+            Just(DbCommand::SaveSystemSnapshot(SystemSnapshotRecord {
+                at: Utc::now(),
+                state: json!({}),
+            })),
+            any_torrent_hash().prop_map(|hash| DbCommand::UpsertTorrent(TorrentRecord {
+                hash,
+                book_id: None,
+                mam_id: None,
+                name: "t".to_string(),
+                state: TorrentStateRecord::Downloading,
+                seeding_time_secs: 0,
+                downloaded_bytes: 0,
+                seen_at: Utc::now(),
+            })),
+            Just(DbCommand::UpsertBook(BookRecord {
+                id: None,
+                mam_id: None,
+                title: None,
+                author: None,
+                status: BookStatus::Queued,
+            })),
+            any_mam_id().prop_map(|mam_id| DbCommand::EnqueueDownload(DownloadQueueRecord {
+                book_id: None,
+                mam_id,
+                status: DownloadStatus::Pending,
+            })),
+            any_mam_id().prop_map(|mam_id| DbCommand::MarkDownloadState(DownloadStateChange {
+                mam_id,
+                status: DownloadStatus::Complete,
+            })),
+        ]
+    }
+
+    proptest! {
+        // DB-2 + DB-3 (Guarantee F): every event yields exactly one publish and
+        // NO action — so a DB failure can never trigger more DB work (no recursion).
+        #[test]
+        fn event_publishes_once_and_emits_no_action(event in any_db_event()) {
+            let mut machine = DbMachine::new((), Instant::now());
+            let is_failure = matches!(event, DbEvent::Failed(_));
+
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            prop_assert!(out.actions.is_empty());
+            prop_assert_eq!(out.publish.len(), 1);
+            match &out.publish[0] {
+                DbPublish::Failed(_) => prop_assert!(is_failure),
+                DbPublish::Succeeded { .. } => prop_assert!(!is_failure),
+            }
+        }
+
+        // DB-1: every command yields exactly one Execute(cmd), no publish, Accepted.
+        #[test]
+        fn command_executes_verbatim(command in any_db_command()) {
+            let mut machine = DbMachine::new((), Instant::now());
+
+            let out = machine.handle_command(Instant::now(), command.clone());
+
+            prop_assert!(out.publish.is_empty());
+            prop_assert_eq!(out.response, DbResponse::Accepted);
+            prop_assert_eq!(out.actions, vec![DbAction::Execute(command)]);
+        }
+    }
+}

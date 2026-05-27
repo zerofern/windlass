@@ -364,3 +364,144 @@ mod tests {
         assert!(out.publish.is_empty());
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use std::time::{Duration, Instant};
+
+    use proptest::prelude::*;
+    use windlass_machine::{Machine, Timed};
+    use windlass_mam_core::{MamCommand, MamPublish};
+    use windlass_qbit_core::{QbitCommand, QbitPublish};
+    use windlass_types::{TorrentHash, VpnPort};
+    use windlass_vpn_core::VpnPublish;
+
+    use crate::{
+        ServiceStatus, SystemStateView, WindlassAction, WindlassConfig, WindlassEvent,
+        WindlassMachine, WindlassTimer,
+    };
+
+    fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
+        (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
+    }
+
+    fn any_torrent_hash() -> impl Strategy<Value = TorrentHash> {
+        "[a-f0-9]{40}".prop_map(TorrentHash)
+    }
+
+    fn any_service_status() -> impl Strategy<Value = ServiceStatus> {
+        prop_oneof![
+            Just(ServiceStatus::Unknown),
+            Just(ServiceStatus::Ready),
+            Just(ServiceStatus::Degraded),
+        ]
+    }
+
+    fn any_windlass_machine() -> impl Strategy<Value = WindlassMachine> {
+        (
+            any_service_status(),
+            any_service_status(),
+            any_service_status(),
+            proptest::option::of(any_vpn_port()),
+        )
+            .prop_map(|(vpn, qbit, mam, forwarded_port)| {
+                let mut machine = WindlassMachine::new(
+                    WindlassConfig {
+                        snapshot_interval: Duration::from_secs(60),
+                    },
+                    Instant::now(),
+                );
+                machine.state = SystemStateView {
+                    vpn,
+                    qbit,
+                    mam,
+                    forwarded_port,
+                };
+                machine
+            })
+    }
+
+    fn any_vpn_publish() -> impl Strategy<Value = VpnPublish> {
+        prop_oneof![
+            Just(VpnPublish::Connected),
+            Just(VpnPublish::Disconnected),
+            any_vpn_port().prop_map(|port| VpnPublish::PortReady { port }),
+            Just(VpnPublish::PortUnavailable),
+        ]
+    }
+
+    fn any_qbit_publish() -> impl Strategy<Value = QbitPublish> {
+        prop_oneof![
+            Just(QbitPublish::Ready),
+            any::<String>().prop_map(|reason| QbitPublish::Unavailable { reason }),
+            any_vpn_port().prop_map(|port| QbitPublish::ListenPortReady { port }),
+            prop::collection::vec(any_torrent_hash(), 0..4)
+                .prop_map(|hashes| QbitPublish::TorrentsUpdated { hashes }),
+        ]
+    }
+
+    fn any_mam_publish() -> impl Strategy<Value = MamPublish> {
+        prop_oneof![
+            Just(MamPublish::Ready),
+            any::<String>().prop_map(|reason| MamPublish::Unavailable { reason }),
+            (0u64..=3600).prop_map(|s| MamPublish::RateLimited {
+                retry_after: Duration::from_secs(s)
+            }),
+            proptest::option::of(any_vpn_port())
+                .prop_map(|seedbox_port| MamPublish::Connectable { seedbox_port }),
+            any::<String>().prop_map(|reason| MamPublish::NotConnectable { reason }),
+            any_vpn_port().prop_map(|port| MamPublish::SeedboxPortReady { port }),
+        ]
+    }
+
+    fn any_windlass_event() -> impl Strategy<Value = WindlassEvent> {
+        prop_oneof![
+            Just(WindlassEvent::Init),
+            any_vpn_publish().prop_map(WindlassEvent::Vpn),
+            any_qbit_publish().prop_map(WindlassEvent::Qbit),
+            any_mam_publish().prop_map(WindlassEvent::Mam),
+            (any::<String>(), any::<String>())
+                .prop_map(|(operation, message)| WindlassEvent::DbFailed { operation, message }),
+            Just(WindlassEvent::TimerFired(WindlassTimer::Snapshot)),
+        ]
+    }
+
+    proptest! {
+        // GLOBAL-1 (no panic).
+        #[test]
+        fn handle_never_panics(mut machine in any_windlass_machine(), event in any_windlass_event()) {
+            let _ = machine.handle(Instant::now(), Timed::now(event));
+        }
+
+        // DOM-1 (Guarantee C, marquee): the domain never commands qBit or MAM to
+        // converge on a port unless it currently holds that forwarded port.
+        #[test]
+        fn converge_commands_imply_forwarded_port(
+            mut machine in any_windlass_machine(),
+            event in any_windlass_event(),
+        ) {
+            let out = machine.handle(Instant::now(), Timed::now(event));
+            for action in &out.actions {
+                if let WindlassAction::Qbit(QbitCommand::EnsureListenPort { port })
+                    | WindlassAction::Mam(MamCommand::EnsureSeedboxPort { port }) = action
+                {
+                    prop_assert_eq!(machine.state().forwarded_port, Some(*port));
+                }
+            }
+        }
+
+        // DOM-2 (Guarantees B/C): losing VPN connectivity always clears the
+        // forwarded port, regardless of prior state.
+        #[test]
+        fn vpn_loss_clears_forwarded_port(
+            mut machine in any_windlass_machine(),
+            lost in prop_oneof![
+                Just(VpnPublish::Disconnected),
+                Just(VpnPublish::PortUnavailable),
+            ],
+        ) {
+            machine.handle(Instant::now(), Timed::now(WindlassEvent::Vpn(lost)));
+            prop_assert!(machine.state().forwarded_port.is_none());
+        }
+    }
+}

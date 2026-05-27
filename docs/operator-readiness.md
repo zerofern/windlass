@@ -364,12 +364,14 @@ against regressions and future invariant stories have a harness to build on.
   `Command` (primitive strategies for shared `windlass-types` are duplicated
   per crate — no shared strategy crate for now).
 - Primary test style is **direct `(state, event)` generation**: generate a
-  machine state (via a `#[cfg(test)]` from-parts constructor), generate an event
-  or command, run `handle` / `handle_command` once, and assert the invariants on
-  the outcome and post-state. This covers the full `(state × event)` cross-
-  product, including states a fixed event history would rarely reach.
-- Each machine exposes a test-only constructor that builds its state from parts
-  (its fields are private), plus a state `Strategy`.
+  machine state, generate an event or command, run `handle` / `handle_command`
+  once, and assert the invariants on the outcome and post-state. This covers the
+  full `(state × event)` cross-product, including states a fixed event history
+  would rarely reach.
+- Each machine has a state `Strategy`. Inline `#[cfg(test)] mod prop_tests` is a
+  child of the crate root, so it can set the machine's private fields directly
+  (build via `Machine::new` then override the state fields) — no production
+  from-parts constructor is needed.
 - Sequence-folding from `Machine::new` is kept as a **secondary** tool for the
   few genuinely history-shaped properties; it is no longer the default.
 - Generic baseline per machine: no generated `(state, event)` panics.
@@ -434,8 +436,10 @@ and the later stories that add rich operator state.
   classification above (total invariants welcome impossible states; reachable-only
   ones use the valid-by-construction generator). Folding is reserved for the few
   history-shaped properties.
-- Each machine needs a `#[cfg(test)]` from-parts constructor since its fields are
-  private — this is the main code change direct generation requires.
+- No production code change is needed to build arbitrary states: an inline
+  `#[cfg(test)] mod prop_tests` is a descendant of the crate root and can set the
+  machine's private fields directly (construct via `Machine::new`, then override
+  the state fields in the generator).
 - Small enumerable input shapes are clearer as **example unit tests** than as
   properties — e.g. `VpnEvent::StateRead`'s four `connected × port` combinations
   each get an explicit test asserting the exact publishes (this is also where the

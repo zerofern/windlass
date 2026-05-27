@@ -13,3 +13,6 @@ windlass-mam-core  = { workspace = true }
 windlass-qbit-core = { workspace = true }
 windlass-types     = { workspace = true }
 windlass-vpn-core  = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
