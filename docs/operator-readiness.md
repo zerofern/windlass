@@ -42,6 +42,17 @@ Implement these stories one at a time, in this order:
 16. Clarify the manual download happy path and blocked states in the UI.
 17. Make HnR/compliance risk visible enough that unsafe manual deletion is hard
     to miss.
+18. Decide whether cores must defend against dishonest shell events.
+19. Enforce the HnR seed-time lock on automatic torrent deletion.
+20. Restrict automatic deletion and blacklisting to zero-byte dead torrents.
+21. Force qBittorrent to download every file in a torrent (no partials).
+22. Rank and gate disk auto-eviction by HnR-satisfied deletion value.
+23. Auto-revert banned qBittorrent privacy settings (DHT, PeX, LPD).
+24. Orchestrate qBittorrent queue limits to protect unsatisfied torrents.
+25. Pause new automated downloads near the unsatisfied class limit.
+26. Gate new downloads on upload health (ratio and credit buffer).
+27. Keep the MAM account alive with a routine homepage heartbeat.
+28. Distinguish MAM `Unreachable` from `NotConnectable`.
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -400,3 +411,374 @@ pot cycle, so I do not need to remember this recurring tracker task manually.
   donation is enabled, whether donation was already attempted, and whether a
   retry is allowed.
 - The MAM shell should own only HTTP details and return typed events.
+
+## Story: Decide Whether Cores Must Defend Against Dishonest Shell Events
+
+Status: To Do
+
+### Problem
+
+While cataloging operator invariants (see `docs/invariants.md`), two cases
+surfaced where a core's published facts are only correct because the shell is
+trusted to send well-formed events. Today these are documented as shell
+contracts, not enforced by the machine:
+
+1. VPN `StateRead { connected: false, port: Some(_) }` would make `VpnMachine`
+   publish `Disconnected` and `PortReady` together, advertising a forwarded port
+   for a VPN it just reported as down. The machine assumes the shell never
+   reports a disconnected VPN that still has a port.
+
+2. qBit's `ListenPortSet { port }` arm publishes `ListenPortReady { port }`
+   directly, bypassing the desired-port filter that the other qBit port-publish
+   paths use (invariant QBIT-4). It is only consistent because the shell only
+   emits `ListenPortSet` as the success result of a `SetListenPort` action the
+   machine itself issued for the desired port.
+
+Neither is a known live bug, because the real shells uphold the contracts. The
+question is whether the cores should defend against these inputs anyway, so the
+invariants hold for *any* event sequence rather than only well-formed ones.
+
+### User Story
+
+As the maintainer, I want a deliberate decision on whether cores must stay
+correct under arbitrary (including dishonest) shell events, so the property
+tests either constrain their generators to the shell contract or prove the
+machines are robust without that assumption.
+
+### Acceptance Criteria
+
+- Decide, per case, between "defend in the machine" and "trust the shell
+  contract".
+- If defending: VPN drops/ignores a port when reporting disconnected, and qBit
+  routes `ListenPortSet` through the desired-port filter (or an equivalent fix),
+  with unit tests for the dishonest input.
+- If trusting: the shell contract is documented at the shell boundary (not only
+  in `docs/invariants.md`), and the property-test generators are constrained to
+  exclude the disallowed event combinations.
+- `docs/invariants.md` is updated to reflect the decision (shell contract vs.
+  enforced invariant).
+
+### Implementation Notes
+
+- This decision directly shapes story 10's generators: defending means
+  unconstrained generators; trusting means the generators must encode the
+  contract.
+- Prefer the cheaper option unless defending removes a real class of operator
+  risk.
+
+## Story: Enforce The HnR Seed-Time Lock On Automatic Torrent Deletion
+
+Status: To Do
+
+### Problem
+
+MAM Rules 2.5 & 2.7 prohibit hit-and-run: a torrent that has downloaded any
+data must keep seeding until it reaches 72 hours of seed time. The operator
+cores do not yet track per-torrent seed time, and there is no deletion decision
+that is gated on it. Any future automatic deletion path could evict a torrent
+mid-HnR and risk an account ban.
+
+This is the highest-stakes operator safety rule. See `docs/invariants.md`.
+
+### User Story
+
+As the operator user, I want automatic torrent deletion to be mathematically
+incapable of evicting a torrent that has downloaded data before it reaches 72
+hours of seed time, so the operator can never cause an HnR violation on my
+behalf.
+
+### Acceptance Criteria
+
+- The qBit core tracks, per known torrent, at least: downloaded bytes and seed
+  time (sourced from qBittorrent torrent listings).
+- A torrent is classified `HnR-satisfied` only when `seed_time >= 72h` or
+  `downloaded_bytes == 0`.
+- No automatic-deletion action is ever emitted for an HnR-unsatisfied torrent,
+  for any state or event sequence.
+- The deletion decision lives in the core, not the shell; the shell only
+  executes the typed delete action the core authorises.
+- Add the new invariant(s) to `docs/invariants.md` and cover them with
+  property-based tests (story 10): no generated sequence produces a delete
+  action for an HnR-unsatisfied torrent.
+
+### Implementation Notes
+
+- The 72-hour threshold should be configurable but default to the MAM rule.
+- This story only establishes the lock. Choosing *which* satisfied torrents to
+  evict is the disk-eviction story.
+
+## Story: Restrict Automatic Deletion And Blacklisting To Zero-Byte Dead Torrents
+
+Status: To Do
+
+### Problem
+
+MAM rules allow cleaning up stalled or dead torrents, but only when nothing has
+been downloaded. The operator has no concept of "dead torrent" cleanup yet, and
+without an explicit rule a cleanup path could delete and blacklist a torrent
+that already pulled data — both wasting the download and risking HnR.
+
+### User Story
+
+As the operator user, I want stalled or dead torrents to be automatically
+deleted and blacklisted only when they have downloaded exactly zero bytes, so
+cleanup never throws away real progress or triggers HnR.
+
+### Acceptance Criteria
+
+- The core can identify a stalled/dead torrent from qBittorrent state.
+- An automatic delete-and-blacklist action is emitted only when
+  `downloaded_bytes == 0`.
+- A dead torrent with any downloaded data is never auto-deleted by this path; it
+  falls under the HnR seed-time lock instead.
+- The decision lives in the core; the shell executes the typed action.
+- Add the invariant to `docs/invariants.md` and cover it with property tests.
+
+## Story: Force qBittorrent To Download Every File In A Torrent
+
+Status: To Do
+
+### Problem
+
+MAM Rule 2.5 (No Partials) prohibits stopping a download partway and keeping
+only some files — every file in a torrent must be downloaded in full. The
+operator does not currently enforce per-file selection, so a torrent added with
+some files deselected (or qBittorrent defaulting to partial selection) would
+violate the rule.
+
+### User Story
+
+As the operator user, I want Windlass to ensure every file in a torrent is set
+to download, so I never accidentally keep a partial torrent and breach MAM
+rules.
+
+### Acceptance Criteria
+
+- When a torrent is added or observed with deselected files, the qBit core emits
+  an action to set all files to download.
+- The core treats "all files selected" as the only compliant state and converges
+  toward it, retrying on failure like other qBit convergence loops.
+- A torrent is never published as healthy/ready while it has deselected files.
+- The decision lives in the core; the shell performs the qBittorrent file-
+  priority call.
+- Add the invariant to `docs/invariants.md` and cover it with property tests.
+
+## Story: Rank And Gate Disk Auto-Eviction By HnR-Satisfied Deletion Value
+
+Status: To Do
+
+### Problem
+
+The operator must keep the mounted volume from filling up. The spec defines an
+emergency auto-evict that, below a hard floor, silently removes the lowest-value
+torrents — but only HnR-satisfied ones, never HnR-unsatisfied. No disk-eviction
+decision exists yet, and the disk core only observes free space.
+
+### User Story
+
+As the operator user, I want the operator to free disk space automatically when
+it drops below a hard floor by evicting only the lowest-value, HnR-satisfied
+torrents, so my disk never fills up and the operator never deletes something it
+must keep seeding.
+
+### Acceptance Criteria
+
+- The core observes free disk space and a configurable hard floor.
+- When free space is below the floor, the core emits delete actions only for
+  HnR-satisfied torrents (per the HnR seed-time lock).
+- Eviction candidates are ranked by deletion value (e.g. completed + low rating
+  + longest time since last play first); HnR-unsatisfied torrents are never
+  eligible.
+- Eviction stops once free space is back above the floor (no over-deletion).
+- The decision lives in the core; the shell executes deletes.
+- Add the invariant to `docs/invariants.md` and cover it with property tests:
+  eviction never targets an HnR-unsatisfied torrent and never deletes more than
+  needed to clear the floor.
+
+### Implementation Notes
+
+- This depends on the HnR seed-time lock story for the satisfied/unsatisfied
+  classification.
+- The user-directed (proactive) deletion-suggestion flow is separate operator-UI
+  work; this story is only the silent emergency brake.
+
+## Story: Auto-Revert Banned qBittorrent Privacy Settings
+
+Status: To Do
+
+### Problem
+
+MAM Rule 6.1 forbids DHT, PeX, and Local Peer Discovery on private trackers;
+these carry an immediate ban risk. Windlass actively manages qBittorrent's
+config, but the operator does not yet detect or correct these settings.
+
+### User Story
+
+As the operator user, I want Windlass to immediately revert DHT, PeX, or Local
+Peer Discovery whenever it finds them enabled, so my account is never exposed to
+a ban from a stray client setting.
+
+### Acceptance Criteria
+
+- The qBit core observes the DHT/PeX/LPD preference values.
+- If any is enabled, the core emits an action to disable it immediately, with no
+  wait for user confirmation.
+- The intervention is recorded in the activity log and fires a `Critical`
+  alert.
+- The core converges back to the safe state and retries on failure.
+- The decision lives in the core; the shell performs the preference write.
+- Add the invariant to `docs/invariants.md` and cover it with property tests:
+  observing any privacy setting enabled always yields a disable action.
+
+## Story: Orchestrate qBittorrent Queue Limits To Protect Unsatisfied Torrents
+
+Status: To Do
+
+### Problem
+
+qBittorrent's `max_active_downloads`, `max_active_uploads`, and
+`max_active_torrents` limits can park torrents when reached. If an
+HnR-unsatisfied torrent gets parked (stops seeding), it risks an HnR violation.
+The operator does not yet orchestrate the queue to keep unsatisfied torrents
+active.
+
+### User Story
+
+As the operator user, I want Windlass to keep my HnR-unsatisfied torrents
+actively seeding by temporarily pausing fully satisfied torrents when qBittorrent
+limits would otherwise park them, so queue limits never cause an HnR violation.
+
+### Acceptance Criteria
+
+- The qBit core knows each torrent's HnR-satisfied status and qBittorrent's
+  active limits.
+- When limits would park an unsatisfied torrent, the core emits actions to pause
+  satisfied torrents to make room, preferring config-free orchestration.
+- The core never pauses an HnR-unsatisfied torrent to make room for another.
+- If orchestration alone cannot prevent a violation, the core escalates per the
+  next story (queue-limit config auto-correction) rather than allowing the
+  parking.
+- The decision lives in the core; the shell performs pause/resume.
+- Add the invariant to `docs/invariants.md` and cover it with property tests.
+
+### Implementation Notes
+
+- The config-escalation path (auto-raising a limit and firing a `Critical`
+  `Action` notification) can be folded in here or tracked as its own follow-up;
+  keep orchestration-first as the rule.
+
+## Story: Pause New Automated Downloads Near The Unsatisfied Class Limit
+
+Status: To Do
+
+### Problem
+
+MAM Rule 2.8 caps the number of unsatisfied torrents by user class (e.g. 50 for
+User, 100 for Power User). Exceeding it risks penalties. The operator does not
+yet track the unsatisfied count or gate new automated downloads on it.
+
+### User Story
+
+As the operator user, I want Windlass to stop starting new automated downloads
+as my unsatisfied-torrent count approaches the class limit, so I never blow past
+my quota.
+
+### Acceptance Criteria
+
+- The core tracks the current count of unsatisfied torrents and the configured
+  class limit.
+- When the unsatisfied count is at or near the limit, the core suppresses new
+  automated download actions.
+- The gate is released once the unsatisfied count falls back under the
+  threshold.
+- Manual/user-initiated downloads are out of scope for this automatic gate
+  (operator-UI safety is handled elsewhere).
+- The decision lives in the core; add the invariant to `docs/invariants.md` and
+  cover it with property tests: no new automated download is started while the
+  unsatisfied count is at or above the limit.
+
+## Story: Gate New Downloads On Upload Health
+
+Status: To Do
+
+### Problem
+
+MAM Rule 1.4 (upload health) requires staying well clear of the ratio minimum.
+The spec sets the operator gate at global ratio ≥ 2.0 and an upload-credit
+buffer ≥ 25 GB before queueing new downloads. The operator does not yet observe
+ratio/credit or gate downloads on them.
+
+### User Story
+
+As the operator user, I want Windlass to refuse to start new (non-freeleech)
+downloads when my global ratio or upload-credit buffer is too low, so the
+operator never erodes my account health.
+
+### Acceptance Criteria
+
+- The core observes global ratio and upload-credit buffer from MAM.
+- New automated downloads are gated when `ratio < 2.0` or `buffer < 25 GB`
+  (thresholds configurable).
+- Freeleech grabs are exempt from the ratio portion of the gate (they do not
+  spend ratio), consistent with §7.4.
+- The gate is released when both metrics recover.
+- The decision lives in the core; add the invariant to `docs/invariants.md` and
+  cover it with property tests.
+
+## Story: Keep The MAM Account Alive With A Routine Homepage Heartbeat
+
+Status: To Do
+
+### Problem
+
+MAM Rule 1.6: accounts can be disabled for inactivity. The MAM core has no
+keep-alive behavior, so a quiet period with no status/seedbox traffic could let
+the account lapse.
+
+### User Story
+
+As the operator user, I want Windlass to routinely touch the MAM homepage so my
+account is never disabled for inactivity.
+
+### Acceptance Criteria
+
+- The MAM core schedules a recurring keep-alive timer that round-trips like the
+  other MAM timers.
+- On fire, the core emits an action for the shell to hit the MAM homepage and
+  re-schedules the timer (a self-perpetuating chain, like qBit `TorrentRefresh`).
+- The keep-alive interval is configurable.
+- Keep-alive failures are handled conservatively and never create a tight loop.
+- Add the invariant to `docs/invariants.md` (keep-alive chain never dies) and
+  cover it with property tests.
+
+## Story: Distinguish MAM Unreachable From NotConnectable
+
+Status: To Do
+
+### Problem
+
+The MAM connectability heartbeat should distinguish a network failure
+(`Unreachable` — the tracker could not be reached at all) from a genuine
+connectivity problem (`NotConnectable` — the tracker reached qBit and reports it
+is not connectable). The MAM core currently collapses these: `StatusFailed` is a
+generic failure and `StatusFetched { connectable: false }` always publishes
+`NotConnectable`, so operators cannot tell a transient network blip from a real
+seedbox/port problem.
+
+### User Story
+
+As the operator user, I want the operator to tell me whether MAM is genuinely
+reporting my client as not connectable versus simply being unreachable right
+now, so I can distinguish a real port/seedbox problem from a transient network
+issue.
+
+### Acceptance Criteria
+
+- The MAM core models `Unreachable` and `NotConnectable` as distinct outcomes.
+- A failure to reach MAM at all surfaces as `Unreachable`; a successful status
+  read that reports the client not connectable surfaces as `NotConnectable`.
+- The two map to distinct publishes and distinct activity/alert messaging.
+- `Unreachable` is treated as a transient/retryable condition; `NotConnectable`
+  is surfaced as a genuine connectivity problem.
+- Update `docs/invariants.md` for the refined MAM connectability model and cover
+  the distinction with tests.

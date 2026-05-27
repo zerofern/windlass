@@ -328,12 +328,12 @@ the account from automated bans.
     blacklisted if they have downloaded exactly 0 bytes.
 - **The Vault Guardian:** Windlass monitors the MAM Millionaires Vault. When a new vault
   cycle reaches 20,000,000 BP, Windlass checks if the user's global ratio is ≥ 1.05. If
-  eligible, it fires an `Action` (`High`) notification: _"The Millionaires Vault is open. Click here to
-  donate 2,000 BP and secure your Freeleech Wedges."_ To strictly comply with MAM's rules
-  against automated scripts, the system will never execute the donation via headless
-  background scripts; it requires the user's explicit click via the notification deep-link.
-  Freeleech Wedges extend freeleech-like benefits to individual non-freeleech books,
-  complementing the Freeleech Scavenger (§7.4) for high-priority acquisitions — series
+  eligible, it automatically donates 2,000 BP to the vault to secure the user's Freeleech
+  Wedges, then fires a `High` notification confirming the donation: _"The Millionaires Vault
+  was open — I donated 2,000 BP and secured your Freeleech Wedges."_ Donation is gated to at
+  most once per vault cycle, and the donation behaviour (enable/disable and amount) is
+  configurable. Freeleech Wedges extend freeleech-like benefits to individual non-freeleech
+  books, complementing the Freeleech Scavenger (§7.4) for high-priority acquisitions — series
   continuations and specific titles — where a freeleech window is not available.
 - **qBittorrent Configuration Validator & Auto-Tuner:** Windlass does not just send
   torrents to the client; it actively manages the client's internal configuration via the
