@@ -4,7 +4,7 @@ use windlass_core::events::Event;
 use windlass_domain_core::WindlassEvent;
 use windlass_mam_core::MamEvent;
 use windlass_qbit_core::QbitEvent;
-use windlass_types::{MamStatus, VpnPort, WakeupId};
+use windlass_types::{MamStatus, TorrentRecord, TorrentState, VpnPort, WakeupId};
 use windlass_vpn_core::VpnEvent;
 
 pub(super) enum ServiceEvent {
@@ -110,9 +110,15 @@ pub(super) fn legacy_to_service_events(
         })],
         Event::QbitTorrentDetailsReceived { torrents, .. } => {
             vec![ServiceEvent::Qbit(QbitEvent::TorrentsListed {
-                hashes: torrents
+                torrents: torrents
                     .iter()
-                    .map(|torrent| torrent.hash.clone())
+                    .map(|torrent| TorrentRecord {
+                        hash: torrent.hash.clone(),
+                        downloaded_bytes: torrent.downloaded_bytes,
+                        seed_time: Duration::from_secs(torrent.seeding_time_secs),
+                        state: legacy_torrent_state_to_torrent_state(&torrent.state),
+                        mam_id: torrent.mam_id,
+                    })
                     .collect(),
             })]
         }
@@ -153,5 +159,20 @@ pub(super) fn legacy_to_service_events(
         | Event::ManualDownloadRequested { .. }
         | Event::TorrentAddedToQbit { .. }
         | Event::TorrentAddFailed { .. } => Vec::new(),
+    }
+}
+
+fn legacy_torrent_state_to_torrent_state(s: &windlass_core::torrent::TorrentState) -> TorrentState {
+    use windlass_core::torrent::TorrentState as L;
+    match s {
+        L::Downloading => TorrentState::Downloading,
+        L::StalledDownloading => TorrentState::StalledDownloading,
+        L::Uploading => TorrentState::Uploading,
+        L::StalledUploading => TorrentState::StalledUploading,
+        L::ForcedUpload => TorrentState::ForcedUpload,
+        L::PausedDownloading => TorrentState::PausedDownloading,
+        L::PausedUploading => TorrentState::PausedUploading,
+        L::Error => TorrentState::Error,
+        L::Other => TorrentState::Other("other".to_string()),
     }
 }

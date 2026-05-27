@@ -1,25 +1,39 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
-use windlass_types::{AuthCookie, TorrentHash, VpnPort};
+use windlass_types::{AuthCookie, TorrentHash, TorrentRecord, VpnPort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QbitConfig {
     pub auth_retry: Duration,
     pub sync_retry: Duration,
     pub torrent_refresh: Duration,
+    /// Minimum seed time required to satisfy the `HnR` rule.
+    /// Defaults to 72 hours (MAM rules 2.5 & 2.7).
+    pub hnr_seed_time: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QbitCommand {
     EnsureAuthenticated,
-    EnsureListenPort { port: VpnPort },
+    EnsureListenPort {
+        port: VpnPort,
+    },
     RefreshTorrents,
-    PauseTorrent { hash: TorrentHash },
-    ResumeTorrent { hash: TorrentHash },
+    PauseTorrent {
+        hash: TorrentHash,
+    },
+    ResumeTorrent {
+        hash: TorrentHash,
+    },
+    /// Request deletion of a torrent. Blocked if the torrent is HnR-unsatisfied.
+    DeleteTorrent {
+        hash: TorrentHash,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,13 +46,29 @@ pub enum QbitTimer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QbitEvent {
     Init,
-    AuthSucceeded { cookie: AuthCookie },
-    AuthFailed { reason: String },
-    PreferencesRead { listen_port: Option<VpnPort> },
-    PreferencesFailed { reason: String },
-    ListenPortSet { port: VpnPort },
-    ListenPortSetFailed { port: VpnPort, reason: String },
-    TorrentsListed { hashes: Vec<TorrentHash> },
+    AuthSucceeded {
+        cookie: AuthCookie,
+    },
+    AuthFailed {
+        reason: String,
+    },
+    PreferencesRead {
+        listen_port: Option<VpnPort>,
+    },
+    PreferencesFailed {
+        reason: String,
+    },
+    ListenPortSet {
+        port: VpnPort,
+    },
+    ListenPortSetFailed {
+        port: VpnPort,
+        reason: String,
+    },
+    /// Full torrent listing from qBittorrent, including compliance data.
+    TorrentsListed {
+        torrents: Vec<TorrentRecord>,
+    },
     TimerFired(QbitTimer),
 }
 
@@ -60,6 +90,11 @@ pub enum QbitAction {
         hash: TorrentHash,
     },
     ResumeTorrent {
+        cookie: AuthCookie,
+        hash: TorrentHash,
+    },
+    /// Delete a torrent from qBittorrent. Only emitted when the `HnR` lock permits.
+    DeleteTorrent {
         cookie: AuthCookie,
         hash: TorrentHash,
     },
@@ -108,6 +143,8 @@ pub struct QbitMachine {
     /// True once the self-perpetuating `TorrentRefresh` timer chain has been started.
     /// Prevents a second independent chain from being spawned on re-authentication.
     refresh_scheduled: bool,
+    /// Per-torrent state updated on every `TorrentsListed` event.
+    torrents: HashMap<TorrentHash, TorrentRecord>,
 }
 
 impl QbitMachine {
@@ -119,6 +156,45 @@ impl QbitMachine {
     #[must_use]
     pub const fn listen_port(&self) -> Option<VpnPort> {
         self.listen_port
+    }
+
+    /// Returns whether the torrent with the given hash satisfies the `HnR` seeding
+    /// requirement, or `None` if the hash is not in the known torrent map.
+    ///
+    /// A torrent is `HnR`-satisfied iff:
+    /// - `downloaded_bytes == 0` (nothing was downloaded, so no seeding obligation), or
+    /// - `seed_time >= config.hnr_seed_time` (the required seed window has elapsed).
+    #[must_use]
+    pub fn hnr_satisfied(&self, hash: &TorrentHash) -> Option<bool> {
+        self.torrents
+            .get(hash)
+            .map(|t| t.downloaded_bytes == 0 || t.seed_time >= self.config.hnr_seed_time)
+    }
+
+    /// The single authorisation gate for all torrent-deletion paths.
+    ///
+    /// Returns a `DeleteTorrent` action only when:
+    /// - there is an active cookie (qBit is connected), AND
+    /// - the torrent is NOT a known HnR-unsatisfied torrent.
+    ///
+    /// An unknown torrent (not in the map) is treated as deletable, mirroring the
+    /// legacy `on_delete_torrent_requested` semantics.  A known torrent with
+    /// `downloaded_bytes > 0 && seed_time < hnr_seed_time` is blocked.
+    fn authorize_delete(&self, hash: &TorrentHash) -> Vec<QbitAction> {
+        let Some(cookie) = self.cookie.clone() else {
+            return Vec::new();
+        };
+        // Block if known and HnR-unsatisfied; allow if unknown or satisfied.
+        if let Some(t) = self.torrents.get(hash)
+            && t.downloaded_bytes > 0
+            && t.seed_time < self.config.hnr_seed_time
+        {
+            return Vec::new();
+        }
+        vec![QbitAction::DeleteTorrent {
+            cookie,
+            hash: hash.clone(),
+        }]
     }
 
     fn retry_listen_port_or_read_preferences(&self) -> Vec<QbitAction> {
@@ -172,6 +248,7 @@ impl Machine for QbitMachine {
             listen_port: None,
             desired_listen_port: None,
             refresh_scheduled: false,
+            torrents: HashMap::new(),
         }
     }
 
@@ -243,10 +320,14 @@ impl Machine for QbitMachine {
                     publish: self.listen_port_publish(Some(port)),
                 }
             }
-            QbitEvent::TorrentsListed { hashes } => Outcome {
-                actions: Vec::new(),
-                publish: vec![QbitPublish::TorrentsUpdated { hashes }],
-            },
+            QbitEvent::TorrentsListed { torrents } => {
+                let hashes: Vec<TorrentHash> = torrents.iter().map(|t| t.hash.clone()).collect();
+                self.torrents = torrents.into_iter().map(|t| (t.hash.clone(), t)).collect();
+                Outcome {
+                    actions: Vec::new(),
+                    publish: vec![QbitPublish::TorrentsUpdated { hashes }],
+                }
+            }
             QbitEvent::TimerFired(QbitTimer::SyncRetry) => Outcome {
                 actions: self.retry_listen_port_or_read_preferences(),
                 publish: Vec::new(),
@@ -303,6 +384,9 @@ impl Machine for QbitMachine {
                     vec![QbitAction::ResumeTorrent { cookie, hash }]
                 })
             }
+            QbitCommand::DeleteTorrent { hash } => {
+                return Self::outcome(self.authorize_delete(&hash), QbitResponse::Accepted);
+            }
         };
         Self::outcome(actions, QbitResponse::Accepted)
     }
@@ -313,11 +397,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use windlass_machine::{Machine, Outcome, Timed};
-    use windlass_types::{AuthCookie, VpnPort};
+    use windlass_types::{AuthCookie, TorrentHash, TorrentRecord, TorrentState, VpnPort};
 
     use crate::{
         QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish, QbitTimer,
     };
+
+    const HNR_SEED_TIME: Duration = Duration::from_secs(72 * 3600);
 
     fn machine() -> QbitMachine {
         QbitMachine::new(
@@ -325,9 +411,20 @@ mod tests {
                 auth_retry: Duration::from_secs(1),
                 sync_retry: Duration::from_secs(2),
                 torrent_refresh: Duration::from_secs(30),
+                hnr_seed_time: HNR_SEED_TIME,
             },
             Instant::now(),
         )
+    }
+
+    fn record(hash: &TorrentHash, downloaded: u64, seed_secs: u64) -> TorrentRecord {
+        TorrentRecord {
+            hash: hash.clone(),
+            downloaded_bytes: downloaded,
+            seed_time: Duration::from_secs(seed_secs),
+            state: TorrentState::Uploading,
+            mam_id: None,
+        }
     }
 
     fn handle(machine: &mut QbitMachine, event: QbitEvent) -> Outcome<QbitAction, QbitPublish> {
@@ -626,15 +723,135 @@ mod tests {
             "second AuthSucceeded must NOT schedule a second TorrentRefresh chain"
         );
     }
+
+    // ── HnR seed-time lock unit tests (QBIT-8) ───────────────────────────────
+
+    fn authenticated_machine() -> (QbitMachine, AuthCookie) {
+        let mut m = machine();
+        let cookie = AuthCookie::new("sid".to_string());
+        let _ = m.handle(
+            Instant::now(),
+            Timed::now(QbitEvent::AuthSucceeded {
+                cookie: cookie.clone(),
+            }),
+        );
+        (m, cookie)
+    }
+
+    fn load_torrent(m: &mut QbitMachine, r: TorrentRecord) {
+        let _ = m.handle(
+            Instant::now(),
+            Timed::now(QbitEvent::TorrentsListed { torrents: vec![r] }),
+        );
+    }
+
+    #[test]
+    fn hnr_unsatisfied_torrent_blocks_delete() {
+        // A torrent with downloaded_bytes > 0 and seed_time < 72h must NOT be deleted.
+        let (mut m, _) = authenticated_machine();
+        let hash = TorrentHash("a".repeat(40));
+        // 1 byte downloaded, only 1 hour seeded — well under 72h
+        load_torrent(&mut m, record(&hash, 1, 3600));
+        let out = m.handle_command(
+            Instant::now(),
+            QbitCommand::DeleteTorrent { hash: hash.clone() },
+        );
+        assert!(
+            out.actions.is_empty(),
+            "delete must be blocked for HnR-unsatisfied torrent"
+        );
+    }
+
+    #[test]
+    fn hnr_satisfied_torrent_allows_delete() {
+        // A torrent with seed_time >= 72h should be deletable.
+        let (mut m, cookie) = authenticated_machine();
+        let hash = TorrentHash("b".repeat(40));
+        // 1 byte downloaded, 72h seeded — exactly at the threshold
+        load_torrent(&mut m, record(&hash, 1, 72 * 3600));
+        let out = m.handle_command(
+            Instant::now(),
+            QbitCommand::DeleteTorrent { hash: hash.clone() },
+        );
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::DeleteTorrent {
+                cookie,
+                hash: hash.clone(),
+            }],
+            "delete must be emitted for HnR-satisfied torrent"
+        );
+    }
+
+    #[test]
+    fn zero_byte_torrent_allows_delete_even_with_low_seed_time() {
+        // A torrent with downloaded_bytes == 0 is always HnR-satisfied, regardless of seed time.
+        let (mut m, cookie) = authenticated_machine();
+        let hash = TorrentHash("c".repeat(40));
+        // 0 bytes downloaded, 0 seconds seeded
+        load_torrent(&mut m, record(&hash, 0, 0));
+        let out = m.handle_command(
+            Instant::now(),
+            QbitCommand::DeleteTorrent { hash: hash.clone() },
+        );
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::DeleteTorrent {
+                cookie,
+                hash: hash.clone(),
+            }],
+            "delete must be emitted for zero-byte torrent"
+        );
+    }
+
+    #[test]
+    fn no_cookie_blocks_delete_regardless_of_hnr_status() {
+        // Without a cookie (qBit not connected), no delete action is emitted.
+        let mut m = machine();
+        let hash = TorrentHash("d".repeat(40));
+        // Load a satisfied torrent (seed_time >= 72h)
+        load_torrent(&mut m, record(&hash, 1, 72 * 3600));
+        let out = m.handle_command(
+            Instant::now(),
+            QbitCommand::DeleteTorrent { hash: hash.clone() },
+        );
+        assert!(
+            out.actions.is_empty(),
+            "delete must be blocked when no cookie is present"
+        );
+    }
+
+    #[test]
+    fn unknown_torrent_allows_delete_when_authenticated() {
+        // A torrent not in the map (unknown) is treated as deletable.
+        let (mut m, cookie) = authenticated_machine();
+        let hash = TorrentHash("e".repeat(40));
+        // Do NOT load the torrent — it should be unknown
+        let out = m.handle_command(
+            Instant::now(),
+            QbitCommand::DeleteTorrent { hash: hash.clone() },
+        );
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::DeleteTorrent {
+                cookie,
+                hash: hash.clone(),
+            }],
+            "delete must be emitted for unknown torrent"
+        );
+    }
 }
 
 #[cfg(test)]
 mod prop_tests {
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
     use windlass_machine::{Machine, Timed};
-    use windlass_types::{AuthCookie, TorrentHash, VpnPort};
+    use windlass_types::{
+        AuthCookie, MamTorrentId, TorrentHash, TorrentRecord, TorrentState, VpnPort,
+    };
 
     use crate::{
         QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish, QbitTimer,
@@ -652,6 +869,49 @@ mod prop_tests {
         "[a-f0-9]{40}".prop_map(TorrentHash)
     }
 
+    fn any_torrent_state() -> impl Strategy<Value = TorrentState> {
+        prop_oneof![
+            Just(TorrentState::Downloading),
+            Just(TorrentState::StalledDownloading),
+            Just(TorrentState::Uploading),
+            Just(TorrentState::StalledUploading),
+            Just(TorrentState::ForcedUpload),
+            Just(TorrentState::PausedDownloading),
+            Just(TorrentState::PausedUploading),
+            Just(TorrentState::Error),
+            any::<String>().prop_map(TorrentState::Other),
+        ]
+    }
+
+    fn any_mam_id() -> impl Strategy<Value = MamTorrentId> {
+        (1u64..=u64::MAX).prop_map(|id| MamTorrentId::try_new(id).unwrap())
+    }
+
+    fn any_torrent_record() -> impl Strategy<Value = TorrentRecord> {
+        (
+            any_torrent_hash(),
+            any::<u64>(),
+            // seed_time as secs: 0..=(200*3600) to keep durations reasonable
+            (0u64..=(200 * 3600)),
+            any_torrent_state(),
+            proptest::option::of(any_mam_id()),
+        )
+            .prop_map(
+                |(hash, downloaded_bytes, seed_secs, state, mam_id)| TorrentRecord {
+                    hash,
+                    downloaded_bytes,
+                    seed_time: Duration::from_secs(seed_secs),
+                    state,
+                    mam_id,
+                },
+            )
+    }
+
+    fn any_torrent_map() -> impl Strategy<Value = HashMap<TorrentHash, TorrentRecord>> {
+        prop::collection::vec(any_torrent_record(), 0..4)
+            .prop_map(|records| records.into_iter().map(|r| (r.hash.clone(), r)).collect())
+    }
+
     // Fully-arbitrary state, including unreachable combinations: the tested
     // invariants are total.
     fn any_qbit_machine() -> impl Strategy<Value = QbitMachine> {
@@ -660,14 +920,16 @@ mod prop_tests {
             proptest::option::of(any_vpn_port()),
             proptest::option::of(any_vpn_port()),
             any::<bool>(),
+            any_torrent_map(),
         )
             .prop_map(
-                |(cookie, listen_port, desired_listen_port, refresh_scheduled)| {
+                |(cookie, listen_port, desired_listen_port, refresh_scheduled, torrents)| {
                     let mut machine = QbitMachine::new(
                         QbitConfig {
                             auth_retry: Duration::from_secs(1),
                             sync_retry: Duration::from_secs(2),
                             torrent_refresh: Duration::from_secs(30),
+                            hnr_seed_time: Duration::from_secs(72 * 3600),
                         },
                         Instant::now(),
                     );
@@ -675,6 +937,7 @@ mod prop_tests {
                     machine.listen_port = listen_port;
                     machine.desired_listen_port = desired_listen_port;
                     machine.refresh_scheduled = refresh_scheduled;
+                    machine.torrents = torrents;
                     machine
                 },
             )
@@ -691,8 +954,8 @@ mod prop_tests {
             any_vpn_port().prop_map(|port| QbitEvent::ListenPortSet { port }),
             (any_vpn_port(), any::<String>())
                 .prop_map(|(port, reason)| QbitEvent::ListenPortSetFailed { port, reason }),
-            prop::collection::vec(any_torrent_hash(), 0..4)
-                .prop_map(|hashes| QbitEvent::TorrentsListed { hashes }),
+            prop::collection::vec(any_torrent_record(), 0..4)
+                .prop_map(|torrents| QbitEvent::TorrentsListed { torrents }),
             Just(QbitEvent::TimerFired(QbitTimer::AuthRetry)),
             Just(QbitEvent::TimerFired(QbitTimer::SyncRetry)),
             Just(QbitEvent::TimerFired(QbitTimer::TorrentRefresh)),
@@ -706,6 +969,7 @@ mod prop_tests {
             Just(QbitCommand::RefreshTorrents),
             any_torrent_hash().prop_map(|hash| QbitCommand::PauseTorrent { hash }),
             any_torrent_hash().prop_map(|hash| QbitCommand::ResumeTorrent { hash }),
+            any_torrent_hash().prop_map(|hash| QbitCommand::DeleteTorrent { hash }),
         ]
     }
 
@@ -717,6 +981,7 @@ mod prop_tests {
                 | QbitAction::ListTorrents { .. }
                 | QbitAction::PauseTorrent { .. }
                 | QbitAction::ResumeTorrent { .. }
+                | QbitAction::DeleteTorrent { .. }
         )
     }
 
@@ -725,6 +990,12 @@ mod prop_tests {
         #[test]
         fn handle_never_panics(mut machine in any_qbit_machine(), event in any_qbit_event()) {
             let _ = machine.handle(Instant::now(), Timed::now(event));
+        }
+
+        // GLOBAL-1 (no panic) for commands.
+        #[test]
+        fn handle_command_never_panics(mut machine in any_qbit_machine(), command in any_qbit_command()) {
+            let _ = machine.handle_command(Instant::now(), command);
         }
 
         // QBIT-1 (Guarantees C/D): no cookie-bearing action is emitted unless the
@@ -771,6 +1042,56 @@ mod prop_tests {
                     prop_assert!(
                         machine.desired_listen_port.is_none()
                             || machine.desired_listen_port == Some(*port)
+                    );
+                }
+            }
+        }
+
+        // QBIT-8 [safety] (Guarantee A): no DeleteTorrent action is ever emitted
+        // for a hash that is known to the machine with downloaded_bytes > 0 and
+        // seed_time < hnr_seed_time. This is the HnR seed-time lock invariant.
+        // Tested against fully-arbitrary machine state (total invariant).
+        #[test]
+        fn no_delete_action_for_hnr_unsatisfied_torrent_on_event(
+            mut machine in any_qbit_machine(),
+            event in any_qbit_event(),
+        ) {
+            // Snapshot the unsatisfied hashes BEFORE handle mutates state.
+            let unsatisfied: std::collections::HashSet<TorrentHash> = machine.torrents.iter()
+                .filter(|(_, t)| {
+                    t.downloaded_bytes > 0 && t.seed_time < machine.config.hnr_seed_time
+                })
+                .map(|(h, _)| h.clone())
+                .collect();
+            let out = machine.handle(Instant::now(), Timed::now(event));
+            for action in &out.actions {
+                if let QbitAction::DeleteTorrent { hash, .. } = action {
+                    prop_assert!(
+                        !unsatisfied.contains(hash),
+                        "DeleteTorrent emitted for HnR-unsatisfied hash {hash:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn no_delete_action_for_hnr_unsatisfied_torrent_on_command(
+            mut machine in any_qbit_machine(),
+            command in any_qbit_command(),
+        ) {
+            // Snapshot the unsatisfied hashes BEFORE handle_command mutates state.
+            let unsatisfied: std::collections::HashSet<TorrentHash> = machine.torrents.iter()
+                .filter(|(_, t)| {
+                    t.downloaded_bytes > 0 && t.seed_time < machine.config.hnr_seed_time
+                })
+                .map(|(h, _)| h.clone())
+                .collect();
+            let out = machine.handle_command(Instant::now(), command);
+            for action in &out.actions {
+                if let QbitAction::DeleteTorrent { hash, .. } = action {
+                    prop_assert!(
+                        !unsatisfied.contains(hash),
+                        "DeleteTorrent emitted for HnR-unsatisfied hash {hash:?}"
                     );
                 }
             }

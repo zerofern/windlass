@@ -1,9 +1,11 @@
+use std::time::Duration;
+
 use tokio::sync::mpsc::UnboundedSender;
 
-use windlass_clients::qbit::QbitClient;
+use windlass_clients::qbit::{QbitClient, QbitTorrentState};
 use windlass_machine::{Shell, Timed};
 use windlass_qbit_core::{QbitAction, QbitEvent};
-use windlass_types::TorrentHash;
+use windlass_types::{TorrentRecord, TorrentState};
 
 pub struct QbitShell {
     client: QbitClient,
@@ -18,6 +20,9 @@ impl Shell for QbitShell {
         Self { client }
     }
 
+    // Each action arm is a small `tokio::spawn` block; the function is long because
+    // the action set is large, not because any single arm is complex.
+    #[allow(clippy::too_many_lines)]
     fn dispatch(&mut self, action: QbitAction, event_tx: &UnboundedSender<Timed<QbitEvent>>) {
         match action {
             QbitAction::Login => {
@@ -87,8 +92,23 @@ impl Shell for QbitShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let details = client.list_torrent_details(&cookie).await;
-                    let hashes: Vec<TorrentHash> = details.into_iter().map(|d| d.hash).collect();
-                    let _ = tx.send(Timed::now(QbitEvent::TorrentsListed { hashes }));
+                    let torrents: Vec<TorrentRecord> = details
+                        .into_iter()
+                        .map(|d| TorrentRecord {
+                            hash: d.hash,
+                            downloaded_bytes: d.downloaded_bytes,
+                            seed_time: Duration::from_secs(d.seeding_time_secs),
+                            state: qbit_state_to_torrent_state(d.state),
+                            mam_id: d.mam_id,
+                        })
+                        .collect();
+                    let _ = tx.send(Timed::now(QbitEvent::TorrentsListed { torrents }));
+                });
+            }
+            QbitAction::DeleteTorrent { cookie, hash } => {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    client.delete_torrent(&cookie, &hash).await;
                 });
             }
             QbitAction::PauseTorrent { cookie, hash } => {
@@ -112,5 +132,19 @@ impl Shell for QbitShell {
                 });
             }
         }
+    }
+}
+
+fn qbit_state_to_torrent_state(s: QbitTorrentState) -> TorrentState {
+    match s {
+        QbitTorrentState::Downloading => TorrentState::Downloading,
+        QbitTorrentState::StalledDownloading => TorrentState::StalledDownloading,
+        QbitTorrentState::Uploading => TorrentState::Uploading,
+        QbitTorrentState::StalledUploading => TorrentState::StalledUploading,
+        QbitTorrentState::ForcedUpload => TorrentState::ForcedUpload,
+        QbitTorrentState::PausedDownloading => TorrentState::PausedDownloading,
+        QbitTorrentState::PausedUploading => TorrentState::PausedUploading,
+        QbitTorrentState::Error => TorrentState::Error,
+        QbitTorrentState::Other(s) => TorrentState::Other(s),
     }
 }

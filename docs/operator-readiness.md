@@ -552,7 +552,7 @@ machines are robust without that assumption.
 
 ## Story: Enforce The HnR Seed-Time Lock On Automatic Torrent Deletion
 
-Status: To Do
+Status: Done
 
 ### Problem
 

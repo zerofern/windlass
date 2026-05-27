@@ -179,6 +179,39 @@ pub enum AlertPriority {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TorrentHash(pub String);
 
+// ── Torrent tracking ──────────────────────────────────────────────────────────
+
+/// qBittorrent torrent state as reported by the API.
+///
+/// Mirrors `QbitTorrentState` from `windlass-clients` but lives in `windlass-types`
+/// so it can be stored in the qBit core without a dependency on the clients crate.
+/// The shell converts between the two at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TorrentState {
+    Downloading,
+    StalledDownloading,
+    Uploading,
+    StalledUploading,
+    ForcedUpload,
+    PausedDownloading,
+    PausedUploading,
+    Error,
+    Other(String),
+}
+
+/// Per-torrent record stored in the qBit core.
+///
+/// Sourced from qBittorrent torrent listings and used by the `HnR` seed-time lock
+/// and future compliance stories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentRecord {
+    pub hash: TorrentHash,
+    pub downloaded_bytes: u64,
+    pub seed_time: Duration,
+    pub state: TorrentState,
+    pub mam_id: Option<MamTorrentId>,
+}
+
 /// A MAM torrent ID parsed from the torrent's comment field.
 /// Comment URL format: `https://www.myanonamouse.net/t/12345`
 #[nutype(

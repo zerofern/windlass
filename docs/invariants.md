@@ -187,11 +187,13 @@ Shell contracts:
 ### qBit machine (`QbitMachine`)
 
 State: `cookie: Option<AuthCookie>`, `listen_port: Option<VpnPort>`,
-`desired_listen_port: Option<VpnPort>`, `refresh_scheduled: bool`.
+`desired_listen_port: Option<VpnPort>`, `refresh_scheduled: bool`,
+`torrents: HashMap<TorrentHash, TorrentRecord>` (per-torrent seed-time and
+download tracking; populated on every `TorrentsListed` event).
 
 - **QBIT-1 [safety]** No cookie-bearing action (`ReadPreferences`,
-  `SetListenPort`, `ListTorrents`, `PauseTorrent`, `ResumeTorrent`) is emitted
-  while `cookie == None`. → C, D
+  `SetListenPort`, `ListTorrents`, `PauseTorrent`, `ResumeTorrent`,
+  `DeleteTorrent`) is emitted while `cookie == None`. → C, D
 - **QBIT-2 [safety]** The `TorrentRefresh` timer chain is started at most once;
   repeated `AuthSucceeded` never spawns a second chain. → F
 - **QBIT-3 [liveness]** Once started, the `TorrentRefresh` timer always
@@ -206,6 +208,13 @@ State: `cookie: Option<AuthCookie>`, `listen_port: Option<VpnPort>`,
   `SetListenPort` / `Login`, never both. → C
 - **QBIT-7 [liveness]** While desired ≠ current, a retry path eventually
   re-issues `SetListenPort`. → C, F
+- **QBIT-8 [safety]** *(HnR seed-time lock — §19)* No `DeleteTorrent` action is
+  ever emitted for a torrent that is known to the machine with
+  `downloaded_bytes > 0 && seed_time < hnr_seed_time`. A torrent is deletable
+  only when: it is unknown to the machine, or `downloaded_bytes == 0` (zero-byte
+  — nothing was downloaded), or `seed_time >= hnr_seed_time` (fully
+  `HnR`-satisfied). The machine has no cookie → no action at all. This invariant
+  is total (holds for any generated machine state, including unreachable ones). → A
 
 Shell contract: `ListenPortSet { port }` is now routed through the
 desired-port filter (`listen_port_publish`), so QBIT-4 holds for any event —
