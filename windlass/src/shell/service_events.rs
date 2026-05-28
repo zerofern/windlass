@@ -95,11 +95,19 @@ pub(super) fn legacy_to_service_events(
                 ServiceEvent::Mam(MamEvent::StatusFetched {
                     connectable: true,
                     seedbox_port: forwarded_port,
+                    // Legacy bridge: ratio/upload_credit_bytes are not carried by
+                    // the legacy event.  Default to 0.0/0 (fail-closed per §26):
+                    // the upload-health gate will fire until the new shell path
+                    // (MamShell::FetchStatus → fetch_mam_status) provides real values.
+                    ratio: 0.0,
+                    upload_credit_bytes: 0,
                 }),
             ],
             MamStatus::NotConnectable => vec![ServiceEvent::Mam(MamEvent::StatusFetched {
                 connectable: false,
                 seedbox_port: forwarded_port,
+                ratio: 0.0,
+                upload_credit_bytes: 0,
             })],
             MamStatus::Unreachable => vec![ServiceEvent::Mam(MamEvent::StatusFailed {
                 reason: "MAM unreachable".to_string(),

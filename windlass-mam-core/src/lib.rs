@@ -6,9 +6,24 @@ use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_types::VpnPort;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// 25 GiB in bytes (binary GiB: 1024³ = 1 073 741 824).
+///
+/// This is the default upload-credit-buffer threshold per §26.  The binary GiB
+/// choice mirrors how storage capacities are measured on the tracker and is
+/// the conventionally understood meaning of "25 GB" in torrent-tracker contexts.
+pub const DEFAULT_MIN_UPLOAD_BUFFER_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MamConfig {
     pub status_retry: Duration,
+    /// Minimum global ratio required for non-freeleech downloads (§26).
+    /// Default: `2.0`.
+    pub min_global_ratio: f64,
+    /// Minimum upload-credit buffer (bytes-equivalent) for all downloads (§26).
+    /// Freeleech grabs also require the buffer even though they bypass the ratio
+    /// (§7.4 spec: freeleech does not spend ratio, but upload health still matters).
+    /// Default: 25 GiB (`DEFAULT_MIN_UPLOAD_BUFFER_BYTES`).
+    pub min_upload_buffer_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +39,9 @@ pub enum MamTimer {
     RateLimitExpired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `MamEvent` cannot derive `Eq` because `StatusFetched` carries `ratio: f64`,
+// and `f64` only implements `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MamEvent {
     Init,
     AuthSucceeded,
@@ -34,6 +51,12 @@ pub enum MamEvent {
     StatusFetched {
         connectable: bool,
         seedbox_port: Option<VpnPort>,
+        /// Global upload ratio from MAM (§26).  `0.0` when the field is absent
+        /// (fail-closed: the upload-health gate fires on a missing ratio).
+        ratio: f64,
+        /// Upload-credit proxy in bytes-equivalent (§26).  `0` when absent
+        /// (fail-closed).
+        upload_credit_bytes: u64,
     },
     StatusFailed {
         reason: String,
@@ -55,14 +78,37 @@ pub enum MamAction {
     ScheduleTimer { timer: MamTimer, after: Duration },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `MamPublish` cannot derive `Eq` because `UploadHealthDegraded` carries `f64`
+// fields, and `f64` only implements `PartialEq`, not `Eq` (NaN ≠ NaN).
+// The other variants are logically equatable; this is an acceptable trade-off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MamPublish {
     Ready,
-    Unavailable { reason: String },
-    RateLimited { retry_after: Duration },
-    Connectable { seedbox_port: Option<VpnPort> },
-    NotConnectable { reason: String },
-    SeedboxPortReady { port: VpnPort },
+    Unavailable {
+        reason: String,
+    },
+    RateLimited {
+        retry_after: Duration,
+    },
+    Connectable {
+        seedbox_port: Option<VpnPort>,
+    },
+    NotConnectable {
+        reason: String,
+    },
+    SeedboxPortReady {
+        port: VpnPort,
+    },
+    /// Published when the upload-health gate would block a non-freeleech download
+    /// (§26).  Published on every `StatusFetched` where `!upload_health_ok(false)`.
+    UploadHealthDegraded {
+        ratio: f64,
+        upload_credit_bytes: u64,
+        /// `true` iff `ratio >= config.min_global_ratio`.
+        ratio_ok: bool,
+        /// `true` iff `upload_credit_bytes >= config.min_upload_buffer_bytes`.
+        buffer_ok: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +116,8 @@ pub enum MamTopic {
     Availability,
     Connectability,
     Seedbox,
+    /// Upload-health alerts (§26).
+    UploadHealth,
 }
 
 impl HasTopic<MamTopic> for MamPublish {
@@ -80,6 +128,7 @@ impl HasTopic<MamTopic> for MamPublish {
             }
             Self::Connectable { .. } | Self::NotConnectable { .. } => MamTopic::Connectability,
             Self::SeedboxPortReady { .. } => MamTopic::Seedbox,
+            Self::UploadHealthDegraded { .. } => MamTopic::UploadHealth,
         }
     }
 }
@@ -89,12 +138,20 @@ pub enum MamResponse {
     Accepted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `MamMachine` cannot derive `Eq` because `MamConfig.min_global_ratio` and the
+// `ratio` field are `f64`, which only implements `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MamMachine {
     config: MamConfig,
     authenticated: bool,
     seedbox_port: Option<VpnPort>,
     desired_seedbox_port: Option<VpnPort>,
+    /// Last observed global upload ratio (§26).  Initialised to `0.0`
+    /// (fail-closed: the gate fires until a real value is observed).
+    ratio: f64,
+    /// Last observed upload-credit proxy in bytes-equivalent (§26).
+    /// Initialised to `0` (fail-closed).
+    upload_credit_bytes: u64,
 }
 
 impl MamMachine {
@@ -106,6 +163,35 @@ impl MamMachine {
     #[must_use]
     pub const fn seedbox_port(&self) -> Option<VpnPort> {
         self.seedbox_port
+    }
+
+    /// Returns the last observed global upload ratio (§26).
+    #[must_use]
+    pub const fn ratio(&self) -> f64 {
+        self.ratio
+    }
+
+    /// Returns the last observed upload-credit proxy in bytes-equivalent (§26).
+    #[must_use]
+    pub const fn upload_credit_bytes(&self) -> u64 {
+        self.upload_credit_bytes
+    }
+
+    /// Returns `true` when the upload-health gate would allow a new download.
+    ///
+    /// - When `freeleech == false`: both `ratio >= min_global_ratio` **and**
+    ///   `upload_credit_bytes >= min_upload_buffer_bytes` must hold.
+    /// - When `freeleech == true`: freeleech bypasses the ratio requirement
+    ///   (§7.4 spec — freeleech does not spend ratio) but the buffer requirement
+    ///   still applies.
+    #[must_use]
+    pub fn upload_health_ok(&self, freeleech: bool) -> bool {
+        let buffer_ok = self.upload_credit_bytes >= self.config.min_upload_buffer_bytes;
+        if freeleech {
+            buffer_ok
+        } else {
+            self.ratio >= self.config.min_global_ratio && buffer_ok
+        }
     }
 
     fn refresh_or_update_seedbox(&self) -> Vec<MamAction> {
@@ -154,6 +240,10 @@ impl Machine for MamMachine {
             authenticated: false,
             seedbox_port: None,
             desired_seedbox_port: None,
+            // Start at 0.0 / 0 so the upload-health gate fires until real
+            // values are observed (fail-closed per §26).
+            ratio: 0.0,
+            upload_credit_bytes: 0,
         }
     }
 
@@ -190,8 +280,12 @@ impl Machine for MamMachine {
             MamEvent::StatusFetched {
                 connectable,
                 seedbox_port,
+                ratio,
+                upload_credit_bytes,
             } => {
                 self.seedbox_port = seedbox_port;
+                self.ratio = ratio;
+                self.upload_credit_bytes = upload_credit_bytes;
                 let mut publish = vec![if connectable {
                     MamPublish::Connectable { seedbox_port }
                 } else {
@@ -201,6 +295,20 @@ impl Machine for MamMachine {
                 }];
                 if connectable {
                     publish.extend(self.seedbox_publish(seedbox_port));
+                }
+                // §26: publish UploadHealthDegraded when the strictest
+                // (non-freeleech) gate would block.  This is checked
+                // regardless of connectability so the alert fires even
+                // during a not-connectable state.
+                if !self.upload_health_ok(false) {
+                    let ratio_ok = ratio >= self.config.min_global_ratio;
+                    let buffer_ok = upload_credit_bytes >= self.config.min_upload_buffer_bytes;
+                    publish.push(MamPublish::UploadHealthDegraded {
+                        ratio,
+                        upload_credit_bytes,
+                        ratio_ok,
+                        buffer_ok,
+                    });
                 }
                 Outcome {
                     actions: self.converge_seedbox(),
@@ -268,6 +376,8 @@ mod tests {
         MamMachine::new(
             MamConfig {
                 status_retry: Duration::from_secs(5),
+                min_global_ratio: 2.0,
+                min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
             },
             Instant::now(),
         )
@@ -342,6 +452,9 @@ mod tests {
             MamEvent::StatusFetched {
                 connectable: true,
                 seedbox_port: Some(observed),
+                // Healthy ratio/buffer so no UploadHealthDegraded publish.
+                ratio: 3.0,
+                upload_credit_bytes: 50 * 1024 * 1024 * 1024,
             },
         );
 
@@ -398,6 +511,179 @@ mod tests {
         assert!(out.actions.is_empty());
         assert_eq!(out.publish, vec![MamPublish::SeedboxPortReady { port }]);
     }
+
+    // ── upload_health_ok predicate tests (§26) ────────────────────────────────
+
+    #[test]
+    fn upload_health_ok_false_when_ratio_and_buffer_both_good() {
+        let mut m = machine();
+        m.ratio = 3.0;
+        m.upload_credit_bytes = 30 * 1024 * 1024 * 1024;
+        assert!(m.upload_health_ok(false));
+    }
+
+    #[test]
+    fn upload_health_ok_false_when_ratio_bad() {
+        let mut m = machine();
+        m.ratio = 1.5;
+        m.upload_credit_bytes = 30 * 1024 * 1024 * 1024;
+        assert!(!m.upload_health_ok(false));
+    }
+
+    #[test]
+    fn upload_health_ok_false_when_buffer_bad() {
+        let mut m = machine();
+        m.ratio = 3.0;
+        m.upload_credit_bytes = 0;
+        assert!(!m.upload_health_ok(false));
+    }
+
+    #[test]
+    fn upload_health_ok_false_when_both_bad() {
+        let mut m = machine();
+        m.ratio = 0.5;
+        m.upload_credit_bytes = 0;
+        assert!(!m.upload_health_ok(false));
+    }
+
+    #[test]
+    fn upload_health_ok_freeleech_true_ignores_ratio_when_buffer_ok() {
+        let mut m = machine();
+        m.ratio = 0.5; // below min_global_ratio
+        m.upload_credit_bytes = 30 * 1024 * 1024 * 1024;
+        // freeleech bypasses ratio requirement
+        assert!(m.upload_health_ok(true));
+    }
+
+    #[test]
+    fn upload_health_ok_freeleech_false_when_buffer_bad_even_with_good_ratio() {
+        let mut m = machine();
+        m.ratio = 5.0;
+        m.upload_credit_bytes = 0; // below min_upload_buffer_bytes
+        assert!(!m.upload_health_ok(true));
+    }
+
+    // ── StatusFetched upload-health publish tests (§26) ───────────────────────
+
+    #[test]
+    fn status_fetched_bad_ratio_emits_upload_health_degraded_with_ratio_ok_false() {
+        let mut m = machine();
+        let out = handle(
+            &mut m,
+            MamEvent::StatusFetched {
+                connectable: true,
+                seedbox_port: None,
+                ratio: 1.5,
+                upload_credit_bytes: 30 * 1024 * 1024 * 1024,
+            },
+        );
+        let degraded = out
+            .publish
+            .iter()
+            .find(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }));
+        assert!(
+            degraded.is_some(),
+            "must emit UploadHealthDegraded when ratio is bad"
+        );
+        if let Some(MamPublish::UploadHealthDegraded {
+            ratio_ok,
+            buffer_ok,
+            ..
+        }) = degraded
+        {
+            assert!(!ratio_ok, "ratio_ok must be false when ratio < min");
+            assert!(*buffer_ok, "buffer_ok must be true when buffer >= min");
+        }
+    }
+
+    #[test]
+    fn status_fetched_bad_buffer_emits_upload_health_degraded_with_buffer_ok_false() {
+        let mut m = machine();
+        let out = handle(
+            &mut m,
+            MamEvent::StatusFetched {
+                connectable: true,
+                seedbox_port: None,
+                ratio: 3.0,
+                upload_credit_bytes: 0,
+            },
+        );
+        let degraded = out
+            .publish
+            .iter()
+            .find(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }));
+        assert!(
+            degraded.is_some(),
+            "must emit UploadHealthDegraded when buffer is bad"
+        );
+        if let Some(MamPublish::UploadHealthDegraded {
+            ratio_ok,
+            buffer_ok,
+            ..
+        }) = degraded
+        {
+            assert!(*ratio_ok, "ratio_ok must be true when ratio >= min");
+            assert!(!buffer_ok, "buffer_ok must be false when buffer < min");
+        }
+    }
+
+    #[test]
+    fn status_fetched_good_health_emits_no_upload_health_degraded() {
+        let mut m = machine();
+        let out = handle(
+            &mut m,
+            MamEvent::StatusFetched {
+                connectable: true,
+                seedbox_port: None,
+                ratio: 3.0,
+                upload_credit_bytes: 50 * 1024 * 1024 * 1024,
+            },
+        );
+        let degraded_count = out
+            .publish
+            .iter()
+            .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
+            .count();
+        assert_eq!(
+            degraded_count, 0,
+            "must not emit UploadHealthDegraded when health is ok"
+        );
+    }
+
+    #[test]
+    fn status_fetched_both_bad_emits_one_upload_health_degraded_with_both_flags_false() {
+        let mut m = machine();
+        let out = handle(
+            &mut m,
+            MamEvent::StatusFetched {
+                connectable: true,
+                seedbox_port: None,
+                ratio: 0.5,
+                upload_credit_bytes: 0,
+            },
+        );
+        let degraded_count = out
+            .publish
+            .iter()
+            .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
+            .count();
+        assert_eq!(
+            degraded_count, 1,
+            "must emit exactly one UploadHealthDegraded when both bad"
+        );
+        if let Some(MamPublish::UploadHealthDegraded {
+            ratio_ok,
+            buffer_ok,
+            ..
+        }) = out
+            .publish
+            .iter()
+            .find(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
+        {
+            assert!(!ratio_ok, "ratio_ok must be false");
+            assert!(!buffer_ok, "buffer_ok must be false");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -414,26 +700,56 @@ mod prop_tests {
         (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
     }
 
+    /// Ratio constrained to `0.0..=10.0` to avoid NaN/Infinity, which are
+    /// pathological inputs the parse boundary already rejects.
+    fn any_ratio() -> impl Strategy<Value = f64> {
+        (0u32..=1000u32).prop_map(|n| f64::from(n) / 100.0)
+    }
+
+    /// Buffer constrained to `0..=(100 GiB)`.
+    fn any_buffer() -> impl Strategy<Value = u64> {
+        0u64..=(100 * 1024 * 1024 * 1024u64)
+    }
+
+    fn any_mam_config() -> impl Strategy<Value = MamConfig> {
+        (any_ratio(), any_buffer()).prop_map(|(min_global_ratio, min_upload_buffer_bytes)| {
+            MamConfig {
+                status_retry: Duration::from_secs(5),
+                min_global_ratio,
+                min_upload_buffer_bytes,
+            }
+        })
+    }
+
     // Fully-arbitrary state, including unreachable field combinations: the tested
     // invariants are total.
     fn any_mam_machine() -> impl Strategy<Value = MamMachine> {
         (
+            any_mam_config(),
             any::<bool>(),
             proptest::option::of(any_vpn_port()),
             proptest::option::of(any_vpn_port()),
+            any_ratio(),
+            any_buffer(),
         )
-            .prop_map(|(authenticated, seedbox_port, desired_seedbox_port)| {
-                let mut machine = MamMachine::new(
-                    MamConfig {
-                        status_retry: Duration::from_secs(5),
-                    },
-                    Instant::now(),
-                );
-                machine.authenticated = authenticated;
-                machine.seedbox_port = seedbox_port;
-                machine.desired_seedbox_port = desired_seedbox_port;
-                machine
-            })
+            .prop_map(
+                |(
+                    config,
+                    authenticated,
+                    seedbox_port,
+                    desired_seedbox_port,
+                    ratio,
+                    upload_credit_bytes,
+                )| {
+                    let mut machine = MamMachine::new(config, Instant::now());
+                    machine.authenticated = authenticated;
+                    machine.seedbox_port = seedbox_port;
+                    machine.desired_seedbox_port = desired_seedbox_port;
+                    machine.ratio = ratio;
+                    machine.upload_credit_bytes = upload_credit_bytes;
+                    machine
+                },
+            )
     }
 
     fn any_mam_event() -> impl Strategy<Value = MamEvent> {
@@ -441,12 +757,20 @@ mod prop_tests {
             Just(MamEvent::Init),
             Just(MamEvent::AuthSucceeded),
             any::<String>().prop_map(|reason| MamEvent::AuthFailed { reason }),
-            (any::<bool>(), proptest::option::of(any_vpn_port())).prop_map(
-                |(connectable, seedbox_port)| MamEvent::StatusFetched {
-                    connectable,
-                    seedbox_port,
-                }
-            ),
+            (
+                any::<bool>(),
+                proptest::option::of(any_vpn_port()),
+                any_ratio(),
+                any_buffer(),
+            )
+                .prop_map(|(connectable, seedbox_port, ratio, upload_credit_bytes)| {
+                    MamEvent::StatusFetched {
+                        connectable,
+                        seedbox_port,
+                        ratio,
+                        upload_credit_bytes,
+                    }
+                }),
             any::<String>().prop_map(|reason| MamEvent::StatusFailed { reason }),
             Just(MamEvent::SeedboxUpdated),
             any::<String>().prop_map(|reason| MamEvent::SeedboxUpdateFailed { reason }),
@@ -505,6 +829,70 @@ mod prop_tests {
                 prop_assert_eq!(out.publish.len(), 1);
                 let is_unavailable = matches!(out.publish[0], MamPublish::Unavailable { .. });
                 prop_assert!(is_unavailable);
+            }
+        }
+
+        // MAM-7 [safety] (upload-health alert — §26):
+        // `StatusFetched` publishes `UploadHealthDegraded` iff
+        // `!upload_health_ok(freeleech=false)`.  The published `ratio_ok` and
+        // `buffer_ok` flags are consistent with the configured thresholds.
+        // Total invariant.
+        #[test]
+        fn upload_health_degraded_iff_not_upload_health_ok(
+            mut machine in any_mam_machine(),
+            connectable in any::<bool>(),
+            seedbox_port in proptest::option::of(any_vpn_port()),
+            ratio in any_ratio(),
+            upload_credit_bytes in any_buffer(),
+        ) {
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::StatusFetched {
+                    connectable,
+                    seedbox_port,
+                    ratio,
+                    upload_credit_bytes,
+                }),
+            );
+
+            // After handle, self.ratio and self.upload_credit_bytes are updated.
+            let expected_health_ok = machine.upload_health_ok(false);
+            let degraded_publishes: Vec<_> = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
+                .collect();
+
+            if expected_health_ok {
+                prop_assert!(
+                    degraded_publishes.is_empty(),
+                    "upload_health_ok(false)=true must produce no UploadHealthDegraded"
+                );
+            } else {
+                prop_assert_eq!(
+                    degraded_publishes.len(),
+                    1,
+                    "upload_health_ok(false)=false must produce exactly one UploadHealthDegraded"
+                );
+                // Check flag consistency.
+                if let MamPublish::UploadHealthDegraded {
+                    ratio: r,
+                    upload_credit_bytes: b,
+                    ratio_ok,
+                    buffer_ok,
+                } = degraded_publishes[0]
+                {
+                    prop_assert_eq!(
+                        *ratio_ok,
+                        *r >= machine.config.min_global_ratio,
+                        "ratio_ok must be consistent with the threshold"
+                    );
+                    prop_assert_eq!(
+                        *buffer_ok,
+                        *b >= machine.config.min_upload_buffer_bytes,
+                        "buffer_ok must be consistent with the threshold"
+                    );
+                }
             }
         }
     }

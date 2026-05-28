@@ -253,7 +253,25 @@ QBIT-4 property test uses an unconstrained generator.
 ### MAM machine (`MamMachine`)
 
 State: `authenticated: bool`, `seedbox_port: Option<VpnPort>`,
-`desired_seedbox_port: Option<VpnPort>`.
+`desired_seedbox_port: Option<VpnPort>`, `ratio: f64` (last observed global
+upload ratio; initialised to `0.0` — fail-closed per §26), `upload_credit_bytes:
+u64` (last observed upload-credit proxy in bytes-equivalent; initialised to `0`
+— fail-closed per §26).
+
+Config additions (§26): `min_global_ratio: f64` (default `2.0`),
+`min_upload_buffer_bytes: u64` (default 25 GiB binary).
+
+New topic (§26): `UploadHealth` — carries `UploadHealthDegraded` publishes.
+
+Public predicates (§26): `upload_health_ok(freeleech: bool)` — when `freeleech
+== false`: `ratio >= min_global_ratio && upload_credit_bytes >=
+min_upload_buffer_bytes`; when `freeleech == true`: only the buffer check applies
+(freeleech does not spend ratio per §7.4 spec).
+
+Note: `MamMachine` and `MamPublish` do not derive `Eq` because the `ratio` field
+is `f64`, which only implements `PartialEq` (NaN ≠ NaN). Both derive `PartialEq`
+and can be compared for structural equality with the understanding that NaN values
+are never produced by the parse boundary.
 
 - **MAM-1 [safety]** `SeedboxPortReady { port }` is only published for a port
   equal to `desired_seedbox_port` (or when none is desired). → C
@@ -270,6 +288,16 @@ State: `authenticated: bool`, `seedbox_port: Option<VpnPort>`,
   `SeedboxPortReady { p }`. → C
 - **MAM-6 [liveness]** While desired ≠ current, a retry path eventually re-issues
   `UpdateSeedbox`. → C, F
+
+### MAM machine additions (§26)
+
+- **MAM-7 [safety]** *(upload-health alert — §26)* `StatusFetched` publishes
+  `UploadHealthDegraded { ratio, upload_credit_bytes, ratio_ok, buffer_ok }` iff
+  `!upload_health_ok(freeleech=false)` (i.e. `ratio < min_global_ratio || upload_credit_bytes <
+  min_upload_buffer_bytes`). When both metrics are healthy, no `UploadHealthDegraded` is
+  published. When degraded, exactly one is published. The `ratio_ok` flag equals
+  `ratio >= config.min_global_ratio`; `buffer_ok` equals `upload_credit_bytes >=
+  config.min_upload_buffer_bytes`. Total invariant. → A
 
 ### DB machine (`DbMachine`)
 
@@ -307,6 +335,28 @@ Option<VpnPort> }`.
   `Db(MarkDownloadState { mam_id: id, status: Blacklisted })` action and
   exactly one `Activity` publish. A `DeadTorrentRemoved { mam_id: None }` event
   emits no action and no publish. → A
+
+### Domain machine additions (§26)
+
+- **DOM-13 [safety]** *(upload-health alert routing — §26)*
+  `Mam(UploadHealthDegraded { ratio, upload_credit_bytes, ratio_ok, buffer_ok })` emits
+  exactly one `Db(RecordAlert { priority: Warning, title: "Upload health degraded" })`
+  action and exactly one `Activity` publish. The alert body describes which of ratio and
+  buffer are below threshold. Total invariant. → A
+
+### Deferred (§26)
+
+The `AddTorrent` suppression invariant from the story 26 acceptance criteria —
+*`!candidate.freeleech && !upload_health_ok(false) ⇒ no Action::AddTorrent`* — is
+**deferred to story 29** (the composite admission gate), because `Action::AddTorrent`
+does not yet exist. Story 26 builds the state (`ratio`, `upload_credit_bytes`), the
+predicate (`upload_health_ok()`), and the alert path. Story 29 will consume
+`upload_health_ok()` as one gate of the fail-closed admission predicate:
+
+```
+if !candidate.freeleech && !upload_health_ok(false)
+then no Action::AddTorrent   [to be enforced in story 29]
+```
 
 ### Disk machine (`DiskMachine`)
 

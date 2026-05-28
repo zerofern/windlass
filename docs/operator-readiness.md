@@ -841,7 +841,7 @@ then no emitted action is Action::AddTorrent
 
 ## Story: Gate New Downloads On Upload Health
 
-Status: To Do
+Status: Done
 
 ### Problem
 

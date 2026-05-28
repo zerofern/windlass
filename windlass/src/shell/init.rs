@@ -198,6 +198,9 @@ pub(super) async fn init_shell(
     let (mam_handles, _mam_join) = windlass_machine::spawn::<MamMachine, MamShell>(
         MamConfig {
             status_retry: Duration::from_secs(30),
+            // §26 upload-health gate defaults (binary GiB; see MamConfig docs).
+            min_global_ratio: 2.0,
+            min_upload_buffer_bytes: windlass_mam_core::DEFAULT_MIN_UPLOAD_BUFFER_BYTES,
         },
         mam.clone(),
     )
@@ -210,6 +213,7 @@ pub(super) async fn init_shell(
                 MamTopic::Availability,
                 MamTopic::Connectability,
                 MamTopic::Seedbox,
+                MamTopic::UploadHealth,
             ],
             mam_pub_tx,
         ))

@@ -19,7 +19,9 @@ pub struct WindlassConfig {
     pub snapshot_interval: Duration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `WindlassEvent` cannot derive `Eq` because `MamPublish::UploadHealthDegraded`
+// carries `f64` fields, which only implement `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindlassEvent {
     Init,
     Vpn(VpnPublish),
@@ -234,6 +236,13 @@ impl Machine for WindlassMachine {
                 self.state.mam = ServiceStatus::Degraded;
                 self.publish_state_with_activity(reason)
             }
+            // DOM-13: UploadHealthDegraded → one RecordAlert(Warning) + one Activity publish.
+            WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
+                ratio,
+                upload_credit_bytes,
+                ratio_ok,
+                buffer_ok,
+            }) => Self::on_upload_health_degraded(ratio, upload_credit_bytes, ratio_ok, buffer_ok),
             WindlassEvent::Mam(MamPublish::RateLimited { retry_after }) => {
                 self.state.mam = ServiceStatus::Degraded;
                 self.publish_state_with_activity(format!(
@@ -437,6 +446,53 @@ impl WindlassMachine {
                     at: chrono::Utc::now(),
                     source: ActivitySource::Qbit,
                     action: "unsatisfied_quota_approaching".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles the `UploadHealthDegraded` MAM publish (DOM-13 / §26).
+    ///
+    /// The global ratio or upload-credit buffer is below the configured threshold.
+    /// Emits one `RecordAlert(Warning)` action and one `Activity` publish.
+    /// Priority is `Warning` (not `Critical`) because the gate is precautionary:
+    /// no download is being blocked yet — the alert surfaces the degraded health
+    /// so the operator can act before it becomes a compliance issue.
+    fn on_upload_health_degraded(
+        ratio: f64,
+        upload_credit_bytes: u64,
+        ratio_ok: bool,
+        buffer_ok: bool,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let buffer_gib = upload_credit_bytes / (1024 * 1024 * 1024);
+        let mut reasons = Vec::new();
+        if !ratio_ok {
+            reasons.push(format!("ratio {ratio:.2} is below minimum"));
+        }
+        if !buffer_ok {
+            reasons.push(format!("upload buffer {buffer_gib} GiB is below minimum"));
+        }
+        let body = format!(
+            "Upload health degraded — {}. Non-freeleech downloads will be blocked.",
+            reasons.join("; ")
+        );
+        let message = format!("Upload health degraded: ratio={ratio:.2}, buffer={buffer_gib} GiB");
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Warning,
+                    title: "Upload health degraded".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Domain,
+                    action: "upload_health_degraded".to_string(),
                     book_id: None,
                     detail: Some(message.clone()),
                     metadata: serde_json::Value::Null,
@@ -953,6 +1009,86 @@ mod tests {
             panic!("expected RecordAlert(Warning)");
         }
     }
+
+    // ── Upload-health alert routing unit tests (DOM-13 / story 26) ───────────
+
+    #[test]
+    fn upload_health_degraded_emits_one_warning_record_alert_and_one_activity() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_mam_core::MamPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
+                ratio: 1.5,
+                upload_credit_bytes: 0,
+                ratio_ok: false,
+                buffer_ok: false,
+            }),
+        );
+
+        // Exactly 2 actions: RecordAlert(Warning) + RecordActivity
+        assert_eq!(out.actions.len(), 2, "exactly two actions expected");
+        let has_warning_alert = out.actions.iter().any(|a| {
+            matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Warning,
+                    ..
+                }))
+            )
+        });
+        assert!(
+            has_warning_alert,
+            "must emit exactly one RecordAlert(Warning)"
+        );
+        assert!(
+            matches!(
+                &out.actions[1],
+                WindlassAction::Db(DbCommand::RecordActivity(_))
+            ),
+            "second action must be RecordActivity"
+        );
+        // Exactly one Activity publish
+        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
+
+    #[test]
+    fn upload_health_degraded_alert_title_is_upload_health_degraded() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_mam_core::MamPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
+                ratio: 1.5,
+                upload_credit_bytes: 10 * 1024 * 1024 * 1024,
+                ratio_ok: false,
+                buffer_ok: true,
+            }),
+        );
+
+        if let WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+            priority: AlertPriority::Warning,
+            title,
+            ..
+        })) = &out.actions[0]
+        {
+            assert_eq!(title, "Upload health degraded");
+        } else {
+            panic!("expected RecordAlert(Warning)");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1051,6 +1187,16 @@ mod prop_tests {
         ]
     }
 
+    /// Ratio constrained to `0.0..=10.0` to avoid NaN/Infinity.
+    fn any_ratio() -> impl Strategy<Value = f64> {
+        (0u32..=1000u32).prop_map(|n| f64::from(n) / 100.0)
+    }
+
+    /// Upload-credit buffer constrained to `0..=(100 GiB)`.
+    fn any_buffer() -> impl Strategy<Value = u64> {
+        0u64..=(100 * 1024 * 1024 * 1024u64)
+    }
+
     fn any_mam_publish() -> impl Strategy<Value = MamPublish> {
         prop_oneof![
             Just(MamPublish::Ready),
@@ -1062,6 +1208,16 @@ mod prop_tests {
                 .prop_map(|seedbox_port| MamPublish::Connectable { seedbox_port }),
             any::<String>().prop_map(|reason| MamPublish::NotConnectable { reason }),
             any_vpn_port().prop_map(|port| MamPublish::SeedboxPortReady { port }),
+            (any_ratio(), any_buffer(), any::<bool>(), any::<bool>()).prop_map(
+                |(ratio, upload_credit_bytes, ratio_ok, buffer_ok)| {
+                    MamPublish::UploadHealthDegraded {
+                        ratio,
+                        upload_credit_bytes,
+                        ratio_ok,
+                        buffer_ok,
+                    }
+                }
+            ),
         ]
     }
 
@@ -1306,6 +1462,55 @@ mod prop_tests {
                 activity_count,
                 1,
                 "UnsatisfiedQuotaApproaching must emit exactly one Activity publish"
+            );
+        }
+
+        // DOM-13 [safety] (upload-health alert routing — §26):
+        // `Mam(UploadHealthDegraded)` emits exactly one `Db(RecordAlert{Warning})`
+        // and exactly one `Activity` publish.  Total invariant.
+        #[test]
+        fn upload_health_degraded_emits_one_warning_alert_and_one_activity(
+            mut machine in any_windlass_machine(),
+            ratio in any_ratio(),
+            upload_credit_bytes in any_buffer(),
+            ratio_ok in any::<bool>(),
+            buffer_ok in any::<bool>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
+                    ratio,
+                    upload_credit_bytes,
+                    ratio_ok,
+                    buffer_ok,
+                })),
+            );
+
+            let warning_alert_count = out.actions.iter().filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Warning,
+                        ..
+                    }))
+                )
+            }).count();
+            prop_assert_eq!(
+                warning_alert_count,
+                1,
+                "UploadHealthDegraded must emit exactly one RecordAlert(Warning)"
+            );
+
+            let activity_count = out.publish.iter()
+                .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                .count();
+            prop_assert_eq!(
+                activity_count,
+                1,
+                "UploadHealthDegraded must emit exactly one Activity publish"
             );
         }
     }

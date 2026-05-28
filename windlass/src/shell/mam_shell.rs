@@ -5,7 +5,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use windlass_clients::mam::MamClient;
 use windlass_machine::{Shell, Timed};
 use windlass_mam_core::{MamAction, MamEvent};
-use windlass_types::MamStatus;
 
 pub struct MamShell {
     client: MamClient,
@@ -26,31 +25,17 @@ impl Shell for MamShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    let event = match client.check_connectability().await {
-                        windlass_core::events::Event::MamStatusObserved { status, .. } => {
-                            match status {
-                                MamStatus::Connectable => MamEvent::StatusFetched {
-                                    connectable: true,
-                                    seedbox_port: None,
-                                },
-                                MamStatus::NotConnectable => MamEvent::StatusFetched {
-                                    connectable: false,
-                                    seedbox_port: None,
-                                },
-                                MamStatus::Unreachable => MamEvent::StatusFailed {
-                                    reason: "MAM unreachable".to_string(),
-                                },
-                            }
-                        }
-                        windlass_core::events::Event::MamRateLimitViolation { .. } => {
-                            MamEvent::RateLimited {
-                                retry_after: Duration::from_secs(1),
-                            }
-                        }
-                        other => MamEvent::StatusFailed {
-                            reason: format!("unexpected response: {other:?}"),
+                    let event = client.fetch_mam_status().await.map_or_else(
+                        || MamEvent::RateLimited {
+                            retry_after: Duration::from_secs(1),
                         },
-                    };
+                        |status| MamEvent::StatusFetched {
+                            connectable: status.connectable,
+                            seedbox_port: None,
+                            ratio: status.ratio,
+                            upload_credit_bytes: status.upload_credit_bytes,
+                        },
+                    );
                     let _ = tx.send(Timed::now(event));
                 });
             }

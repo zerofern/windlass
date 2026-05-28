@@ -17,11 +17,45 @@ struct DynamicSeedboxResponse {
     ip: String,
 }
 
+/// Typed result of a successful MAM status fetch.
+///
+/// **JSON field choices (§26):**
+/// - `ratio`: the standard MAM `ratio` field (a JSON number, e.g. `2.5`).
+///   Absent ⇒ defaults to `0.0` (fail-closed: the gate fires when the field
+///   is missing, which is the correct behaviour per §26).
+/// - `upload_credit_bytes`: MAM does not expose a dedicated upload-credit-buffer
+///   field in the `/json/load.php` response.  The closest available proxy is
+///   `seedbonus`, which is the site's "seed bonus" point balance.  This field
+///   is not measured in bytes; it is used here as a bytes-equivalent proxy
+///   because it is the only available upload-health signal in the response.
+///   Operators who need a precise byte figure should update this mapping once
+///   the correct MAM endpoint or field is identified.  Absent ⇒ defaults to
+///   `0` (fail-closed).
+#[derive(Debug, Clone)]
+pub struct MamStatusResult {
+    /// `true` iff MAM reports the seedbox as connectable.
+    pub connectable: bool,
+    /// Global upload ratio as reported by MAM (`ratio` JSON field).
+    /// Defaults to `0.0` when the field is absent (fail-closed).
+    pub ratio: f64,
+    /// Upload-credit proxy: the `seedbonus` field from MAM's JSON response,
+    /// interpreted as a bytes-equivalent for the upload-health gate (§26).
+    /// Defaults to `0` when the field is absent (fail-closed).
+    pub upload_credit_bytes: u64,
+}
+
 #[derive(Deserialize)]
 struct JsonLoadResponse {
     connectable: Option<String>,
     #[serde(rename = "unsat")]
     unsat: Option<UnsatSummary>,
+    /// MAM global upload ratio.  Absent ⇒ 0.0 (fail-closed for §26 gate).
+    #[serde(default)]
+    ratio: f64,
+    /// MAM seed-bonus balance, used as upload-credit proxy (§26).
+    /// Absent ⇒ 0 (fail-closed).
+    #[serde(default)]
+    seedbonus: f64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -118,6 +152,92 @@ impl MamClient {
             *self.session.lock().unwrap() = rotated;
         }
         event
+    }
+
+    /// Fetches the MAM status and returns a typed result carrying connectivity,
+    /// upload ratio, and upload-credit proxy (§26).
+    ///
+    /// Returns `None` if the request was rate-limited (caller should emit
+    /// `MamEvent::RateLimited`).  Returns a `MamStatusResult` with
+    /// `connectable: false`, `ratio: 0.0`, and `upload_credit_bytes: 0` on any
+    /// network or parse error (fail-closed per §26).
+    ///
+    /// # Panics
+    /// Panics if the internal session mutex is poisoned.
+    pub async fn fetch_mam_status(&self) -> Option<MamStatusResult> {
+        if !self.check_rate_limit() {
+            return None;
+        }
+        let current = self.session.lock().unwrap().clone();
+        let (result, new_session) = self.do_fetch_mam_status(&current).await;
+        if let Some(rotated) = new_session {
+            *self.session.lock().unwrap() = rotated;
+        }
+        Some(result)
+    }
+
+    async fn do_fetch_mam_status(&self, session: &str) -> (MamStatusResult, Option<String>) {
+        let fail_closed = MamStatusResult {
+            connectable: false,
+            ratio: 0.0,
+            upload_credit_bytes: 0,
+        };
+        let result = self
+            .client
+            .get(&self.load_url)
+            .header(reqwest::header::COOKIE, format!("mam_id={session}"))
+            .send()
+            .await;
+        let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
+        match result {
+            Err(e) => {
+                warn!("MAM status fetch request failed: {e}");
+                (fail_closed, new_session)
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    warn!("MAM status fetch HTTP {}", status);
+                    self.emit_http(&self.load_url, status.as_u16(), "");
+                    return (fail_closed, new_session);
+                }
+                let raw = resp.text().await.unwrap_or_default();
+                self.emit_http(&self.load_url, status.as_u16(), &raw);
+                match serde_json::from_str::<JsonLoadResponse>(&raw) {
+                    Ok(body) => {
+                        let connectable = body
+                            .connectable
+                            .as_deref()
+                            .is_some_and(|s| s.eq_ignore_ascii_case("yes"));
+                        debug!(
+                            "MAM fetch_mam_status: connectable={connectable} ratio={} seedbonus={}",
+                            body.ratio, body.seedbonus
+                        );
+                        if let Some(ref unsat) = body.unsat {
+                            debug!("MAM unsat: {}/{}", unsat.count, unsat.limit);
+                        }
+                        (
+                            MamStatusResult {
+                                connectable,
+                                ratio: body.ratio,
+                                // seedbonus is a non-negative floating-point point balance.
+                                // We clamp to 0.0 before truncating to avoid sign-loss on
+                                // pathological negative values, and use floor() so the cast
+                                // is exact. The cast from a clamped, floored f64 to u64 is
+                                // intentional (bytes-equivalent proxy per §26 docs).
+                                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                                upload_credit_bytes: body.seedbonus.max(0.0).floor() as u64,
+                            },
+                            new_session,
+                        )
+                    }
+                    Err(e) => {
+                        warn!("MAM status fetch parse failed: {e}");
+                        (fail_closed, new_session)
+                    }
+                }
+            }
+        }
     }
 
     /// Checks whether MAM reports the seedbox as connectable.
