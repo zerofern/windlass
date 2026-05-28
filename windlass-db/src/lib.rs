@@ -40,7 +40,7 @@ impl DbPool {
     /// # Errors
     /// Returns `DbError::Migrate` if any migration fails.
     pub async fn migrate(&self) -> Result<(), DbError> {
-        sqlx::migrate!("./postgres/migrations")
+        sqlx::migrate!("./migrations")
             .run(&self.0)
             .await
             .map_err(DbError::Migrate)
