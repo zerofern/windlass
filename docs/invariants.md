@@ -298,6 +298,42 @@ Option<VpnPort> }`.
   exactly one `Activity` publish. A `DeadTorrentRemoved { mam_id: None }` event
   emits no action and no publish. → A
 
+### Disk machine (`DiskMachine`)
+
+State: `free_bytes: Option<u64>`.
+
+- **DISK-1 [safety]** *(disk floor — §22)* `BelowFloor { free_bytes }` is
+  published iff `free_bytes < config.hard_floor_bytes`; otherwise `AboveFloor`.
+  Total invariant. → A
+
+### qBit machine additions (§22)
+
+- **QBIT-11 [safety]** *(disk-pressure eviction gate — §22)*
+  `EvictOneForDiskPressure` emits at most one `DeleteTorrent`, and only for a
+  known HnR-satisfied torrent; composes with QBIT-8. The selected candidate has
+  the largest `seed_time` among satisfied torrents (placeholder rank). → A
+
+### Domain machine additions (§22)
+
+- **DOM-9 [safety]** *(disk-pressure routing — §22)* `Disk(BelowFloor)` produces
+  exactly one `Qbit(EvictOneForDiskPressure)` and one `Activity` publish;
+  `Disk(AboveFloor)` produces nothing. → A
+
+### Deferred rank classes and structural invariants (§22)
+
+The four real deletion-value rank classes — (1) completed + low rating (≤2★)
++ HnR-satisfied, (2) DNF + HnR-satisfied, (3) completed + high rating but long
+since listened + HnR-satisfied, (4) unstarted + long wait + low AI score —
+require librarian data outside operator scope and are deferred to librarian
+integration. The current placeholder rank (longest `seed_time` first among
+HnR-satisfied torrents) holds the spot until then.
+
+The "no history cascade" invariant is structurally satisfied: no
+`DeleteReadingLedger` or `DeleteReview` action variants exist in any of the new
+core crates (`windlass-disk-core`, `windlass-qbit-core`, `windlass-domain-core`,
+or any other `windlass-*-core`). There is no such action to emit, so Guarantee E
+is enforced by the type system.
+
 ### Service runtime (`ServiceRuntime`)
 
 Test coverage deferred (async; see story 10). → underpins all.

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windlass_db_core::{DbCommand, DownloadStateChange, DownloadStatus};
+use windlass_disk_core::DiskPublish;
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
@@ -22,6 +23,7 @@ pub enum WindlassEvent {
     Vpn(VpnPublish),
     Qbit(QbitPublish),
     Mam(MamPublish),
+    Disk(DiskPublish),
     DbFailed { operation: String, message: String },
     TimerFired(WindlassTimer),
 }
@@ -133,6 +135,9 @@ impl Machine for WindlassMachine {
         }
     }
 
+    // Each event arm is a small, self-contained routing decision; the function is
+    // long because the cross-system event set is large, not because any arm is complex.
+    #[allow(clippy::too_many_lines)]
     fn handle(
         &mut self,
         _now: Instant,
@@ -186,7 +191,8 @@ impl Machine for WindlassMachine {
             WindlassEvent::Qbit(
                 QbitPublish::ListenPortReady { .. } | QbitPublish::TorrentsUpdated { .. },
             )
-            | WindlassEvent::Mam(MamPublish::Connectable { .. }) => Outcome::none(),
+            | WindlassEvent::Mam(MamPublish::Connectable { .. })
+            | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
             WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { mam_id, .. }) => {
                 Self::on_dead_torrent_removed(mam_id)
             }
@@ -215,6 +221,14 @@ impl Machine for WindlassMachine {
                     retry_after.as_secs()
                 ))
             }
+            // DOM-9: BelowFloor → one EvictOneForDiskPressure + Activity publish.
+            //        AboveFloor → no action, no publish.
+            WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes }) => Outcome {
+                actions: vec![WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)],
+                publish: vec![WindlassPublish::Activity {
+                    message: format!("Disk pressure: {free_bytes} bytes free — eviction triggered"),
+                }],
+            },
             WindlassEvent::DbFailed { operation, message } => Outcome {
                 actions: Vec::new(),
                 publish: vec![WindlassPublish::Activity {
@@ -453,6 +467,56 @@ mod tests {
             "no publish must be emitted when mam_id is None"
         );
     }
+
+    // ── Disk-pressure routing unit tests (DOM-9 / story 22) ──────────────────
+
+    #[test]
+    fn disk_below_floor_emits_evict_command_and_activity() {
+        use windlass_disk_core::DiskPublish;
+        use windlass_qbit_core::QbitCommand;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Disk(DiskPublish::BelowFloor {
+                free_bytes: 500_000,
+            }),
+        );
+
+        assert_eq!(
+            out.actions,
+            vec![WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)],
+            "BelowFloor must emit exactly one EvictOneForDiskPressure command"
+        );
+        assert_eq!(out.actions.len(), 1, "exactly one action expected");
+        assert_eq!(
+            out.publish.len(),
+            1,
+            "exactly one publish expected (Activity)"
+        );
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
+
+    #[test]
+    fn disk_above_floor_emits_nothing() {
+        use windlass_disk_core::DiskPublish;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Disk(DiskPublish::AboveFloor {
+                free_bytes: 2_000_000,
+            }),
+        );
+
+        assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
+        assert!(out.publish.is_empty(), "AboveFloor must emit no publishes");
+    }
 }
 
 #[cfg(test)]
@@ -468,7 +532,7 @@ mod prop_tests {
 
     use crate::{
         ServiceStatus, SystemStateView, WindlassAction, WindlassConfig, WindlassEvent,
-        WindlassMachine, WindlassTimer,
+        WindlassMachine, WindlassPublish, WindlassTimer,
     };
 
     fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
@@ -550,12 +614,21 @@ mod prop_tests {
         ]
     }
 
+    fn any_disk_publish() -> impl Strategy<Value = windlass_disk_core::DiskPublish> {
+        use windlass_disk_core::DiskPublish;
+        prop_oneof![
+            any::<u64>().prop_map(|free_bytes| DiskPublish::BelowFloor { free_bytes }),
+            any::<u64>().prop_map(|free_bytes| DiskPublish::AboveFloor { free_bytes }),
+        ]
+    }
+
     fn any_windlass_event() -> impl Strategy<Value = WindlassEvent> {
         prop_oneof![
             Just(WindlassEvent::Init),
             any_vpn_publish().prop_map(WindlassEvent::Vpn),
             any_qbit_publish().prop_map(WindlassEvent::Qbit),
             any_mam_publish().prop_map(WindlassEvent::Mam),
+            any_disk_publish().prop_map(WindlassEvent::Disk),
             (any::<String>(), any::<String>())
                 .prop_map(|(operation, message)| WindlassEvent::DbFailed { operation, message }),
             Just(WindlassEvent::TimerFired(WindlassTimer::Snapshot)),
@@ -598,6 +671,46 @@ mod prop_tests {
         ) {
             machine.handle(Instant::now(), Timed::now(WindlassEvent::Vpn(lost)));
             prop_assert!(machine.state().forwarded_port.is_none());
+        }
+
+        // DOM-9 [safety] (disk-pressure routing — §22):
+        // BelowFloor → exactly one EvictOneForDiskPressure + one Activity publish.
+        // AboveFloor → no actions, no publishes.
+        // Total invariant.
+        #[test]
+        fn disk_below_floor_produces_exactly_one_evict_and_one_activity(
+            mut machine in any_windlass_machine(),
+            free_bytes in any::<u64>(),
+        ) {
+            use windlass_disk_core::DiskPublish;
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes })),
+            );
+            prop_assert_eq!(out.actions.len(), 1);
+            prop_assert!(
+                matches!(out.actions[0], WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)),
+                "BelowFloor must emit exactly one EvictOneForDiskPressure"
+            );
+            prop_assert_eq!(out.publish.len(), 1);
+            prop_assert!(
+                matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+                "BelowFloor must emit exactly one Activity publish"
+            );
+        }
+
+        #[test]
+        fn disk_above_floor_produces_nothing(
+            mut machine in any_windlass_machine(),
+            free_bytes in any::<u64>(),
+        ) {
+            use windlass_disk_core::DiskPublish;
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Disk(DiskPublish::AboveFloor { free_bytes })),
+            );
+            prop_assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
+            prop_assert!(out.publish.is_empty(), "AboveFloor must emit no publishes");
         }
     }
 }

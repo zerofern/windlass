@@ -3293,6 +3293,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-disk-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "windlass-machine",
+]
+
+[[package]]
 name = "windlass-domain-core"
 version = "0.1.0"
 dependencies = [
@@ -3301,6 +3310,7 @@ dependencies = [
  "serde",
  "serde_json",
  "windlass-db-core",
+ "windlass-disk-core",
  "windlass-machine",
  "windlass-mam-core",
  "windlass-qbit-core",

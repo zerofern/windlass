@@ -678,7 +678,7 @@ for any Action::AddTorrent { file_selection, .. } for a MAM torrent:
 
 ## Story: Rank And Gate Disk Auto-Eviction By HnR-Satisfied Deletion Value
 
-Status: To Do
+Status: Done
 
 ### Problem
 

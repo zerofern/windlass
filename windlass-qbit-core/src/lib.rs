@@ -34,6 +34,18 @@ pub enum QbitCommand {
     DeleteTorrent {
         hash: TorrentHash,
     },
+    /// Evict the single highest-ranked HnR-satisfied torrent to relieve disk
+    /// pressure.
+    ///
+    /// Placeholder rank: longest `seed_time` first (descending) among all
+    /// HnR-satisfied torrents known to the machine.  At most one
+    /// `DeleteTorrent` action is emitted — the caller re-evaluates after the
+    /// next disk observation.
+    ///
+    /// The four real rank classes (completed+low-rating, DNF,
+    /// completed+high-rating+long-since-listened, unstarted+low-AI-score)
+    /// require librarian data outside operator scope and are deferred.
+    EvictOneForDiskPressure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +228,23 @@ impl QbitMachine {
             cookie,
             hash: hash.clone(),
         }]
+    }
+
+    /// Select and authorise the deletion of the single highest-ranked
+    /// HnR-satisfied torrent, using the placeholder rank of longest `seed_time`
+    /// first.
+    ///
+    /// Returns at most one `DeleteTorrent` action (QBIT-11).  If there are no
+    /// satisfied candidates, or no cookie is present, returns an empty vec.
+    fn evict_one_for_disk_pressure(&self) -> Vec<QbitAction> {
+        // Select the HnR-satisfied torrent with the longest seed_time.
+        let candidate = self
+            .torrents
+            .values()
+            .filter(|t| t.downloaded_bytes == 0 || t.seed_time >= self.config.hnr_seed_time)
+            .max_by_key(|t| t.seed_time);
+
+        candidate.map_or_else(Vec::new, |t| self.authorize_delete(&t.hash.clone()))
     }
 
     /// Returns `true` when the torrent's state and download size classify it as
@@ -470,6 +499,9 @@ impl Machine for QbitMachine {
             }
             QbitCommand::DeleteTorrent { hash } => {
                 return Self::outcome(self.authorize_delete(&hash), QbitResponse::Accepted);
+            }
+            QbitCommand::EvictOneForDiskPressure => {
+                return Self::outcome(self.evict_one_for_disk_pressure(), QbitResponse::Accepted);
             }
         };
         Self::outcome(actions, QbitResponse::Accepted)
@@ -1155,6 +1187,74 @@ mod tests {
             "DeadTorrentRemoved must be published"
         );
     }
+
+    // ── EvictOneForDiskPressure unit tests (QBIT-11 / story 22) ──────────────
+
+    #[test]
+    fn evict_one_selects_longest_seed_time_satisfied_torrent() {
+        // The candidate with the largest seed_time among HnR-satisfied torrents
+        // is selected.  Both torrents below are satisfied (seed_time >= 72h).
+        let (mut m, cookie) = authenticated_machine();
+        let hash_short = TorrentHash("s".repeat(40));
+        let hash_long = TorrentHash("l".repeat(40));
+        load_torrent(&mut m, record(&hash_short, 1, 72 * 3600)); // exactly 72h
+        load_torrent(&mut m, record(&hash_long, 1, 80 * 3600)); // 80h — winner
+        let out = m.handle_command(Instant::now(), QbitCommand::EvictOneForDiskPressure);
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::DeleteTorrent {
+                cookie,
+                hash: hash_long,
+            }],
+            "eviction must target the torrent with the longest seed_time"
+        );
+    }
+
+    #[test]
+    fn evict_one_no_satisfied_torrents_emits_no_delete() {
+        let (mut m, _cookie) = authenticated_machine();
+        let hash = TorrentHash("u".repeat(40));
+        // 1 byte downloaded, only 1 hour seeded — HnR-unsatisfied.
+        load_torrent(&mut m, record(&hash, 1, 3600));
+        let out = m.handle_command(Instant::now(), QbitCommand::EvictOneForDiskPressure);
+        assert!(
+            out.actions.is_empty(),
+            "no delete must be emitted when no HnR-satisfied candidate exists"
+        );
+    }
+
+    #[test]
+    fn evict_one_no_cookie_emits_no_delete() {
+        let mut m = machine();
+        let hash = TorrentHash("v".repeat(40));
+        load_torrent(&mut m, record(&hash, 0, 0));
+        let out = m.handle_command(Instant::now(), QbitCommand::EvictOneForDiskPressure);
+        assert!(
+            out.actions.is_empty(),
+            "no delete must be emitted when no cookie is present"
+        );
+    }
+
+    #[test]
+    fn evict_one_skips_hnr_unsatisfied_even_with_longer_seed_time() {
+        // Unsatisfied torrent has the longest total seed_time but must be skipped.
+        let (mut m, cookie) = authenticated_machine();
+        let hash_unsat = TorrentHash("w".repeat(40));
+        let hash_sat = TorrentHash("x".repeat(40));
+        // Unsatisfied: 100h seed_time but still has bytes to go (seed_time < 72h
+        // would normally block, but here we test the filter directly — set 1h).
+        load_torrent(&mut m, record(&hash_unsat, 1, 3600)); // 1 byte, 1h — unsatisfied
+        load_torrent(&mut m, record(&hash_sat, 0, 0)); // 0 bytes — always satisfied
+        let out = m.handle_command(Instant::now(), QbitCommand::EvictOneForDiskPressure);
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::DeleteTorrent {
+                cookie,
+                hash: hash_sat,
+            }],
+            "unsatisfied torrent must not be selected even when present"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1285,6 +1385,7 @@ mod prop_tests {
             any_torrent_hash().prop_map(|hash| QbitCommand::PauseTorrent { hash }),
             any_torrent_hash().prop_map(|hash| QbitCommand::ResumeTorrent { hash }),
             any_torrent_hash().prop_map(|hash| QbitCommand::DeleteTorrent { hash }),
+            Just(QbitCommand::EvictOneForDiskPressure),
         ]
     }
 
@@ -1495,6 +1596,54 @@ mod prop_tests {
                     !matches!(action, QbitAction::SetAllFilesPriority { .. }),
                     "SetAllFilesPriority must never be emitted without a cookie"
                 );
+            }
+        }
+
+        // QBIT-11 [safety] (disk-pressure eviction gate — §22):
+        // `EvictOneForDiskPressure` emits at most one `DeleteTorrent`, and any
+        // emitted `DeleteTorrent` targets an HnR-satisfied torrent.
+        // Composes with QBIT-8 (total invariant).
+        #[test]
+        fn evict_one_emits_at_most_one_delete(mut machine in any_qbit_machine()) {
+            let out = machine.handle_command(
+                Instant::now(),
+                QbitCommand::EvictOneForDiskPressure,
+            );
+            let delete_actions: Vec<_> = out
+                .actions
+                .iter()
+                .filter(|a| matches!(a, QbitAction::DeleteTorrent { .. }))
+                .collect();
+            prop_assert!(
+                delete_actions.len() <= 1,
+                "EvictOneForDiskPressure emitted {} DeleteTorrent actions, expected at most 1",
+                delete_actions.len()
+            );
+        }
+
+        #[test]
+        fn evict_one_targets_only_hnr_satisfied_torrent(mut machine in any_qbit_machine()) {
+            // Snapshot unsatisfied hashes BEFORE the command.
+            let unsatisfied: std::collections::HashSet<TorrentHash> = machine
+                .torrents
+                .iter()
+                .filter(|(_, t)| {
+                    t.downloaded_bytes > 0 && t.seed_time < machine.config.hnr_seed_time
+                })
+                .map(|(h, _)| h.clone())
+                .collect();
+
+            let out = machine.handle_command(
+                Instant::now(),
+                QbitCommand::EvictOneForDiskPressure,
+            );
+            for action in &out.actions {
+                if let QbitAction::DeleteTorrent { hash, .. } = action {
+                    prop_assert!(
+                        !unsatisfied.contains(hash),
+                        "EvictOneForDiskPressure DeleteTorrent targets HnR-unsatisfied hash {hash:?}"
+                    );
+                }
             }
         }
     }
