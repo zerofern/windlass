@@ -111,6 +111,12 @@ impl Shell for QbitShell {
                     client.delete_torrent(&cookie, &hash).await;
                 });
             }
+            QbitAction::SetAllFilesPriority { cookie, hash } => {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    client.set_all_files_priority(&cookie, &hash).await;
+                });
+            }
             QbitAction::PauseTorrent { cookie, hash } => {
                 let client = self.client.clone();
                 tokio::spawn(async move {

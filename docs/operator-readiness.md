@@ -642,7 +642,7 @@ already HnR-satisfied; forbidden in every other case.
 
 ## Story: Force qBittorrent To Download Every File In A Torrent
 
-Status: To Do
+Status: Done
 
 ### Problem
 

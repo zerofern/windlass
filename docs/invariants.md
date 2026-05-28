@@ -193,7 +193,8 @@ download tracking; populated on every `TorrentsListed` event).
 
 - **QBIT-1 [safety]** No cookie-bearing action (`ReadPreferences`,
   `SetListenPort`, `ListTorrents`, `PauseTorrent`, `ResumeTorrent`,
-  `DeleteTorrent`) is emitted while `cookie == None`. → C, D
+  `DeleteTorrent`, `SetAllFilesPriority`) is emitted while `cookie == None`.
+  → C, D
 - **QBIT-2 [safety]** The `TorrentRefresh` timer chain is started at most once;
   repeated `AuthSucceeded` never spawns a second chain. → F
 - **QBIT-3 [liveness]** Once started, the `TorrentRefresh` timer always
@@ -222,6 +223,16 @@ download tracking; populated on every `TorrentsListed` event).
   the HnR seed-time lock (QBIT-8) instead. A dead torrent is zero-byte by
   definition, so QBIT-8 and QBIT-9 compose: the gate allows it whenever a
   cookie is present. This invariant is total. → A
+- **QBIT-10 [safety]** *(No-partials enforcement — §21)* Every newly-seen
+  torrent (a hash not present in `self.torrents` before a `TorrentsListed`
+  event) triggers exactly one `SetAllFilesPriority { hash, .. }` action when
+  `cookie` is `Some`, and none when `cookie` is `None`. A hash already in
+  `self.torrents` never triggers `SetAllFilesPriority` again (fire-once
+  semantics). This invariant is total. → A
+
+  *Note:* the broader `AddTorrent { file_selection == All }` invariant from
+  story 21's acceptance criteria is deferred to story 29 (fail-closed download
+  admission control), when `AddTorrent` is introduced.
 
 Shell contract: `ListenPortSet { port }` is now routed through the
 desired-port filter (`listen_port_publish`), so QBIT-4 holds for any event —

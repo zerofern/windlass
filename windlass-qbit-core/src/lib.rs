@@ -98,6 +98,12 @@ pub enum QbitAction {
         cookie: AuthCookie,
         hash: TorrentHash,
     },
+    /// Set all files in a torrent to download (MAM "no partials" rule — §21).
+    /// Emitted once for every newly-seen torrent hash when a cookie is present.
+    SetAllFilesPriority {
+        cookie: AuthCookie,
+        hash: TorrentHash,
+    },
     ScheduleTimer {
         timer: QbitTimer,
         after: Duration,
@@ -286,6 +292,9 @@ impl Machine for QbitMachine {
         }
     }
 
+    // Each event arm is a small, self-contained decision; the function is long
+    // because the event set is large, not because any single arm is complex.
+    #[allow(clippy::too_many_lines)]
     fn handle(
         &mut self,
         _now: Instant,
@@ -357,6 +366,14 @@ impl Machine for QbitMachine {
             QbitEvent::TorrentsListed { torrents } => {
                 let hashes: Vec<TorrentHash> = torrents.iter().map(|t| t.hash.clone()).collect();
 
+                // Compute newly-seen hashes BEFORE replacing the map (§21 / QBIT-10).
+                // A hash is newly-seen when it is not already a key in self.torrents.
+                let newly_seen: Vec<TorrentHash> = torrents
+                    .iter()
+                    .filter(|t| !self.torrents.contains_key(&t.hash))
+                    .map(|t| t.hash.clone())
+                    .collect();
+
                 // Collect dead-torrent metadata before the map is updated.
                 let dead: Vec<(TorrentHash, Option<MamTorrentId>)> = torrents
                     .iter()
@@ -368,6 +385,18 @@ impl Machine for QbitMachine {
 
                 let mut actions = Vec::new();
                 let mut publish = vec![QbitPublish::TorrentsUpdated { hashes }];
+
+                // For each newly-seen torrent, emit SetAllFilesPriority to enforce
+                // the MAM "no partials" rule (§21 / QBIT-10).  Mirrors legacy
+                // `check_new_torrents` which ran before `check_dead_torrents`.
+                if let Some(c) = &self.cookie {
+                    for hash in newly_seen {
+                        actions.push(QbitAction::SetAllFilesPriority {
+                            cookie: c.clone(),
+                            hash,
+                        });
+                    }
+                }
 
                 // For each dead torrent, attempt an authorised delete.  Only
                 // emit `DeadTorrentRemoved` when the delete is actually
@@ -1022,6 +1051,110 @@ mod tests {
             "no DeadTorrentRemoved must be published without a cookie"
         );
     }
+
+    // ── No-partials enforcement unit tests (QBIT-10 / story 21) ─────────────
+
+    #[test]
+    fn new_torrent_with_cookie_emits_set_all_files_priority() {
+        // QBIT-10: first time a hash appears with an active cookie →
+        // SetAllFilesPriority is emitted.
+        let (mut m, cookie) = authenticated_machine();
+        let hash = TorrentHash("f".repeat(40));
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![record(&hash, 0, 0)],
+            },
+        );
+        assert!(
+            out.actions.contains(&QbitAction::SetAllFilesPriority {
+                cookie,
+                hash: hash.clone(),
+            }),
+            "SetAllFilesPriority must be emitted for a newly-seen torrent"
+        );
+    }
+
+    #[test]
+    fn already_known_torrent_no_set_all_files_priority_on_second_listing() {
+        // QBIT-10: fire-once — a hash already in the map must NOT produce a
+        // second SetAllFilesPriority on the next TorrentsListed.
+        let (mut m, _) = authenticated_machine();
+        let hash = TorrentHash("g".repeat(40));
+        // First listing — loads the torrent into the map.
+        let _ = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![record(&hash, 0, 0)],
+            },
+        );
+        // Second listing — same hash; must NOT emit SetAllFilesPriority again.
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![record(&hash, 0, 0)],
+            },
+        );
+        assert!(
+            !out.actions.iter().any(
+                |a| matches!(a, QbitAction::SetAllFilesPriority { hash: h, .. } if h == &hash)
+            ),
+            "SetAllFilesPriority must NOT be re-emitted for an already-known torrent"
+        );
+    }
+
+    #[test]
+    fn no_cookie_no_set_all_files_priority() {
+        // QBIT-10 + QBIT-1: without a cookie, no SetAllFilesPriority is emitted.
+        let mut m = machine();
+        let hash = TorrentHash("h".repeat(40));
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![record(&hash, 0, 0)],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::SetAllFilesPriority { .. })),
+            "SetAllFilesPriority must NOT be emitted without a cookie"
+        );
+    }
+
+    #[test]
+    fn first_time_seen_dead_torrent_emits_both_set_all_files_and_delete() {
+        // QBIT-10 co-existence with QBIT-9: a first-time-seen dead torrent gets
+        // BOTH SetAllFilesPriority AND DeleteTorrent (mirrors legacy ordering:
+        // check_new_torrents ran before check_dead_torrents).
+        let (mut m, cookie) = authenticated_machine();
+        let hash = TorrentHash("i".repeat(40));
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![stalled_zero_byte_record(&hash)],
+            },
+        );
+        assert!(
+            out.actions.contains(&QbitAction::SetAllFilesPriority {
+                cookie: cookie.clone(),
+                hash: hash.clone(),
+            }),
+            "SetAllFilesPriority must be emitted for a newly-seen dead torrent"
+        );
+        assert!(
+            out.actions.contains(&QbitAction::DeleteTorrent {
+                cookie,
+                hash: hash.clone(),
+            }),
+            "DeleteTorrent must also be emitted for a newly-seen dead torrent"
+        );
+        assert!(
+            out.publish
+                .contains(&QbitPublish::DeadTorrentRemoved { hash, mam_id: None }),
+            "DeadTorrentRemoved must be published"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1164,6 +1297,7 @@ mod prop_tests {
                 | QbitAction::PauseTorrent { .. }
                 | QbitAction::ResumeTorrent { .. }
                 | QbitAction::DeleteTorrent { .. }
+                | QbitAction::SetAllFilesPriority { .. }
         )
     }
 
@@ -1313,6 +1447,54 @@ mod prop_tests {
                     // this path, but compose with QBIT-8 to be sure), the test is
                     // vacuously satisfied.
                 }
+            }
+        }
+
+        // QBIT-10 [safety] (Guarantee A): no SetAllFilesPriority is emitted for
+        // a hash that was already in self.torrents before the TorrentsListed event.
+        // Fire-once semantics: the action is emitted only for newly-seen hashes.
+        // Tested against fully-arbitrary machine state (total invariant).
+        #[test]
+        fn no_set_all_files_priority_for_previously_known_hash(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            // Snapshot the known hashes BEFORE handle mutates state.
+            let previously_known: std::collections::HashSet<TorrentHash> =
+                machine.torrents.keys().cloned().collect();
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            for action in &out.actions {
+                if let QbitAction::SetAllFilesPriority { hash, .. } = action {
+                    prop_assert!(
+                        !previously_known.contains(hash),
+                        "SetAllFilesPriority emitted for already-known hash {hash:?}"
+                    );
+                }
+            }
+        }
+
+        // QBIT-1 extended: SetAllFilesPriority (now in carries_cookie) is never
+        // emitted while unauthenticated.  This is covered generically by the
+        // existing `events_emit_no_cookie_action_while_unauthenticated` test
+        // because carries_cookie now includes SetAllFilesPriority.
+        // The test below is a dedicated targeted check for clarity.
+        #[test]
+        fn no_set_all_files_priority_without_cookie(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            // Force unauthenticated.
+            machine.cookie = None;
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+            for action in &out.actions {
+                prop_assert!(
+                    !matches!(action, QbitAction::SetAllFilesPriority { .. }),
+                    "SetAllFilesPriority must never be emitted without a cookie"
+                );
             }
         }
     }
