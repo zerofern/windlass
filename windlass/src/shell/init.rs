@@ -171,6 +171,10 @@ pub(super) async fn init_shell(
             sync_retry: Duration::from_secs(2),
             torrent_refresh: Duration::from_secs(30),
             hnr_seed_time: Duration::from_hours(72),
+            // MAM Power User class cap (MAM Rule 2.8 — §25).
+            // Set to 0 to disable the gate (e.g. for lower-class accounts where
+            // the real limit is unknown; operators should set this explicitly).
+            unsatisfied_quota_limit: 100,
         },
         qbit.clone(),
     )
@@ -185,6 +189,7 @@ pub(super) async fn init_shell(
                 QbitTopic::Torrents,
                 QbitTopic::Privacy,
                 QbitTopic::Queue,
+                QbitTopic::Quota,
             ],
             qbit_pub_tx,
         ))

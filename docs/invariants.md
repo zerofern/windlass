@@ -195,7 +195,11 @@ all must be false per MAM Rule 6.1),
 `max_active_torrents: u32` (last-observed queue limit; initialised to `u32::MAX`
 meaning "no limit"; populated on every `PreferencesRead` event — §24).
 
-Topics: `Availability`, `ListenPort`, `Torrents`, `Privacy` (§23), `Queue` (§24).
+Config: `unsatisfied_quota_limit: u32` (MAM Rule 2.8 class cap; `0` disables
+the gate; production default 100 for MAM Power User class — §25).
+
+Topics: `Availability`, `ListenPort`, `Torrents`, `Privacy` (§23), `Queue` (§24),
+`Quota` (§25).
 
 - **QBIT-1 [safety]** No cookie-bearing action (`ReadPreferences`,
   `SetListenPort`, `ListTorrents`, `PauseTorrent`, `ResumeTorrent`,
@@ -378,6 +382,54 @@ current implementation skips orchestration if no satisfied seeder is available,
 and relies on the operator noticing the parked torrent via the activity log and
 UI. Tracking: operator-readiness story 25 (unsatisfied quota gate) will gate new
 downloads before the queue fills, reducing the chance escalation is needed.
+
+### qBit machine additions (§25)
+
+State additions: `unsatisfied_quota_limit: u32` added to `QbitConfig` (the
+configurable MAM class cap from Rule 2.8; `0` means the gate is disabled).
+
+New topic: `Quota` — carries `UnsatisfiedQuotaCritical` and
+`UnsatisfiedQuotaApproaching` publishes.
+
+Public predicates: `unsatisfied_count()` counts torrents where
+`downloaded_bytes > 0 && seed_time < hnr_seed_time`; `unsatisfied_quota_full()`
+returns `true` iff `unsatisfied_quota_limit > 0 && unsatisfied_count() >=
+unsatisfied_quota_limit` (story 29 will consume this as a fail-closed admission
+predicate).
+
+- **QBIT-17 [safety]** *(quota critical — §25)*: a `TorrentsListed` event
+  publishes `UnsatisfiedQuotaCritical { unsatisfied, limit }` iff
+  `config.unsatisfied_quota_limit > 0 &&
+  unsatisfied_count >= unsatisfied_quota_limit` (after the map is replaced).
+  Total invariant. → A
+- **QBIT-18 [safety]** *(quota approaching — §25)*: a `TorrentsListed` event
+  publishes `UnsatisfiedQuotaApproaching { unsatisfied, limit }` iff
+  `config.unsatisfied_quota_limit > 0 &&
+  limit.saturating_sub(5) <= unsatisfied_count < limit` (after the map is
+  replaced). Total invariant. → A
+
+### Domain machine additions (§25)
+
+- **DOM-12 [safety]** *(quota alert routing — §25)*:
+  `Qbit(UnsatisfiedQuotaCritical)` emits exactly one
+  `Db(RecordAlert { priority: Critical, title: "Quota limit reached" })` and
+  exactly one `Activity` publish; `Qbit(UnsatisfiedQuotaApproaching)` emits
+  exactly one `Db(RecordAlert { priority: Warning, title: "Approaching quota
+  limit" })` and exactly one `Activity` publish. Total invariant. → A
+
+### Deferred (§25)
+
+The `AddTorrent` suppression invariant originally described in the story 25
+acceptance criteria — *`unsatisfied_count >= class_limit ⇒ no
+Action::AddTorrent`* — is **deferred to story 29** (the composite admission
+gate), because `Action::AddTorrent` does not yet exist. Story 25 builds the
+state, the alert path, and exposes the `unsatisfied_quota_full()` predicate
+that story 29 will consume as one gate of the fail-closed admission predicate:
+
+```
+if unsatisfied_count >= class_limit
+then no Action::AddTorrent   [to be enforced in story 29]
+```
 
 ### Deferred rank classes and structural invariants (§22)
 

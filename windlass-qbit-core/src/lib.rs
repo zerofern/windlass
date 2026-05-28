@@ -15,6 +15,10 @@ pub struct QbitConfig {
     /// Minimum seed time required to satisfy the `HnR` rule.
     /// Defaults to 72 hours (MAM rules 2.5 & 2.7).
     pub hnr_seed_time: Duration,
+    /// Maximum number of unsatisfied torrents allowed by the user's MAM class
+    /// (MAM Rule 2.8).  `0` means the gate is disabled (no limit enforced).
+    /// Default for production: 100 (MAM Power User class cap).
+    pub unsatisfied_quota_limit: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +190,20 @@ pub enum QbitPublish {
         paused: TorrentHash,
         force_resumed: TorrentHash,
     },
+    /// Published when the unsatisfied-torrent count meets or exceeds
+    /// `config.unsatisfied_quota_limit` (MAM Rule 2.8 — §25).  The domain
+    /// core turns this into a `Critical` alert and activity entry.
+    UnsatisfiedQuotaCritical {
+        unsatisfied: u32,
+        limit: u32,
+    },
+    /// Published when the unsatisfied-torrent count is within 5 of
+    /// `config.unsatisfied_quota_limit` but has not yet reached it (§25).
+    /// The domain core turns this into a `Warning` alert and activity entry.
+    UnsatisfiedQuotaApproaching {
+        unsatisfied: u32,
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +215,8 @@ pub enum QbitTopic {
     Privacy,
     /// Queue-orchestration events (§24): active-limit management.
     Queue,
+    /// Unsatisfied-torrent quota events (MAM Rule 2.8 — §25).
+    Quota,
 }
 
 impl HasTopic<QbitTopic> for QbitPublish {
@@ -209,6 +229,9 @@ impl HasTopic<QbitTopic> for QbitPublish {
             Self::TorrentsUpdated { .. } | Self::DeadTorrentRemoved { .. } => QbitTopic::Torrents,
             Self::BannedPrivacySettingsObserved { .. } => QbitTopic::Privacy,
             Self::QueueOrchestrated { .. } => QbitTopic::Queue,
+            Self::UnsatisfiedQuotaCritical { .. } | Self::UnsatisfiedQuotaApproaching { .. } => {
+                QbitTopic::Quota
+            }
         }
     }
 }
@@ -455,6 +478,51 @@ impl QbitMachine {
             .into_iter()
             .collect()
     }
+
+    /// Count of torrents in `self.torrents` that are HnR-unsatisfied:
+    /// `downloaded_bytes > 0 && seed_time < config.hnr_seed_time`.
+    ///
+    /// Returns `u32::MAX` on overflow (impossible with typical torrent counts, but
+    /// saturating is safer than panicking).
+    #[must_use]
+    pub fn unsatisfied_count(&self) -> u32 {
+        u32::try_from(
+            self.torrents
+                .values()
+                .filter(|t| t.downloaded_bytes > 0 && t.seed_time < self.config.hnr_seed_time)
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Returns `true` iff the unsatisfied-quota gate is enabled
+    /// (`config.unsatisfied_quota_limit > 0`) and the current unsatisfied count
+    /// has met or exceeded the limit.
+    ///
+    /// Story 29 will consume this as a fail-closed admission predicate.
+    #[must_use]
+    pub fn unsatisfied_quota_full(&self) -> bool {
+        self.config.unsatisfied_quota_limit > 0
+            && self.unsatisfied_count() >= self.config.unsatisfied_quota_limit
+    }
+
+    /// Evaluate the unsatisfied-quota state and return any quota publish (§25 /
+    /// QBIT-17/18).  Returns an empty vec when the gate is disabled (`limit == 0`)
+    /// or when the count is safely below the warning threshold.
+    fn quota_publish(&self) -> Vec<QbitPublish> {
+        let limit = self.config.unsatisfied_quota_limit;
+        if limit == 0 {
+            return Vec::new();
+        }
+        let unsatisfied = self.unsatisfied_count();
+        if unsatisfied >= limit {
+            vec![QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit }]
+        } else if unsatisfied >= limit.saturating_sub(5) {
+            vec![QbitPublish::UnsatisfiedQuotaApproaching { unsatisfied, limit }]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl Machine for QbitMachine {
@@ -631,6 +699,11 @@ impl Machine for QbitMachine {
                 actions.extend(orch_actions);
                 publish.extend(orch_publish);
 
+                // Quota evaluation step (§25 / QBIT-17/18): after the map is
+                // replaced, evaluate the unsatisfied count against the configured
+                // class limit.  Emits at most one quota publish per listing.
+                publish.extend(self.quota_publish());
+
                 Outcome { actions, publish }
             }
             // QBIT-12: success is a no-op — next PreferencesRead will confirm
@@ -729,6 +802,7 @@ mod tests {
                 sync_retry: Duration::from_secs(2),
                 torrent_refresh: Duration::from_secs(30),
                 hnr_seed_time: HNR_SEED_TIME,
+                unsatisfied_quota_limit: 0,
             },
             Instant::now(),
         )
@@ -1816,6 +1890,201 @@ mod tests {
             "no QueueOrchestrated published without a cookie"
         );
     }
+
+    // ── Unsatisfied-quota unit tests (QBIT-17/18 / story 25) ────────────────
+
+    fn machine_with_quota(limit: u32) -> QbitMachine {
+        QbitMachine::new(
+            QbitConfig {
+                auth_retry: Duration::from_secs(1),
+                sync_retry: Duration::from_secs(2),
+                torrent_refresh: Duration::from_secs(30),
+                hnr_seed_time: HNR_SEED_TIME,
+                unsatisfied_quota_limit: limit,
+            },
+            Instant::now(),
+        )
+    }
+
+    fn unsatisfied_record(hash: &TorrentHash) -> TorrentRecord {
+        // downloaded > 0, seed_time < 72h → HnR-unsatisfied
+        TorrentRecord {
+            hash: hash.clone(),
+            downloaded_bytes: 1024,
+            seed_time: Duration::from_secs(3600), // 1h
+            state: TorrentState::Uploading,
+            mam_id: None,
+        }
+    }
+
+    fn load_n_unsatisfied(m: &mut QbitMachine, n: usize) {
+        let torrents: Vec<TorrentRecord> = (0..n)
+            .map(|i| unsatisfied_record(&TorrentHash(format!("{:0>40x}", i))))
+            .collect();
+        let _ = m.handle(
+            Instant::now(),
+            Timed::now(QbitEvent::TorrentsListed { torrents }),
+        );
+    }
+
+    #[test]
+    fn quota_disabled_no_publish() {
+        // unsatisfied_quota_limit = 0 → gate disabled, never publishes quota events.
+        let mut m = machine_with_quota(0);
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: (0..200_u32)
+                    .map(|i| unsatisfied_record(&TorrentHash(format!("{:0>40x}", i))))
+                    .collect(),
+            },
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })),
+            "quota disabled must never publish UnsatisfiedQuotaCritical"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
+            "quota disabled must never publish UnsatisfiedQuotaApproaching"
+        );
+    }
+
+    #[test]
+    fn quota_critical_at_limit() {
+        // unsatisfied == limit → UnsatisfiedQuotaCritical.
+        let limit: u32 = 10;
+        let mut m = machine_with_quota(limit);
+        let torrents: Vec<TorrentRecord> = (0..limit)
+            .map(|i| unsatisfied_record(&TorrentHash(format!("{:0>40x}", i))))
+            .collect();
+        let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
+        assert!(
+            out.publish.iter().any(|p| matches!(
+                p,
+                QbitPublish::UnsatisfiedQuotaCritical {
+                    unsatisfied,
+                    limit: l
+                } if *unsatisfied == limit && *l == limit
+            )),
+            "must publish UnsatisfiedQuotaCritical when unsatisfied == limit"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
+            "must not also publish UnsatisfiedQuotaApproaching"
+        );
+    }
+
+    #[test]
+    fn quota_approaching_at_limit_minus_1() {
+        // unsatisfied == limit - 1 → UnsatisfiedQuotaApproaching (boundary).
+        let limit: u32 = 10;
+        let mut m = machine_with_quota(limit);
+        let torrents: Vec<TorrentRecord> = (0..(limit - 1))
+            .map(|i| unsatisfied_record(&TorrentHash(format!("{:0>40x}", i))))
+            .collect();
+        let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
+        assert!(
+            out.publish.iter().any(|p| matches!(
+                p,
+                QbitPublish::UnsatisfiedQuotaApproaching {
+                    unsatisfied,
+                    limit: l
+                } if *unsatisfied == limit - 1 && *l == limit
+            )),
+            "must publish UnsatisfiedQuotaApproaching when unsatisfied == limit - 1"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })),
+            "must not publish UnsatisfiedQuotaCritical when below limit"
+        );
+    }
+
+    #[test]
+    fn quota_approaching_at_limit_minus_5() {
+        // unsatisfied == limit - 5 → UnsatisfiedQuotaApproaching (lower boundary).
+        let limit: u32 = 10;
+        let mut m = machine_with_quota(limit);
+        let torrents: Vec<TorrentRecord> = (0..(limit - 5))
+            .map(|i| unsatisfied_record(&TorrentHash(format!("{:0>40x}", i))))
+            .collect();
+        let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
+        assert!(
+            out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
+            "must publish UnsatisfiedQuotaApproaching when unsatisfied == limit - 5"
+        );
+    }
+
+    #[test]
+    fn quota_no_publish_below_warning_threshold() {
+        // unsatisfied == limit - 6 → no quota publish.
+        let limit: u32 = 10;
+        let mut m = machine_with_quota(limit);
+        let torrents: Vec<TorrentRecord> = (0..(limit - 6))
+            .map(|i| unsatisfied_record(&TorrentHash(format!("{:0>40x}", i))))
+            .collect();
+        let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })),
+            "must not publish critical below warning threshold"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
+            "must not publish approaching when 6 below limit"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_count_accessor() {
+        let mut m = machine_with_quota(100);
+        // 2 unsatisfied (downloaded > 0, seed < 72h), 1 satisfied (seed >= 72h), 1 zero-byte
+        let _ = m.handle(
+            Instant::now(),
+            Timed::now(QbitEvent::TorrentsListed {
+                torrents: vec![
+                    unsatisfied_record(&TorrentHash("a".repeat(40))),
+                    unsatisfied_record(&TorrentHash("b".repeat(40))),
+                    record(&TorrentHash("c".repeat(40)), 1, 72 * 3600), // satisfied
+                    record(&TorrentHash("d".repeat(40)), 0, 0),         // zero-byte
+                ],
+            }),
+        );
+        assert_eq!(m.unsatisfied_count(), 2);
+    }
+
+    #[test]
+    fn unsatisfied_quota_full_accessor_false_when_below_limit() {
+        let mut m = machine_with_quota(5);
+        load_n_unsatisfied(&mut m, 4);
+        assert!(!m.unsatisfied_quota_full());
+    }
+
+    #[test]
+    fn unsatisfied_quota_full_accessor_true_at_limit() {
+        let mut m = machine_with_quota(5);
+        load_n_unsatisfied(&mut m, 5);
+        assert!(m.unsatisfied_quota_full());
+    }
+
+    #[test]
+    fn unsatisfied_quota_full_false_when_limit_is_zero() {
+        let mut m = machine_with_quota(0);
+        load_n_unsatisfied(&mut m, 1000);
+        assert!(!m.unsatisfied_quota_full(), "limit 0 must disable the gate");
+    }
 }
 
 #[cfg(test)]
@@ -1902,6 +2171,7 @@ mod prop_tests {
             any::<bool>(),
             any::<bool>(),
             any::<u32>(),
+            any::<u32>(),
         )
             .prop_map(
                 |(
@@ -1914,6 +2184,7 @@ mod prop_tests {
                     pex,
                     lsd,
                     max_active_torrents,
+                    unsatisfied_quota_limit,
                 )| {
                     let mut machine = QbitMachine::new(
                         QbitConfig {
@@ -1921,6 +2192,7 @@ mod prop_tests {
                             sync_retry: Duration::from_secs(2),
                             torrent_refresh: Duration::from_secs(30),
                             hnr_seed_time: Duration::from_secs(72 * 3600),
+                            unsatisfied_quota_limit,
                         },
                         Instant::now(),
                     );
@@ -2489,6 +2761,80 @@ mod prop_tests {
                     );
                 }
             }
+        }
+
+        // QBIT-17 [safety] (quota critical — §25):
+        // `TorrentsListed` publishes `UnsatisfiedQuotaCritical { unsatisfied, limit }`
+        // iff `limit > 0 && unsatisfied >= limit` after the map is replaced.
+        // Total invariant against fully-arbitrary state.
+        #[test]
+        fn quota_critical_iff_limit_positive_and_count_at_or_above(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            let limit = machine.config.unsatisfied_quota_limit;
+            let hnr_seed_time = machine.config.hnr_seed_time;
+
+            // Compute the expected unsatisfied count from the NEW listing.
+            let new_unsatisfied = u32::try_from(
+                torrents.iter().filter(|t| {
+                    t.downloaded_bytes > 0 && t.seed_time < hnr_seed_time
+                }).count()
+            ).unwrap_or(u32::MAX);
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            let critical_count = out.publish.iter().filter(|p| {
+                matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })
+            }).count();
+
+            let expected_critical = if limit > 0 && new_unsatisfied >= limit { 1 } else { 0 };
+            prop_assert_eq!(
+                critical_count,
+                expected_critical,
+                "QBIT-17: UnsatisfiedQuotaCritical count mismatch (limit={}, unsatisfied={})",
+                limit,
+                new_unsatisfied,
+            );
+        }
+
+        // QBIT-18 [safety] (quota approaching — §25):
+        // `TorrentsListed` publishes `UnsatisfiedQuotaApproaching { unsatisfied, limit }`
+        // iff `limit > 0 && limit.saturating_sub(5) <= unsatisfied < limit`.
+        // Total invariant against fully-arbitrary state.
+        #[test]
+        fn quota_approaching_iff_limit_positive_and_count_in_warning_range(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            let limit = machine.config.unsatisfied_quota_limit;
+            let hnr_seed_time = machine.config.hnr_seed_time;
+
+            let new_unsatisfied = u32::try_from(
+                torrents.iter().filter(|t| {
+                    t.downloaded_bytes > 0 && t.seed_time < hnr_seed_time
+                }).count()
+            ).unwrap_or(u32::MAX);
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            let approaching_count = out.publish.iter().filter(|p| {
+                matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })
+            }).count();
+
+            let in_warning_range = limit > 0
+                && new_unsatisfied >= limit.saturating_sub(5)
+                && new_unsatisfied < limit;
+            let expected_approaching = if in_warning_range { 1 } else { 0 };
+            prop_assert_eq!(
+                approaching_count,
+                expected_approaching,
+                "QBIT-18: UnsatisfiedQuotaApproaching count mismatch (limit={}, unsatisfied={})",
+                limit,
+                new_unsatisfied,
+            );
         }
     }
 }

@@ -200,6 +200,15 @@ impl Machine for WindlassMachine {
                 ref paused,
                 ref force_resumed,
             }) => Self::on_queue_orchestrated(paused, force_resumed),
+            // DOM-12: UnsatisfiedQuotaCritical → one RecordAlert(Critical) + one Activity publish.
+            WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit }) => {
+                Self::on_unsatisfied_quota_critical(unsatisfied, limit)
+            }
+            // DOM-12: UnsatisfiedQuotaApproaching → one RecordAlert(Warning) + one Activity publish.
+            WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaApproaching {
+                unsatisfied,
+                limit,
+            }) => Self::on_unsatisfied_quota_approaching(unsatisfied, limit),
             WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { mam_id, .. }) => {
                 Self::on_dead_torrent_removed(mam_id)
             }
@@ -369,6 +378,70 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 },
             ))],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles the `UnsatisfiedQuotaCritical` qBit publish (DOM-12 / §25).
+    ///
+    /// The unsatisfied-torrent count has met or exceeded the configured class
+    /// limit (MAM Rule 2.8).  Emits one `RecordAlert(Critical)` action and one
+    /// `Activity` publish.
+    fn on_unsatisfied_quota_critical(
+        unsatisfied: u32,
+        limit: u32,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!("{unsatisfied}/{limit} unsatisfied torrents — download disabled.");
+        let message = format!("Quota limit reached: {body}");
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Critical,
+                    title: "Quota limit reached".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Qbit,
+                    action: "unsatisfied_quota_critical".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles the `UnsatisfiedQuotaApproaching` qBit publish (DOM-12 / §25).
+    ///
+    /// The unsatisfied-torrent count is within 5 of the configured class limit
+    /// (MAM Rule 2.8).  Emits one `RecordAlert(Warning)` action and one
+    /// `Activity` publish.
+    fn on_unsatisfied_quota_approaching(
+        unsatisfied: u32,
+        limit: u32,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!("{unsatisfied}/{limit} unsatisfied torrents.");
+        let message = format!("Approaching quota limit: {body}");
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Warning,
+                    title: "Approaching quota limit".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Qbit,
+                    action: "unsatisfied_quota_approaching".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
             publish: vec![WindlassPublish::Activity { message }],
         }
     }
@@ -730,6 +803,156 @@ mod tests {
             "publish must be an Activity"
         );
     }
+
+    // ── Quota alert routing unit tests (DOM-12 / story 25) ───────────────────
+
+    #[test]
+    fn quota_critical_emits_critical_alert_and_activity() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaCritical {
+                unsatisfied: 10,
+                limit: 10,
+            }),
+        );
+
+        // Exactly 2 actions: RecordAlert(Critical) + RecordActivity
+        assert_eq!(out.actions.len(), 2, "exactly two actions expected");
+        let has_critical_alert = out.actions.iter().any(|a| {
+            matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Critical,
+                    ..
+                }))
+            )
+        });
+        assert!(
+            has_critical_alert,
+            "must emit exactly one RecordAlert(Critical)"
+        );
+        assert!(
+            matches!(
+                &out.actions[1],
+                WindlassAction::Db(DbCommand::RecordActivity(_))
+            ),
+            "second action must be RecordActivity"
+        );
+        // Exactly one Activity publish
+        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
+
+    #[test]
+    fn quota_critical_alert_body_mentions_counts() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaCritical {
+                unsatisfied: 100,
+                limit: 100,
+            }),
+        );
+
+        if let WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+            priority: AlertPriority::Critical,
+            body,
+            title,
+            ..
+        })) = &out.actions[0]
+        {
+            assert!(body.contains("100/100"), "body should contain counts");
+            assert_eq!(title, "Quota limit reached");
+        } else {
+            panic!("expected RecordAlert(Critical)");
+        }
+    }
+
+    #[test]
+    fn quota_approaching_emits_warning_alert_and_activity() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaApproaching {
+                unsatisfied: 8,
+                limit: 10,
+            }),
+        );
+
+        // Exactly 2 actions: RecordAlert(Warning) + RecordActivity
+        assert_eq!(out.actions.len(), 2, "exactly two actions expected");
+        let has_warning_alert = out.actions.iter().any(|a| {
+            matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Warning,
+                    ..
+                }))
+            )
+        });
+        assert!(
+            has_warning_alert,
+            "must emit exactly one RecordAlert(Warning)"
+        );
+        assert!(
+            matches!(
+                &out.actions[1],
+                WindlassAction::Db(DbCommand::RecordActivity(_))
+            ),
+            "second action must be RecordActivity"
+        );
+        // Exactly one Activity publish
+        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
+
+    #[test]
+    fn quota_approaching_alert_body_mentions_counts() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaApproaching {
+                unsatisfied: 95,
+                limit: 100,
+            }),
+        );
+
+        if let WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+            priority: AlertPriority::Warning,
+            body,
+            title,
+            ..
+        })) = &out.actions[0]
+        {
+            assert!(body.contains("95/100"), "body should contain counts");
+            assert_eq!(title, "Approaching quota limit");
+        } else {
+            panic!("expected RecordAlert(Warning)");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -818,6 +1041,12 @@ mod prop_tests {
                     paused,
                     force_resumed,
                 }
+            }),
+            (any::<u32>(), any::<u32>()).prop_map(|(unsatisfied, limit)| {
+                QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit }
+            }),
+            (any::<u32>(), any::<u32>()).prop_map(|(unsatisfied, limit)| {
+                QbitPublish::UnsatisfiedQuotaApproaching { unsatisfied, limit }
             }),
         ]
     }
@@ -987,6 +1216,96 @@ mod prop_tests {
                 activity_publish_count,
                 1,
                 "BannedPrivacySettingsObserved must emit exactly one Activity publish"
+            );
+        }
+
+        // DOM-12 [safety] (quota alert routing — §25):
+        // `Qbit(UnsatisfiedQuotaCritical)` emits exactly one
+        // `Db(RecordAlert { Critical })` and one `Activity` publish.
+        // Total invariant.
+        #[test]
+        fn quota_critical_emits_one_critical_alert_and_one_activity(
+            mut machine in any_windlass_machine(),
+            unsatisfied in any::<u32>(),
+            limit in any::<u32>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Qbit(
+                    QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit },
+                )),
+            );
+
+            let critical_alert_count = out.actions.iter().filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Critical,
+                        ..
+                    }))
+                )
+            }).count();
+            prop_assert_eq!(
+                critical_alert_count,
+                1,
+                "UnsatisfiedQuotaCritical must emit exactly one RecordAlert(Critical)"
+            );
+
+            let activity_count = out.publish.iter()
+                .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                .count();
+            prop_assert_eq!(
+                activity_count,
+                1,
+                "UnsatisfiedQuotaCritical must emit exactly one Activity publish"
+            );
+        }
+
+        // DOM-12 [safety] (quota alert routing — §25):
+        // `Qbit(UnsatisfiedQuotaApproaching)` emits exactly one
+        // `Db(RecordAlert { Warning })` and one `Activity` publish.
+        // Total invariant.
+        #[test]
+        fn quota_approaching_emits_one_warning_alert_and_one_activity(
+            mut machine in any_windlass_machine(),
+            unsatisfied in any::<u32>(),
+            limit in any::<u32>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Qbit(
+                    QbitPublish::UnsatisfiedQuotaApproaching { unsatisfied, limit },
+                )),
+            );
+
+            let warning_alert_count = out.actions.iter().filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Warning,
+                        ..
+                    }))
+                )
+            }).count();
+            prop_assert_eq!(
+                warning_alert_count,
+                1,
+                "UnsatisfiedQuotaApproaching must emit exactly one RecordAlert(Warning)"
+            );
+
+            let activity_count = out.publish.iter()
+                .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                .count();
+            prop_assert_eq!(
+                activity_count,
+                1,
+                "UnsatisfiedQuotaApproaching must emit exactly one Activity publish"
             );
         }
     }

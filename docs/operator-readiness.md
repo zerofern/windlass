@@ -804,7 +804,7 @@ limits would otherwise park them, so queue limits never cause an HnR violation.
 
 ## Story: Pause New Automated Downloads Near The Unsatisfied Class Limit
 
-Status: To Do
+Status: Done
 
 ### Problem
 
