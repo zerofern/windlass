@@ -739,7 +739,7 @@ AI score.
 
 ## Story: Auto-Revert Banned qBittorrent Privacy Settings
 
-Status: To Do
+Status: Done
 
 ### Problem
 

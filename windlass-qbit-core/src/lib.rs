@@ -66,6 +66,12 @@ pub enum QbitEvent {
     },
     PreferencesRead {
         listen_port: Option<VpnPort>,
+        /// Whether DHT is enabled — banned on private trackers (MAM Rule 6.1).
+        dht: bool,
+        /// Whether Peer Exchange (`PeX`) is enabled — banned on private trackers (MAM Rule 6.1).
+        pex: bool,
+        /// Whether Local Service Discovery is enabled — banned on private trackers (MAM Rule 6.1).
+        lsd: bool,
     },
     PreferencesFailed {
         reason: String,
@@ -80,6 +86,12 @@ pub enum QbitEvent {
     /// Full torrent listing from qBittorrent, including compliance data.
     TorrentsListed {
         torrents: Vec<TorrentRecord>,
+    },
+    /// Shell successfully disabled DHT, `PeX`, and LSD.
+    PrivacySettingsDisabled,
+    /// Shell failed to disable banned privacy settings.
+    PrivacySettingsDisableFailed {
+        reason: String,
     },
     TimerFired(QbitTimer),
 }
@@ -116,6 +128,11 @@ pub enum QbitAction {
         cookie: AuthCookie,
         hash: TorrentHash,
     },
+    /// Disable DHT, `PeX`, and LSD on qBittorrent (MAM Rule 6.1 — §23).
+    /// Emitted when any of these settings is observed as `true`.
+    DisableBannedPrivacySettings {
+        cookie: AuthCookie,
+    },
     ScheduleTimer {
         timer: QbitTimer,
         after: Duration,
@@ -141,6 +158,14 @@ pub enum QbitPublish {
         hash: TorrentHash,
         mam_id: Option<MamTorrentId>,
     },
+    /// Published when a `PreferencesRead` reveals that at least one of DHT, `PeX`,
+    /// or LSD is enabled — a MAM Rule 6.1 violation.  The domain core uses this
+    /// to fire a `Critical` alert.
+    BannedPrivacySettingsObserved {
+        dht: bool,
+        pex: bool,
+        lsd: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +173,8 @@ pub enum QbitTopic {
     Availability,
     ListenPort,
     Torrents,
+    /// Privacy-settings violations (MAM Rule 6.1 — §23).
+    Privacy,
 }
 
 impl HasTopic<QbitTopic> for QbitPublish {
@@ -158,6 +185,7 @@ impl HasTopic<QbitTopic> for QbitPublish {
             // `DeadTorrentRemoved` is routed on `Torrents` so the domain's
             // existing `Torrents` subscription delivers it without a new topic.
             Self::TorrentsUpdated { .. } | Self::DeadTorrentRemoved { .. } => QbitTopic::Torrents,
+            Self::BannedPrivacySettingsObserved { .. } => QbitTopic::Privacy,
         }
     }
 }
@@ -165,6 +193,22 @@ impl HasTopic<QbitTopic> for QbitPublish {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QbitResponse {
     Accepted,
+}
+
+/// Last-observed state of the three privacy settings banned by MAM Rule 6.1.
+/// Grouped to avoid triggering `clippy::struct_excessive_bools` on `QbitMachine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PrivacySettings {
+    dht: bool,
+    pex: bool,
+    lsd: bool,
+}
+
+impl PrivacySettings {
+    /// Returns `true` if any banned setting is enabled.
+    const fn any_banned(self) -> bool {
+        self.dht || self.pex || self.lsd
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +222,8 @@ pub struct QbitMachine {
     refresh_scheduled: bool,
     /// Per-torrent state updated on every `TorrentsListed` event.
     torrents: HashMap<TorrentHash, TorrentRecord>,
+    /// Last-observed privacy settings (MAM Rule 6.1 — all must be false).
+    privacy: PrivacySettings,
 }
 
 impl QbitMachine {
@@ -318,6 +364,7 @@ impl Machine for QbitMachine {
             desired_listen_port: None,
             refresh_scheduled: false,
             torrents: HashMap::new(),
+            privacy: PrivacySettings::default(),
         }
     }
 
@@ -368,15 +415,36 @@ impl Machine for QbitMachine {
                 }],
                 publish: vec![QbitPublish::Unavailable { reason }],
             },
-            QbitEvent::PreferencesRead { listen_port } => {
+            QbitEvent::PreferencesRead {
+                listen_port,
+                dht,
+                pex,
+                lsd,
+            } => {
                 self.listen_port = listen_port;
-                Outcome {
-                    actions: self.converge_listen_port(),
-                    publish: self.listen_port_publish(listen_port),
+                self.privacy = PrivacySettings { dht, pex, lsd };
+
+                let mut actions = self.converge_listen_port();
+                let mut publish = self.listen_port_publish(listen_port);
+
+                // QBIT-12: if any banned privacy setting is enabled, disable
+                // them and publish the observation.  The disable action is only
+                // emitted when a cookie is present (QBIT-1).
+                if self.privacy.any_banned() {
+                    if let Some(cookie) = self.cookie.clone() {
+                        actions.push(QbitAction::DisableBannedPrivacySettings { cookie });
+                    }
+                    publish.push(QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd });
                 }
+
+                Outcome { actions, publish }
             }
+            // All retryable failures: schedule one SyncRetry, publish Unavailable.
+            // QBIT-5 (PreferencesFailed / ListenPortSetFailed) and QBIT-13
+            // (PrivacySettingsDisableFailed) share this arm because the action is identical.
             QbitEvent::PreferencesFailed { reason }
-            | QbitEvent::ListenPortSetFailed { reason, .. } => Outcome {
+            | QbitEvent::ListenPortSetFailed { reason, .. }
+            | QbitEvent::PrivacySettingsDisableFailed { reason } => Outcome {
                 actions: vec![QbitAction::ScheduleTimer {
                     timer: QbitTimer::SyncRetry,
                     after: self.config.sync_retry,
@@ -441,15 +509,24 @@ impl Machine for QbitMachine {
 
                 Outcome { actions, publish }
             }
+            // QBIT-12: success is a no-op — next PreferencesRead will confirm
+            // the settings are now false.
+            QbitEvent::PrivacySettingsDisabled => Outcome::none(),
             QbitEvent::TimerFired(QbitTimer::SyncRetry) => Outcome {
                 actions: self.retry_listen_port_or_read_preferences(),
                 publish: Vec::new(),
             },
             QbitEvent::TimerFired(QbitTimer::TorrentRefresh) => {
-                let mut actions = self
-                    .cookie
-                    .clone()
-                    .map_or_else(Vec::new, |cookie| vec![QbitAction::ListTorrents { cookie }]);
+                let mut actions = self.cookie.clone().map_or_else(Vec::new, |cookie| {
+                    // Piggyback a prefs read on every torrent-refresh cycle so
+                    // banned privacy settings are caught continuously (§23).
+                    vec![
+                        QbitAction::ListTorrents {
+                            cookie: cookie.clone(),
+                        },
+                        QbitAction::ReadPreferences { cookie },
+                    ]
+                });
                 actions.push(QbitAction::ScheduleTimer {
                     timer: QbitTimer::TorrentRefresh,
                     after: self.config.torrent_refresh,
@@ -660,6 +737,9 @@ mod tests {
             &mut machine,
             QbitEvent::PreferencesRead {
                 listen_port: Some(observed),
+                dht: false,
+                pex: false,
+                lsd: false,
             },
         );
 
@@ -1255,6 +1335,163 @@ mod tests {
             "unsatisfied torrent must not be selected even when present"
         );
     }
+
+    // ── Privacy auto-revert unit tests (QBIT-12/QBIT-13 / story 23) ─────────
+
+    #[test]
+    fn preferences_read_with_dht_emits_disable_and_publishes_observed() {
+        // Authenticated + DHT=true → DisableBannedPrivacySettings + BannedPrivacySettingsObserved.
+        let (mut m, cookie) = authenticated_machine();
+        let out = handle(
+            &mut m,
+            QbitEvent::PreferencesRead {
+                listen_port: None,
+                dht: true,
+                pex: false,
+                lsd: false,
+            },
+        );
+        assert!(
+            out.actions
+                .contains(&QbitAction::DisableBannedPrivacySettings { cookie }),
+            "DisableBannedPrivacySettings must be emitted for dht=true when authenticated"
+        );
+        assert!(
+            out.publish
+                .contains(&QbitPublish::BannedPrivacySettingsObserved {
+                    dht: true,
+                    pex: false,
+                    lsd: false,
+                }),
+            "BannedPrivacySettingsObserved must be published when dht=true"
+        );
+    }
+
+    #[test]
+    fn preferences_read_clean_no_disable_no_publish() {
+        // No banned setting → no DisableBannedPrivacySettings, no privacy publish.
+        let (mut m, _cookie) = authenticated_machine();
+        let out = handle(
+            &mut m,
+            QbitEvent::PreferencesRead {
+                listen_port: None,
+                dht: false,
+                pex: false,
+                lsd: false,
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::DisableBannedPrivacySettings { .. })),
+            "no DisableBannedPrivacySettings when all settings are clean"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. })),
+            "no BannedPrivacySettingsObserved when all settings are clean"
+        );
+    }
+
+    #[test]
+    fn preferences_read_dht_unauthenticated_no_disable_action_but_still_publishes() {
+        // Judgment call: unauthenticated + banned setting observed → we still publish
+        // BannedPrivacySettingsObserved so the domain can fire a Critical alert even
+        // though we cannot yet issue the disable action (no cookie).
+        let mut m = machine();
+        let out = handle(
+            &mut m,
+            QbitEvent::PreferencesRead {
+                listen_port: None,
+                dht: true,
+                pex: false,
+                lsd: false,
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::DisableBannedPrivacySettings { .. })),
+            "no DisableBannedPrivacySettings without a cookie (QBIT-1)"
+        );
+        assert!(
+            out.publish
+                .contains(&QbitPublish::BannedPrivacySettingsObserved {
+                    dht: true,
+                    pex: false,
+                    lsd: false,
+                }),
+            "BannedPrivacySettingsObserved must still be published even without a cookie"
+        );
+    }
+
+    #[test]
+    fn privacy_settings_disable_failed_schedules_sync_retry_publishes_unavailable() {
+        // QBIT-13: failure → one SyncRetry scheduled + Unavailable published.
+        let (mut m, _cookie) = authenticated_machine();
+        let out = handle(
+            &mut m,
+            QbitEvent::PrivacySettingsDisableFailed {
+                reason: "forbidden".to_string(),
+            },
+        );
+        assert_eq!(
+            out.actions,
+            vec![QbitAction::ScheduleTimer {
+                timer: QbitTimer::SyncRetry,
+                after: Duration::from_secs(2),
+            }],
+            "PrivacySettingsDisableFailed must schedule exactly one SyncRetry"
+        );
+        assert_eq!(
+            out.publish,
+            vec![QbitPublish::Unavailable {
+                reason: "forbidden".to_string(),
+            }],
+            "PrivacySettingsDisableFailed must publish Unavailable"
+        );
+    }
+
+    #[test]
+    fn privacy_settings_disabled_is_noop() {
+        // QBIT-12: success is a no-op.
+        let (mut m, _cookie) = authenticated_machine();
+        let out = handle(&mut m, QbitEvent::PrivacySettingsDisabled);
+        assert!(
+            out.actions.is_empty(),
+            "PrivacySettingsDisabled must emit no actions"
+        );
+        assert!(
+            out.publish.is_empty(),
+            "PrivacySettingsDisabled must emit no publishes"
+        );
+    }
+
+    #[test]
+    fn torrent_refresh_timer_also_issues_read_preferences() {
+        // TorrentRefresh now piggbacks ReadPreferences for continuous prefs observation.
+        let (mut m, cookie) = authenticated_machine();
+        let out = handle(&mut m, QbitEvent::TimerFired(QbitTimer::TorrentRefresh));
+        assert!(
+            out.actions.contains(&QbitAction::ListTorrents {
+                cookie: cookie.clone()
+            }),
+            "TorrentRefresh must still issue ListTorrents"
+        );
+        assert!(
+            out.actions
+                .contains(&QbitAction::ReadPreferences { cookie }),
+            "TorrentRefresh must also issue ReadPreferences"
+        );
+        assert!(
+            out.actions.contains(&QbitAction::ScheduleTimer {
+                timer: QbitTimer::TorrentRefresh,
+                after: Duration::from_secs(30),
+            }),
+            "TorrentRefresh must re-schedule itself"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1269,7 +1506,8 @@ mod prop_tests {
     };
 
     use crate::{
-        QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish, QbitTimer,
+        PrivacySettings, QbitAction, QbitCommand, QbitConfig, QbitEvent, QbitMachine, QbitPublish,
+        QbitTimer,
     };
 
     fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
@@ -1336,9 +1574,21 @@ mod prop_tests {
             proptest::option::of(any_vpn_port()),
             any::<bool>(),
             any_torrent_map(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
         )
             .prop_map(
-                |(cookie, listen_port, desired_listen_port, refresh_scheduled, torrents)| {
+                |(
+                    cookie,
+                    listen_port,
+                    desired_listen_port,
+                    refresh_scheduled,
+                    torrents,
+                    dht,
+                    pex,
+                    lsd,
+                )| {
                     let mut machine = QbitMachine::new(
                         QbitConfig {
                             auth_retry: Duration::from_secs(1),
@@ -1353,6 +1603,7 @@ mod prop_tests {
                     machine.desired_listen_port = desired_listen_port;
                     machine.refresh_scheduled = refresh_scheduled;
                     machine.torrents = torrents;
+                    machine.privacy = PrivacySettings { dht, pex, lsd };
                     machine
                 },
             )
@@ -1363,14 +1614,26 @@ mod prop_tests {
             Just(QbitEvent::Init),
             any_auth_cookie().prop_map(|cookie| QbitEvent::AuthSucceeded { cookie }),
             any::<String>().prop_map(|reason| QbitEvent::AuthFailed { reason }),
-            proptest::option::of(any_vpn_port())
-                .prop_map(|listen_port| QbitEvent::PreferencesRead { listen_port }),
+            (
+                proptest::option::of(any_vpn_port()),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(|(listen_port, dht, pex, lsd)| QbitEvent::PreferencesRead {
+                    listen_port,
+                    dht,
+                    pex,
+                    lsd,
+                }),
             any::<String>().prop_map(|reason| QbitEvent::PreferencesFailed { reason }),
             any_vpn_port().prop_map(|port| QbitEvent::ListenPortSet { port }),
             (any_vpn_port(), any::<String>())
                 .prop_map(|(port, reason)| QbitEvent::ListenPortSetFailed { port, reason }),
             prop::collection::vec(any_torrent_record(), 0..4)
                 .prop_map(|torrents| QbitEvent::TorrentsListed { torrents }),
+            Just(QbitEvent::PrivacySettingsDisabled),
+            any::<String>().prop_map(|reason| QbitEvent::PrivacySettingsDisableFailed { reason }),
             Just(QbitEvent::TimerFired(QbitTimer::AuthRetry)),
             Just(QbitEvent::TimerFired(QbitTimer::SyncRetry)),
             Just(QbitEvent::TimerFired(QbitTimer::TorrentRefresh)),
@@ -1399,6 +1662,7 @@ mod prop_tests {
                 | QbitAction::ResumeTorrent { .. }
                 | QbitAction::DeleteTorrent { .. }
                 | QbitAction::SetAllFilesPriority { .. }
+                | QbitAction::DisableBannedPrivacySettings { .. }
         )
     }
 
@@ -1645,6 +1909,132 @@ mod prop_tests {
                     );
                 }
             }
+        }
+
+        // QBIT-12 [safety] (banned privacy auto-revert — §23):
+        // For any state with `cookie == Some`, a `PreferencesRead` event in which
+        // any of `dht/pex/lsd` is true emits exactly one `DisableBannedPrivacySettings`
+        // action and publishes `BannedPrivacySettingsObserved`.
+        // `cookie == None` never emits the disable action (QBIT-1).
+        // Total invariant.
+        #[test]
+        fn preferences_read_with_banned_setting_and_cookie_emits_disable(
+            mut machine in any_qbit_machine(),
+            listen_port in proptest::option::of(any_vpn_port()),
+            dht in any::<bool>(),
+            pex in any::<bool>(),
+            lsd in any::<bool>(),
+        ) {
+            // Only test when at least one banned setting is true.
+            prop_assume!(dht || pex || lsd);
+
+            let has_cookie = machine.cookie.is_some();
+            let event = QbitEvent::PreferencesRead { listen_port, dht, pex, lsd };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            let disable_count = out.actions.iter().filter(|a| {
+                matches!(a, QbitAction::DisableBannedPrivacySettings { .. })
+            }).count();
+
+            if has_cookie {
+                prop_assert_eq!(
+                    disable_count,
+                    1,
+                    "PreferencesRead with banned setting and cookie must emit exactly one \
+                     DisableBannedPrivacySettings"
+                );
+            } else {
+                prop_assert_eq!(
+                    disable_count,
+                    0,
+                    "PreferencesRead without cookie must not emit DisableBannedPrivacySettings"
+                );
+            }
+
+            // BannedPrivacySettingsObserved must always be published when any setting is banned,
+            // regardless of cookie (the qBit core publishes the observation independently of
+            // whether it can act on it — the domain needs to alert regardless).
+            let observed_count = out.publish.iter().filter(|p| {
+                matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. })
+            }).count();
+            prop_assert_eq!(
+                observed_count,
+                1,
+                "PreferencesRead with any banned setting must publish exactly one \
+                 BannedPrivacySettingsObserved"
+            );
+        }
+
+        // QBIT-12 complement: no banned setting → no disable action, no privacy publish.
+        #[test]
+        fn preferences_read_with_no_banned_settings_emits_no_disable_and_no_publish(
+            mut machine in any_qbit_machine(),
+            listen_port in proptest::option::of(any_vpn_port()),
+        ) {
+            let event = QbitEvent::PreferencesRead {
+                listen_port,
+                dht: false,
+                pex: false,
+                lsd: false,
+            };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            prop_assert!(
+                !out.actions.iter().any(|a| matches!(a, QbitAction::DisableBannedPrivacySettings { .. })),
+                "no DisableBannedPrivacySettings when all settings are clean"
+            );
+            prop_assert!(
+                !out.publish.iter().any(|p| matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. })),
+                "no BannedPrivacySettingsObserved publish when all settings are clean"
+            );
+        }
+
+        // QBIT-13 [safety] (privacy retry — §23):
+        // `PrivacySettingsDisableFailed` schedules exactly one `SyncRetry` and
+        // publishes `Unavailable`; no immediate retry action.
+        // Total invariant.
+        #[test]
+        fn privacy_disable_failed_schedules_sync_retry_and_publishes_unavailable(
+            mut machine in any_qbit_machine(),
+            reason in any::<String>(),
+        ) {
+            let event = QbitEvent::PrivacySettingsDisableFailed { reason };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            let sync_retry_count = out.actions.iter().filter(|a| {
+                matches!(a, QbitAction::ScheduleTimer { timer: QbitTimer::SyncRetry, .. })
+            }).count();
+            prop_assert_eq!(
+                sync_retry_count,
+                1,
+                "PrivacySettingsDisableFailed must schedule exactly one SyncRetry"
+            );
+
+            let unavailable_count = out.publish.iter().filter(|p| {
+                matches!(p, QbitPublish::Unavailable { .. })
+            }).count();
+            prop_assert_eq!(
+                unavailable_count,
+                1,
+                "PrivacySettingsDisableFailed must publish exactly one Unavailable"
+            );
+
+            // No disable action should be emitted immediately (no tight loop).
+            prop_assert!(
+                !out.actions.iter().any(|a| matches!(a, QbitAction::DisableBannedPrivacySettings { .. })),
+                "PrivacySettingsDisableFailed must not immediately retry the disable action"
+            );
+        }
+
+        // QBIT-12: PrivacySettingsDisabled is a no-op.
+        #[test]
+        fn privacy_settings_disabled_is_noop(mut machine in any_qbit_machine()) {
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(QbitEvent::PrivacySettingsDisabled),
+            );
+            prop_assert!(out.actions.is_empty(), "PrivacySettingsDisabled must emit no actions");
+            prop_assert!(out.publish.is_empty(), "PrivacySettingsDisabled must emit no publishes");
         }
     }
 }

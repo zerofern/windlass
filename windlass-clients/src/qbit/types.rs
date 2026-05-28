@@ -52,6 +52,12 @@ pub struct QbitPreferences {
     pub downloads: u32,
     pub uploads: u32,
     pub listen_port: Option<VpnPort>,
+    /// Whether DHT is enabled (MAM Rule 6.1: must be false on private trackers).
+    pub dht: bool,
+    /// Whether Peer Exchange (`PeX`) is enabled (MAM Rule 6.1: must be false).
+    pub pex: bool,
+    /// Whether Local Service Discovery (LSD/LPD) is enabled (MAM Rule 6.1: must be false).
+    pub lsd: bool,
 }
 
 // ── Wire deserialization types (private to this module) ───────────────────────
@@ -75,6 +81,15 @@ pub(super) struct PreferencesWire {
     pub max_active_downloads: i64,
     pub max_active_uploads: i64,
     pub listen_port: Option<i64>,
+    /// DHT (Distributed Hash Table) — banned on private trackers (MAM Rule 6.1).
+    #[serde(default)]
+    pub dht: bool,
+    /// Peer Exchange — banned on private trackers (MAM Rule 6.1).
+    #[serde(default)]
+    pub pex: bool,
+    /// Local Service Discovery — banned on private trackers (MAM Rule 6.1).
+    #[serde(default)]
+    pub lsd: bool,
 }
 
 // ── parse_mam_id ──────────────────────────────────────────────────────────────

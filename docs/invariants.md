@@ -189,12 +189,16 @@ Shell contracts:
 State: `cookie: Option<AuthCookie>`, `listen_port: Option<VpnPort>`,
 `desired_listen_port: Option<VpnPort>`, `refresh_scheduled: bool`,
 `torrents: HashMap<TorrentHash, TorrentRecord>` (per-torrent seed-time and
-download tracking; populated on every `TorrentsListed` event).
+download tracking; populated on every `TorrentsListed` event),
+`privacy: PrivacySettings { dht, pex, lsd }` (last-observed privacy settings;
+all must be false per MAM Rule 6.1).
+
+Topics: `Availability`, `ListenPort`, `Torrents`, `Privacy` (§23).
 
 - **QBIT-1 [safety]** No cookie-bearing action (`ReadPreferences`,
   `SetListenPort`, `ListTorrents`, `PauseTorrent`, `ResumeTorrent`,
-  `DeleteTorrent`, `SetAllFilesPriority`) is emitted while `cookie == None`.
-  → C, D
+  `DeleteTorrent`, `SetAllFilesPriority`, `DisableBannedPrivacySettings`) is
+  emitted while `cookie == None`. → C, D
 - **QBIT-2 [safety]** The `TorrentRefresh` timer chain is started at most once;
   repeated `AuthSucceeded` never spawns a second chain. → F
 - **QBIT-3 [liveness]** Once started, the `TorrentRefresh` timer always
@@ -312,12 +316,32 @@ State: `free_bytes: Option<u64>`.
   `EvictOneForDiskPressure` emits at most one `DeleteTorrent`, and only for a
   known HnR-satisfied torrent; composes with QBIT-8. The selected candidate has
   the largest `seed_time` among satisfied torrents (placeholder rank). → A
+- **QBIT-12 [safety]** *(banned privacy auto-revert — §23)* A `PreferencesRead`
+  with any of `dht|pex|lsd` true emits exactly one `DisableBannedPrivacySettings`
+  action when `cookie == Some` and publishes `BannedPrivacySettingsObserved`
+  (regardless of cookie — the domain needs to alert even when unauthenticated).
+  No banned setting → no action, no publish. Total invariant. → A
+- **QBIT-13 [safety]** *(privacy retry — §23)* `PrivacySettingsDisableFailed`
+  (merged into the shared retryable-failures arm with QBIT-5) schedules exactly
+  one `SyncRetry` and publishes `Unavailable`; no immediate retry. → F
 
 ### Domain machine additions (§22)
 
 - **DOM-9 [safety]** *(disk-pressure routing — §22)* `Disk(BelowFloor)` produces
   exactly one `Qbit(EvictOneForDiskPressure)` and one `Activity` publish;
   `Disk(AboveFloor)` produces nothing. → A
+
+### qBit machine additions (§23)
+
+- **QBIT-12 [safety]** *(see above)*
+- **QBIT-13 [safety]** *(see above)*
+
+### Domain machine additions (§23)
+
+- **DOM-10 [safety]** *(privacy alert routing — §23)*
+  `Qbit(BannedPrivacySettingsObserved { any true })` emits exactly one
+  `Db(RecordAlert{ priority: Critical })`, one `Db(RecordActivity)`, and one
+  `Activity` publish. Total invariant. → A
 
 ### Deferred rank classes and structural invariants (§22)
 

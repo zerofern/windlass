@@ -257,6 +257,9 @@ impl QbitClient {
                         .listen_port
                         .and_then(|port| u16::try_from(port).ok())
                         .and_then(|port| windlass_types::VpnPort::try_new(port).ok()),
+                    dht: w.dht,
+                    pex: w.pex,
+                    lsd: w.lsd,
                 }),
                 Err(e) => {
                     warn!("Failed to parse preferences: {e}");

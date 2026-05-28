@@ -60,8 +60,25 @@ impl Shell for QbitShell {
                         },
                         |prefs| QbitEvent::PreferencesRead {
                             listen_port: prefs.listen_port,
+                            dht: prefs.dht,
+                            pex: prefs.pex,
+                            lsd: prefs.lsd,
                         },
                     );
+                    let _ = tx.send(Timed::now(event));
+                });
+            }
+            QbitAction::DisableBannedPrivacySettings { cookie } => {
+                let client = self.client.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let event = if client.set_private_tracker_safe_prefs(&cookie).await {
+                        QbitEvent::PrivacySettingsDisabled
+                    } else {
+                        QbitEvent::PrivacySettingsDisableFailed {
+                            reason: "failed to set private tracker safe prefs".to_string(),
+                        }
+                    };
                     let _ = tx.send(Timed::now(event));
                 });
             }

@@ -145,6 +145,11 @@ pub(super) fn legacy_to_service_events(
         Event::QbitPreferencesReceived { listen_port, .. } => {
             vec![ServiceEvent::Qbit(QbitEvent::PreferencesRead {
                 listen_port: *listen_port,
+                // Legacy bridge: the old event does not carry privacy settings.
+                // Default to false (safe: no spurious disable action emitted).
+                dht: false,
+                pex: false,
+                lsd: false,
             })]
         }
         Event::QbitPreferencesFailed { reason, .. } => {

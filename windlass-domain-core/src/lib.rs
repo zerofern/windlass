@@ -3,7 +3,9 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windlass_db_core::{DbCommand, DownloadStateChange, DownloadStatus};
+use windlass_db_core::{
+    ActivityRecord, ActivitySource, AlertRecord, DbCommand, DownloadStateChange, DownloadStatus,
+};
 use windlass_disk_core::DiskPublish;
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
@@ -196,6 +198,10 @@ impl Machine for WindlassMachine {
             WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { mam_id, .. }) => {
                 Self::on_dead_torrent_removed(mam_id)
             }
+            // DOM-10: BannedPrivacySettingsObserved → one Critical RecordAlert + one Activity.
+            WindlassEvent::Qbit(QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd }) => {
+                Self::on_banned_privacy_settings_observed(dht, pex, lsd)
+            }
             WindlassEvent::Mam(MamPublish::SeedboxPortReady { port }) => Outcome {
                 actions: vec![WindlassAction::SendAlert {
                     priority: AlertPriority::Info,
@@ -265,6 +271,53 @@ impl Machine for WindlassMachine {
 }
 
 impl WindlassMachine {
+    /// Handles the `BannedPrivacySettingsObserved` qBit publish (DOM-10 / §23).
+    ///
+    /// Emits one `RecordAlert(Critical)` action and one `Activity` publish listing
+    /// which of DHT, `PeX`, and LSD are enabled.  This is only called when at least
+    /// one setting is `true` — the qBit core never publishes this event for all-false.
+    fn on_banned_privacy_settings_observed(
+        dht: bool,
+        pex: bool,
+        lsd: bool,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let mut enabled = Vec::new();
+        if dht {
+            enabled.push("DHT");
+        }
+        if pex {
+            enabled.push("PeX");
+        }
+        if lsd {
+            enabled.push("LSD");
+        }
+        let settings = enabled.join(", ");
+        let body = format!(
+            "The following banned privacy settings are enabled: {settings}. \
+             They have been disabled automatically."
+        );
+        let message = format!("Banned qBit privacy settings auto-reverted: {settings}");
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Critical,
+                    title: "Banned qBit privacy setting enabled".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Domain,
+                    action: "privacy_auto_revert".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
     /// Handles the `DeadTorrentRemoved` qBit publish.
     ///
     /// When `mam_id` is `Some`, emits a `MarkDownloadState(Blacklisted)` DB command
@@ -517,6 +570,89 @@ mod tests {
         assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
         assert!(out.publish.is_empty(), "AboveFloor must emit no publishes");
     }
+
+    // ── Privacy auto-revert routing unit tests (DOM-10 / story 23) ───────────
+
+    #[test]
+    fn banned_privacy_settings_observed_dht_only_emits_critical_alert_and_activity() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::BannedPrivacySettingsObserved {
+                dht: true,
+                pex: false,
+                lsd: false,
+            }),
+        );
+
+        // Must have exactly 2 actions: RecordAlert(Critical) + RecordActivity
+        assert_eq!(out.actions.len(), 2, "exactly two actions expected");
+        let has_critical_alert = out.actions.iter().any(|a| {
+            matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Critical,
+                    ..
+                }))
+            )
+        });
+        assert!(
+            has_critical_alert,
+            "must emit exactly one RecordAlert(Critical)"
+        );
+        assert!(
+            matches!(
+                &out.actions[1],
+                WindlassAction::Db(DbCommand::RecordActivity(_))
+            ),
+            "second action must be RecordActivity"
+        );
+
+        // Exactly one Activity publish
+        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
+
+    #[test]
+    fn banned_privacy_settings_all_true_emits_critical_alert_mentioning_all() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::BannedPrivacySettingsObserved {
+                dht: true,
+                pex: true,
+                lsd: true,
+            }),
+        );
+
+        assert_eq!(out.actions.len(), 2);
+        let alert_action = &out.actions[0];
+        if let WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+            priority: AlertPriority::Critical,
+            body,
+            ..
+        })) = alert_action
+        {
+            assert!(body.contains("DHT"), "body should mention DHT");
+            assert!(body.contains("PeX"), "body should mention PeX");
+            assert!(body.contains("LSD"), "body should mention LSD");
+        } else {
+            panic!("expected RecordAlert(Critical)");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -597,6 +733,9 @@ mod prop_tests {
                 .prop_map(|hashes| QbitPublish::TorrentsUpdated { hashes }),
             (any_torrent_hash(), proptest::option::of(any_mam_id()))
                 .prop_map(|(hash, mam_id)| QbitPublish::DeadTorrentRemoved { hash, mam_id }),
+            (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(dht, pex, lsd)| {
+                QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd }
+            }),
         ]
     }
 
@@ -711,6 +850,61 @@ mod prop_tests {
             );
             prop_assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
             prop_assert!(out.publish.is_empty(), "AboveFloor must emit no publishes");
+        }
+
+        // DOM-10 [safety] (privacy alert routing — §23):
+        // `Qbit(BannedPrivacySettingsObserved { any true })` emits exactly one
+        // `Db(RecordAlert{ priority: Critical })` and one `Activity` publish.
+        // Total invariant.
+        #[test]
+        fn banned_privacy_settings_with_any_true_emits_critical_alert_and_activity(
+            mut machine in any_windlass_machine(),
+            // Generate at least one `true` by OR-ing with a guaranteed-true flag.
+            dht in any::<bool>(),
+            pex in any::<bool>(),
+            lsd in any::<bool>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            // Only test the invariant when at least one setting is true.
+            // (The qBit core never publishes this event with all-false, but we
+            // need to skip the all-false case here to stay within the qBit-core
+            // invariant scope.)
+            prop_assume!(dht || pex || lsd);
+
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Qbit(
+                    QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd },
+                )),
+            );
+
+            let critical_alert_count = out.actions.iter().filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Critical,
+                        ..
+                    }))
+                )
+            }).count();
+            prop_assert_eq!(
+                critical_alert_count,
+                1,
+                "BannedPrivacySettingsObserved must emit exactly one RecordAlert(Critical)"
+            );
+
+            let activity_publish_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                .count();
+            prop_assert_eq!(
+                activity_publish_count,
+                1,
+                "BannedPrivacySettingsObserved must emit exactly one Activity publish"
+            );
         }
     }
 }

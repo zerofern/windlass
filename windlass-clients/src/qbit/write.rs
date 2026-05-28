@@ -6,6 +6,48 @@ use windlass_types::{AuthCookie, TorrentHash};
 use super::QbitClient;
 
 impl QbitClient {
+    /// Disables DHT, Peer Exchange (`PeX`), and Local Service Discovery (`LSD`) in
+    /// qBittorrent.  These settings are banned on private trackers (MAM Rule 6.1).
+    ///
+    /// Returns `true` on success, `false` on any error.
+    pub async fn set_private_tracker_safe_prefs(&self, cookie: &AuthCookie) -> bool {
+        let url = format!("{}/api/v2/app/setPreferences", self.base_url);
+        let req_body = r#"{"dht":false,"pex":false,"lsd":false}"#;
+        match self
+            .client
+            .post(&url)
+            .header(
+                reqwest::header::COOKIE,
+                format!("SID={}", cookie.expose_secret()),
+            )
+            .form(&[("json", req_body)])
+            .send()
+            .await
+        {
+            Err(e) => {
+                warn!("set_private_tracker_safe_prefs request failed: {e}");
+                false
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                self.emit_http(
+                    "POST",
+                    &url,
+                    Some(req_body.to_owned()),
+                    status.as_u16(),
+                    &body,
+                );
+                if status.is_success() {
+                    true
+                } else {
+                    warn!("set_private_tracker_safe_prefs failed: status={status}");
+                    false
+                }
+            }
+        }
+    }
+
     /// Adds a torrent from raw `.torrent` file bytes.
     ///
     /// Returns the info hash on success, `None` on failure.
