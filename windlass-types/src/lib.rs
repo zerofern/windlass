@@ -199,6 +199,28 @@ pub enum TorrentState {
     Other(String),
 }
 
+impl TorrentState {
+    /// Returns `true` when the torrent is counted as active by qBittorrent's
+    /// queue limit (`max_active_torrents`).
+    ///
+    /// Active states: `Downloading`, `Uploading`, `ForcedUpload`,
+    /// `StalledDownloading`, `StalledUploading`.
+    /// Inactive states: `PausedDownloading`, `PausedUploading`, `Error`, `Other`.
+    ///
+    /// Mirrors `windlass_core::torrent::TorrentState::is_active` (legacy reference).
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Downloading
+                | Self::Uploading
+                | Self::ForcedUpload
+                | Self::StalledDownloading
+                | Self::StalledUploading
+        )
+    }
+}
+
 /// Per-torrent record stored in the qBit core.
 ///
 /// Sourced from qBittorrent torrent listings and used by the `HnR` seed-time lock

@@ -150,6 +150,10 @@ pub(super) fn legacy_to_service_events(
                 dht: false,
                 pex: false,
                 lsd: false,
+                // Legacy bridge: default to u32::MAX ("no limit") so shadow-mode
+                // events from the old code path never trigger queue orchestration.
+                // The new path populates this from `QbitPreferences.max_active_torrents`.
+                max_active_torrents: u32::MAX,
             })]
         }
         Event::QbitPreferencesFailed { reason, .. } => {

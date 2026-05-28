@@ -63,6 +63,7 @@ impl Shell for QbitShell {
                             dht: prefs.dht,
                             pex: prefs.pex,
                             lsd: prefs.lsd,
+                            max_active_torrents: prefs.max_active_torrents,
                         },
                     );
                     let _ = tx.send(Timed::now(event));
@@ -141,6 +142,12 @@ impl Shell for QbitShell {
                 });
             }
             QbitAction::ResumeTorrent { cookie, hash } => {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    client.resume_torrent(&cookie, &hash).await;
+                });
+            }
+            QbitAction::ForceResumeTorrent { cookie, hash } => {
                 let client = self.client.clone();
                 tokio::spawn(async move {
                     client.force_resume_torrent(&cookie, &hash).await;

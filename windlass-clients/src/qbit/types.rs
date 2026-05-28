@@ -58,6 +58,11 @@ pub struct QbitPreferences {
     pub pex: bool,
     /// Whether Local Service Discovery (LSD/LPD) is enabled (MAM Rule 6.1: must be false).
     pub lsd: bool,
+    /// Maximum number of simultaneously active torrents (`max_active_torrents`).
+    ///
+    /// A value of `u32::MAX` means "no limit" (used when the preference is
+    /// negative, which qBittorrent uses to indicate unlimited).
+    pub max_active_torrents: u32,
 }
 
 // ── Wire deserialization types (private to this module) ───────────────────────

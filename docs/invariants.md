@@ -191,14 +191,16 @@ State: `cookie: Option<AuthCookie>`, `listen_port: Option<VpnPort>`,
 `torrents: HashMap<TorrentHash, TorrentRecord>` (per-torrent seed-time and
 download tracking; populated on every `TorrentsListed` event),
 `privacy: PrivacySettings { dht, pex, lsd }` (last-observed privacy settings;
-all must be false per MAM Rule 6.1).
+all must be false per MAM Rule 6.1),
+`max_active_torrents: u32` (last-observed queue limit; initialised to `u32::MAX`
+meaning "no limit"; populated on every `PreferencesRead` event — §24).
 
-Topics: `Availability`, `ListenPort`, `Torrents`, `Privacy` (§23).
+Topics: `Availability`, `ListenPort`, `Torrents`, `Privacy` (§23), `Queue` (§24).
 
 - **QBIT-1 [safety]** No cookie-bearing action (`ReadPreferences`,
   `SetListenPort`, `ListTorrents`, `PauseTorrent`, `ResumeTorrent`,
-  `DeleteTorrent`, `SetAllFilesPriority`, `DisableBannedPrivacySettings`) is
-  emitted while `cookie == None`. → C, D
+  `DeleteTorrent`, `SetAllFilesPriority`, `DisableBannedPrivacySettings`,
+  `ForceResumeTorrent`) is emitted while `cookie == None`. → C, D
 - **QBIT-2 [safety]** The `TorrentRefresh` timer chain is started at most once;
   repeated `AuthSucceeded` never spawns a second chain. → F
 - **QBIT-3 [liveness]** Once started, the `TorrentRefresh` timer always
@@ -342,6 +344,40 @@ State: `free_bytes: Option<u64>`.
   `Qbit(BannedPrivacySettingsObserved { any true })` emits exactly one
   `Db(RecordAlert{ priority: Critical })`, one `Db(RecordActivity)`, and one
   `Activity` publish. Total invariant. → A
+
+### qBit machine additions (§24)
+
+- **QBIT-14 [safety]** *(queue orchestration: never pause unsatisfied — §24)*:
+  every `PauseTorrent` emitted from the `TorrentsListed` orchestration path
+  targets a known HnR-satisfied torrent (`seed_time >= hnr_seed_time` or
+  `downloaded_bytes == 0`). Total invariant. → A
+- **QBIT-15 [safety]** *(queue orchestration: force-resume protects unsatisfied —
+  §24)*: every `ForceResumeTorrent` emitted targets a known HnR-unsatisfied
+  torrent with `downloaded_bytes > 0 && seed_time < hnr_seed_time` and a
+  `PausedUploading` or `StalledUploading` state. Total invariant. → A
+- **QBIT-16 [safety]** *(queue orchestration: limit-triggered — §24)*: a
+  `QueueOrchestrated` publish (and the paired `PauseTorrent` +
+  `ForceResumeTorrent`) is emitted only when `active_count >= max_active_torrents`
+  at observation time, only when both a parked unsatisfied and an oldest satisfied
+  seeder exist, and only when a cookie is present. Total invariant. → A
+
+### Domain machine additions (§24)
+
+- **DOM-11 [safety]** *(queue activity routing — §24)*:
+  `Qbit(QueueOrchestrated { paused, force_resumed })` emits exactly one
+  `Db(RecordActivity { source: Qbit, action: "queue_orchestrated" })` action and
+  exactly one `Activity` publish describing the swap. → (mechanism)
+
+### Deferred (§24)
+
+Queue-limit config auto-correction (escalation path): if orchestration alone
+cannot prevent an HnR-unsatisfied torrent from being parked (e.g. no satisfied
+seeder exists to swap out), the core should auto-raise `max_active_torrents` in
+qBittorrent and fire a `Critical` alert. This escalation is **deferred** — the
+current implementation skips orchestration if no satisfied seeder is available,
+and relies on the operator noticing the parked torrent via the activity log and
+UI. Tracking: operator-readiness story 25 (unsatisfied quota gate) will gate new
+downloads before the queue fills, reducing the chance escalation is needed.
 
 ### Deferred rank classes and structural invariants (§22)
 

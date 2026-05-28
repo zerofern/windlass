@@ -195,6 +195,11 @@ impl Machine for WindlassMachine {
             )
             | WindlassEvent::Mam(MamPublish::Connectable { .. })
             | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
+            // DOM-11: QueueOrchestrated → one RecordActivity + one Activity publish.
+            WindlassEvent::Qbit(QbitPublish::QueueOrchestrated {
+                ref paused,
+                ref force_resumed,
+            }) => Self::on_queue_orchestrated(paused, force_resumed),
             WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { mam_id, .. }) => {
                 Self::on_dead_torrent_removed(mam_id)
             }
@@ -340,6 +345,32 @@ impl WindlassMachine {
                 ),
             }],
         })
+    }
+
+    /// Handles the `QueueOrchestrated` qBit publish (DOM-11 / §24).
+    ///
+    /// Emits one `RecordActivity` DB command and one `Activity` publish describing
+    /// the queue-orchestration swap (which satisfied seeder was paused and which
+    /// unsatisfied torrent was force-resumed).
+    fn on_queue_orchestrated(
+        paused: &windlass_types::TorrentHash,
+        force_resumed: &windlass_types::TorrentHash,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let detail = format!("paused={paused:?} resumed={force_resumed:?}");
+        let message = format!("Queue orchestrated: {detail}");
+        Outcome {
+            actions: vec![WindlassAction::Db(DbCommand::RecordActivity(
+                ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Qbit,
+                    action: "queue_orchestrated".to_string(),
+                    book_id: None,
+                    detail: Some(detail),
+                    metadata: serde_json::Value::Null,
+                },
+            ))],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
     }
 
     fn publish_state(&self) -> Outcome<WindlassAction, WindlassPublish> {
@@ -653,6 +684,52 @@ mod tests {
             panic!("expected RecordAlert(Critical)");
         }
     }
+
+    // ── Queue-orchestration routing unit tests (DOM-11 / story 24) ───────────
+
+    #[test]
+    fn queue_orchestrated_emits_record_activity_and_activity_publish() {
+        use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand};
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::TorrentHash;
+
+        let mut machine = machine();
+        let paused = TorrentHash("a".repeat(40));
+        let force_resumed = TorrentHash("b".repeat(40));
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::QueueOrchestrated {
+                paused: paused.clone(),
+                force_resumed: force_resumed.clone(),
+            }),
+        );
+
+        // Exactly one action: RecordActivity
+        assert_eq!(
+            out.actions.len(),
+            1,
+            "exactly one action expected (RecordActivity)"
+        );
+        assert!(
+            matches!(
+                &out.actions[0],
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    source: ActivitySource::Qbit,
+                    action,
+                    ..
+                })) if action == "queue_orchestrated"
+            ),
+            "action must be Db(RecordActivity {{ source: Qbit, action: queue_orchestrated }})"
+        );
+
+        // Exactly one Activity publish
+        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -735,6 +812,12 @@ mod prop_tests {
                 .prop_map(|(hash, mam_id)| QbitPublish::DeadTorrentRemoved { hash, mam_id }),
             (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(dht, pex, lsd)| {
                 QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd }
+            }),
+            (any_torrent_hash(), any_torrent_hash()).prop_map(|(paused, force_resumed)| {
+                QbitPublish::QueueOrchestrated {
+                    paused,
+                    force_resumed,
+                }
             }),
         ]
     }

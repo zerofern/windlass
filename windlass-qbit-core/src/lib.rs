@@ -72,6 +72,12 @@ pub enum QbitEvent {
         pex: bool,
         /// Whether Local Service Discovery is enabled — banned on private trackers (MAM Rule 6.1).
         lsd: bool,
+        /// Maximum number of simultaneously active torrents.
+        ///
+        /// `u32::MAX` means "no limit" (mirrors qBittorrent's negative value
+        /// for unlimited, and is also the safe default for the legacy bridge so
+        /// that events from the old code path never trigger orchestration).
+        max_active_torrents: u32,
     },
     PreferencesFailed {
         reason: String,
@@ -133,6 +139,13 @@ pub enum QbitAction {
     DisableBannedPrivacySettings {
         cookie: AuthCookie,
     },
+    /// Force-resume a torrent, bypassing seeding ratio/time limits (§24).
+    /// Emitted by the queue-orchestration path to wake an HnR-unsatisfied
+    /// torrent that was parked by the active-torrent limit.
+    ForceResumeTorrent {
+        cookie: AuthCookie,
+        hash: TorrentHash,
+    },
     ScheduleTimer {
         timer: QbitTimer,
         after: Duration,
@@ -166,6 +179,13 @@ pub enum QbitPublish {
         pex: bool,
         lsd: bool,
     },
+    /// Published when queue orchestration fires: the machine paused a satisfied
+    /// seeder and force-resumed a parked unsatisfied torrent to protect `HnR` (§24).
+    /// Subscribers (primarily the domain core) use this to record activity.
+    QueueOrchestrated {
+        paused: TorrentHash,
+        force_resumed: TorrentHash,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +195,8 @@ pub enum QbitTopic {
     Torrents,
     /// Privacy-settings violations (MAM Rule 6.1 — §23).
     Privacy,
+    /// Queue-orchestration events (§24): active-limit management.
+    Queue,
 }
 
 impl HasTopic<QbitTopic> for QbitPublish {
@@ -186,6 +208,7 @@ impl HasTopic<QbitTopic> for QbitPublish {
             // existing `Torrents` subscription delivers it without a new topic.
             Self::TorrentsUpdated { .. } | Self::DeadTorrentRemoved { .. } => QbitTopic::Torrents,
             Self::BannedPrivacySettingsObserved { .. } => QbitTopic::Privacy,
+            Self::QueueOrchestrated { .. } => QbitTopic::Queue,
         }
     }
 }
@@ -224,6 +247,14 @@ pub struct QbitMachine {
     torrents: HashMap<TorrentHash, TorrentRecord>,
     /// Last-observed privacy settings (MAM Rule 6.1 — all must be false).
     privacy: PrivacySettings,
+    /// Maximum number of simultaneously active torrents, as last observed from
+    /// qBittorrent preferences.
+    ///
+    /// Initialised to `u32::MAX` ("no limit") so orchestration never fires until
+    /// a real `PreferencesRead` event sets a concrete value.  The legacy bridge
+    /// also defaults this to `u32::MAX` so bridged events cannot trigger
+    /// orchestration on the old code path.
+    max_active_torrents: u32,
 }
 
 impl QbitMachine {
@@ -312,6 +343,85 @@ impl QbitMachine {
             )
     }
 
+    /// Queue-orchestration step (§24 / QBIT-14/15/16).
+    ///
+    /// When `active_count >= max_active_torrents`, finds a parked HnR-unsatisfied
+    /// torrent and the oldest HnR-satisfied active seeder, then pauses the satisfied
+    /// seeder and force-resumes the unsatisfied one.
+    ///
+    /// Iteration over the torrent map is non-deterministic, so candidates are
+    /// sorted by `TorrentHash` before selection.  This gives a stable, reproducible
+    /// pick across runs for the same map contents.
+    ///
+    /// Returns `(actions, publishes)`.  Both vecs are empty unless orchestration
+    /// actually fires.
+    fn orchestrate_queue(&self) -> (Vec<QbitAction>, Vec<QbitPublish>) {
+        let Some(cookie) = self.cookie.clone() else {
+            return (Vec::new(), Vec::new());
+        };
+
+        // Count active torrents in the current map.
+        let active_count = u32::try_from(
+            self.torrents
+                .values()
+                .filter(|t| t.state.is_active())
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+
+        if active_count < self.max_active_torrents {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Collect and sort candidates for determinism.
+        let mut all_torrents: Vec<&TorrentRecord> = self.torrents.values().collect();
+        all_torrents.sort_by(|a, b| a.hash.0.cmp(&b.hash.0));
+
+        // Parked: unsatisfied torrent in PausedUploading or StalledUploading.
+        let parked = all_torrents.iter().find(|t| {
+            t.downloaded_bytes > 0
+                && t.seed_time < self.config.hnr_seed_time
+                && matches!(
+                    t.state,
+                    TorrentState::PausedUploading | TorrentState::StalledUploading
+                )
+        });
+
+        let Some(parked) = parked else {
+            return (Vec::new(), Vec::new());
+        };
+
+        // Oldest satisfied seeder: seed_time >= hnr_seed_time and state == Uploading.
+        let oldest_satisfied = all_torrents
+            .iter()
+            .filter(|t| {
+                t.seed_time >= self.config.hnr_seed_time
+                    && matches!(t.state, TorrentState::Uploading)
+            })
+            .max_by_key(|t| t.seed_time);
+
+        let Some(oldest_satisfied) = oldest_satisfied else {
+            return (Vec::new(), Vec::new());
+        };
+
+        let actions = vec![
+            QbitAction::PauseTorrent {
+                cookie: cookie.clone(),
+                hash: oldest_satisfied.hash.clone(),
+            },
+            QbitAction::ForceResumeTorrent {
+                cookie,
+                hash: parked.hash.clone(),
+            },
+        ];
+        let publishes = vec![QbitPublish::QueueOrchestrated {
+            paused: oldest_satisfied.hash.clone(),
+            force_resumed: parked.hash.clone(),
+        }];
+
+        (actions, publishes)
+    }
+
     fn retry_listen_port_or_read_preferences(&self) -> Vec<QbitAction> {
         let Some(cookie) = self.cookie.clone() else {
             return vec![QbitAction::Login];
@@ -365,6 +475,9 @@ impl Machine for QbitMachine {
             refresh_scheduled: false,
             torrents: HashMap::new(),
             privacy: PrivacySettings::default(),
+            // Initialised to MAX so orchestration is disabled until a real
+            // PreferencesRead arrives.
+            max_active_torrents: u32::MAX,
         }
     }
 
@@ -420,9 +533,11 @@ impl Machine for QbitMachine {
                 dht,
                 pex,
                 lsd,
+                max_active_torrents,
             } => {
                 self.listen_port = listen_port;
                 self.privacy = PrivacySettings { dht, pex, lsd };
+                self.max_active_torrents = max_active_torrents;
 
                 let mut actions = self.converge_listen_port();
                 let mut publish = self.listen_port_publish(listen_port);
@@ -506,6 +621,15 @@ impl Machine for QbitMachine {
                         publish.push(QbitPublish::DeadTorrentRemoved { hash, mam_id });
                     }
                 }
+
+                // Queue-orchestration step (§24 / QBIT-14/15/16):
+                // if the active-torrent limit is reached and there is a parked
+                // unsatisfied torrent, pause the oldest satisfied seeder and
+                // force-resume the parked one.  Only runs when a cookie is present
+                // (checked inside orchestrate_queue).
+                let (orch_actions, orch_publish) = self.orchestrate_queue();
+                actions.extend(orch_actions);
+                publish.extend(orch_publish);
 
                 Outcome { actions, publish }
             }
@@ -740,6 +864,7 @@ mod tests {
                 dht: false,
                 pex: false,
                 lsd: false,
+                max_active_torrents: u32::MAX,
             },
         );
 
@@ -1349,6 +1474,7 @@ mod tests {
                 dht: true,
                 pex: false,
                 lsd: false,
+                max_active_torrents: u32::MAX,
             },
         );
         assert!(
@@ -1378,6 +1504,7 @@ mod tests {
                 dht: false,
                 pex: false,
                 lsd: false,
+                max_active_torrents: u32::MAX,
             },
         );
         assert!(
@@ -1407,6 +1534,7 @@ mod tests {
                 dht: true,
                 pex: false,
                 lsd: false,
+                max_active_torrents: u32::MAX,
             },
         );
         assert!(
@@ -1490,6 +1618,202 @@ mod tests {
                 after: Duration::from_secs(30),
             }),
             "TorrentRefresh must re-schedule itself"
+        );
+    }
+
+    // ── Queue-orchestration unit tests (QBIT-14/15/16 / story 24) ───────────
+
+    fn satisfied_uploading(hash: &TorrentHash, seed_secs: u64) -> TorrentRecord {
+        TorrentRecord {
+            hash: hash.clone(),
+            downloaded_bytes: 1024,
+            seed_time: Duration::from_secs(seed_secs),
+            state: TorrentState::Uploading,
+            mam_id: None,
+        }
+    }
+
+    fn unsatisfied_paused_uploading(hash: &TorrentHash) -> TorrentRecord {
+        TorrentRecord {
+            hash: hash.clone(),
+            downloaded_bytes: 1024,
+            seed_time: Duration::from_secs(3600), // 1h < 72h
+            state: TorrentState::PausedUploading,
+            mam_id: None,
+        }
+    }
+
+    fn authenticated_machine_with_limit(limit: u32) -> (QbitMachine, AuthCookie) {
+        let (mut m, cookie) = authenticated_machine();
+        m.max_active_torrents = limit;
+        (m, cookie)
+    }
+
+    #[test]
+    fn queue_below_limit_no_orchestration() {
+        // Active count < limit → no orchestration even with eligible torrents.
+        let (mut m, cookie) = authenticated_machine_with_limit(10);
+        let sat = TorrentHash("a".repeat(40));
+        let unsat = TorrentHash("b".repeat(40));
+        load_torrent(&mut m, satisfied_uploading(&sat, 72 * 3600));
+        load_torrent(&mut m, unsatisfied_paused_uploading(&unsat));
+
+        // Only 2 active but limit is 10 → no orchestration.
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![
+                    satisfied_uploading(&sat, 72 * 3600),
+                    unsatisfied_paused_uploading(&unsat),
+                ],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::PauseTorrent { .. })),
+            "no PauseTorrent when below limit"
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::ForceResumeTorrent { .. })),
+            "no ForceResumeTorrent when below limit"
+        );
+        let _ = cookie; // suppress unused warning
+    }
+
+    #[test]
+    fn queue_at_limit_no_parked_unsatisfied_no_orchestration() {
+        // Active count >= limit but no parked unsatisfied torrent → no orchestration.
+        let (mut m, _) = authenticated_machine_with_limit(1);
+        let sat = TorrentHash("c".repeat(40));
+        load_torrent(&mut m, satisfied_uploading(&sat, 72 * 3600));
+
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![satisfied_uploading(&sat, 72 * 3600)],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::PauseTorrent { .. })),
+            "no PauseTorrent when no parked unsatisfied torrent"
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::ForceResumeTorrent { .. })),
+            "no ForceResumeTorrent when no parked unsatisfied torrent"
+        );
+    }
+
+    #[test]
+    fn queue_at_limit_parked_unsatisfied_but_no_satisfied_seeder_no_orchestration() {
+        // Active count >= limit + parked unsatisfied exists, but no satisfied Uploading → skip.
+        let (mut m, _) = authenticated_machine_with_limit(0);
+        let unsat = TorrentHash("d".repeat(40));
+        load_torrent(&mut m, unsatisfied_paused_uploading(&unsat));
+
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![unsatisfied_paused_uploading(&unsat)],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::PauseTorrent { .. })),
+            "no PauseTorrent when no satisfied seeder exists"
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::ForceResumeTorrent { .. })),
+            "no ForceResumeTorrent when no satisfied seeder exists"
+        );
+    }
+
+    #[test]
+    fn queue_orchestration_full_case() {
+        // Active >= limit + parked unsatisfied + satisfied seeder → orchestrate.
+        let (mut m, cookie) = authenticated_machine_with_limit(1);
+        let sat = TorrentHash("e".repeat(40));
+        let unsat = TorrentHash("f".repeat(40));
+        load_torrent(&mut m, satisfied_uploading(&sat, 72 * 3600));
+        load_torrent(&mut m, unsatisfied_paused_uploading(&unsat));
+
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![
+                    satisfied_uploading(&sat, 72 * 3600),
+                    unsatisfied_paused_uploading(&unsat),
+                ],
+            },
+        );
+        assert!(
+            out.actions.contains(&QbitAction::PauseTorrent {
+                cookie: cookie.clone(),
+                hash: sat.clone(),
+            }),
+            "PauseTorrent must target the satisfied seeder"
+        );
+        assert!(
+            out.actions.contains(&QbitAction::ForceResumeTorrent {
+                cookie,
+                hash: unsat.clone(),
+            }),
+            "ForceResumeTorrent must target the parked unsatisfied torrent"
+        );
+        assert!(
+            out.publish.contains(&QbitPublish::QueueOrchestrated {
+                paused: sat,
+                force_resumed: unsat,
+            }),
+            "QueueOrchestrated must be published"
+        );
+    }
+
+    #[test]
+    fn queue_no_cookie_no_orchestration() {
+        // No cookie → no orchestration even when limits would trigger.
+        let mut m = machine();
+        m.max_active_torrents = 0; // limit = 0, definitely at/above
+        let sat = TorrentHash("g".repeat(40));
+        let unsat = TorrentHash("h".repeat(40));
+        load_torrent(&mut m, satisfied_uploading(&sat, 72 * 3600));
+        load_torrent(&mut m, unsatisfied_paused_uploading(&unsat));
+
+        let out = handle(
+            &mut m,
+            QbitEvent::TorrentsListed {
+                torrents: vec![
+                    satisfied_uploading(&sat, 72 * 3600),
+                    unsatisfied_paused_uploading(&unsat),
+                ],
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::PauseTorrent { .. })),
+            "no PauseTorrent without a cookie"
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, QbitAction::ForceResumeTorrent { .. })),
+            "no ForceResumeTorrent without a cookie"
+        );
+        assert!(
+            !out.publish
+                .iter()
+                .any(|p| matches!(p, QbitPublish::QueueOrchestrated { .. })),
+            "no QueueOrchestrated published without a cookie"
         );
     }
 }
@@ -1577,6 +1901,7 @@ mod prop_tests {
             any::<bool>(),
             any::<bool>(),
             any::<bool>(),
+            any::<u32>(),
         )
             .prop_map(
                 |(
@@ -1588,6 +1913,7 @@ mod prop_tests {
                     dht,
                     pex,
                     lsd,
+                    max_active_torrents,
                 )| {
                     let mut machine = QbitMachine::new(
                         QbitConfig {
@@ -1604,6 +1930,7 @@ mod prop_tests {
                     machine.refresh_scheduled = refresh_scheduled;
                     machine.torrents = torrents;
                     machine.privacy = PrivacySettings { dht, pex, lsd };
+                    machine.max_active_torrents = max_active_torrents;
                     machine
                 },
             )
@@ -1619,12 +1946,16 @@ mod prop_tests {
                 any::<bool>(),
                 any::<bool>(),
                 any::<bool>(),
+                any::<u32>(),
             )
-                .prop_map(|(listen_port, dht, pex, lsd)| QbitEvent::PreferencesRead {
-                    listen_port,
-                    dht,
-                    pex,
-                    lsd,
+                .prop_map(|(listen_port, dht, pex, lsd, max_active_torrents)| {
+                    QbitEvent::PreferencesRead {
+                        listen_port,
+                        dht,
+                        pex,
+                        lsd,
+                        max_active_torrents,
+                    }
                 }),
             any::<String>().prop_map(|reason| QbitEvent::PreferencesFailed { reason }),
             any_vpn_port().prop_map(|port| QbitEvent::ListenPortSet { port }),
@@ -1663,6 +1994,7 @@ mod prop_tests {
                 | QbitAction::DeleteTorrent { .. }
                 | QbitAction::SetAllFilesPriority { .. }
                 | QbitAction::DisableBannedPrivacySettings { .. }
+                | QbitAction::ForceResumeTorrent { .. }
         )
     }
 
@@ -1929,7 +2261,13 @@ mod prop_tests {
             prop_assume!(dht || pex || lsd);
 
             let has_cookie = machine.cookie.is_some();
-            let event = QbitEvent::PreferencesRead { listen_port, dht, pex, lsd };
+            let event = QbitEvent::PreferencesRead {
+                listen_port,
+                dht,
+                pex,
+                lsd,
+                max_active_torrents: u32::MAX,
+            };
             let out = machine.handle(Instant::now(), Timed::now(event));
 
             let disable_count = out.actions.iter().filter(|a| {
@@ -1976,6 +2314,7 @@ mod prop_tests {
                 dht: false,
                 pex: false,
                 lsd: false,
+                max_active_torrents: u32::MAX,
             };
             let out = machine.handle(Instant::now(), Timed::now(event));
 
@@ -2035,6 +2374,121 @@ mod prop_tests {
             );
             prop_assert!(out.actions.is_empty(), "PrivacySettingsDisabled must emit no actions");
             prop_assert!(out.publish.is_empty(), "PrivacySettingsDisabled must emit no publishes");
+        }
+
+        // QBIT-14 [safety] (queue orchestration: never pause unsatisfied — §24):
+        // Every `PauseTorrent` emitted from the `TorrentsListed` orchestration
+        // path targets a known HnR-satisfied torrent
+        // (`seed_time >= hnr_seed_time` or `downloaded_bytes == 0`).
+        // Tested against fully-arbitrary machine state (total invariant).
+        #[test]
+        fn orchestration_pause_targets_only_hnr_satisfied(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            // Build a lookup of the listed torrents BEFORE they overwrite the map.
+            let listed: HashMap<TorrentHash, TorrentRecord> = torrents
+                .iter()
+                .map(|t| (t.hash.clone(), t.clone()))
+                .collect();
+            let hnr_seed_time = machine.config.hnr_seed_time;
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            for action in &out.actions {
+                if let QbitAction::PauseTorrent { hash, .. } = action {
+                    // Must be known in the listing AND HnR-satisfied.
+                    if let Some(record) = listed.get(hash) {
+                        prop_assert!(
+                            record.downloaded_bytes == 0 || record.seed_time >= hnr_seed_time,
+                            "PauseTorrent targets HnR-unsatisfied hash {hash:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // QBIT-15 [safety] (queue orchestration: force-resume protects unsatisfied — §24):
+        // Every `ForceResumeTorrent` emitted targets a known HnR-unsatisfied torrent
+        // with `downloaded_bytes > 0 && seed_time < hnr_seed_time` and a
+        // paused/stalled-upload state.
+        // Total invariant.
+        #[test]
+        fn orchestration_force_resume_targets_only_hnr_unsatisfied_parked(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            let listed: HashMap<TorrentHash, TorrentRecord> = torrents
+                .iter()
+                .map(|t| (t.hash.clone(), t.clone()))
+                .collect();
+            let hnr_seed_time = machine.config.hnr_seed_time;
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            for action in &out.actions {
+                if let QbitAction::ForceResumeTorrent { hash, .. } = action {
+                    if let Some(record) = listed.get(hash) {
+                        prop_assert!(
+                            record.downloaded_bytes > 0 && record.seed_time < hnr_seed_time,
+                            "ForceResumeTorrent targets a non-unsatisfied hash {hash:?}"
+                        );
+                        prop_assert!(
+                            matches!(
+                                record.state,
+                                TorrentState::PausedUploading | TorrentState::StalledUploading
+                            ),
+                            "ForceResumeTorrent targets a torrent not in paused/stalled-upload \
+                             state: {:?}",
+                            record.state
+                        );
+                    }
+                }
+            }
+        }
+
+        // QBIT-16 [safety] (queue orchestration: limit-triggered — §24):
+        // A `QueueOrchestrated` publish is emitted only when
+        // `active_count >= max_active_torrents` at observation time, and only
+        // when cookie is present.
+        // Total invariant.
+        #[test]
+        fn queue_orchestrated_only_when_limit_reached(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            // Snapshot active count and limit BEFORE handle mutates state.
+            let active_count_before = u32::try_from(
+                machine.torrents.values().filter(|t| t.state.is_active()).count(),
+            )
+            .unwrap_or(u32::MAX);
+            let limit_before = machine.max_active_torrents;
+            let had_cookie = machine.cookie.is_some();
+
+            // But orchestration uses the NEW torrent list — compute active count from it.
+            let new_active_count = u32::try_from(
+                torrents.iter().filter(|t| t.state.is_active()).count(),
+            )
+            .unwrap_or(u32::MAX);
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            for publish in &out.publish {
+                if let QbitPublish::QueueOrchestrated { .. } = publish {
+                    prop_assert!(
+                        had_cookie,
+                        "QueueOrchestrated published without a cookie"
+                    );
+                    prop_assert!(
+                        new_active_count >= limit_before,
+                        "QueueOrchestrated published but new_active_count={new_active_count} \
+                         < limit={limit_before} (old active={active_count_before})"
+                    );
+                }
+            }
         }
     }
 }

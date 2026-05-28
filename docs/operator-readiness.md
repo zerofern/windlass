@@ -767,7 +767,7 @@ a ban from a stray client setting.
 
 ## Story: Orchestrate qBittorrent Queue Limits To Protect Unsatisfied Torrents
 
-Status: To Do
+Status: Done
 
 ### Problem
 

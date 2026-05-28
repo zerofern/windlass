@@ -260,6 +260,9 @@ impl QbitClient {
                     dht: w.dht,
                     pex: w.pex,
                     lsd: w.lsd,
+                    // A negative value in qBittorrent means "unlimited"; map to
+                    // u32::MAX so downstream code can use a simple >= comparison.
+                    max_active_torrents: u32::try_from(w.max_active_torrents).unwrap_or(u32::MAX),
                 }),
                 Err(e) => {
                     warn!("Failed to parse preferences: {e}");

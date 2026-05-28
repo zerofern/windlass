@@ -184,6 +184,7 @@ pub(super) async fn init_shell(
                 QbitTopic::ListenPort,
                 QbitTopic::Torrents,
                 QbitTopic::Privacy,
+                QbitTopic::Queue,
             ],
             qbit_pub_tx,
         ))
