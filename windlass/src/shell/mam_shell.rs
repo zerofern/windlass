@@ -59,10 +59,12 @@ impl Shell for MamShell {
                                 retry_after: Duration::from_secs(1),
                             }
                         }
+                        // §30: ASN mismatch is a distinct compliance signal,
+                        // not a generic SeedboxUpdateFailed.  The MAM core
+                        // tracks it via AsnState and the domain blocks
+                        // admission + raises a Critical alert.
                         windlass_core::events::Event::MamAsnMismatch { ip, .. } => {
-                            MamEvent::SeedboxUpdateFailed {
-                                reason: format!("ASN mismatch for {}", ip.0),
-                            }
+                            MamEvent::AsnMismatch { ip }
                         }
                         // §28: a transport-level failure now arrives as a
                         // distinct event instead of being silently mapped to

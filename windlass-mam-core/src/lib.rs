@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
-use windlass_types::VpnPort;
+use windlass_types::{VpnIp, VpnPort};
 
 /// 25 GiB in bytes (binary GiB: 1024³ = 1 073 741 824).
 ///
@@ -86,6 +86,14 @@ pub enum MamEvent {
     Unreachable {
         reason: String,
     },
+    /// §30: MAM rejected the dynamic-seedbox update with an ASN mismatch —
+    /// our current IP belongs to an autonomous system the account is not
+    /// registered for.  Distinct from `SeedboxUpdateFailed` (other refusals)
+    /// because §30 routes it as a `Critical` compliance signal that blocks
+    /// download admission (DOM-20).
+    AsnMismatch {
+        ip: VpnIp,
+    },
     SeedboxUpdated,
     SeedboxUpdateFailed {
         reason: String,
@@ -149,6 +157,18 @@ pub enum MamPublish {
         ratio: f64,
         upload_credit_bytes: u64,
     },
+    /// §30: rising-edge ASN-mismatch signal.  Published exactly once when
+    /// `asn_state` transitions from any non-`Mismatched` value (Unknown or
+    /// Accepted) to `Mismatched`.  Carries the offending IP so the alert
+    /// body can name it.
+    AsnMismatch {
+        ip: VpnIp,
+    },
+    /// §30: rising-edge ASN-accepted signal.  Published exactly once when
+    /// `asn_state` transitions from any non-`Accepted` value (Unknown or
+    /// Mismatched) to `Accepted`, i.e. on the first `SeedboxUpdated` after
+    /// a fresh start or after a prior mismatch.
+    AsnAccepted,
     /// §27: published exactly once on the rising edge when
     /// `consecutive_status_failures` crosses `keep_alive_failure_threshold`.
     /// Carries the last retryable-failure reason for the alert body.
@@ -167,6 +187,8 @@ pub enum MamTopic {
     UploadHealth,
     /// Keep-alive heartbeat degradation alerts (§27).
     KeepAlive,
+    /// MAM ASN-compliance signals (§30).
+    Compliance,
 }
 
 impl HasTopic<MamTopic> for MamPublish {
@@ -183,6 +205,7 @@ impl HasTopic<MamTopic> for MamPublish {
                 MamTopic::UploadHealth
             }
             Self::KeepAliveDegraded { .. } => MamTopic::KeepAlive,
+            Self::AsnMismatch { .. } | Self::AsnAccepted => MamTopic::Compliance,
         }
     }
 }
@@ -190,6 +213,18 @@ impl HasTopic<MamTopic> for MamPublish {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MamResponse {
     Accepted,
+}
+
+/// §30: MAM ASN-compliance state.
+///
+/// `Unknown` is the boot/restart default — we have not yet observed a
+/// successful or rejected seedbox update.  Admission stays blocked until
+/// the state transitions to `Accepted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AsnState {
+    Unknown,
+    Accepted,
+    Mismatched,
 }
 
 // `MamMachine` cannot derive `Eq` because `MamConfig.min_global_ratio` and the
@@ -214,6 +249,10 @@ pub struct MamMachine {
     /// `AuthFailed`/`StatusFailed`/`SeedboxUpdateFailed`; reset by
     /// `StatusFetched`.
     consecutive_status_failures: u32,
+    /// §30: MAM ASN-compliance state.  See `AsnState` docs.  Initial
+    /// value is `Unknown` — domain admission stays blocked until a
+    /// `SeedboxUpdated` arrives or a `Mismatched` is observed.
+    asn_state: AsnState,
 }
 
 impl MamMachine {
@@ -243,6 +282,12 @@ impl MamMachine {
     #[must_use]
     pub const fn consecutive_status_failures(&self) -> u32 {
         self.consecutive_status_failures
+    }
+
+    /// Returns the current MAM ASN-compliance state (§30).
+    #[must_use]
+    pub const fn asn_state(&self) -> AsnState {
+        self.asn_state
     }
 
     /// Returns `true` once the `KeepAlive` chain has been started (§27).
@@ -284,11 +329,20 @@ impl MamMachine {
         }
     }
 
+    /// Picks the right action on a retry/rate-limit-expiry tick.
+    ///
+    /// Avoids issuing a redundant `UpdateSeedbox` when the desired port has
+    /// already been registered with MAM — important because the dynamic-
+    /// seedbox endpoint should not be hit unnecessarily (see Mousehole's
+    /// `getUpdateReason`: skip the call when nothing changed).  A future
+    /// story will add IP-change detection so we *do* update on a public IP
+    /// change even when the port is unchanged.
     fn refresh_or_update_seedbox(&self) -> Vec<MamAction> {
-        if self.desired_seedbox_port.is_some() {
-            vec![MamAction::UpdateSeedbox]
-        } else {
-            vec![MamAction::FetchStatus]
+        match self.desired_seedbox_port {
+            Some(desired) if self.seedbox_port != Some(desired) => {
+                vec![MamAction::UpdateSeedbox]
+            }
+            _ => vec![MamAction::FetchStatus],
         }
     }
 
@@ -336,6 +390,7 @@ impl Machine for MamMachine {
             upload_credit_bytes: 0,
             keep_alive_scheduled: false,
             consecutive_status_failures: 0,
+            asn_state: AsnState::Unknown,
         }
     }
 
@@ -489,12 +544,46 @@ impl Machine for MamMachine {
                 if let Some(p) = port {
                     self.seedbox_port = Some(p);
                 }
+                let mut publish: Vec<MamPublish> = port
+                    .map(|p| MamPublish::SeedboxPortReady { port: p })
+                    .into_iter()
+                    .collect();
+                // §30 / MAM-15: rising-edge transition to ASN-accepted.  Only
+                // publish when transitioning from Unknown or Mismatched.
+                if self.asn_state != AsnState::Accepted {
+                    self.asn_state = AsnState::Accepted;
+                    publish.push(MamPublish::AsnAccepted);
+                }
                 Outcome {
                     actions: Vec::new(),
-                    publish: port
-                        .map(|p| MamPublish::SeedboxPortReady { port: p })
-                        .into_iter()
-                        .collect(),
+                    publish,
+                }
+            }
+            // §30 / MAM-14: rising-edge ASN-mismatch.  Publishes
+            // `AsnMismatch` only when transitioning from Unknown or Accepted
+            // to Mismatched; subsequent mismatches before a successful
+            // update do not re-publish.  Also schedules `StatusRetry` and
+            // bumps the §27 keep-alive failure counter — a persistent ASN
+            // mismatch shows up as a degraded heartbeat too.
+            MamEvent::AsnMismatch { ip } => {
+                let mut publish = Vec::new();
+                if self.asn_state != AsnState::Mismatched {
+                    self.asn_state = AsnState::Mismatched;
+                    publish.push(MamPublish::AsnMismatch { ip });
+                }
+                let crossed = self.bump_keep_alive_failures();
+                if crossed {
+                    publish.push(MamPublish::KeepAliveDegraded {
+                        consecutive_failures: self.consecutive_status_failures,
+                        last_reason: format!("ASN mismatch for {}", ip.0),
+                    });
+                }
+                Outcome {
+                    actions: vec![MamAction::ScheduleTimer {
+                        timer: MamTimer::StatusRetry,
+                        after: self.config.status_retry,
+                    }],
+                    publish,
                 }
             }
             MamEvent::RateLimited { retry_after } => Outcome {
@@ -617,7 +706,15 @@ mod tests {
         let out = handle(&mut machine, MamEvent::SeedboxUpdated);
 
         assert_eq!(machine.seedbox_port(), Some(port));
-        assert_eq!(out.publish, vec![MamPublish::SeedboxPortReady { port }]);
+        // §30: the first SeedboxUpdated also publishes AsnAccepted (rising
+        // edge from Unknown).
+        assert_eq!(
+            out.publish,
+            vec![
+                MamPublish::SeedboxPortReady { port },
+                MamPublish::AsnAccepted,
+            ]
+        );
     }
 
     #[test]
@@ -1131,9 +1228,9 @@ mod prop_tests {
 
     use proptest::prelude::*;
     use windlass_machine::{Machine, Timed};
-    use windlass_types::VpnPort;
+    use windlass_types::{VpnIp, VpnPort};
 
-    use crate::{MamAction, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer};
+    use crate::{AsnState, MamAction, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer};
 
     fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
         (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
@@ -1177,6 +1274,14 @@ mod prop_tests {
 
     // Fully-arbitrary state, including unreachable field combinations: the tested
     // invariants are total.
+    fn any_asn_state() -> impl Strategy<Value = AsnState> {
+        prop_oneof![
+            Just(AsnState::Unknown),
+            Just(AsnState::Accepted),
+            Just(AsnState::Mismatched),
+        ]
+    }
+
     fn any_mam_machine() -> impl Strategy<Value = MamMachine> {
         (
             any_mam_config(),
@@ -1187,6 +1292,7 @@ mod prop_tests {
             any_buffer(),
             any::<bool>(),
             0u32..=20u32,
+            any_asn_state(),
         )
             .prop_map(
                 |(
@@ -1198,6 +1304,7 @@ mod prop_tests {
                     upload_credit_bytes,
                     keep_alive_scheduled,
                     consecutive_status_failures,
+                    asn_state,
                 )| {
                     let mut machine = MamMachine::new(config, Instant::now());
                     machine.authenticated = authenticated;
@@ -1207,6 +1314,7 @@ mod prop_tests {
                     machine.upload_credit_bytes = upload_credit_bytes;
                     machine.keep_alive_scheduled = keep_alive_scheduled;
                     machine.consecutive_status_failures = consecutive_status_failures;
+                    machine.asn_state = asn_state;
                     machine
                 },
             )
@@ -1233,6 +1341,9 @@ mod prop_tests {
                 }),
             any::<String>().prop_map(|reason| MamEvent::StatusFailed { reason }),
             any::<String>().prop_map(|reason| MamEvent::Unreachable { reason }),
+            any::<[u8; 4]>().prop_map(|b| MamEvent::AsnMismatch {
+                ip: VpnIp(std::net::Ipv4Addr::from(b)),
+            }),
             Just(MamEvent::SeedboxUpdated),
             any::<String>().prop_map(|reason| MamEvent::SeedboxUpdateFailed { reason }),
             (0u64..=3600).prop_map(|s| MamEvent::RateLimited {
@@ -1608,6 +1719,66 @@ mod prop_tests {
                 .count();
             prop_assert_eq!(notconnectable_count, 1);
             prop_assert_eq!(unreachable_count, 0);
+        }
+
+        // MAM-14 [safety] (§30): rising-edge AsnMismatch publish.  When an
+        // `AsnMismatch` event arrives while `asn_state != Mismatched`, the
+        // machine publishes exactly one `AsnMismatch { ip }` and transitions
+        // to `Mismatched`.  Subsequent mismatches while already in
+        // `Mismatched` publish zero.  Total invariant.
+        #[test]
+        fn asn_mismatch_publishes_on_rising_edge_only(
+            mut machine in any_mam_machine(),
+            ip_bytes in any::<[u8; 4]>(),
+        ) {
+            let pre = machine.asn_state();
+            let ip = VpnIp(std::net::Ipv4Addr::from(ip_bytes));
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::AsnMismatch { ip }),
+            );
+            prop_assert_eq!(machine.asn_state(), AsnState::Mismatched);
+            let mismatch_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::AsnMismatch { .. }))
+                .count();
+            if pre == AsnState::Mismatched {
+                prop_assert_eq!(mismatch_count, 0,
+                    "no re-publish when already in Mismatched");
+            } else {
+                prop_assert_eq!(mismatch_count, 1,
+                    "rising edge must publish exactly one AsnMismatch");
+            }
+        }
+
+        // MAM-15 [safety] (§30): rising-edge AsnAccepted publish.  When a
+        // `SeedboxUpdated` event arrives while `asn_state != Accepted`, the
+        // machine publishes exactly one `AsnAccepted` and transitions to
+        // `Accepted`.  Subsequent updates while already in `Accepted`
+        // publish zero.  Total invariant.
+        #[test]
+        fn asn_accepted_publishes_on_rising_edge_only(
+            mut machine in any_mam_machine(),
+        ) {
+            let pre = machine.asn_state();
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::SeedboxUpdated),
+            );
+            prop_assert_eq!(machine.asn_state(), AsnState::Accepted);
+            let accepted_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::AsnAccepted))
+                .count();
+            if pre == AsnState::Accepted {
+                prop_assert_eq!(accepted_count, 0,
+                    "no re-publish when already in Accepted");
+            } else {
+                prop_assert_eq!(accepted_count, 1,
+                    "rising edge must publish exactly one AsnAccepted");
+            }
         }
     }
 }

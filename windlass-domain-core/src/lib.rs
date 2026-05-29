@@ -10,7 +10,7 @@ use windlass_disk_core::DiskPublish;
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
-use windlass_types::{AlertPriority, MamTorrentId, VpnPort};
+use windlass_types::{AlertPriority, MamTorrentId, VpnIp, VpnPort};
 use windlass_vpn_core::{VpnCommand, VpnPublish};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +187,9 @@ pub struct AdmissionState {
 
 impl AdmissionState {
     /// Fail-closed defaults: every "ok" gate is false, every "full" gate is
-    /// true.  `vpn_ip_compliant` defaults to `Some(true)` per the §30 stub.
+    /// true, and `vpn_ip_compliant` is `None` (unknown).  §30 flips it to
+    /// `Some(true)` on a successful seedbox update and `Some(false)` on a
+    /// fresh ASN mismatch.
     const fn fail_closed() -> Self {
         Self {
             upload_health_ok: false,
@@ -195,10 +197,7 @@ impl AdmissionState {
             qbit_privacy_clean: false,
             qbit_listen_port: None,
             mam_healthy: false,
-            // TODO(§30): replace with `None` (unknown) once §30 wires the
-            // VPN-IP-compliance publish.  For now default to compliant so the
-            // gate doesn't block every candidate before §30 lands.
-            vpn_ip_compliant: Some(true),
+            vpn_ip_compliant: None,
         }
     }
 
@@ -494,6 +493,17 @@ impl Machine for WindlassMachine {
             // §29: positive-side counterpart — both metrics meet the minimums.
             WindlassEvent::Mam(MamPublish::UploadHealthOk { .. }) => {
                 self.admission.upload_health_ok = true;
+                Outcome::none()
+            }
+            // DOM-20 (§30): MAM rejected our IP with an ASN mismatch.
+            // Blocks admission and fires a Critical alert.
+            WindlassEvent::Mam(MamPublish::AsnMismatch { ip }) => {
+                self.admission.vpn_ip_compliant = Some(false);
+                Self::on_mam_asn_mismatch(ip)
+            }
+            // §30: MAM accepted our IP — clear the admission gate.
+            WindlassEvent::Mam(MamPublish::AsnAccepted) => {
+                self.admission.vpn_ip_compliant = Some(true);
                 Outcome::none()
             }
             // DOM-14: KeepAliveDegraded → one RecordAlert(Warning) + one Activity publish.
@@ -801,6 +811,43 @@ impl WindlassMachine {
                     at: chrono::Utc::now(),
                     source: ActivitySource::Domain,
                     action: "upload_health_degraded".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles the `AsnMismatch` MAM publish (DOM-20 / §30).
+    ///
+    /// MAM rejected our dynamic-seedbox update because our current IP
+    /// belongs to an unregistered ASN.  Emits one `RecordAlert(Critical)`,
+    /// one `RecordActivity`, and one `Activity` publish.  The §29 admission
+    /// gate is already blocked by the caller, so the alert is the operator's
+    /// signal to register the new ASN with MAM (or wait for Windlass
+    /// automation to do so in a future story).
+    fn on_mam_asn_mismatch(ip: VpnIp) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!(
+            "MAM rejected the dynamic-seedbox update from IP {}: ASN not \
+             registered for this account. Autograb is blocked until the \
+             next successful seedbox update.",
+            ip.0,
+        );
+        let message = format!("MAM ASN mismatch for {}", ip.0);
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Critical,
+                    title: "MAM ASN mismatch".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Mam,
+                    action: "mam_asn_mismatch".to_string(),
                     book_id: None,
                     detail: Some(message.clone()),
                     metadata: serde_json::Value::Null,
@@ -1669,6 +1716,73 @@ mod tests {
             "Unreachable must emit exactly one Activity publish"
         );
     }
+
+    // ── DOM-20: AsnMismatch routing (§30) ─────────────────────────────────────
+
+    #[test]
+    fn asn_mismatch_emits_one_critical_alert_and_blocks_admission() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_mam_core::MamPublish;
+        use windlass_types::{AlertPriority, VpnIp};
+
+        let mut machine = machine();
+        let ip = VpnIp(std::net::Ipv4Addr::new(10, 20, 30, 40));
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::AsnMismatch { ip }),
+        );
+
+        let critical_alert_count = out
+            .actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Critical,
+                        ..
+                    }))
+                )
+            })
+            .count();
+        assert_eq!(
+            critical_alert_count, 1,
+            "AsnMismatch must emit exactly one RecordAlert(Critical)"
+        );
+
+        let activity_db_count = out
+            .actions
+            .iter()
+            .filter(|a| matches!(a, WindlassAction::Db(DbCommand::RecordActivity(_))))
+            .count();
+        assert_eq!(activity_db_count, 1, "must emit one RecordActivity");
+
+        let activity_publish_count = out
+            .publish
+            .iter()
+            .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+            .count();
+        assert_eq!(activity_publish_count, 1, "must publish one Activity");
+
+        // Admission gate flipped to non-compliant.
+        assert_eq!(machine.admission().vpn_ip_compliant, Some(false));
+    }
+
+    #[test]
+    fn asn_accepted_flips_admission_to_compliant() {
+        use windlass_mam_core::MamPublish;
+
+        let mut machine = machine();
+        // Pre-condition: gate is unknown by default.
+        assert_eq!(machine.admission().vpn_ip_compliant, None);
+
+        let out = handle(&mut machine, WindlassEvent::Mam(MamPublish::AsnAccepted));
+
+        assert!(out.actions.is_empty(), "AsnAccepted emits no actions");
+        assert!(out.publish.is_empty(), "AsnAccepted emits no publishes");
+        assert_eq!(machine.admission().vpn_ip_compliant, Some(true));
+    }
 }
 
 #[cfg(test)]
@@ -1868,6 +1982,10 @@ mod prop_tests {
                     }
                 }
             ),
+            any::<[u8; 4]>().prop_map(|b| MamPublish::AsnMismatch {
+                ip: windlass_types::VpnIp(std::net::Ipv4Addr::from(b)),
+            }),
+            Just(MamPublish::AsnAccepted),
             (any::<u32>(), any::<String>()).prop_map(|(consecutive_failures, last_reason)| {
                 MamPublish::KeepAliveDegraded {
                     consecutive_failures,
@@ -2350,6 +2468,49 @@ mod prop_tests {
                 prop_assert_eq!(add_count, 0,
                     "DOM-19: blocked admission emits zero AddTorrent");
             }
+        }
+
+        // DOM-20 [safety] (§30): `Mam(AsnMismatch { ip })` emits exactly one
+        // `Db(RecordAlert{Critical})`, one `Db(RecordActivity)`, and one
+        // `Activity` publish; admission flips to `Some(false)`.  Total
+        // invariant.
+        #[test]
+        fn asn_mismatch_emits_one_critical_alert_and_one_activity(
+            mut machine in any_windlass_machine(),
+            ip_bytes in any::<[u8; 4]>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::{AlertPriority, VpnIp};
+
+            let ip = VpnIp(std::net::Ipv4Addr::from(ip_bytes));
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Mam(MamPublish::AsnMismatch { ip })),
+            );
+
+            let critical_count = out.actions.iter().filter(|a| matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Critical,
+                    ..
+                }))
+            )).count();
+            prop_assert_eq!(critical_count, 1,
+                "DOM-20: AsnMismatch must emit one RecordAlert(Critical)");
+
+            let activity_db_count = out.actions.iter().filter(|a| matches!(
+                a, WindlassAction::Db(DbCommand::RecordActivity(_))
+            )).count();
+            prop_assert_eq!(activity_db_count, 1,
+                "DOM-20: must emit one RecordActivity");
+
+            let activity_count = out.publish.iter().filter(|p| matches!(
+                p, WindlassPublish::Activity { .. }
+            )).count();
+            prop_assert_eq!(activity_count, 1,
+                "DOM-20: must publish exactly one Activity");
+
+            prop_assert_eq!(machine.admission().vpn_ip_compliant, Some(false));
         }
     }
 }

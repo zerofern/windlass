@@ -55,8 +55,9 @@ Implement these stories one at a time, in this order:
 28. Distinguish MAM `Unreachable` from `NotConnectable`.
 29. Enforce fail-closed download admission control (composite gate).
 30. Block MAM automation on VPN IP non-compliance.
-31. Make dependent-container orchestration safe under Gluetun.
-32. Fully port legacy `windlass-core` to the per-system cores and remove it.
+31. Mousehole-style proactive dynamic-seedbox update on IP change.
+32. Make dependent-container orchestration safe under Gluetun.
+33. Fully port legacy `windlass-core` to the per-system cores and remove it.
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -1047,40 +1048,206 @@ then upload_health_ok(c) and under_quota() and qbit_privacy_clean()
 - Manual, user-initiated downloads are out of scope for the *autonomous* gate,
   but the UI must still warn explicitly where a gate would have blocked.
 
-## Story: Block MAM Automation On VPN IP Non-Compliance
+## Story: Block MAM Automation On MAM ASN-Mismatch Rejection
+
+Status: Done
+
+### Problem
+
+MAM Rule 1.2 requires the seedbox to come from an ASN (effectively, a VPN
+provider) the user has registered with MAM staff. The dynamic-seedbox
+endpoint (`update_seedbox`) accepts arbitrary IPs within registered ASNs —
+this is **intentional** and supports rotating VPN exits. The risk is *not*
+that the IP changes; it is that the new IP belongs to an ASN MAM has not
+authorised for this account, in which case MAM rejects the update with
+"ASN mismatch".
+
+Today that rejection arrives as `Event::MamAsnMismatch { ip }`, gets
+collapsed by the MAM shell into a generic `MamEvent::SeedboxUpdateFailed`,
+and the operator never learns it is a compliance event. Continuing
+autograb after an ASN-mismatch can pile up unsuccessful torrent activity
+from an unrecognised IP — exactly the pattern that draws staff attention.
+
+The static-IP framing from earlier drafts of this story is wrong for the
+dynamic-seedbox model. The actual signal is from MAM, not from a local
+expected-vs-observed comparison.
+
+### User Story
+
+As the operator user, I want all autograb activity to stop immediately if
+MAM tells me my current IP is on an unrecognised ASN, and I want a
+`Critical` alert so I know to register the new ASN with MAM staff (or, in
+the future, let Windlass register it for me automatically).
+
+### Acceptance Criteria
+
+- The MAM core distinguishes `MamEvent::AsnMismatch { ip }` from generic
+  retryable failures. The shell maps `Event::MamAsnMismatch` to this new
+  event instead of `MamEvent::SeedboxUpdateFailed`.
+- The MAM core tracks ASN-compliance state with three values: `Unknown`
+  (initial, before any seedbox interaction), `Accepted` (MAM successfully
+  accepted our last update), and `Mismatched` (MAM rejected with ASN
+  mismatch).
+- On the rising edge into `Mismatched`, the MAM core publishes exactly one
+  `MamPublish::AsnMismatch { ip }` on a new `MamTopic::Compliance` topic.
+  Re-emitted only on a subsequent rising edge.
+- On the rising edge into `Accepted` (next successful `SeedboxUpdated`),
+  the MAM core publishes exactly one `MamPublish::AsnAccepted`.
+- The domain core consumes both publishes to flip
+  `admission.vpn_ip_compliant` between `Some(true)`, `Some(false)`, and
+  `None`. The initial admission default is `None` — admission fail-closed
+  until MAM confirms acceptance.
+- `Mam(AsnMismatch { ip })` emits exactly one `Db(RecordAlert{Critical,
+  "MAM ASN mismatch"})`, one `Db(RecordActivity)`, and one `Activity`
+  publish. The alert body names the offending IP.
+- The §29 admission predicate's `vpn_ip_compliant` gate now consumes a
+  real signal — the §29 stub `Some(true)` default is replaced with a real
+  fail-closed `None`.
+- ASN-mismatch counts toward the §27 keep-alive failure counter — a
+  persistent compliance problem also shows up as a degraded heartbeat
+  (consistent with how other retryable failures behave).
+- Add invariants to `docs/invariants.md` and cover them with property
+  tests.
+
+Core invariants (property tests):
+
+```
+# MAM-14: rising-edge AsnMismatch publish
+if MamEvent::AsnMismatch arrives while asn_state != Some(Mismatched):
+  publishes exactly one MamPublish::AsnMismatch { ip }
+  asn_state == Some(Mismatched) afterwards
+if MamEvent::AsnMismatch arrives while asn_state == Some(Mismatched):
+  publishes zero MamPublish::AsnMismatch
+
+# MAM-15: rising-edge AsnAccepted publish
+if MamEvent::SeedboxUpdated arrives while asn_state != Some(Accepted):
+  publishes exactly one MamPublish::AsnAccepted
+  asn_state == Some(Accepted) afterwards
+if MamEvent::SeedboxUpdated arrives while asn_state == Some(Accepted):
+  publishes zero MamPublish::AsnAccepted
+
+# DOM-20: AsnMismatch alert routing
+Mam(AsnMismatch { ip }) emits:
+  exactly one Db(RecordAlert{Critical, title: "MAM ASN mismatch"})
+  exactly one Db(RecordActivity)
+  exactly one WindlassPublish::Activity
+```
+
+### Implementation Notes
+
+- Multi-ASN MAM accounts are common — the user can register several ASNs
+  and rotate between them freely without triggering this gate. Automating
+  ASN registration on a fresh mismatch (so Windlass adds the new ASN for
+  the user) is a future story; this story only detects + alerts.
+- The dynamic-seedbox `update_seedbox` call is the only MAM endpoint that
+  returns an explicit ASN-mismatch response, so this is the only path
+  that flips the gate to `Mismatched`. `fetch_mam_status` is read-only
+  and doesn't carry the signal.
+- Leak prevention ("no traffic outside the VPN") is a different concern,
+  owned by §32 (Gluetun namespace ownership and dependent orchestration).
+- This story does not implement automatic ASN registration. When the
+  alert fires, the operator manually adds the new ASN via the MAM web UI.
+
+## Story: Mousehole-Style Proactive Dynamic-Seedbox Update On IP Change
 
 Status: To Do
 
 ### Problem
 
-MAM Rule 1.2 locks Gluetun to a single static server IP registered with MAM
-staff. If the observed VPN IP drifts from the registered one, continuing MAM
-automation risks a compliance violation. The spec says Windlass monitors the IP
-and alerts, but there is no rule that *blocks* automation on a mismatch, and the
-VPN core does not yet compare observed vs expected IP.
+§30 made Windlass survive a MAM ASN-mismatch rejection (block admission,
+alert the operator). It is the reactive half of the compliance story. The
+proactive half — *push an `update_seedbox` call whenever the public IP
+changes so MAM never sees the mismatch in the first place* — is still
+missing.
+
+Today the only path that calls `MamAction::UpdateSeedbox` is
+`MamCommand::EnsureSeedboxPort`, which the domain emits on **port**
+change. There is no IP-change path. If Gluetun rotates exits while the
+forwarded port stays the same, MAM keeps thinking we're on the old IP
+until either §27's keep-alive heartbeat fails (after the threshold) or
+§30 fires on the next port-driven update. Both are reactive.
+
+The mature reference for this is [Mousehole][m] — the project the user
+is migrating from. Mousehole's `getUpdateReason()` is invoked every
+`CHECK_INTERVAL_SECONDS` (default 300 s). It compares the host's current
+IP and ASN against the MAM `/jsonLoad.php` response and triggers
+`update_seedbox` only when something changed — or when the last response
+is older than `STALE_RESPONSE_SECONDS` (default 86 400 s ≈ 1 day) so the
+session cookie stays fresh. That dedup is the standard the dynamic-
+seedbox endpoint expects.
+
+[m]: https://github.com/t-mart/mousehole
 
 ### User Story
 
-As the operator user, I want all MAM automation to stop immediately if my VPN IP
-no longer matches the IP registered with MAM, so a VPN server change can never
-put my account out of compliance.
+As the operator user, I want Windlass to push a `update_seedbox` call as
+soon as my VPN exit IP changes, and refresh the registration at least
+once a day even when nothing changes, so MAM always knows where I am and
+my session cookie never expires.
 
 ### Acceptance Criteria
 
-- The VPN core knows the expected (registered) IP and the observed public IP.
-- On mismatch, the core blocks all MAM automation — most importantly it is a
-  hard gate in download admission (§29) that beats every other signal, freeleech
-  included.
-- A mismatch fires a `Critical` alert.
-- The block clears only when the observed IP matches the expected IP again.
-- Add the invariant to `docs/invariants.md` and cover it with property tests.
+- The VPN core observes the public IP through a new shell path (e.g. a
+  periodic GET to `https://api.ipify.org` routed through Gluetun).
+  Emits `VpnEvent::PublicIpChanged { ip }` only when the value
+  changes — never on a re-observation of the same IP.
+- The VPN core publishes `VpnPublish::PublicIpObserved { ip }` on a new
+  `VpnTopic::PublicIp` topic, rising-edge on any change.
+- The MAM client's `JsonLoadResponse` is extended to parse the
+  registered IP from the MAM response body (the field MAM exposes in
+  `/jsonLoad.php`).
+- `MamStatusResult` gains a `registered_ip: Option<Ipv4Addr>` field
+  carrying that value. The MAM machine stores it.
+- The MAM machine compares the latest VPN-observed IP against the
+  registered IP. When they differ, it emits `UpdateSeedbox`. When they
+  agree, it does **not** emit `UpdateSeedbox` even if the keep-alive
+  tick fires — the FetchStatus heartbeat is enough.
+- A new `MamTimer::StaleRegistrationRefresh` fires once per
+  `MamConfig::stale_registration_interval` (default 24 h) and emits
+  `UpdateSeedbox` unconditionally, so the cookie/registration stays
+  fresh even when the IP is stable.
+- A successful `SeedboxUpdated` resets the stale-registration timer.
+- Add invariants to `docs/invariants.md`: rising-edge
+  `PublicIpChanged`, no `UpdateSeedbox` when observed == registered
+  (outside the stale-refresh tick), `UpdateSeedbox` always emitted on
+  observed != registered or on stale-refresh.
 
-Core invariant (property test):
+Core invariants (property tests):
 
 ```
-if observed_vpn_ip != expected_vpn_ip
-then no emitted action is Action::AddTorrent   (and a Critical alert is expected)
+# VPN-8: PublicIpChanged is rising-edge only
+PublicIpObserved { ip } is emitted iff pre.observed_ip != Some(ip)
+                                      and post.observed_ip == Some(ip)
+
+# MAM-16: dedup against registered IP
+if MamEvent indicates the periodic keep-alive tick fired
+and machine.registered_ip == Some(observed) and !stale_due:
+  no emitted action is MamAction::UpdateSeedbox
+
+# MAM-17: stale-refresh forces an update
+if MamEvent::TimerFired(StaleRegistrationRefresh):
+  emitted actions contain exactly one MamAction::UpdateSeedbox
+  the timer is re-scheduled for `stale_registration_interval`
 ```
+
+### Implementation Notes
+
+- The host-IP observation shell is a new piece of plumbing — it needs
+  to use the VPN-routed `reqwest::Client` so the observed IP is the
+  VPN exit IP, not the host's bare public IP. The Mousehole reference
+  hits `api.ipify.org`; we should pick a similar low-overhead endpoint
+  (consider one that also reports ASN, e.g. `https://ifconfig.co/json`,
+  so a later story can add ASN-side dedup too).
+- ASN-aware dedup is intentionally left for a follow-up: it requires
+  also tracking ASN in `MamStatusResult` and is mostly redundant given
+  §30 catches the mismatch reactively.
+- The §30 retry-path tightening (skip `UpdateSeedbox` when desired ==
+  current) is the first step of this dedup work — that small change
+  shipped with §30.
+- This story narrows the §30 reactive window: instead of the operator
+  noticing an alert and registering an ASN, Windlass calls `update_seedbox`
+  as soon as the IP moves, so MAM never sees a mismatch in normal
+  rotations.
 
 ## Story: Make Dependent-Container Orchestration Safe Under Gluetun
 
@@ -1205,9 +1372,9 @@ actually guard what runs in production.
 
 - This is the capstone of the per-system migration: stories 2-9 moved each core
   onto the service runtime in shadow, and the per-feature stories (§§19-26,
-  §23, §30, §31) build the torrent/download/compliance/orchestration decisions
-  in the new cores. This story flips the live loop onto those cores and deletes
-  the legacy crate.
+  §§30-32) build the torrent/download/compliance/orchestration decisions in the
+  new cores. This story flips the live loop onto those cores and deletes the
+  legacy crate.
 - Sequence the flip *after* the per-feature decision stories have reached
   behavior parity in the new cores, so the cutover does not regress live
   behavior or run both paths.

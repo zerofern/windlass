@@ -51,7 +51,7 @@ tracker and peers.
 
 *Enforced by:* VPN-1 + DOM-2 (a VPN drop immediately clears downstream port/
 state), and Gluetun stack orchestration — no dependent on a stale namespace, no
-start before Gluetun is healthy and IP-compliant (§31, not yet implemented).
+start before Gluetun is healthy and IP-compliant (§32, not yet implemented).
 
 ### Guarantee C — What we advertise is the real forwarded port
 
@@ -112,7 +112,7 @@ retry, never an immediate one), QBIT-3 + DOM-5 + MAM-9 (self-perpetuating
 refresh / snapshot / keep-alive chains never stop), MAM-8 (chain-starts-once),
 MAM-10 + DOM-14 (operator is alerted on persistent keep-alive failure),
 DB-2 + DB-3 (DB failure handling emits no action, so it cannot recurse), plus
-the restart circuit breaker and crash-dump-once rules (§31, not yet implemented).
+the restart circuit breaker and crash-dump-once rules (§32, not yet implemented).
 
 ### Guarantee G — The dashboard always shows current truth
 
@@ -425,6 +425,31 @@ Option<VpnPort> }`.
   MAM-7, every `StatusFetched` publishes exactly one of
   `{UploadHealthOk, UploadHealthDegraded}`.  Total invariant. → A
 
+### MAM machine additions (§30)
+
+State additions: `asn_state: AsnState` (one of `Unknown`/`Accepted`/`Mismatched`,
+initial `Unknown`).
+
+New event: `MamEvent::AsnMismatch { ip: VpnIp }` — emitted by the shell when
+`Event::MamAsnMismatch` arrives from the dynamic-seedbox endpoint (was
+previously collapsed into `SeedboxUpdateFailed`).
+
+New publishes: `MamPublish::AsnMismatch { ip }` and `MamPublish::AsnAccepted`
+on the new `MamTopic::Compliance` topic.  Both fire only on a rising-edge
+transition of `asn_state`.
+
+- **MAM-14 [safety]** *(rising-edge AsnMismatch — §30)* `MamEvent::AsnMismatch
+  { ip }` transitions `asn_state` to `Mismatched`.  If `asn_state` was not
+  already `Mismatched`, publishes exactly one `MamPublish::AsnMismatch { ip }`;
+  otherwise publishes zero.  The event also schedules a `StatusRetry` and
+  bumps the §27 keep-alive failure counter (a persistent compliance
+  rejection shows up as a degraded heartbeat).  Total invariant. → A
+- **MAM-15 [safety]** *(rising-edge AsnAccepted — §30)* `MamEvent::SeedboxUpdated`
+  transitions `asn_state` to `Accepted`.  If `asn_state` was not already
+  `Accepted`, publishes exactly one `MamPublish::AsnAccepted`; otherwise
+  publishes zero.  The `SeedboxPortReady` publish (MAM-5) is independent
+  and unaffected by this rule.  Total invariant. → A
+
 ### qBit machine additions (§29)
 
 - **QBIT-19 [safety]** *(quota positive signal — §29)* `TorrentsListed`
@@ -489,6 +514,25 @@ this default and wire the real comparison.
   one gate fails, the handler emits exactly one `WindlassPublish::Activity`
   whose message names the failing gates in canonical order.  No silent
   drops.  Total invariant. → A, G
+
+### Domain machine additions (§30)
+
+- **DOM-20 [safety]** *(ASN-mismatch alert routing — §30)*
+  `Mam(AsnMismatch { ip })` emits exactly one
+  `Db(RecordAlert { priority: Critical, title: "MAM ASN mismatch" })`, one
+  `Db(RecordActivity { source: Mam, action: "mam_asn_mismatch" })`, and one
+  `Activity` publish.  The alert body names the offending IP.  The handler
+  also flips `admission.vpn_ip_compliant` to `Some(false)`, which blocks
+  every subsequent `TryAddTorrent` until a fresh `AsnAccepted` arrives.
+  Total invariant. → A
+
+  Counterpart: `Mam(AsnAccepted)` flips `admission.vpn_ip_compliant` to
+  `Some(true)` with no actions or publishes — the §29 admission predicate
+  is the only consumer.
+
+  The §29 stub default for `vpn_ip_compliant` (`Some(true)`) is now
+  replaced by the real fail-closed default `None`; admission stays blocked
+  until MAM confirms acceptance.
 
 ### Resolved (§26 → §29)
 

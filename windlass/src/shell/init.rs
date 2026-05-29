@@ -219,6 +219,7 @@ pub(super) async fn init_shell(
                 MamTopic::Seedbox,
                 MamTopic::UploadHealth,
                 MamTopic::KeepAlive,
+                MamTopic::Compliance,
             ],
             mam_pub_tx,
         ))
