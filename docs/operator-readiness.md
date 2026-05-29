@@ -1014,12 +1014,12 @@ fails closed and never snatches under an unsafe condition.
   - **VPN IP compliant** — `observed_vpn_ip == expected_vpn_ip` (§30); this gate
     beats every other signal, freeleech included.
   - **Not already-snatched** — `candidate.my_snatched == false` *(owned by
-    downloader/librarian discovery work; consumed here as an external gate)*.
+    librarian-readiness A2; consumed here as an external gate)*.
   - **Not a collection** — `numfiles <= 20` unless `source == ManualMamUrl`
-    *(owned by downloader/librarian discovery work)*.
+    *(owned by librarian-readiness A2)*.
   - **Freeleech window fits** — `now + est_download_duration + safety_buffer <=
     freeleech_window_end` for freeleech candidates *(owned by
-    downloader/librarian discovery work)*.
+    librarian-readiness A2)*.
 - When a gate blocks, the allowed outcomes are limited to non-snatch actions
   (e.g. skip, `RequestManualReview`, `RejectCandidate`, `BlockDownloads`,
   `FixQbitPrivacy`, `FireAlert`) — never an autonomous add.
