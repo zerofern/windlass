@@ -160,6 +160,7 @@ pub const fn event_variant(event: &Event) -> &'static str {
         Event::QbitPortSyncFailed { .. } => "QbitPortSyncFailed",
         Event::MamUpdateSuccess { .. } => "MamUpdateSuccess",
         Event::MamAsnMismatch { .. } => "MamAsnMismatch",
+        Event::MamUnreachable { .. } => "MamUnreachable",
         Event::MamStatusObserved { .. } => "MamStatusObserved",
         Event::DiskSpaceObserved { .. } => "DiskSpaceObserved",
         Event::NewTorrentsObserved { .. } => "NewTorrentsObserved",

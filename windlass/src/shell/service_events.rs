@@ -89,6 +89,12 @@ pub(super) fn legacy_to_service_events(
         Event::MamAsnMismatch { ip, .. } => vec![ServiceEvent::Mam(MamEvent::StatusFailed {
             reason: format!("MAM ASN mismatch for {}", ip.0),
         })],
+        // §28: legacy MamUnreachable maps to the new MAM-core Unreachable
+        // event so the new MAM machine publishes the distinct Unreachable
+        // signal (MAM-11) instead of a generic StatusFailed.
+        Event::MamUnreachable { reason, .. } => vec![ServiceEvent::Mam(MamEvent::Unreachable {
+            reason: reason.clone(),
+        })],
         Event::MamStatusObserved { status, .. } => match status {
             MamStatus::Connectable => vec![
                 ServiceEvent::Mam(MamEvent::AuthSucceeded),

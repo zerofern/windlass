@@ -14,8 +14,8 @@ use windlass_types::VpnPort;
 pub const DEFAULT_MIN_UPLOAD_BUFFER_BYTES: u64 = 25 * 1024 * 1024 * 1024;
 
 /// Default keep-alive interval (§27).  Matches Mousehole's default check
-/// cadence (5 minutes).
-pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// cadence (5 minutes / 300 seconds).
+pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Default consecutive-failure threshold for `KeepAliveDegraded` (§27).
 pub const DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD: u32 = 3;
@@ -78,6 +78,14 @@ pub enum MamEvent {
     StatusFailed {
         reason: String,
     },
+    /// §28: MAM could not be reached at all (DNS/TCP/TLS/timeout).  Distinct
+    /// from `StatusFailed` (MAM responded but the response was wrong) and
+    /// from `StatusFetched { connectable: false }` (MAM responded and
+    /// reports we are unconnectable).  Routed by the shell from
+    /// `MamFetchError::Unreachable` or `Event::MamUnreachable`.
+    Unreachable {
+        reason: String,
+    },
     SeedboxUpdated,
     SeedboxUpdateFailed {
         reason: String,
@@ -111,6 +119,13 @@ pub enum MamPublish {
         seedbox_port: Option<VpnPort>,
     },
     NotConnectable {
+        reason: String,
+    },
+    /// §28: MAM could not be reached at all.  Distinct from `NotConnectable`,
+    /// which means MAM responded and reports our client is not connectable.
+    /// `Unreachable` is transient; the operator alert path lives in the
+    /// keep-alive degraded publish (§27) rather than a Critical/Warning here.
+    Unreachable {
         reason: String,
     },
     SeedboxPortReady {
@@ -152,7 +167,9 @@ impl HasTopic<MamTopic> for MamPublish {
             Self::Ready | Self::Unavailable { .. } | Self::RateLimited { .. } => {
                 MamTopic::Availability
             }
-            Self::Connectable { .. } | Self::NotConnectable { .. } => MamTopic::Connectability,
+            Self::Connectable { .. } | Self::NotConnectable { .. } | Self::Unreachable { .. } => {
+                MamTopic::Connectability
+            }
             Self::SeedboxPortReady { .. } => MamTopic::Seedbox,
             Self::UploadHealthDegraded { .. } => MamTopic::UploadHealth,
             Self::KeepAliveDegraded { .. } => MamTopic::KeepAlive,
@@ -368,6 +385,32 @@ impl Machine for MamMachine {
                 // §27 / MAM-10: increment the consecutive-failure count, and
                 // publish KeepAliveDegraded exactly once on the rising edge
                 // when the count crosses the configured threshold.
+                let crossed = self.bump_keep_alive_failures();
+                if crossed {
+                    publish.push(MamPublish::KeepAliveDegraded {
+                        consecutive_failures: self.consecutive_status_failures,
+                        last_reason: reason,
+                    });
+                }
+                Outcome {
+                    actions: vec![MamAction::ScheduleTimer {
+                        timer: MamTimer::StatusRetry,
+                        after: self.config.status_retry,
+                    }],
+                    publish,
+                }
+            }
+            // §28 / MAM-11: a transport-level failure publishes
+            // `Unreachable` on the Connectability topic — distinct from
+            // `Unavailable` (which means "MAM responded but is broken for me
+            // right now") and from `NotConnectable` (which means "MAM
+            // responded and reports my client is unreachable from their
+            // side").  Same StatusRetry + keep-alive-counter handling as the
+            // other retryable failures.
+            MamEvent::Unreachable { reason } => {
+                let mut publish = vec![MamPublish::Unreachable {
+                    reason: reason.clone(),
+                }];
                 let crossed = self.bump_keep_alive_failures();
                 if crossed {
                     publish.push(MamPublish::KeepAliveDegraded {
@@ -1165,6 +1208,7 @@ mod prop_tests {
                     }
                 }),
             any::<String>().prop_map(|reason| MamEvent::StatusFailed { reason }),
+            any::<String>().prop_map(|reason| MamEvent::Unreachable { reason }),
             Just(MamEvent::SeedboxUpdated),
             any::<String>().prop_map(|reason| MamEvent::SeedboxUpdateFailed { reason }),
             (0u64..=3600).prop_map(|s| MamEvent::RateLimited {
@@ -1202,14 +1246,17 @@ mod prop_tests {
         }
 
         // MAM-2 (Guarantee F): a retryable failure schedules exactly one backed-off
-        // StatusRetry and publishes Unavailable — never an immediate retry action.
-        // §27: failures may also publish KeepAliveDegraded on the rising edge,
-        // but the action shape and the Unavailable publish are unchanged.
+        // StatusRetry and publishes its kind-specific publish — never an
+        // immediate retry action.  §27 adds: failures may also publish
+        // KeepAliveDegraded on the rising edge.  §28 generalises this from
+        // "always Unavailable" to "Unavailable for Auth/Status/Seedbox
+        // failures, Unreachable for transport-level Unreachable".
         #[test]
         fn failures_schedule_one_status_retry(
             mut machine in any_mam_machine(),
             reason in any::<String>(),
         ) {
+            // Auth/Status/Seedbox failures publish Unavailable.
             for event in [
                 MamEvent::AuthFailed { reason: reason.clone() },
                 MamEvent::StatusFailed { reason: reason.clone() },
@@ -1229,6 +1276,33 @@ mod prop_tests {
                     .count();
                 prop_assert_eq!(unavailable_count, 1);
             }
+            // §28 / MAM-11: Unreachable publishes Unreachable, not Unavailable,
+            // but still schedules exactly one StatusRetry.
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::Unreachable { reason }),
+            );
+            prop_assert_eq!(out.actions.len(), 1);
+            let is_status_retry = matches!(
+                out.actions[0],
+                MamAction::ScheduleTimer { timer: MamTimer::StatusRetry, .. }
+            );
+            prop_assert!(is_status_retry);
+            let unreachable_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::Unreachable { .. }))
+                .count();
+            prop_assert_eq!(unreachable_count, 1);
+            let unavailable_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::Unavailable { .. }))
+                .count();
+            prop_assert_eq!(
+                unavailable_count, 0,
+                "Unreachable must not also publish Unavailable"
+            );
         }
 
         // MAM-7 [safety] (upload-health alert — §26):
@@ -1395,6 +1469,74 @@ mod prop_tests {
                 prop_assert_eq!(degraded_count, 0,
                     "no KeepAliveDegraded outside the rising-edge transition");
             }
+        }
+
+        // MAM-11 [safety] (§28): the `Unreachable` event publishes exactly
+        // one `MamPublish::Unreachable { reason }` and zero
+        // `MamPublish::NotConnectable`.  Total invariant — `NotConnectable`
+        // belongs strictly to `StatusFetched { connectable: false }`.
+        #[test]
+        fn unreachable_event_publishes_unreachable_not_notconnectable(
+            mut machine in any_mam_machine(),
+            reason in any::<String>(),
+        ) {
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::Unreachable { reason: reason.clone() }),
+            );
+            let unreachable_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::Unreachable { .. }))
+                .count();
+            let notconnectable_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::NotConnectable { .. }))
+                .count();
+            prop_assert_eq!(unreachable_count, 1);
+            prop_assert_eq!(notconnectable_count, 0);
+            if let Some(MamPublish::Unreachable { reason: r }) = out
+                .publish
+                .iter()
+                .find(|p| matches!(p, MamPublish::Unreachable { .. }))
+            {
+                prop_assert_eq!(r, &reason);
+            }
+        }
+
+        // MAM-12 [safety] (§28): `StatusFetched { connectable: false }`
+        // publishes exactly one `NotConnectable` and zero `Unreachable`.
+        // Total invariant — `Unreachable` belongs strictly to the
+        // `Unreachable` event.
+        #[test]
+        fn status_fetched_not_connectable_publishes_notconnectable_not_unreachable(
+            mut machine in any_mam_machine(),
+            seedbox_port in proptest::option::of(any_vpn_port()),
+            ratio in any_ratio(),
+            upload_credit_bytes in any_buffer(),
+        ) {
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::StatusFetched {
+                    connectable: false,
+                    seedbox_port,
+                    ratio,
+                    upload_credit_bytes,
+                }),
+            );
+            let notconnectable_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::NotConnectable { .. }))
+                .count();
+            let unreachable_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::Unreachable { .. }))
+                .count();
+            prop_assert_eq!(notconnectable_count, 1);
+            prop_assert_eq!(unreachable_count, 0);
         }
     }
 }

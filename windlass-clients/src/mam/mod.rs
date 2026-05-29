@@ -17,6 +17,34 @@ struct DynamicSeedboxResponse {
     ip: String,
 }
 
+/// §28: typed failure surface for `fetch_mam_status`.
+///
+/// Distinguishes the three retryable failure shapes:
+///
+/// - `Unreachable` — we could not reach a MAM endpoint at all (DNS, TCP
+///   connect, TLS, request timeout).  Routed to `MamEvent::Unreachable` by
+///   the shell, which the MAM core publishes as `MamPublish::Unreachable`
+///   on the `Connectability` topic.  Distinct from `NotConnectable`, which
+///   means MAM was reachable but reports our client is not connectable.
+/// - `LocalRateLimit` — the operator's own 400 ms inter-request guard
+///   triggered before the request was sent.  Distinct from MAM's
+///   server-side rate limit (which would arrive as a non-`Ok` HTTP
+///   response).  Mapped to `MamEvent::RateLimited` today.
+/// - `StatusFailed` — MAM was reached but responded with an unrecognised
+///   HTTP status, a non-`Success` body, or an unparseable response.
+///   Mapped to `MamEvent::StatusFailed`.
+///
+/// Previously `fetch_mam_status` returned `Option<MamStatusResult>` and the
+/// `None` branch was a lie: it collapsed network errors, parse failures, and
+/// the local rate-limit guard into the same shape, so the shell could not
+/// tell a DNS failure from a 429.  This enum is the honest surface.
+#[derive(Debug, Clone)]
+pub enum MamFetchError {
+    Unreachable(String),
+    LocalRateLimit,
+    StatusFailed(String),
+}
+
 /// Typed result of a successful MAM status fetch.
 ///
 /// **JSON field choices (§26):**
@@ -157,31 +185,35 @@ impl MamClient {
     /// Fetches the MAM status and returns a typed result carrying connectivity,
     /// upload ratio, and upload-credit proxy (§26).
     ///
-    /// Returns `None` if the request was rate-limited (caller should emit
-    /// `MamEvent::RateLimited`).  Returns a `MamStatusResult` with
-    /// `connectable: false`, `ratio: 0.0`, and `upload_credit_bytes: 0` on any
-    /// network or parse error (fail-closed per §26).
+    /// §28: returns a typed `Result` distinguishing the three retryable
+    /// failure shapes.  See [`MamFetchError`] for the meaning of each.
+    ///
+    /// # Errors
+    /// - `MamFetchError::LocalRateLimit` — the operator's 400 ms inter-request
+    ///   guard triggered.
+    /// - `MamFetchError::Unreachable` — the request failed at the transport
+    ///   layer (DNS, TCP connect, TLS, request timeout).
+    /// - `MamFetchError::StatusFailed` — MAM responded but the response was
+    ///   not a successful, well-formed status payload.
     ///
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
-    pub async fn fetch_mam_status(&self) -> Option<MamStatusResult> {
+    pub async fn fetch_mam_status(&self) -> Result<MamStatusResult, MamFetchError> {
         if !self.check_rate_limit() {
-            return None;
+            return Err(MamFetchError::LocalRateLimit);
         }
         let current = self.session.lock().unwrap().clone();
         let (result, new_session) = self.do_fetch_mam_status(&current).await;
         if let Some(rotated) = new_session {
             *self.session.lock().unwrap() = rotated;
         }
-        Some(result)
+        result
     }
 
-    async fn do_fetch_mam_status(&self, session: &str) -> (MamStatusResult, Option<String>) {
-        let fail_closed = MamStatusResult {
-            connectable: false,
-            ratio: 0.0,
-            upload_credit_bytes: 0,
-        };
+    async fn do_fetch_mam_status(
+        &self,
+        session: &str,
+    ) -> (Result<MamStatusResult, MamFetchError>, Option<String>) {
         let result = self
             .client
             .get(&self.load_url)
@@ -191,15 +223,20 @@ impl MamClient {
         let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
         match result {
             Err(e) => {
-                warn!("MAM status fetch request failed: {e}");
-                (fail_closed, new_session)
+                let reason = e.to_string();
+                warn!("MAM status fetch request failed: {reason}");
+                (Err(MamFetchError::Unreachable(reason)), new_session)
             }
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    warn!("MAM status fetch HTTP {}", status);
-                    self.emit_http(&self.load_url, status.as_u16(), "");
-                    return (fail_closed, new_session);
+                    let code = status.as_u16();
+                    warn!("MAM status fetch HTTP {status}");
+                    self.emit_http(&self.load_url, code, "");
+                    return (
+                        Err(MamFetchError::StatusFailed(format!("HTTP {code}"))),
+                        new_session,
+                    );
                 }
                 let raw = resp.text().await.unwrap_or_default();
                 self.emit_http(&self.load_url, status.as_u16(), &raw);
@@ -217,7 +254,7 @@ impl MamClient {
                             debug!("MAM unsat: {}/{}", unsat.count, unsat.limit);
                         }
                         (
-                            MamStatusResult {
+                            Ok(MamStatusResult {
                                 connectable,
                                 ratio: body.ratio,
                                 // seedbonus is a non-negative floating-point point balance.
@@ -227,13 +264,14 @@ impl MamClient {
                                 // intentional (bytes-equivalent proxy per §26 docs).
                                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                                 upload_credit_bytes: body.seedbonus.max(0.0).floor() as u64,
-                            },
+                            }),
                             new_session,
                         )
                     }
                     Err(e) => {
+                        let reason = format!("parse: {e}");
                         warn!("MAM status fetch parse failed: {e}");
-                        (fail_closed, new_session)
+                        (Err(MamFetchError::StatusFailed(reason)), new_session)
                     }
                 }
             }
@@ -293,9 +331,19 @@ impl MamClient {
         let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
 
         match result {
+            // §28: a transport-level failure means we did not reach MAM at
+            // all.  Previously this returned `MamUpdateSuccess` (an obvious
+            // lie that made the operator look healthy during DNS/TLS outages).
             Err(e) => {
-                warn!("MAM seedbox update request failed: {e}");
-                (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
+                let reason = e.to_string();
+                warn!("MAM seedbox update request failed: {reason}");
+                (
+                    Event::MamUnreachable {
+                        at: Utc::now(),
+                        reason,
+                    },
+                    new_session,
+                )
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -855,8 +903,10 @@ mod tests {
     // ── do_update_seedbox error paths ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn update_seedbox_network_error_returns_success() {
-        // Network failure is treated as "no-op success" — the Core retries on a wakeup.
+    async fn update_seedbox_network_error_returns_unreachable() {
+        // §28: a transport-level failure now surfaces as Event::MamUnreachable
+        // (was Event::MamUpdateSuccess — the historical lie that masked DNS
+        // and TLS failures as healthy operator state).
         let mam = MamClient::new(
             None,
             "my_session".into(),
@@ -867,7 +917,7 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
+        assert!(matches!(event, Event::MamUnreachable { .. }));
     }
 
     #[tokio::test]

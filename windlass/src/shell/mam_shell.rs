@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use windlass_clients::mam::MamClient;
+use windlass_clients::mam::{MamClient, MamFetchError};
 use windlass_machine::{Shell, Timed};
 use windlass_mam_core::{MamAction, MamEvent};
 
@@ -25,17 +25,24 @@ impl Shell for MamShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    let event = client.fetch_mam_status().await.map_or_else(
-                        || MamEvent::RateLimited {
-                            retry_after: Duration::from_secs(1),
-                        },
-                        |status| MamEvent::StatusFetched {
+                    // §28: map the typed MamFetchError surface to the right
+                    // MAM-core event so the machine can publish Unreachable
+                    // vs StatusFailed vs RateLimited distinctly.
+                    let event = match client.fetch_mam_status().await {
+                        Ok(status) => MamEvent::StatusFetched {
                             connectable: status.connectable,
                             seedbox_port: None,
                             ratio: status.ratio,
                             upload_credit_bytes: status.upload_credit_bytes,
                         },
-                    );
+                        Err(MamFetchError::Unreachable(reason)) => MamEvent::Unreachable { reason },
+                        Err(MamFetchError::LocalRateLimit) => MamEvent::RateLimited {
+                            retry_after: Duration::from_secs(1),
+                        },
+                        Err(MamFetchError::StatusFailed(reason)) => {
+                            MamEvent::StatusFailed { reason }
+                        }
+                    };
                     let _ = tx.send(Timed::now(event));
                 });
             }
@@ -56,6 +63,12 @@ impl Shell for MamShell {
                             MamEvent::SeedboxUpdateFailed {
                                 reason: format!("ASN mismatch for {}", ip.0),
                             }
+                        }
+                        // §28: a transport-level failure now arrives as a
+                        // distinct event instead of being silently mapped to
+                        // SeedboxUpdateFailed.
+                        windlass_core::events::Event::MamUnreachable { reason, .. } => {
+                            MamEvent::Unreachable { reason }
                         }
                         other => MamEvent::SeedboxUpdateFailed {
                             reason: format!("unexpected response: {other:?}"),

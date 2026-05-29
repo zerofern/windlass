@@ -76,10 +76,17 @@ impl SystemState {
                 status: MamStatus::Connectable,
                 ..
             } => self.on_mam_connectable(),
+            // §28: legacy bridge treats `Event::MamUnreachable` (new) the
+            // same as the existing `MamStatus::NotConnectable | Unreachable`
+            // bucket — degraded MAM service.  The new per-system MAM core
+            // (which is retiring this legacy path per story 32) handles the
+            // distinct Unreachable vs NotConnectable signals properly via
+            // MAM-11/12 and DOM-15/16.
             Event::MamStatusObserved {
                 status: MamStatus::NotConnectable | MamStatus::Unreachable,
                 ..
-            } => self.on_mam_not_connectable(),
+            }
+            | Event::MamUnreachable { .. } => self.on_mam_not_connectable(),
 
             // ── Monitoring ────────────────────────────────────────────────────
             Event::DiskSpaceObserved { space, .. } => handlers::on_disk_space_observed(space),

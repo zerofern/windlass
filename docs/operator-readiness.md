@@ -943,7 +943,7 @@ my MAM-derived state never goes silently stale.
 
 ## Story: Distinguish MAM Unreachable From NotConnectable
 
-Status: To Do
+Status: Done
 
 ### Problem
 

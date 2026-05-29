@@ -80,8 +80,10 @@ declines to take risky autonomous actions rather than guessing.
 *Why it matters:* guessing under uncertainty is how an automated operator does
 damage a human never would.
 
-*Enforced by:* QBIT-1 (no authenticated action without a cookie), MAM
-not-connectable / unreachable handling (§28), the fail-closed admission predicate
+*Enforced by:* QBIT-1 (no authenticated action without a cookie), MAM-11/12
+(distinct `Unreachable` vs `NotConnectable` signals so the operator UI
+distinguishes a transient network blip from a real port problem) + DOM-15
+(Warning alert on real not-connectable), the fail-closed admission predicate
 and unknown-MAM-health gate (§29, not yet implemented).
 
 ### Guarantee E — Never silently lose the user's data or history
@@ -277,7 +279,9 @@ are never produced by the parse boundary.
 - **MAM-1 [safety]** `SeedboxPortReady { port }` is only published for a port
   equal to `desired_seedbox_port` (or when none is desired). → C
 - **MAM-2 [safety]** Every retryable failure schedules exactly one `StatusRetry`
-  and publishes `Unavailable`; no immediate-retry action. → F
+  and publishes its kind-specific publish; no immediate-retry action.
+  `AuthFailed`/`StatusFailed`/`SeedboxUpdateFailed` publish `Unavailable`;
+  the §28 `Unreachable` event publishes `Unreachable` (see MAM-11). → F
 - **MAM-3 [safety]** `RateLimited { retry_after }` schedules one
   `RateLimitExpired` timer for `retry_after` and publishes `RateLimited`; the
   machine backs off. → F
@@ -335,6 +339,31 @@ routed on a new `MamTopic::KeepAlive`.
   `last_reason` carries this event's reason. `StatusFetched` resets the
   counter to `0`, re-arming the rising edge. Total invariant. → F
 
+### MAM machine additions (§28)
+
+§28 distinguishes a transport-level failure (couldn't reach MAM at all) from
+a real connectivity problem (MAM responded and reports our client is
+unreachable). The previous `Unavailable` bucket collapsed these together.
+
+New event: `MamEvent::Unreachable { reason }` — emitted by the shell when
+`MamFetchError::Unreachable` or `Event::MamUnreachable` arrives from the MAM
+client (DNS, TCP connect, TLS, request timeout).
+
+New publish: `MamPublish::Unreachable { reason }` on
+`MamTopic::Connectability` (alongside `Connectable` and `NotConnectable`).
+
+- **MAM-11 [safety]** *(unreachable distinction — §28)* `MamEvent::Unreachable
+  { reason }` publishes exactly one `MamPublish::Unreachable { reason }` and
+  zero `MamPublish::NotConnectable`. Same `StatusRetry` scheduling as other
+  retryable failures and same keep-alive counter contribution (MAM-10).
+  Total invariant. → D, F
+- **MAM-12 [safety]** *(not-connectable scope — §28)* `MamEvent::StatusFetched
+  { connectable: false, .. }` publishes exactly one
+  `MamPublish::NotConnectable { reason }` and zero
+  `MamPublish::Unreachable`. The `Unreachable` publish belongs strictly to
+  the `Unreachable` event, not to a successful status read that reports
+  unconnectable. Total invariant. → D
+
 ### DB machine (`DbMachine`)
 
 Stateless.
@@ -387,6 +416,22 @@ Option<VpnPort> }`.
   `Db(RecordAlert { priority: Warning, title: "MAM heartbeat failing" })` action and
   exactly one `Activity` publish. The alert body carries both the consecutive-failure
   count and the most recent failure reason. Total invariant. → F
+
+### Domain machine additions (§28)
+
+- **DOM-15 [safety]** *(not-connectable alert routing — §28)*
+  `Mam(NotConnectable { reason })` emits exactly one
+  `Db(RecordAlert { priority: Warning, title: "MAM reports not connectable" })`,
+  one `Db(RecordActivity { source: Mam, action: "mam_not_connectable" })`,
+  one `SystemState` snapshot publish, and one `Activity` publish. The MAM
+  `ServiceStatus` is set to `Degraded`. The alert body carries the failure
+  reason. Total invariant. → A, D
+- **DOM-16 [safety]** *(unreachable routing — §28)* `Mam(Unreachable { reason })`
+  emits zero `RecordAlert` and exactly one `Activity` publish, plus a
+  `SystemState` snapshot. The MAM `ServiceStatus` is set to `Degraded`.
+  No alert is emitted because the signal is transient — the §27
+  `KeepAliveDegraded` path handles persistent unreachability. Total
+  invariant. → F
 
 ### Deferred (§26)
 

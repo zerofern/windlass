@@ -121,6 +121,15 @@ pub enum Event {
         at: DateTime<Utc>,
     },
 
+    /// §28: a MAM HTTP request failed at the network/transport layer
+    /// (DNS, TCP connect, TLS, request timeout — anything that means we did
+    /// not reach a MAM endpoint).  Distinct from `MamAsnMismatch` or other
+    /// "MAM responded with a refusal" failures, which mean we did reach MAM.
+    MamUnreachable {
+        at: DateTime<Utc>,
+        reason: String,
+    },
+
     /// Full torrent details received from qBittorrent, converted to core types by the shell.
     QbitTorrentDetailsReceived {
         at: DateTime<Utc>,
@@ -183,6 +192,7 @@ impl Event {
             | Self::QbitPortSyncFailed { at, .. }
             | Self::MamUpdateSuccess { at }
             | Self::MamAsnMismatch { at, .. }
+            | Self::MamUnreachable { at, .. }
             | Self::MamStatusObserved { at, .. }
             | Self::DiskSpaceObserved { at, .. }
             | Self::NewTorrentsObserved { at, .. }

@@ -230,11 +230,27 @@ impl Machine for WindlassMachine {
                 self.state.mam = ServiceStatus::Ready;
                 self.publish_state()
             }
-            WindlassEvent::Mam(
-                MamPublish::Unavailable { reason } | MamPublish::NotConnectable { reason },
-            ) => {
+            // §28: Unavailable keeps the broad "MAM degraded" semantics —
+            // Activity log + ServiceStatus::Degraded, no alert.
+            WindlassEvent::Mam(MamPublish::Unavailable { reason }) => {
                 self.state.mam = ServiceStatus::Degraded;
                 self.publish_state_with_activity(reason)
+            }
+            // DOM-15 (§28): NotConnectable is now a real connectivity problem
+            // — MAM responded and told us our client is unreachable from
+            // their side.  Emit a Warning alert in addition to the
+            // Activity/Degraded path.
+            WindlassEvent::Mam(MamPublish::NotConnectable { reason }) => {
+                self.state.mam = ServiceStatus::Degraded;
+                self.on_mam_not_connectable(&reason)
+            }
+            // DOM-16 (§28): Unreachable is a transient transport failure
+            // (DNS, TCP, TLS, timeout).  Activity + ServiceStatus::Degraded
+            // only — no alert here.  Persistent unreachability already
+            // surfaces via the §27 KeepAliveDegraded path.
+            WindlassEvent::Mam(MamPublish::Unreachable { reason }) => {
+                self.state.mam = ServiceStatus::Degraded;
+                self.publish_state_with_activity(format!("MAM unreachable: {reason}"))
             }
             // DOM-13: UploadHealthDegraded → one RecordAlert(Warning) + one Activity publish.
             WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
@@ -504,6 +520,41 @@ impl WindlassMachine {
                 })),
             ],
             publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles the `NotConnectable` MAM publish (DOM-15 / §28).
+    ///
+    /// MAM responded to a status fetch and told us our client is unreachable
+    /// from their side — a real port/seedbox connectivity problem, not a
+    /// transient network blip.  Emits one `RecordAlert(Warning)` and one
+    /// Activity.  Distinct from `Unreachable` (transport failure, no alert)
+    /// and `Unavailable` (broad degradation, no alert).
+    fn on_mam_not_connectable(&self, reason: &str) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!("MAM reports the client as not connectable: {reason}");
+        let message = format!("MAM not connectable: {reason}");
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Warning,
+                    title: "MAM reports not connectable".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Mam,
+                    action: "mam_not_connectable".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+                self.snapshot_action(),
+            ],
+            publish: vec![
+                WindlassPublish::SystemState(self.state.clone()),
+                WindlassPublish::Activity { message },
+            ],
         }
     }
 
@@ -1215,6 +1266,122 @@ mod tests {
             panic!("expected RecordAlert(Warning)");
         }
     }
+
+    // ── DOM-15 / DOM-16: NotConnectable vs Unreachable routing (§28) ──────────
+
+    #[test]
+    fn not_connectable_emits_one_warning_alert_and_one_activity() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_mam_core::MamPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::NotConnectable {
+                reason: "port closed".to_string(),
+            }),
+        );
+
+        let warning_alert_count = out
+            .actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Warning,
+                        ..
+                    }))
+                )
+            })
+            .count();
+        assert_eq!(
+            warning_alert_count, 1,
+            "NotConnectable must emit exactly one RecordAlert(Warning)"
+        );
+
+        let activity_db_count = out
+            .actions
+            .iter()
+            .filter(|a| matches!(a, WindlassAction::Db(DbCommand::RecordActivity(_))))
+            .count();
+        assert_eq!(activity_db_count, 1, "must emit one RecordActivity");
+
+        let activity_publish_count = out
+            .publish
+            .iter()
+            .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+            .count();
+        assert_eq!(activity_publish_count, 1, "must publish one Activity");
+    }
+
+    #[test]
+    fn not_connectable_alert_title_and_body_include_reason() {
+        use windlass_db_core::DbCommand;
+        use windlass_mam_core::MamPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::NotConnectable {
+                reason: "blocked".to_string(),
+            }),
+        );
+
+        let alert = out.actions.iter().find_map(|a| {
+            if let WindlassAction::Db(DbCommand::RecordAlert(record)) = a {
+                Some(record)
+            } else {
+                None
+            }
+        });
+        let alert = alert.expect("must emit a RecordAlert");
+        assert_eq!(alert.priority, AlertPriority::Warning);
+        assert_eq!(alert.title, "MAM reports not connectable");
+        assert!(
+            alert.body.contains("blocked"),
+            "body should include the reason"
+        );
+    }
+
+    #[test]
+    fn unreachable_emits_activity_only_no_alert() {
+        use windlass_db_core::DbCommand;
+        use windlass_mam_core::MamPublish;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::Unreachable {
+                reason: "dns failed".to_string(),
+            }),
+        );
+
+        let alert_count = out
+            .actions
+            .iter()
+            .filter(|a| matches!(a, WindlassAction::Db(DbCommand::RecordAlert(_))))
+            .count();
+        assert_eq!(
+            alert_count, 0,
+            "Unreachable must NOT emit any RecordAlert (transient signal)"
+        );
+
+        let activity_count = out
+            .publish
+            .iter()
+            .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+            .count();
+        assert_eq!(
+            activity_count, 1,
+            "Unreachable must emit exactly one Activity publish"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1333,6 +1500,7 @@ mod prop_tests {
             proptest::option::of(any_vpn_port())
                 .prop_map(|seedbox_port| MamPublish::Connectable { seedbox_port }),
             any::<String>().prop_map(|reason| MamPublish::NotConnectable { reason }),
+            any::<String>().prop_map(|reason| MamPublish::Unreachable { reason }),
             any_vpn_port().prop_map(|port| MamPublish::SeedboxPortReady { port }),
             (any_ratio(), any_buffer(), any::<bool>(), any::<bool>()).prop_map(
                 |(ratio, upload_credit_bytes, ratio_ok, buffer_ok)| {
@@ -1688,6 +1856,81 @@ mod prop_tests {
                 activity_count,
                 1,
                 "KeepAliveDegraded must emit exactly one Activity publish"
+            );
+        }
+
+        // DOM-15 [safety] (§28): `Mam(NotConnectable)` emits exactly one
+        // `Db(RecordAlert{Warning})` + one Activity publish.  Total invariant.
+        #[test]
+        fn not_connectable_emits_one_warning_alert_and_one_activity(
+            mut machine in any_windlass_machine(),
+            reason in any::<String>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Mam(MamPublish::NotConnectable { reason })),
+            );
+
+            let warning_alert_count = out.actions.iter().filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Warning,
+                        ..
+                    }))
+                )
+            }).count();
+            prop_assert_eq!(
+                warning_alert_count,
+                1,
+                "NotConnectable must emit exactly one RecordAlert(Warning)"
+            );
+
+            let activity_count = out.publish.iter()
+                .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                .count();
+            prop_assert_eq!(
+                activity_count,
+                1,
+                "NotConnectable must emit exactly one Activity publish"
+            );
+        }
+
+        // DOM-16 [safety] (§28): `Mam(Unreachable)` emits zero RecordAlert
+        // + exactly one Activity publish.  Transient transport signal —
+        // alert escalation lives in the §27 KeepAliveDegraded path.
+        // Total invariant.
+        #[test]
+        fn unreachable_emits_activity_only_no_alert(
+            mut machine in any_windlass_machine(),
+            reason in any::<String>(),
+        ) {
+            use windlass_db_core::DbCommand;
+
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Mam(MamPublish::Unreachable { reason })),
+            );
+
+            let alert_count = out.actions.iter().filter(|a| {
+                matches!(a, WindlassAction::Db(DbCommand::RecordAlert(_)))
+            }).count();
+            prop_assert_eq!(
+                alert_count,
+                0,
+                "Unreachable must emit zero RecordAlert"
+            );
+
+            let activity_count = out.publish.iter()
+                .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                .count();
+            prop_assert_eq!(
+                activity_count,
+                1,
+                "Unreachable must emit exactly one Activity publish"
             );
         }
     }
