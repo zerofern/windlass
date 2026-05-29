@@ -153,6 +153,22 @@ impl Shell for QbitShell {
                     client.force_resume_torrent(&cookie, &hash).await;
                 });
             }
+            // §29 / DOM-17: the domain has authorised this add via the
+            // composite admission predicate.  TODO(librarian A1): fetch the
+            // .torrent bytes from MAM and call qBit's add-torrent API.  For
+            // now this is a no-op stub so the predicate path is exercisable
+            // without the MAM-fetch + qBit-add wiring.
+            QbitAction::AddTorrent {
+                cookie: _,
+                mam_id,
+                dl_url,
+            } => {
+                tracing::info!(
+                    "QbitAction::AddTorrent stub for mam_id={} dl_url={dl_url} \
+                     (librarian A1 will wire the real fetch+add)",
+                    mam_id.into_inner(),
+                );
+            }
             QbitAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {

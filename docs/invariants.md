@@ -417,6 +417,28 @@ Option<VpnPort> }`.
   exactly one `Activity` publish. The alert body carries both the consecutive-failure
   count and the most recent failure reason. Total invariant. → F
 
+### MAM machine additions (§29)
+
+- **MAM-13 [safety]** *(upload-health positive signal — §29)* `StatusFetched`
+  publishes exactly one `MamPublish::UploadHealthOk { ratio, upload_credit_bytes }`
+  iff `upload_health_ok(false)` is true, and zero otherwise.  Combined with
+  MAM-7, every `StatusFetched` publishes exactly one of
+  `{UploadHealthOk, UploadHealthDegraded}`.  Total invariant. → A
+
+### qBit machine additions (§29)
+
+- **QBIT-19 [safety]** *(quota positive signal — §29)* `TorrentsListed`
+  publishes exactly one `QbitPublish::UnsatisfiedQuotaOk { unsatisfied, limit }`
+  iff `config.unsatisfied_quota_limit > 0 && unsatisfied < limit.saturating_sub(5)`.
+  Counterpart to QBIT-17/18.  Total invariant. → A
+- **QBIT-20 [safety]** *(privacy positive signal — §29)* `PreferencesRead`
+  publishes exactly one `QbitPublish::PrivacyClean` iff none of DHT, PeX, LSD
+  is enabled, and zero otherwise.  Counterpart to QBIT-12.  Total invariant. → A
+- **QBIT-21 [safety]** *(add-torrent cookie gate — §29)* `QbitCommand::AddTorrent`
+  emits a `QbitAction::AddTorrent` only when `cookie == Some` — admission is
+  owned by the domain (DOM-17), but the per-machine QBIT-1 cookie gate still
+  applies. → C, D
+
 ### Domain machine additions (§28)
 
 - **DOM-15 [safety]** *(not-connectable alert routing — §28)*
@@ -433,19 +455,48 @@ Option<VpnPort> }`.
   `KeepAliveDegraded` path handles persistent unreachability. Total
   invariant. → F
 
-### Deferred (§26)
+### Domain machine additions (§29)
 
-The `AddTorrent` suppression invariant from the story 26 acceptance criteria —
-*`!candidate.freeleech && !upload_health_ok(false) ⇒ no Action::AddTorrent`* — is
-**deferred to story 29** (the composite admission gate), because `Action::AddTorrent`
-does not yet exist. Story 26 builds the state (`ratio`, `upload_credit_bytes`), the
-predicate (`upload_health_ok()`), and the alert path. Story 29 will consume
-`upload_health_ok()` as one gate of the fail-closed admission predicate:
+§29 introduces the composite fail-closed admission predicate and the single
+`WindlassCommand::TryAddTorrent` entry point.  The domain tracks an
+`AdmissionState` snapshot updated by the per-system positive publishes
+(MAM-13, QBIT-19, QBIT-20) and the existing negative publishes (MAM-7,
+QBIT-12, QBIT-17/18 plus the §28 connectability and §27 keep-alive signals
+that mark MAM unhealthy).
 
-```
-if !candidate.freeleech && !upload_health_ok(false)
-then no Action::AddTorrent   [to be enforced in story 29]
-```
+The candidate-side gates (`already-snatched`, `collection-skip` for
+`numfiles > 20`, `freeleech-window-fits`) live here and are consumed from
+the `DownloadCandidate` payload.  These three are the gates librarian-
+readiness A2 owns; §29 is their enforcement point.
+
+The VPN-IP-compliance gate (§30) is still unimplemented; the placeholder
+default is `Some(true)` so §29 can be exercised end-to-end.  §30 will replace
+this default and wire the real comparison.
+
+- **DOM-17 [safety]** *(composite admission, success — §29)*
+  `WindlassCommand::TryAddTorrent { candidate }` emits exactly one
+  `WindlassAction::Qbit(QbitCommand::AddTorrent)` iff every gate holds for
+  `(state, admission, candidate)`: `upload_health_ok` (bypassed for
+  freeleech), `!unsatisfied_quota_full`, `qbit_privacy_clean`,
+  `qbit_listen_port == forwarded_port`, `mam_healthy`,
+  `vpn_ip_compliant == Some(true)`, `!candidate.my_snatched`,
+  `candidate.numfiles <= 20`, `freeleech_window_fits(candidate)`. Total
+  invariant against fully-arbitrary admission state and candidate. → A
+- **DOM-18 [safety]** *(composite admission, contrapositive — §29)* If any
+  single gate fails, the handler emits zero `AddTorrent` actions for the
+  candidate. Total invariant. → A
+- **DOM-19 [safety]** *(blocked-admission activity log — §29)* When at least
+  one gate fails, the handler emits exactly one `WindlassPublish::Activity`
+  whose message names the failing gates in canonical order.  No silent
+  drops.  Total invariant. → A, G
+
+### Resolved (§26 → §29)
+
+The story-26 `AddTorrent` suppression invariant
+(*`!candidate.freeleech && !upload_health_ok(false) ⇒ no Action::AddTorrent`*) is
+**now enforced** by DOM-17/18 as part of the composite admission predicate.
+The §29 implementation introduces `QbitAction::AddTorrent` and the predicate
+that consumes `upload_health_ok()` as one gate.
 
 ### Disk machine (`DiskMachine`)
 
@@ -556,19 +607,14 @@ predicate).
   exactly one `Db(RecordAlert { priority: Warning, title: "Approaching quota
   limit" })` and exactly one `Activity` publish. Total invariant. → A
 
-### Deferred (§25)
+### Resolved (§25 → §29)
 
-The `AddTorrent` suppression invariant originally described in the story 25
-acceptance criteria — *`unsatisfied_count >= class_limit ⇒ no
-Action::AddTorrent`* — is **deferred to story 29** (the composite admission
-gate), because `Action::AddTorrent` does not yet exist. Story 25 builds the
-state, the alert path, and exposes the `unsatisfied_quota_full()` predicate
-that story 29 will consume as one gate of the fail-closed admission predicate:
-
-```
-if unsatisfied_count >= class_limit
-then no Action::AddTorrent   [to be enforced in story 29]
-```
+The story-25 `AddTorrent` suppression invariant
+(*`unsatisfied_count >= class_limit ⇒ no Action::AddTorrent`*) is **now
+enforced** by DOM-17/18 as one gate of the composite admission predicate.
+The §29 implementation consumes `unsatisfied_quota_full` from the admission
+state which is in turn flipped by QBIT-17 (Critical) and cleared by QBIT-19
+(Ok).
 
 ### Deferred rank classes and structural invariants (§22)
 

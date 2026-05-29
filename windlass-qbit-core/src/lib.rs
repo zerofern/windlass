@@ -50,6 +50,14 @@ pub enum QbitCommand {
     /// completed+high-rating+long-since-listened, unstarted+low-AI-score)
     /// require librarian data outside operator scope and are deferred.
     EvictOneForDiskPressure,
+    /// §29: add a torrent to qBittorrent.  Only emitted by the qBit core
+    /// when the domain's composite admission predicate authorises the add
+    /// (DOM-17).  The qBit core does not re-check the gates — admission is
+    /// owned by the domain.  qBit core simply requires a cookie (QBIT-1).
+    AddTorrent {
+        mam_id: MamTorrentId,
+        dl_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +158,14 @@ pub enum QbitAction {
         cookie: AuthCookie,
         hash: TorrentHash,
     },
+    /// §29: add a torrent to qBittorrent.  Only emitted in response to a
+    /// `QbitCommand::AddTorrent` that arrives via the domain's admission
+    /// gate.  Requires a cookie (QBIT-1).
+    AddTorrent {
+        cookie: AuthCookie,
+        mam_id: MamTorrentId,
+        dl_url: String,
+    },
     ScheduleTimer {
         timer: QbitTimer,
         after: Duration,
@@ -204,6 +220,20 @@ pub enum QbitPublish {
         unsatisfied: u32,
         limit: u32,
     },
+    /// §29: positive counterpart to `UnsatisfiedQuotaCritical/Approaching`.
+    /// Published on every `TorrentsListed` where the unsatisfied count is
+    /// strictly below `limit - 5` (i.e. outside both the critical and the
+    /// approaching bands).  Gives the domain a rising-edge positive signal
+    /// for the admission-gate state.
+    UnsatisfiedQuotaOk {
+        unsatisfied: u32,
+        limit: u32,
+    },
+    /// §29: positive counterpart to `BannedPrivacySettingsObserved`.
+    /// Published on every `PreferencesRead` where DHT, `PeX`, and LSD are
+    /// all `false`.  Gives the domain a rising-edge positive signal for the
+    /// admission-gate state.
+    PrivacyClean,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,11 +257,11 @@ impl HasTopic<QbitTopic> for QbitPublish {
             // `DeadTorrentRemoved` is routed on `Torrents` so the domain's
             // existing `Torrents` subscription delivers it without a new topic.
             Self::TorrentsUpdated { .. } | Self::DeadTorrentRemoved { .. } => QbitTopic::Torrents,
-            Self::BannedPrivacySettingsObserved { .. } => QbitTopic::Privacy,
+            Self::BannedPrivacySettingsObserved { .. } | Self::PrivacyClean => QbitTopic::Privacy,
             Self::QueueOrchestrated { .. } => QbitTopic::Queue,
-            Self::UnsatisfiedQuotaCritical { .. } | Self::UnsatisfiedQuotaApproaching { .. } => {
-                QbitTopic::Quota
-            }
+            Self::UnsatisfiedQuotaCritical { .. }
+            | Self::UnsatisfiedQuotaApproaching { .. }
+            | Self::UnsatisfiedQuotaOk { .. } => QbitTopic::Quota,
         }
     }
 }
@@ -507,8 +537,10 @@ impl QbitMachine {
     }
 
     /// Evaluate the unsatisfied-quota state and return any quota publish (§25 /
-    /// QBIT-17/18).  Returns an empty vec when the gate is disabled (`limit == 0`)
-    /// or when the count is safely below the warning threshold.
+    /// QBIT-17/18).  Returns an empty vec when the gate is disabled (`limit == 0`).
+    /// §29: also returns the positive `UnsatisfiedQuotaOk` publish when the count
+    /// is safely below the warning threshold, so the domain admission state has a
+    /// rising-edge positive signal.
     fn quota_publish(&self) -> Vec<QbitPublish> {
         let limit = self.config.unsatisfied_quota_limit;
         if limit == 0 {
@@ -520,7 +552,7 @@ impl QbitMachine {
         } else if unsatisfied >= limit.saturating_sub(5) {
             vec![QbitPublish::UnsatisfiedQuotaApproaching { unsatisfied, limit }]
         } else {
-            Vec::new()
+            vec![QbitPublish::UnsatisfiedQuotaOk { unsatisfied, limit }]
         }
     }
 }
@@ -612,12 +644,16 @@ impl Machine for QbitMachine {
 
                 // QBIT-12: if any banned privacy setting is enabled, disable
                 // them and publish the observation.  The disable action is only
-                // emitted when a cookie is present (QBIT-1).
+                // emitted when a cookie is present (QBIT-1).  §29: when all
+                // three are clean, publish the positive `PrivacyClean` signal
+                // so the domain admission state can clear.
                 if self.privacy.any_banned() {
                     if let Some(cookie) = self.cookie.clone() {
                         actions.push(QbitAction::DisableBannedPrivacySettings { cookie });
                     }
                     publish.push(QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd });
+                } else {
+                    publish.push(QbitPublish::PrivacyClean);
                 }
 
                 Outcome { actions, publish }
@@ -776,6 +812,18 @@ impl Machine for QbitMachine {
             }
             QbitCommand::EvictOneForDiskPressure => {
                 return Self::outcome(self.evict_one_for_disk_pressure(), QbitResponse::Accepted);
+            }
+            // §29 / QBIT-1: only emit `AddTorrent` when a cookie is present.
+            // Admission is owned by the domain (DOM-17) — the qBit core does
+            // not re-check the §29 gates here.
+            QbitCommand::AddTorrent { mam_id, dl_url } => {
+                self.cookie.clone().map_or_else(Vec::new, |cookie| {
+                    vec![QbitAction::AddTorrent {
+                        cookie,
+                        mam_id,
+                        dl_url,
+                    }]
+                })
             }
         };
         Self::outcome(actions, QbitResponse::Accepted)
@@ -949,7 +997,9 @@ mod tests {
                 port: desired,
             }]
         );
-        assert!(out.publish.is_empty());
+        // §29: PreferencesRead with all three privacy settings off now
+        // emits a positive PrivacyClean publish.
+        assert_eq!(out.publish, vec![QbitPublish::PrivacyClean]);
     }
 
     #[test]
@@ -2835,6 +2885,83 @@ mod prop_tests {
                 limit,
                 new_unsatisfied,
             );
+        }
+
+        // QBIT-19 [safety] (§29): positive counterpart to QBIT-17/18.
+        // `TorrentsListed` publishes `UnsatisfiedQuotaOk { unsatisfied, limit }`
+        // iff `limit > 0 && unsatisfied < limit.saturating_sub(5)` — i.e. the
+        // count is strictly below the approaching band.  Total invariant.
+        #[test]
+        fn quota_ok_iff_limit_positive_and_count_below_warning_range(
+            mut machine in any_qbit_machine(),
+            torrents in prop::collection::vec(any_torrent_record(), 0..5),
+        ) {
+            let limit = machine.config.unsatisfied_quota_limit;
+            let hnr_seed_time = machine.config.hnr_seed_time;
+
+            let new_unsatisfied = u32::try_from(
+                torrents.iter().filter(|t| {
+                    t.downloaded_bytes > 0 && t.seed_time < hnr_seed_time
+                }).count()
+            ).unwrap_or(u32::MAX);
+
+            let event = QbitEvent::TorrentsListed { torrents };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            let ok_count = out.publish.iter().filter(|p| {
+                matches!(p, QbitPublish::UnsatisfiedQuotaOk { .. })
+            }).count();
+
+            let below_warning = limit > 0 && new_unsatisfied < limit.saturating_sub(5);
+            let expected_ok = if below_warning { 1 } else { 0 };
+            prop_assert_eq!(
+                ok_count,
+                expected_ok,
+                "QBIT-19: UnsatisfiedQuotaOk count mismatch (limit={}, unsatisfied={})",
+                limit,
+                new_unsatisfied,
+            );
+        }
+
+        // QBIT-20 [safety] (§29): positive counterpart to QBIT-12.
+        // `PreferencesRead` publishes exactly one `PrivacyClean` iff none of
+        // DHT/PeX/LSD is enabled, and zero otherwise.  Total invariant.
+        #[test]
+        fn privacy_clean_iff_all_three_off(
+            mut machine in any_qbit_machine(),
+            listen_port in proptest::option::of(any_vpn_port()),
+            dht in any::<bool>(),
+            pex in any::<bool>(),
+            lsd in any::<bool>(),
+            max_active_torrents in any::<u32>(),
+        ) {
+            let event = QbitEvent::PreferencesRead {
+                listen_port,
+                dht,
+                pex,
+                lsd,
+                max_active_torrents,
+            };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            let clean_count = out.publish.iter()
+                .filter(|p| matches!(p, QbitPublish::PrivacyClean))
+                .count();
+            let banned_count = out.publish.iter()
+                .filter(|p| matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. }))
+                .count();
+
+            if dht || pex || lsd {
+                prop_assert_eq!(clean_count, 0,
+                    "QBIT-20: PrivacyClean must not fire when any setting is on");
+                prop_assert_eq!(banned_count, 1,
+                    "QBIT-12: BannedPrivacySettingsObserved must fire when any setting is on");
+            } else {
+                prop_assert_eq!(clean_count, 1,
+                    "QBIT-20: PrivacyClean must fire when all three are off");
+                prop_assert_eq!(banned_count, 0,
+                    "QBIT-12: BannedPrivacySettingsObserved must not fire when all are off");
+            }
         }
     }
 }

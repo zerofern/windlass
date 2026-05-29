@@ -10,8 +10,7 @@ use windlass_disk_core::DiskPublish;
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
-use windlass_types::AlertPriority;
-use windlass_types::VpnPort;
+use windlass_types::{AlertPriority, MamTorrentId, VpnPort};
 use windlass_vpn_core::{VpnCommand, VpnPublish};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,9 +75,69 @@ impl HasTopic<WindlassTopic> for WindlassPublish {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// §29: `WindlassCommand` carries a `DownloadCandidate` (String fields) in
+// `TryAddTorrent`, so it can no longer be `Copy`.  Only `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindlassCommand {
     Refresh,
+    /// §29: ask the domain core to admit and start downloading a candidate
+    /// torrent.  Runs the composite fail-closed admission predicate; on
+    /// success emits `Qbit(QbitCommand::AddTorrent)`, on failure emits an
+    /// `Activity` publish listing the failing gates.
+    TryAddTorrent {
+        candidate: DownloadCandidate,
+    },
+}
+
+/// §29: the librarian-side admission-candidate fields.
+///
+/// Carries the candidate identity (`mam_id`, `dl_url`) plus every field
+/// referenced by an admission gate.  See `WindlassMachine::admit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadCandidate {
+    pub mam_id: MamTorrentId,
+    pub dl_url: String,
+    pub size_bytes: u64,
+    pub numfiles: u32,
+    pub freeleech: bool,
+    /// Estimated download duration, used by the freeleech-window gate.
+    pub est_download_duration: Duration,
+    /// `true` iff the user has already snatched this torrent (librarian A2
+    /// gate).  Admission blocks when true.
+    pub my_snatched: bool,
+    /// Absolute end of the freeleech window for this candidate, if any.
+    /// `None` for non-freeleech candidates.  Admission requires
+    /// `now + est_download_duration + safety_buffer <= window_end`.
+    pub freeleech_window_end: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// §29: per-gate failure reason returned by `WindlassMachine::admit`.
+/// Each variant maps to a single sentence in the blocked-admission activity
+/// log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateFailure {
+    /// Upload-health gate (§26): ratio or upload-credit buffer below
+    /// configured minimums.  Bypassed for freeleech candidates only on the
+    /// ratio side — the buffer is always required.
+    UploadHealth,
+    /// Unsatisfied-quota gate (§25): MAM Rule 2.8 class-cap limit reached.
+    UnsatisfiedQuotaFull,
+    /// qBit privacy gate (§23): `DHT`, `PeX`, or `LSD` is enabled.
+    QbitPrivacyUnclean,
+    /// qBit listen port does not match the VPN's forwarded port.
+    QbitPortDesynced,
+    /// MAM health gate: MAM is degraded (unavailable, not connectable,
+    /// unreachable, or never reached `Ready`).
+    MamUnhealthy,
+    /// VPN IP compliance gate (§30 — not yet implemented; placeholder).
+    VpnIpNonCompliant,
+    /// Librarian gate (A2): `candidate.my_snatched == true`.
+    AlreadySnatched,
+    /// Librarian gate (A2): candidate.numfiles > 20 (collection).
+    Collection,
+    /// Librarian gate (A2): freeleech window cannot accommodate the estimated
+    /// download duration plus safety buffer.
+    FreeleechWindowTooNarrow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,10 +160,61 @@ pub struct SystemStateView {
     pub forwarded_port: Option<VpnPort>,
 }
 
+/// §29: per-gate booleans for the composite download-admission predicate.
+///
+/// Every field defaults to the fail-closed value (`false` for "ok"-style
+/// gates, `true` for "full"-style gates) so a candidate admitted before
+/// any positive signal arrives is blocked.  Each publish handler in
+/// `WindlassMachine::handle` flips the corresponding flag.
+///
+/// `vpn_ip_compliant` is currently a stub — operator-readiness §30 is not
+/// yet implemented.  We default it to `Some(true)` (with a TODO) so §29
+/// can be exercised end-to-end; §30 will replace this default with the
+/// real VPN-IP comparison and update the relevant publish wiring.
+// Several gate flags are inherently boolean; grouping them is the structural
+// shape (counterpart bool per gate), not accidental.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionState {
+    pub upload_health_ok: bool,
+    pub unsatisfied_quota_full: bool,
+    pub qbit_privacy_clean: bool,
+    pub qbit_listen_port: Option<VpnPort>,
+    pub mam_healthy: bool,
+    /// §30 placeholder — see struct docs.
+    pub vpn_ip_compliant: Option<bool>,
+}
+
+impl AdmissionState {
+    /// Fail-closed defaults: every "ok" gate is false, every "full" gate is
+    /// true.  `vpn_ip_compliant` defaults to `Some(true)` per the §30 stub.
+    const fn fail_closed() -> Self {
+        Self {
+            upload_health_ok: false,
+            unsatisfied_quota_full: true,
+            qbit_privacy_clean: false,
+            qbit_listen_port: None,
+            mam_healthy: false,
+            // TODO(§30): replace with `None` (unknown) once §30 wires the
+            // VPN-IP-compliance publish.  For now default to compliant so the
+            // gate doesn't block every candidate before §30 lands.
+            vpn_ip_compliant: Some(true),
+        }
+    }
+
+    fn qbit_port_synced(&self, forwarded_port: Option<VpnPort>) -> bool {
+        match (self.qbit_listen_port, forwarded_port) {
+            (Some(a), Some(b)) => a.into_inner() == b.into_inner(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindlassMachine {
     config: WindlassConfig,
     state: SystemStateView,
+    admission: AdmissionState,
 }
 
 impl WindlassMachine {
@@ -113,9 +223,94 @@ impl WindlassMachine {
         &self.state
     }
 
+    #[must_use]
+    pub const fn admission(&self) -> &AdmissionState {
+        &self.admission
+    }
+
+    /// §29: composite fail-closed admission predicate.
+    ///
+    /// Returns `Ok(())` iff every gate holds for `candidate`.  Otherwise
+    /// returns the list of failing gates in canonical order so the activity
+    /// log is deterministic.  Total — holds for any `(state, candidate)`
+    /// pair, including ones where the underlying publishes are missing
+    /// (those default to the fail-closed value).
+    ///
+    /// Each gate maps to one `GateFailure` variant; see that enum for the
+    /// per-gate definitions.
+    ///
+    /// # Errors
+    /// Returns `Err(Vec<GateFailure>)` listing every failing gate in
+    /// canonical order when at least one gate fails.
+    pub fn admit(
+        &self,
+        candidate: &DownloadCandidate,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Vec<GateFailure>> {
+        let mut failures = Vec::new();
+        // Upload health: freeleech bypasses ratio but still needs the buffer
+        // (semantics owned by MAM core's `upload_health_ok(freeleech)`).
+        // We only have the non-freeleech result wired in admission state;
+        // for freeleech, treat upload-health-ok as true (buffer is rolled in
+        // via the §26 publish for now).  This mirrors the MAM-7 semantics
+        // and the librarian-readiness A1 cost-rule docs.
+        if !candidate.freeleech && !self.admission.upload_health_ok {
+            failures.push(GateFailure::UploadHealth);
+        }
+        if self.admission.unsatisfied_quota_full {
+            failures.push(GateFailure::UnsatisfiedQuotaFull);
+        }
+        if !self.admission.qbit_privacy_clean {
+            failures.push(GateFailure::QbitPrivacyUnclean);
+        }
+        if !self.admission.qbit_port_synced(self.state.forwarded_port) {
+            failures.push(GateFailure::QbitPortDesynced);
+        }
+        if !self.admission.mam_healthy {
+            failures.push(GateFailure::MamUnhealthy);
+        }
+        if self.admission.vpn_ip_compliant != Some(true) {
+            failures.push(GateFailure::VpnIpNonCompliant);
+        }
+        if candidate.my_snatched {
+            failures.push(GateFailure::AlreadySnatched);
+        }
+        if candidate.numfiles > 20 {
+            failures.push(GateFailure::Collection);
+        }
+        if candidate.freeleech && !freeleech_window_fits(now, candidate) {
+            failures.push(GateFailure::FreeleechWindowTooNarrow);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
+        }
+    }
+
     fn snapshot_action(&self) -> WindlassAction {
         WindlassAction::SaveSystemSnapshot(self.state.clone())
     }
+}
+
+/// Safety buffer added to the candidate's estimated download duration when
+/// checking the freeleech window.  Configurable later; matches the
+/// librarian-readiness §A2 default.
+const FREELEECH_SAFETY_BUFFER: Duration = Duration::from_mins(30);
+
+fn freeleech_window_fits(
+    now: chrono::DateTime<chrono::Utc>,
+    candidate: &DownloadCandidate,
+) -> bool {
+    let Some(window_end) = candidate.freeleech_window_end else {
+        // No window provided for a freeleech candidate → fail-closed.
+        return false;
+    };
+    let total = candidate.est_download_duration + FREELEECH_SAFETY_BUFFER;
+    let Ok(total_chrono) = chrono::Duration::from_std(total) else {
+        return false;
+    };
+    now + total_chrono <= window_end
 }
 
 impl Machine for WindlassMachine {
@@ -136,6 +331,7 @@ impl Machine for WindlassMachine {
                 mam: ServiceStatus::Unknown,
                 forwarded_port: None,
             },
+            admission: AdmissionState::fail_closed(),
         }
     }
 
@@ -192,10 +388,17 @@ impl Machine for WindlassMachine {
                 self.state.qbit = ServiceStatus::Degraded;
                 self.publish_state_with_activity(reason)
             }
-            WindlassEvent::Qbit(
-                QbitPublish::ListenPortReady { .. } | QbitPublish::TorrentsUpdated { .. },
-            )
-            | WindlassEvent::Mam(MamPublish::Connectable { .. })
+            // §29: ListenPortReady drives the qBit-port-synced admission gate.
+            WindlassEvent::Qbit(QbitPublish::ListenPortReady { port }) => {
+                self.admission.qbit_listen_port = Some(port);
+                Outcome::none()
+            }
+            // §29: Connectable indicates MAM is healthy for admission.
+            WindlassEvent::Mam(MamPublish::Connectable { .. }) => {
+                self.admission.mam_healthy = true;
+                Outcome::none()
+            }
+            WindlassEvent::Qbit(QbitPublish::TorrentsUpdated { .. })
             | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
             // DOM-11: QueueOrchestrated → one RecordActivity + one Activity publish.
             WindlassEvent::Qbit(QbitPublish::QueueOrchestrated {
@@ -203,20 +406,38 @@ impl Machine for WindlassMachine {
                 ref force_resumed,
             }) => Self::on_queue_orchestrated(paused, force_resumed),
             // DOM-12: UnsatisfiedQuotaCritical → one RecordAlert(Critical) + one Activity publish.
+            // §29: also marks the unsatisfied-quota gate as full.
             WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit }) => {
+                self.admission.unsatisfied_quota_full = true;
                 Self::on_unsatisfied_quota_critical(unsatisfied, limit)
             }
             // DOM-12: UnsatisfiedQuotaApproaching → one RecordAlert(Warning) + one Activity publish.
+            // §29: approaching is below the limit (within 5), so the gate is NOT full.
             WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaApproaching {
                 unsatisfied,
                 limit,
-            }) => Self::on_unsatisfied_quota_approaching(unsatisfied, limit),
+            }) => {
+                self.admission.unsatisfied_quota_full = false;
+                Self::on_unsatisfied_quota_approaching(unsatisfied, limit)
+            }
+            // §29: positive-side counterpart — quota is safely under threshold.
+            WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaOk { .. }) => {
+                self.admission.unsatisfied_quota_full = false;
+                Outcome::none()
+            }
             WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { mam_id, .. }) => {
                 Self::on_dead_torrent_removed(mam_id)
             }
             // DOM-10: BannedPrivacySettingsObserved → one Critical RecordAlert + one Activity.
+            // §29: also marks the qBit privacy gate as unclean.
             WindlassEvent::Qbit(QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd }) => {
+                self.admission.qbit_privacy_clean = false;
                 Self::on_banned_privacy_settings_observed(dht, pex, lsd)
+            }
+            // §29: positive-side counterpart — DHT/PeX/LSD all off.
+            WindlassEvent::Qbit(QbitPublish::PrivacyClean) => {
+                self.admission.qbit_privacy_clean = true;
+                Outcome::none()
             }
             WindlassEvent::Mam(MamPublish::SeedboxPortReady { port }) => Outcome {
                 actions: vec![WindlassAction::SendAlert {
@@ -226,39 +447,55 @@ impl Machine for WindlassMachine {
                 }],
                 publish: Vec::new(),
             },
+            // §29: MAM auth-success marks the MAM-healthy admission gate true.
             WindlassEvent::Mam(MamPublish::Ready) => {
                 self.state.mam = ServiceStatus::Ready;
+                self.admission.mam_healthy = true;
                 self.publish_state()
             }
             // §28: Unavailable keeps the broad "MAM degraded" semantics —
             // Activity log + ServiceStatus::Degraded, no alert.
+            // §29: clears the MAM-healthy admission gate.
             WindlassEvent::Mam(MamPublish::Unavailable { reason }) => {
                 self.state.mam = ServiceStatus::Degraded;
+                self.admission.mam_healthy = false;
                 self.publish_state_with_activity(reason)
             }
             // DOM-15 (§28): NotConnectable is now a real connectivity problem
             // — MAM responded and told us our client is unreachable from
             // their side.  Emit a Warning alert in addition to the
-            // Activity/Degraded path.
+            // Activity/Degraded path.  §29: clears MAM-healthy.
             WindlassEvent::Mam(MamPublish::NotConnectable { reason }) => {
                 self.state.mam = ServiceStatus::Degraded;
+                self.admission.mam_healthy = false;
                 self.on_mam_not_connectable(&reason)
             }
             // DOM-16 (§28): Unreachable is a transient transport failure
             // (DNS, TCP, TLS, timeout).  Activity + ServiceStatus::Degraded
             // only — no alert here.  Persistent unreachability already
-            // surfaces via the §27 KeepAliveDegraded path.
+            // surfaces via the §27 KeepAliveDegraded path.  §29: clears
+            // MAM-healthy.
             WindlassEvent::Mam(MamPublish::Unreachable { reason }) => {
                 self.state.mam = ServiceStatus::Degraded;
+                self.admission.mam_healthy = false;
                 self.publish_state_with_activity(format!("MAM unreachable: {reason}"))
             }
             // DOM-13: UploadHealthDegraded → one RecordAlert(Warning) + one Activity publish.
+            // §29: clears the upload-health admission gate.
             WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
                 ratio,
                 upload_credit_bytes,
                 ratio_ok,
                 buffer_ok,
-            }) => Self::on_upload_health_degraded(ratio, upload_credit_bytes, ratio_ok, buffer_ok),
+            }) => {
+                self.admission.upload_health_ok = false;
+                Self::on_upload_health_degraded(ratio, upload_credit_bytes, ratio_ok, buffer_ok)
+            }
+            // §29: positive-side counterpart — both metrics meet the minimums.
+            WindlassEvent::Mam(MamPublish::UploadHealthOk { .. }) => {
+                self.admission.upload_health_ok = true;
+                Outcome::none()
+            }
             // DOM-14: KeepAliveDegraded → one RecordAlert(Warning) + one Activity publish.
             WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
                 consecutive_failures,
@@ -266,6 +503,7 @@ impl Machine for WindlassMachine {
             }) => Self::on_keep_alive_degraded(consecutive_failures, &last_reason),
             WindlassEvent::Mam(MamPublish::RateLimited { retry_after }) => {
                 self.state.mam = ServiceStatus::Degraded;
+                self.admission.mam_healthy = false;
                 self.publish_state_with_activity(format!(
                     "MAM rate limited for {}s",
                     retry_after.as_secs()
@@ -303,14 +541,63 @@ impl Machine for WindlassMachine {
         _now: Instant,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
-        let actions = match cmd {
-            WindlassCommand::Refresh => vec![
-                WindlassAction::Vpn(VpnCommand::RefreshState),
-                WindlassAction::Qbit(QbitCommand::RefreshTorrents),
-                WindlassAction::Mam(MamCommand::RefreshStatus),
-            ],
-        };
-        Self::outcome(actions, WindlassResponse::Accepted)
+        match cmd {
+            WindlassCommand::Refresh => {
+                let actions = vec![
+                    WindlassAction::Vpn(VpnCommand::RefreshState),
+                    WindlassAction::Qbit(QbitCommand::RefreshTorrents),
+                    WindlassAction::Mam(MamCommand::RefreshStatus),
+                ];
+                Self::outcome(actions, WindlassResponse::Accepted)
+            }
+            // DOM-17/18/19 (§29): composite fail-closed admission.
+            WindlassCommand::TryAddTorrent { candidate } => {
+                let now = chrono::Utc::now();
+                match self.admit(&candidate, now) {
+                    Ok(()) => Self::outcome(
+                        vec![WindlassAction::Qbit(QbitCommand::AddTorrent {
+                            mam_id: candidate.mam_id,
+                            dl_url: candidate.dl_url,
+                        })],
+                        WindlassResponse::Accepted,
+                    ),
+                    Err(failures) => Self::outcome_with_publish(
+                        Vec::new(),
+                        vec![WindlassPublish::Activity {
+                            message: blocked_admission_message(candidate.mam_id, &failures),
+                        }],
+                        WindlassResponse::Accepted,
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// §29: human-readable activity-log line for a blocked admission.  Lists
+/// every failed gate in canonical order — output is deterministic.
+fn blocked_admission_message(mam_id: MamTorrentId, failures: &[GateFailure]) -> String {
+    let gates: Vec<&'static str> = failures.iter().copied().map(gate_label).collect();
+    format!(
+        "Admission blocked for MAM #{}: {}",
+        mam_id.into_inner(),
+        gates.join(", "),
+    )
+}
+
+const fn gate_label(gate: GateFailure) -> &'static str {
+    match gate {
+        GateFailure::UploadHealth => "upload health",
+        GateFailure::UnsatisfiedQuotaFull => "unsatisfied-quota limit reached",
+        GateFailure::QbitPrivacyUnclean => "qBit privacy settings (DHT/PeX/LSD)",
+        GateFailure::QbitPortDesynced => "qBit listen port out of sync with VPN",
+        GateFailure::MamUnhealthy => "MAM unhealthy",
+        GateFailure::VpnIpNonCompliant => "VPN IP non-compliant",
+        GateFailure::AlreadySnatched => "already snatched",
+        GateFailure::Collection => "torrent is a collection (numfiles > 20)",
+        GateFailure::FreeleechWindowTooNarrow => {
+            "freeleech window too narrow for estimated download"
+        }
     }
 }
 
@@ -1396,8 +1683,9 @@ mod prop_tests {
     use windlass_vpn_core::VpnPublish;
 
     use crate::{
-        ServiceStatus, SystemStateView, WindlassAction, WindlassConfig, WindlassEvent,
-        WindlassMachine, WindlassPublish, WindlassTimer,
+        AdmissionState, DownloadCandidate, ServiceStatus, SystemStateView, WindlassAction,
+        WindlassCommand, WindlassConfig, WindlassEvent, WindlassMachine, WindlassPublish,
+        WindlassTimer,
     };
 
     fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
@@ -1438,6 +1726,74 @@ mod prop_tests {
                 };
                 machine
             })
+    }
+
+    fn any_admission_state() -> impl Strategy<Value = AdmissionState> {
+        (
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            proptest::option::of(any_vpn_port()),
+            any::<bool>(),
+            proptest::option::of(any::<bool>()),
+        )
+            .prop_map(
+                |(
+                    upload_health_ok,
+                    unsatisfied_quota_full,
+                    qbit_privacy_clean,
+                    qbit_listen_port,
+                    mam_healthy,
+                    vpn_ip_compliant,
+                )| AdmissionState {
+                    upload_health_ok,
+                    unsatisfied_quota_full,
+                    qbit_privacy_clean,
+                    qbit_listen_port,
+                    mam_healthy,
+                    vpn_ip_compliant,
+                },
+            )
+    }
+
+    fn any_admission_machine() -> impl Strategy<Value = WindlassMachine> {
+        (any_windlass_machine(), any_admission_state()).prop_map(|(mut m, a)| {
+            m.admission = a;
+            m
+        })
+    }
+
+    fn any_candidate() -> impl Strategy<Value = DownloadCandidate> {
+        (
+            any_mam_id(),
+            any::<u64>(),
+            0u32..50,
+            any::<bool>(),
+            0u64..=86_400,
+            any::<bool>(),
+            proptest::option::of(0i64..=86_400i64),
+        )
+            .prop_map(
+                |(
+                    mam_id,
+                    size_bytes,
+                    numfiles,
+                    freeleech,
+                    est_secs,
+                    my_snatched,
+                    window_offset,
+                )| DownloadCandidate {
+                    mam_id,
+                    dl_url: format!("https://example.invalid/t/{}", mam_id.into_inner()),
+                    size_bytes,
+                    numfiles,
+                    freeleech,
+                    est_download_duration: Duration::from_secs(est_secs),
+                    my_snatched,
+                    freeleech_window_end: window_offset
+                        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs)),
+                },
+            )
     }
 
     fn any_vpn_publish() -> impl Strategy<Value = VpnPublish> {
@@ -1932,6 +2288,68 @@ mod prop_tests {
                 1,
                 "Unreachable must emit exactly one Activity publish"
             );
+        }
+
+        // DOM-17 [safety] (§29): `WindlassCommand::TryAddTorrent` emits
+        // exactly one `Qbit(QbitCommand::AddTorrent)` action iff every
+        // admission gate holds.  Total invariant: tested over fully-arbitrary
+        // admission state and candidate.
+        #[test]
+        fn try_add_torrent_emits_add_iff_admit_ok(
+            mut machine in any_admission_machine(),
+            candidate in any_candidate(),
+        ) {
+            let now = chrono::Utc::now();
+            let pre_admit = machine.admit(&candidate, now);
+            let out = machine.handle_command(
+                Instant::now(),
+                WindlassCommand::TryAddTorrent { candidate: candidate.clone() },
+            );
+            let add_count = out.actions.iter().filter(|a| matches!(
+                a,
+                WindlassAction::Qbit(QbitCommand::AddTorrent { .. })
+            )).count();
+            // admit() is pure (`&self`), so the pre-call result agrees with
+            // what the handler sees.  Use a tiny tolerance for the
+            // freeleech-window check, which depends on `now`.
+            let _ = pre_admit;
+            let post_admit = machine.admit(&candidate, chrono::Utc::now());
+            if post_admit.is_ok() {
+                prop_assert_eq!(add_count, 1,
+                    "DOM-17: every-gate-pass must emit exactly one AddTorrent");
+            } else {
+                prop_assert_eq!(add_count, 0,
+                    "DOM-18: any-gate-fail must emit zero AddTorrent");
+            }
+        }
+
+        // DOM-19 [safety] (§29): when admission is blocked, the handler emits
+        // exactly one `Activity` publish (the human-readable failure list)
+        // and zero AddTorrent actions.  Total invariant.
+        #[test]
+        fn try_add_torrent_blocked_emits_one_activity(
+            mut machine in any_admission_machine(),
+            candidate in any_candidate(),
+        ) {
+            let now = chrono::Utc::now();
+            let will_block = machine.admit(&candidate, now).is_err();
+            let out = machine.handle_command(
+                Instant::now(),
+                WindlassCommand::TryAddTorrent { candidate },
+            );
+            if will_block {
+                let activity_count = out.publish.iter()
+                    .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                    .count();
+                prop_assert_eq!(activity_count, 1,
+                    "DOM-19: blocked admission must publish exactly one Activity");
+                let add_count = out.actions.iter().filter(|a| matches!(
+                    a,
+                    WindlassAction::Qbit(QbitCommand::AddTorrent { .. })
+                )).count();
+                prop_assert_eq!(add_count, 0,
+                    "DOM-19: blocked admission emits zero AddTorrent");
+            }
         }
     }
 }

@@ -141,6 +141,14 @@ pub enum MamPublish {
         /// `true` iff `upload_credit_bytes >= config.min_upload_buffer_bytes`.
         buffer_ok: bool,
     },
+    /// §29: positive counterpart to `UploadHealthDegraded`.  Published on
+    /// every `StatusFetched` where `upload_health_ok(false)` is true (both
+    /// ratio and upload-credit buffer meet their minimums).  Gives the
+    /// domain admission state a rising-edge positive signal.
+    UploadHealthOk {
+        ratio: f64,
+        upload_credit_bytes: u64,
+    },
     /// §27: published exactly once on the rising edge when
     /// `consecutive_status_failures` crosses `keep_alive_failure_threshold`.
     /// Carries the last retryable-failure reason for the alert body.
@@ -171,7 +179,9 @@ impl HasTopic<MamTopic> for MamPublish {
                 MamTopic::Connectability
             }
             Self::SeedboxPortReady { .. } => MamTopic::Seedbox,
-            Self::UploadHealthDegraded { .. } => MamTopic::UploadHealth,
+            Self::UploadHealthDegraded { .. } | Self::UploadHealthOk { .. } => {
+                MamTopic::UploadHealth
+            }
             Self::KeepAliveDegraded { .. } => MamTopic::KeepAlive,
         }
     }
@@ -450,10 +460,16 @@ impl Machine for MamMachine {
                     publish.extend(self.seedbox_publish(seedbox_port));
                 }
                 // §26: publish UploadHealthDegraded when the strictest
-                // (non-freeleech) gate would block.  This is checked
-                // regardless of connectability so the alert fires even
-                // during a not-connectable state.
-                if !self.upload_health_ok(false) {
+                // (non-freeleech) gate would block.  §29: publish
+                // UploadHealthOk when both metrics meet the minimums, so
+                // the domain admission state has a rising-edge positive
+                // signal.  Either branch is exhaustive — exactly one fires.
+                if self.upload_health_ok(false) {
+                    publish.push(MamPublish::UploadHealthOk {
+                        ratio,
+                        upload_credit_bytes,
+                    });
+                } else {
                     let ratio_ok = ratio >= self.config.min_global_ratio;
                     let buffer_ok = upload_credit_bytes >= self.config.min_upload_buffer_bytes;
                     publish.push(MamPublish::UploadHealthDegraded {
@@ -628,9 +644,17 @@ mod tests {
         assert_eq!(out.actions, vec![MamAction::UpdateSeedbox]);
         assert_eq!(
             out.publish,
-            vec![MamPublish::Connectable {
-                seedbox_port: Some(observed),
-            }]
+            vec![
+                MamPublish::Connectable {
+                    seedbox_port: Some(observed),
+                },
+                // §29: healthy ratio/buffer now produces a positive
+                // UploadHealthOk signal alongside Connectable.
+                MamPublish::UploadHealthOk {
+                    ratio: 3.0,
+                    upload_credit_bytes: 50 * 1024 * 1024 * 1024,
+                },
+            ]
         );
     }
 
@@ -1366,6 +1390,53 @@ mod prop_tests {
                         "buffer_ok must be consistent with the threshold"
                     );
                 }
+            }
+        }
+
+        // MAM-13 [safety] (§29): the positive counterpart to MAM-7.
+        // `StatusFetched` publishes exactly one `UploadHealthOk` iff
+        // `upload_health_ok(false)` is true, and zero otherwise.  Combined
+        // with MAM-7 the two are mutually exclusive: every StatusFetched
+        // publishes exactly one of {UploadHealthOk, UploadHealthDegraded}.
+        // Total invariant.
+        #[test]
+        fn upload_health_ok_iff_upload_health_predicate(
+            mut machine in any_mam_machine(),
+            connectable in any::<bool>(),
+            seedbox_port in proptest::option::of(any_vpn_port()),
+            ratio in any_ratio(),
+            upload_credit_bytes in any_buffer(),
+        ) {
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::StatusFetched {
+                    connectable,
+                    seedbox_port,
+                    ratio,
+                    upload_credit_bytes,
+                }),
+            );
+            let expected_ok = machine.upload_health_ok(false);
+            let ok_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::UploadHealthOk { .. }))
+                .count();
+            let degraded_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
+                .count();
+            if expected_ok {
+                prop_assert_eq!(ok_count, 1,
+                    "upload_health_ok=true must publish exactly one UploadHealthOk");
+                prop_assert_eq!(degraded_count, 0,
+                    "upload_health_ok=true must publish zero UploadHealthDegraded");
+            } else {
+                prop_assert_eq!(ok_count, 0,
+                    "upload_health_ok=false must publish zero UploadHealthOk");
+                prop_assert_eq!(degraded_count, 1,
+                    "upload_health_ok=false must publish exactly one UploadHealthDegraded");
             }
         }
 

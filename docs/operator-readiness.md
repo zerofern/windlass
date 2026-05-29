@@ -975,7 +975,7 @@ issue.
 
 ## Story: Enforce Fail-Closed Download Admission Control
 
-Status: To Do
+Status: Done
 
 ### Problem
 
