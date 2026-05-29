@@ -13,6 +13,13 @@ use windlass_types::VpnPort;
 /// the conventionally understood meaning of "25 GB" in torrent-tracker contexts.
 pub const DEFAULT_MIN_UPLOAD_BUFFER_BYTES: u64 = 25 * 1024 * 1024 * 1024;
 
+/// Default keep-alive interval (§27).  Matches Mousehole's default check
+/// cadence (5 minutes).
+pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Default consecutive-failure threshold for `KeepAliveDegraded` (§27).
+pub const DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MamConfig {
     pub status_retry: Duration,
@@ -24,6 +31,14 @@ pub struct MamConfig {
     /// (§7.4 spec: freeleech does not spend ratio, but upload health still matters).
     /// Default: 25 GiB (`DEFAULT_MIN_UPLOAD_BUFFER_BYTES`).
     pub min_upload_buffer_bytes: u64,
+    /// Recurring `FetchStatus` cadence that keeps the MAM account alive
+    /// (§27, MAM Rule 1.6).  Default: 300 s
+    /// (`DEFAULT_KEEP_ALIVE_INTERVAL`, matches Mousehole).
+    pub keep_alive_interval: Duration,
+    /// Consecutive retryable failures required to publish
+    /// `KeepAliveDegraded` (§27).  `0` disables the alert.
+    /// Default: `3` (`DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD`).
+    pub keep_alive_failure_threshold: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +52,8 @@ pub enum MamCommand {
 pub enum MamTimer {
     StatusRetry,
     RateLimitExpired,
+    /// §27: self-perpetuating heartbeat that drives recurring `FetchStatus`.
+    KeepAlive,
 }
 
 // `MamEvent` cannot derive `Eq` because `StatusFetched` carries `ratio: f64`,
@@ -109,6 +126,13 @@ pub enum MamPublish {
         /// `true` iff `upload_credit_bytes >= config.min_upload_buffer_bytes`.
         buffer_ok: bool,
     },
+    /// §27: published exactly once on the rising edge when
+    /// `consecutive_status_failures` crosses `keep_alive_failure_threshold`.
+    /// Carries the last retryable-failure reason for the alert body.
+    KeepAliveDegraded {
+        consecutive_failures: u32,
+        last_reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +142,8 @@ pub enum MamTopic {
     Seedbox,
     /// Upload-health alerts (§26).
     UploadHealth,
+    /// Keep-alive heartbeat degradation alerts (§27).
+    KeepAlive,
 }
 
 impl HasTopic<MamTopic> for MamPublish {
@@ -129,6 +155,7 @@ impl HasTopic<MamTopic> for MamPublish {
             Self::Connectable { .. } | Self::NotConnectable { .. } => MamTopic::Connectability,
             Self::SeedboxPortReady { .. } => MamTopic::Seedbox,
             Self::UploadHealthDegraded { .. } => MamTopic::UploadHealth,
+            Self::KeepAliveDegraded { .. } => MamTopic::KeepAlive,
         }
     }
 }
@@ -152,6 +179,14 @@ pub struct MamMachine {
     /// Last observed upload-credit proxy in bytes-equivalent (§26).
     /// Initialised to `0` (fail-closed).
     upload_credit_bytes: u64,
+    /// §27: `true` once the `KeepAlive` self-perpetuating chain has been
+    /// started.  Guards against a duplicate chain being launched by a second
+    /// `AuthSucceeded` (MAM-8).
+    keep_alive_scheduled: bool,
+    /// §27: consecutive retryable-failure count.  Incremented by every
+    /// `AuthFailed`/`StatusFailed`/`SeedboxUpdateFailed`; reset by
+    /// `StatusFetched`.
+    consecutive_status_failures: u32,
 }
 
 impl MamMachine {
@@ -175,6 +210,34 @@ impl MamMachine {
     #[must_use]
     pub const fn upload_credit_bytes(&self) -> u64 {
         self.upload_credit_bytes
+    }
+
+    /// Returns the current consecutive retryable-failure count (§27).
+    #[must_use]
+    pub const fn consecutive_status_failures(&self) -> u32 {
+        self.consecutive_status_failures
+    }
+
+    /// Returns `true` once the `KeepAlive` chain has been started (§27).
+    #[must_use]
+    pub const fn keep_alive_scheduled(&self) -> bool {
+        self.keep_alive_scheduled
+    }
+
+    /// Increments the consecutive-failure count, returning `true` iff this
+    /// bump crossed `keep_alive_failure_threshold` from below — the
+    /// rising-edge predicate behind MAM-10.  When the threshold is `0` the
+    /// gate is disabled and this always returns `false`.
+    const fn bump_keep_alive_failures(&mut self) -> bool {
+        let threshold = self.config.keep_alive_failure_threshold;
+        if threshold == 0 {
+            self.consecutive_status_failures = self.consecutive_status_failures.saturating_add(1);
+            return false;
+        }
+        let before = self.consecutive_status_failures;
+        let after = before.saturating_add(1);
+        self.consecutive_status_failures = after;
+        before < threshold && after >= threshold
     }
 
     /// Returns `true` when the upload-health gate would allow a new download.
@@ -244,9 +307,14 @@ impl Machine for MamMachine {
             // values are observed (fail-closed per §26).
             ratio: 0.0,
             upload_credit_bytes: 0,
+            keep_alive_scheduled: false,
+            consecutive_status_failures: 0,
         }
     }
 
+    // Each event arm is a small, self-contained decision; the function is long
+    // because the event set is large, not because any single arm is complex.
+    #[allow(clippy::too_many_lines)]
     fn handle(
         &mut self,
         _now: Instant,
@@ -261,22 +329,60 @@ impl Machine for MamMachine {
                 actions: self.refresh_or_update_seedbox(),
                 publish: Vec::new(),
             },
+            // §27: the keep-alive timer always re-schedules itself before
+            // emitting the FetchStatus action, so a dropped result or shell
+            // error cannot kill the chain (MAM-9).
+            MamEvent::TimerFired(MamTimer::KeepAlive) => Outcome {
+                actions: vec![
+                    MamAction::FetchStatus,
+                    MamAction::ScheduleTimer {
+                        timer: MamTimer::KeepAlive,
+                        after: self.config.keep_alive_interval,
+                    },
+                ],
+                publish: Vec::new(),
+            },
             MamEvent::AuthSucceeded => {
                 self.authenticated = true;
+                let mut actions = vec![MamAction::FetchStatus];
+                // §27 / MAM-8: start the keep-alive chain at most once per
+                // machine lifetime, on the first AuthSucceeded.
+                if !self.keep_alive_scheduled {
+                    self.keep_alive_scheduled = true;
+                    actions.push(MamAction::ScheduleTimer {
+                        timer: MamTimer::KeepAlive,
+                        after: self.config.keep_alive_interval,
+                    });
+                }
                 Outcome {
-                    actions: vec![MamAction::FetchStatus],
+                    actions,
                     publish: vec![MamPublish::Ready],
                 }
             }
             MamEvent::AuthFailed { reason }
             | MamEvent::StatusFailed { reason }
-            | MamEvent::SeedboxUpdateFailed { reason } => Outcome {
-                actions: vec![MamAction::ScheduleTimer {
-                    timer: MamTimer::StatusRetry,
-                    after: self.config.status_retry,
-                }],
-                publish: vec![MamPublish::Unavailable { reason }],
-            },
+            | MamEvent::SeedboxUpdateFailed { reason } => {
+                let mut publish = vec![MamPublish::Unavailable {
+                    reason: reason.clone(),
+                }];
+                // §27 / MAM-10: increment the consecutive-failure count, and
+                // publish KeepAliveDegraded exactly once on the rising edge
+                // when the count crosses the configured threshold.
+                let crossed = self.bump_keep_alive_failures();
+                if crossed {
+                    publish.push(MamPublish::KeepAliveDegraded {
+                        consecutive_failures: self.consecutive_status_failures,
+                        last_reason: reason,
+                    });
+                }
+                Outcome {
+                    actions: vec![MamAction::ScheduleTimer {
+                        timer: MamTimer::StatusRetry,
+                        after: self.config.status_retry,
+                    }],
+                    publish,
+                }
+            }
             MamEvent::StatusFetched {
                 connectable,
                 seedbox_port,
@@ -286,6 +392,10 @@ impl Machine for MamMachine {
                 self.seedbox_port = seedbox_port;
                 self.ratio = ratio;
                 self.upload_credit_bytes = upload_credit_bytes;
+                // §27: a successful status read resets the consecutive-
+                // failure count.  After a future failure burst, the rising
+                // edge over the threshold republishes KeepAliveDegraded.
+                self.consecutive_status_failures = 0;
                 let mut publish = vec![if connectable {
                     MamPublish::Connectable { seedbox_port }
                 } else {
@@ -378,6 +488,8 @@ mod tests {
                 status_retry: Duration::from_secs(5),
                 min_global_ratio: 2.0,
                 min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
+                keep_alive_interval: Duration::from_secs(300),
+                keep_alive_failure_threshold: 3,
             },
             Instant::now(),
         )
@@ -394,8 +506,20 @@ mod tests {
         let out = handle(&mut machine, MamEvent::AuthSucceeded);
 
         assert!(machine.is_authenticated());
-        assert_eq!(out.actions, vec![MamAction::FetchStatus]);
+        // §27: AuthSucceeded triggers a status fetch *and* arms the
+        // self-perpetuating KeepAlive timer.
+        assert_eq!(
+            out.actions,
+            vec![
+                MamAction::FetchStatus,
+                MamAction::ScheduleTimer {
+                    timer: MamTimer::KeepAlive,
+                    after: Duration::from_secs(300),
+                },
+            ]
+        );
         assert_eq!(out.publish, vec![MamPublish::Ready]);
+        assert!(machine.keep_alive_scheduled());
     }
 
     #[test]
@@ -684,6 +808,254 @@ mod tests {
             assert!(!buffer_ok, "buffer_ok must be false");
         }
     }
+
+    // ── KeepAlive heartbeat tests (§27) ───────────────────────────────────────
+
+    #[test]
+    fn keep_alive_timer_emits_fetch_and_reschedules() {
+        let mut machine = machine();
+        // Arm the chain via AuthSucceeded; consume its actions.
+        let _ = handle(&mut machine, MamEvent::AuthSucceeded);
+
+        let out = handle(&mut machine, MamEvent::TimerFired(MamTimer::KeepAlive));
+
+        assert_eq!(
+            out.actions,
+            vec![
+                MamAction::FetchStatus,
+                MamAction::ScheduleTimer {
+                    timer: MamTimer::KeepAlive,
+                    after: Duration::from_secs(300),
+                },
+            ]
+        );
+        assert!(out.publish.is_empty());
+    }
+
+    #[test]
+    fn second_auth_success_does_not_arm_second_keep_alive_chain() {
+        let mut machine = machine();
+
+        let first = handle(&mut machine, MamEvent::AuthSucceeded);
+        assert_eq!(
+            first
+                .actions
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    MamAction::ScheduleTimer {
+                        timer: MamTimer::KeepAlive,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "first AuthSucceeded must arm KeepAlive"
+        );
+
+        let second = handle(&mut machine, MamEvent::AuthSucceeded);
+        assert_eq!(
+            second
+                .actions
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    MamAction::ScheduleTimer {
+                        timer: MamTimer::KeepAlive,
+                        ..
+                    }
+                ))
+                .count(),
+            0,
+            "second AuthSucceeded must NOT arm a second KeepAlive chain"
+        );
+    }
+
+    #[test]
+    fn keep_alive_degraded_fires_on_third_consecutive_failure_only() {
+        let mut machine = machine();
+
+        let first = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "boom".to_string(),
+            },
+        );
+        let second = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "boom".to_string(),
+            },
+        );
+        let third = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "third".to_string(),
+            },
+        );
+        let fourth = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "fourth".to_string(),
+            },
+        );
+
+        let degraded_count = |out: &Outcome<MamAction, MamPublish>| {
+            out.publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
+                .count()
+        };
+
+        assert_eq!(degraded_count(&first), 0);
+        assert_eq!(degraded_count(&second), 0);
+        assert_eq!(
+            degraded_count(&third),
+            1,
+            "rising edge fires exactly once on threshold-crossing failure"
+        );
+        assert_eq!(
+            degraded_count(&fourth),
+            0,
+            "no re-publish while still over threshold"
+        );
+
+        if let Some(MamPublish::KeepAliveDegraded {
+            consecutive_failures,
+            last_reason,
+        }) = third
+            .publish
+            .iter()
+            .find(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
+        {
+            assert_eq!(*consecutive_failures, 3);
+            assert_eq!(last_reason, "third");
+        } else {
+            panic!("third failure must publish KeepAliveDegraded");
+        }
+    }
+
+    #[test]
+    fn status_fetched_resets_failure_counter_and_rearms_rising_edge() {
+        let mut machine = machine();
+        for _ in 0..3 {
+            let _ = handle(
+                &mut machine,
+                MamEvent::StatusFailed {
+                    reason: "x".to_string(),
+                },
+            );
+        }
+        assert!(machine.consecutive_status_failures() >= 3);
+
+        let _ = handle(
+            &mut machine,
+            MamEvent::StatusFetched {
+                connectable: true,
+                seedbox_port: None,
+                ratio: 3.0,
+                upload_credit_bytes: 50 * 1024 * 1024 * 1024,
+            },
+        );
+        assert_eq!(machine.consecutive_status_failures(), 0);
+
+        // Burn down to the threshold again; rising edge must fire a second time.
+        let _ = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "y".to_string(),
+            },
+        );
+        let _ = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "y".to_string(),
+            },
+        );
+        let third = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "y".to_string(),
+            },
+        );
+        let degraded_count = third
+            .publish
+            .iter()
+            .filter(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
+            .count();
+        assert_eq!(
+            degraded_count, 1,
+            "rising edge must fire again after a reset"
+        );
+    }
+
+    #[test]
+    fn all_three_failure_kinds_count_toward_keep_alive_threshold() {
+        let mut machine = machine();
+        let _ = handle(
+            &mut machine,
+            MamEvent::AuthFailed {
+                reason: "auth".to_string(),
+            },
+        );
+        let _ = handle(
+            &mut machine,
+            MamEvent::SeedboxUpdateFailed {
+                reason: "seedbox".to_string(),
+            },
+        );
+        let third = handle(
+            &mut machine,
+            MamEvent::StatusFailed {
+                reason: "status".to_string(),
+            },
+        );
+
+        let degraded = third
+            .publish
+            .iter()
+            .find(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }));
+        assert!(
+            degraded.is_some(),
+            "mixed failures must accumulate toward threshold"
+        );
+        if let Some(MamPublish::KeepAliveDegraded {
+            consecutive_failures,
+            last_reason,
+        }) = degraded
+        {
+            assert_eq!(*consecutive_failures, 3);
+            assert_eq!(last_reason, "status");
+        }
+    }
+
+    #[test]
+    fn keep_alive_threshold_zero_disables_degraded_publish() {
+        let mut machine = MamMachine::new(
+            MamConfig {
+                status_retry: Duration::from_secs(5),
+                min_global_ratio: 2.0,
+                min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
+                keep_alive_interval: Duration::from_secs(300),
+                keep_alive_failure_threshold: 0,
+            },
+            Instant::now(),
+        );
+        for _ in 0..10 {
+            let out = handle(
+                &mut machine,
+                MamEvent::StatusFailed {
+                    reason: "x".to_string(),
+                },
+            );
+            assert!(
+                !out.publish
+                    .iter()
+                    .any(|p| matches!(p, MamPublish::KeepAliveDegraded { .. })),
+                "threshold=0 must never publish KeepAliveDegraded"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -712,13 +1084,28 @@ mod prop_tests {
     }
 
     fn any_mam_config() -> impl Strategy<Value = MamConfig> {
-        (any_ratio(), any_buffer()).prop_map(|(min_global_ratio, min_upload_buffer_bytes)| {
-            MamConfig {
-                status_retry: Duration::from_secs(5),
-                min_global_ratio,
-                min_upload_buffer_bytes,
-            }
-        })
+        (
+            any_ratio(),
+            any_buffer(),
+            // 1..=600s keep-alive cadence covers the realistic range without
+            // making the timer constant explode in failure-burst proptests.
+            1u64..=600u64,
+            0u32..=10u32,
+        )
+            .prop_map(
+                |(
+                    min_global_ratio,
+                    min_upload_buffer_bytes,
+                    keep_alive_secs,
+                    keep_alive_failure_threshold,
+                )| MamConfig {
+                    status_retry: Duration::from_secs(5),
+                    min_global_ratio,
+                    min_upload_buffer_bytes,
+                    keep_alive_interval: Duration::from_secs(keep_alive_secs),
+                    keep_alive_failure_threshold,
+                },
+            )
     }
 
     // Fully-arbitrary state, including unreachable field combinations: the tested
@@ -731,6 +1118,8 @@ mod prop_tests {
             proptest::option::of(any_vpn_port()),
             any_ratio(),
             any_buffer(),
+            any::<bool>(),
+            0u32..=20u32,
         )
             .prop_map(
                 |(
@@ -740,6 +1129,8 @@ mod prop_tests {
                     desired_seedbox_port,
                     ratio,
                     upload_credit_bytes,
+                    keep_alive_scheduled,
+                    consecutive_status_failures,
                 )| {
                     let mut machine = MamMachine::new(config, Instant::now());
                     machine.authenticated = authenticated;
@@ -747,6 +1138,8 @@ mod prop_tests {
                     machine.desired_seedbox_port = desired_seedbox_port;
                     machine.ratio = ratio;
                     machine.upload_credit_bytes = upload_credit_bytes;
+                    machine.keep_alive_scheduled = keep_alive_scheduled;
+                    machine.consecutive_status_failures = consecutive_status_failures;
                     machine
                 },
             )
@@ -779,6 +1172,7 @@ mod prop_tests {
             }),
             Just(MamEvent::TimerFired(MamTimer::StatusRetry)),
             Just(MamEvent::TimerFired(MamTimer::RateLimitExpired)),
+            Just(MamEvent::TimerFired(MamTimer::KeepAlive)),
         ]
     }
 
@@ -809,6 +1203,8 @@ mod prop_tests {
 
         // MAM-2 (Guarantee F): a retryable failure schedules exactly one backed-off
         // StatusRetry and publishes Unavailable — never an immediate retry action.
+        // §27: failures may also publish KeepAliveDegraded on the rising edge,
+        // but the action shape and the Unavailable publish are unchanged.
         #[test]
         fn failures_schedule_one_status_retry(
             mut machine in any_mam_machine(),
@@ -817,7 +1213,7 @@ mod prop_tests {
             for event in [
                 MamEvent::AuthFailed { reason: reason.clone() },
                 MamEvent::StatusFailed { reason: reason.clone() },
-                MamEvent::SeedboxUpdateFailed { reason },
+                MamEvent::SeedboxUpdateFailed { reason: reason.clone() },
             ] {
                 let out = machine.handle(Instant::now(), Timed::now(event));
                 prop_assert_eq!(out.actions.len(), 1);
@@ -826,9 +1222,12 @@ mod prop_tests {
                     MamAction::ScheduleTimer { timer: MamTimer::StatusRetry, .. }
                 );
                 prop_assert!(is_status_retry);
-                prop_assert_eq!(out.publish.len(), 1);
-                let is_unavailable = matches!(out.publish[0], MamPublish::Unavailable { .. });
-                prop_assert!(is_unavailable);
+                let unavailable_count = out
+                    .publish
+                    .iter()
+                    .filter(|p| matches!(p, MamPublish::Unavailable { .. }))
+                    .count();
+                prop_assert_eq!(unavailable_count, 1);
             }
         }
 
@@ -893,6 +1292,108 @@ mod prop_tests {
                         "buffer_ok must be consistent with the threshold"
                     );
                 }
+            }
+        }
+
+        // MAM-8 [safety] (§27): AuthSucceeded schedules KeepAlive at most once
+        // per machine lifetime.  Repeated AuthSucceeded events never produce a
+        // second KeepAlive ScheduleTimer.  Tested against a machine whose
+        // keep_alive_scheduled flag is randomly true or false.
+        #[test]
+        fn keep_alive_chain_starts_at_most_once(mut machine in any_mam_machine()) {
+            let was_scheduled = machine.keep_alive_scheduled();
+            let out = machine.handle(Instant::now(), Timed::now(MamEvent::AuthSucceeded));
+            let scheduled = out
+                .actions
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    MamAction::ScheduleTimer { timer: MamTimer::KeepAlive, .. }
+                ))
+                .count();
+            if was_scheduled {
+                prop_assert_eq!(scheduled, 0,
+                    "no second KeepAlive ScheduleTimer when chain already armed");
+            } else {
+                prop_assert_eq!(scheduled, 1,
+                    "AuthSucceeded must arm KeepAlive exactly once");
+            }
+            // After handling AuthSucceeded the chain is always considered armed.
+            prop_assert!(machine.keep_alive_scheduled());
+        }
+
+        // MAM-9 [liveness] (§27): TimerFired(KeepAlive) always emits exactly
+        // one FetchStatus action and exactly one KeepAlive re-schedule action,
+        // for any machine state.  The chain cannot die from a single handler
+        // step.
+        #[test]
+        fn keep_alive_timer_always_reschedules(mut machine in any_mam_machine()) {
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(MamEvent::TimerFired(MamTimer::KeepAlive)),
+            );
+            let fetch_count = out
+                .actions
+                .iter()
+                .filter(|a| matches!(a, MamAction::FetchStatus))
+                .count();
+            let reschedule_count = out
+                .actions
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    MamAction::ScheduleTimer { timer: MamTimer::KeepAlive, .. }
+                ))
+                .count();
+            prop_assert_eq!(fetch_count, 1, "must emit exactly one FetchStatus");
+            prop_assert_eq!(reschedule_count, 1, "must re-arm KeepAlive exactly once");
+            prop_assert!(out.publish.is_empty(),
+                "KeepAlive timer is side-effect-free on publishes");
+        }
+
+        // MAM-10 [safety] (§27): a retryable failure publishes
+        // KeepAliveDegraded iff this event's bump crosses the configured
+        // threshold from below.  Total invariant — holds for any starting
+        // counter, including ones already over the threshold.
+        #[test]
+        fn keep_alive_degraded_publishes_iff_rising_edge(
+            mut machine in any_mam_machine(),
+            reason in any::<String>(),
+            which in 0u8..3,
+        ) {
+            let before = machine.consecutive_status_failures();
+            let threshold = machine.config.keep_alive_failure_threshold;
+
+            let event = match which {
+                0 => MamEvent::AuthFailed { reason: reason.clone() },
+                1 => MamEvent::StatusFailed { reason: reason.clone() },
+                _ => MamEvent::SeedboxUpdateFailed { reason: reason.clone() },
+            };
+            let out = machine.handle(Instant::now(), Timed::now(event));
+
+            let after = machine.consecutive_status_failures();
+            // The counter advances by exactly 1 unless saturated at u32::MAX.
+            prop_assert!(after == before.saturating_add(1));
+
+            let degraded_count = out
+                .publish
+                .iter()
+                .filter(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
+                .count();
+
+            let expected_publish = threshold > 0 && before < threshold && after >= threshold;
+            if expected_publish {
+                prop_assert_eq!(degraded_count, 1,
+                    "rising edge must publish exactly one KeepAliveDegraded");
+                if let Some(MamPublish::KeepAliveDegraded {
+                    consecutive_failures, last_reason,
+                }) = out.publish.iter().find(|p| matches!(p, MamPublish::KeepAliveDegraded { .. })) {
+                    prop_assert_eq!(*consecutive_failures, after);
+                    prop_assert_eq!(last_reason, &reason);
+                }
+            } else {
+                prop_assert_eq!(degraded_count, 0,
+                    "no KeepAliveDegraded outside the rising-edge transition");
             }
         }
     }

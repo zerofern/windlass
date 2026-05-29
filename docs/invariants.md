@@ -106,10 +106,11 @@ snapshots) never silently dies.
 makes outages worse.
 
 *Enforced by:* QBIT-5 / MAM-2 / MAM-3 (failures schedule a single backed-off
-retry, never an immediate one), QBIT-3 + DOM-5 (self-perpetuating refresh /
-snapshot chains never stop), DB-2 + DB-3 (DB failure handling emits no action,
-so it cannot recurse), plus the restart circuit breaker and crash-dump-once
-rules (§31) and MAM keep-alive (§27) — last two not yet implemented.
+retry, never an immediate one), QBIT-3 + DOM-5 + MAM-9 (self-perpetuating
+refresh / snapshot / keep-alive chains never stop), MAM-8 (chain-starts-once),
+MAM-10 + DOM-14 (operator is alerted on persistent keep-alive failure),
+DB-2 + DB-3 (DB failure handling emits no action, so it cannot recurse), plus
+the restart circuit breaker and crash-dump-once rules (§31, not yet implemented).
 
 ### Guarantee G — The dashboard always shows current truth
 
@@ -299,6 +300,41 @@ are never produced by the parse boundary.
   `ratio >= config.min_global_ratio`; `buffer_ok` equals `upload_credit_bytes >=
   config.min_upload_buffer_bytes`. Total invariant. → A
 
+### MAM machine additions (§27)
+
+State additions: `keep_alive_scheduled: bool` (chain-starts-once guard) and
+`consecutive_status_failures: u32` (failure counter reset by `StatusFetched`).
+
+Config additions: `keep_alive_interval: Duration` (default 300 s, mirrors
+Mousehole's default check cadence) and `keep_alive_failure_threshold: u32`
+(default `3`; `0` disables the `KeepAliveDegraded` publish).
+
+New timer: `MamTimer::KeepAlive` — self-perpetuating heartbeat that drives
+recurring `FetchStatus`.
+
+New publish: `MamPublish::KeepAliveDegraded { consecutive_failures, last_reason }`,
+routed on a new `MamTopic::KeepAlive`.
+
+- **MAM-8 [safety]** *(keep-alive chain-starts-once — §27)* `AuthSucceeded`
+  schedules `MamTimer::KeepAlive` exactly once per machine lifetime: the first
+  `AuthSucceeded` emits one `ScheduleTimer { KeepAlive }`; subsequent
+  `AuthSucceeded` events emit zero. Mirrors QBIT-2. Total invariant. → F
+- **MAM-9 [liveness]** *(keep-alive always re-schedules — §27)*
+  `TimerFired(KeepAlive)` always emits exactly one `FetchStatus` action **and**
+  exactly one `ScheduleTimer { KeepAlive }` action, regardless of machine
+  state. The next tick is booked at the start of the current tick, so a
+  dropped result or shell error cannot kill the chain. Mirrors QBIT-3. → F
+- **MAM-10 [safety]** *(keep-alive degraded rising edge — §27)* For each
+  retryable failure event (`AuthFailed` / `StatusFailed` / `SeedboxUpdateFailed`),
+  `consecutive_status_failures` increments by 1 (saturating at `u32::MAX`).
+  `MamPublish::KeepAliveDegraded` is published exactly once when the bump
+  crosses `keep_alive_failure_threshold` from below
+  (`before < threshold && after >= threshold`), and not on any other event.
+  When `keep_alive_failure_threshold == 0` the publish is disabled
+  unconditionally. The `consecutive_failures` field carries `after` and
+  `last_reason` carries this event's reason. `StatusFetched` resets the
+  counter to `0`, re-arming the rising edge. Total invariant. → F
+
 ### DB machine (`DbMachine`)
 
 Stateless.
@@ -343,6 +379,14 @@ Option<VpnPort> }`.
   exactly one `Db(RecordAlert { priority: Warning, title: "Upload health degraded" })`
   action and exactly one `Activity` publish. The alert body describes which of ratio and
   buffer are below threshold. Total invariant. → A
+
+### Domain machine additions (§27)
+
+- **DOM-14 [safety]** *(keep-alive alert routing — §27)*
+  `Mam(KeepAliveDegraded { consecutive_failures, last_reason })` emits exactly one
+  `Db(RecordAlert { priority: Warning, title: "MAM heartbeat failing" })` action and
+  exactly one `Activity` publish. The alert body carries both the consecutive-failure
+  count and the most recent failure reason. Total invariant. → F
 
 ### Deferred (§26)
 

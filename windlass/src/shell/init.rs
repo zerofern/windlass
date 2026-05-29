@@ -201,6 +201,10 @@ pub(super) async fn init_shell(
             // §26 upload-health gate defaults (binary GiB; see MamConfig docs).
             min_global_ratio: 2.0,
             min_upload_buffer_bytes: windlass_mam_core::DEFAULT_MIN_UPLOAD_BUFFER_BYTES,
+            // §27 MAM keep-alive heartbeat defaults (300 s cadence, 3-failure
+            // alert threshold; see MamConfig docs).
+            keep_alive_interval: windlass_mam_core::DEFAULT_KEEP_ALIVE_INTERVAL,
+            keep_alive_failure_threshold: windlass_mam_core::DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD,
         },
         mam.clone(),
     )
@@ -214,6 +218,7 @@ pub(super) async fn init_shell(
                 MamTopic::Connectability,
                 MamTopic::Seedbox,
                 MamTopic::UploadHealth,
+                MamTopic::KeepAlive,
             ],
             mam_pub_tx,
         ))

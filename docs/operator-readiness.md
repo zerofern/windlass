@@ -878,31 +878,68 @@ then no emitted action is Action::AddTorrent
 Freeleech bypasses *only* the ratio portion — it never bypasses the HnR, disk,
 qBit-privacy, port-sync, VPN-IP-compliance, or freeleech-timing gates.
 
-## Story: Keep The MAM Account Alive With A Routine Homepage Heartbeat
+## Story: Keep The MAM Account Alive With A Routine Status-Fetch Heartbeat
 
 Status: To Do
 
 ### Problem
 
 MAM Rule 1.6: accounts can be disabled for inactivity. The MAM core has no
-keep-alive behavior, so a quiet period with no status/seedbox traffic could let
-the account lapse.
+keep-alive behavior. Today `FetchStatus` only fires on `Init`, on the failure-
+retry timer, and on rate-limit expiry, so an extended healthy period with no
+externally-driven refresh can let the account lapse.
+
+The Mousehole project mirrors this with a recurring status check (default
+300 s) that doubles as IP/ASN drift detection. We take the same shape: the
+heartbeat is the recurring `FetchStatus`, not a separate homepage hit. This
+keeps the MAM core's action surface unchanged and means every heartbeat also
+refreshes ratio, upload-credit, connectability, and seedbox observation.
 
 ### User Story
 
-As the operator user, I want Windlass to routinely touch the MAM homepage so my
-account is never disabled for inactivity.
+As the operator user, I want Windlass to routinely fetch MAM status on a
+self-perpetuating cadence so my account is never disabled for inactivity and
+my MAM-derived state never goes silently stale.
 
 ### Acceptance Criteria
 
-- The MAM core schedules a recurring keep-alive timer that round-trips like the
-  other MAM timers.
-- On fire, the core emits an action for the shell to hit the MAM homepage and
-  re-schedules the timer (a self-perpetuating chain, like qBit `TorrentRefresh`).
-- The keep-alive interval is configurable.
-- Keep-alive failures are handled conservatively and never create a tight loop.
-- Add the invariant to `docs/invariants.md` (keep-alive chain never dies) and
-  cover it with property tests.
+- The MAM core schedules a recurring `KeepAlive` timer that round-trips like
+  the other MAM timers.
+- The chain is started **at most once per machine lifetime**, on
+  `AuthSucceeded` (mirrors qBit `TorrentRefresh`).
+- On `TimerFired(KeepAlive)` the core emits exactly one `FetchStatus` action
+  **and** re-schedules `KeepAlive` unconditionally — a self-perpetuating chain
+  whose next tick is booked at the start of the current tick, so a dropped
+  result or shell error cannot kill it.
+- The keep-alive interval is configurable; default `300 s` (matches Mousehole).
+- The core tracks `consecutive_status_failures: u32` and the most recent
+  failure reason. The counter increments on **all three** retryable failure
+  events (`AuthFailed`, `StatusFailed`, `SeedboxUpdateFailed`) and resets on
+  `StatusFetched`.
+- When the counter **crosses** the configured threshold (default `3`),
+  the core publishes exactly one `MamPublish::KeepAliveDegraded { consecutive_failures, last_reason }`
+  on the rising edge — not on every subsequent failure while still degraded.
+- The domain core routes `KeepAliveDegraded` to exactly one
+  `Db(RecordAlert { priority: Warning, title: "MAM heartbeat failing", … })`
+  action and one `Activity` publish, with the failure reason in the body.
+- Keep-alive failures emit no extra retry action of their own: the existing
+  failure-retry chain (`StatusRetry`) and the next scheduled `KeepAlive` tick
+  jointly handle retry; the keep-alive arm never tight-loops.
+- Add invariants to `docs/invariants.md` (`MAM-8` chain-once, `MAM-9` always
+  re-schedules, `MAM-10` degraded rising-edge, `DOM-14` alert routing) and
+  cover them with property tests.
+
+### Implementation Notes
+
+- No new shell action is needed: `FetchStatus` already exists. Only the MAM
+  shell's existing `MamAction::FetchStatus` handler is exercised.
+- Every heartbeat already appears in the debug event/action stream (the
+  `FetchStatus` action and resulting `StatusFetched` event flow through the
+  existing debug machinery), so "see every heartbeat in debug mode" is free —
+  we do **not** add a per-success activity-log entry.
+- The failure counter intentionally counts all three retryable failures
+  because the operator-visible signal is "we can't reliably reach MAM right
+  now", not specifically "the status endpoint is broken".
 
 ## Story: Distinguish MAM Unreachable From NotConnectable
 

@@ -243,6 +243,11 @@ impl Machine for WindlassMachine {
                 ratio_ok,
                 buffer_ok,
             }) => Self::on_upload_health_degraded(ratio, upload_credit_bytes, ratio_ok, buffer_ok),
+            // DOM-14: KeepAliveDegraded → one RecordAlert(Warning) + one Activity publish.
+            WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
+                consecutive_failures,
+                last_reason,
+            }) => Self::on_keep_alive_degraded(consecutive_failures, &last_reason),
             WindlassEvent::Mam(MamPublish::RateLimited { retry_after }) => {
                 self.state.mam = ServiceStatus::Degraded;
                 self.publish_state_with_activity(format!(
@@ -493,6 +498,47 @@ impl WindlassMachine {
                     at: chrono::Utc::now(),
                     source: ActivitySource::Domain,
                     action: "upload_health_degraded".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles the `KeepAliveDegraded` MAM publish (DOM-14 / §27).
+    ///
+    /// The recurring MAM status fetch has failed at least
+    /// `keep_alive_failure_threshold` times in a row.  Emits one
+    /// `RecordAlert(Warning)` and one `Activity` publish.  Priority is
+    /// `Warning` — repeated heartbeat failures are not yet a definite
+    /// account-risk event, but the operator needs to investigate before
+    /// MAM Rule 1.6 (inactivity) kicks in.
+    fn on_keep_alive_degraded(
+        consecutive_failures: u32,
+        last_reason: &str,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!(
+            "MAM keep-alive failing — {consecutive_failures} consecutive failures. \
+             Last reason: {last_reason}",
+        );
+        let message = format!(
+            "MAM heartbeat failing: {consecutive_failures} consecutive failures \
+             (last: {last_reason})",
+        );
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Warning,
+                    title: "MAM heartbeat failing".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Domain,
+                    action: "mam_keep_alive_degraded".to_string(),
                     book_id: None,
                     detail: Some(message.clone()),
                     metadata: serde_json::Value::Null,
@@ -1089,6 +1135,86 @@ mod tests {
             panic!("expected RecordAlert(Warning)");
         }
     }
+
+    // ── DOM-14: KeepAliveDegraded routing (§27) ───────────────────────────────
+
+    #[test]
+    fn keep_alive_degraded_emits_one_warning_record_alert_and_one_activity() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_mam_core::MamPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
+                consecutive_failures: 3,
+                last_reason: "timeout".to_string(),
+            }),
+        );
+
+        assert_eq!(out.actions.len(), 2, "exactly two actions expected");
+        let has_warning_alert = out.actions.iter().any(|a| {
+            matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Warning,
+                    ..
+                }))
+            )
+        });
+        assert!(
+            has_warning_alert,
+            "must emit exactly one RecordAlert(Warning)"
+        );
+        assert!(
+            matches!(
+                &out.actions[1],
+                WindlassAction::Db(DbCommand::RecordActivity(_))
+            ),
+            "second action must be RecordActivity"
+        );
+        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert!(
+            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            "publish must be an Activity"
+        );
+    }
+
+    #[test]
+    fn keep_alive_degraded_alert_title_and_body_include_failure_context() {
+        use windlass_db_core::{AlertRecord, DbCommand};
+        use windlass_mam_core::MamPublish;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
+                consecutive_failures: 5,
+                last_reason: "dns failure".to_string(),
+            }),
+        );
+
+        if let WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+            priority: AlertPriority::Warning,
+            title,
+            body,
+            ..
+        })) = &out.actions[0]
+        {
+            assert_eq!(title, "MAM heartbeat failing");
+            assert!(body.contains("5"), "body should mention the failure count");
+            assert!(
+                body.contains("dns failure"),
+                "body should include the last failure reason"
+            );
+        } else {
+            panic!("expected RecordAlert(Warning)");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1218,6 +1344,12 @@ mod prop_tests {
                     }
                 }
             ),
+            (any::<u32>(), any::<String>()).prop_map(|(consecutive_failures, last_reason)| {
+                MamPublish::KeepAliveDegraded {
+                    consecutive_failures,
+                    last_reason,
+                }
+            }),
         ]
     }
 
@@ -1511,6 +1643,51 @@ mod prop_tests {
                 activity_count,
                 1,
                 "UploadHealthDegraded must emit exactly one Activity publish"
+            );
+        }
+
+        // DOM-14 [safety] (keep-alive alert routing — §27):
+        // `Mam(KeepAliveDegraded)` emits exactly one `Db(RecordAlert{Warning})`
+        // and exactly one `Activity` publish.  Total invariant.
+        #[test]
+        fn keep_alive_degraded_emits_one_warning_alert_and_one_activity(
+            mut machine in any_windlass_machine(),
+            consecutive_failures in any::<u32>(),
+            last_reason in any::<String>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
+                    consecutive_failures,
+                    last_reason,
+                })),
+            );
+
+            let warning_alert_count = out.actions.iter().filter(|a| {
+                matches!(
+                    a,
+                    WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                        priority: AlertPriority::Warning,
+                        ..
+                    }))
+                )
+            }).count();
+            prop_assert_eq!(
+                warning_alert_count,
+                1,
+                "KeepAliveDegraded must emit exactly one RecordAlert(Warning)"
+            );
+
+            let activity_count = out.publish.iter()
+                .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
+                .count();
+            prop_assert_eq!(
+                activity_count,
+                1,
+                "KeepAliveDegraded must emit exactly one Activity publish"
             );
         }
     }
