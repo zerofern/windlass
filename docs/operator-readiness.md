@@ -1385,7 +1385,7 @@ compliance issue.
 
 ## Story: Review And Harden The Integration-Test Suite
 
-Status: To Do
+Status: In Progress (audit complete, see `docs/integration-test-audit.md`)
 
 ### Problem
 
@@ -1397,7 +1397,7 @@ and may not exercise the new control flow: a Gluetun IP change driving a
 MAM seedbox update, an ifconfig.co mismatch flipping the §29 gate, the
 full TryAddTorrent → admission predicate → `Qbit(AddTorrent)` path.
 
-Before §34 (the Gluetun orchestration story) and §35 (the legacy
+Before §35 (the Gluetun orchestration story) and §36 (the legacy
 `windlass-core` retirement), the integration tests should be hardened so
 the cutover doesn't regress live behavior.
 
@@ -1430,8 +1430,11 @@ the §35 legacy-removal cutover can be performed with confidence.
 - Cross-reference the per-story property tests so we don't duplicate
   what's already exercised at the machine layer; the integration suite
   is about wiring + ordering across machines.
-- This story should land before §34/§35 so the cutover has a safety
+- This story should land before §35/§36 so the cutover has a safety
   net.
+- Audit findings are captured in `docs/integration-test-audit.md`; the
+  follow-up test-writing work tracks against §36's per-handler cutover
+  commits.
 
 ## Story: Make Dependent-Container Orchestration Safe Under Gluetun
 
