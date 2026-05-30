@@ -3303,6 +3303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-docker-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "serde",
+ "windlass-machine",
+]
+
+[[package]]
 name = "windlass-domain-core"
 version = "0.1.0"
 dependencies = [

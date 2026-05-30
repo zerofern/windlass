@@ -6,6 +6,7 @@ members = [
     "windlass-types",
     "windlass-core",
     "windlass-disk-core",
+    "windlass-docker-core",
     "windlass-domain-core",
     "windlass-debug",
     "windlass-db-core",
@@ -50,6 +51,7 @@ sqlx             = { version = "0.8", features = ["postgres", "runtime-tokio-rus
 windlass-debug   = { path = "windlass-debug" }
 windlass-db-core = { path = "windlass-db-core" }
 windlass-disk-core = { path = "windlass-disk-core" }
+windlass-docker-core = { path = "windlass-docker-core" }
 windlass-domain-core = { path = "windlass-domain-core" }
 windlass-mam-core = { path = "windlass-mam-core" }
 windlass-machine = { path = "windlass-machine" }
