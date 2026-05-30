@@ -62,6 +62,7 @@ Implement these stories one at a time, in this order:
 35. Make dependent-container orchestration safe under Gluetun.
 36. Fully port legacy `windlass-core` to the per-system cores and remove it.
 37. Review and consolidate the debug-mode workflow (open scope, discuss when picked up).
+38. Introduce a Docker core for container orchestration (prerequisite for §36 step 1: legacy `vpn.rs` cutover).
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -1659,3 +1660,130 @@ Likely candidates:
 - Cross-reference the debug-mode bits sprinkled through the earlier
   stories (initial UI snapshot, event/action queue visibility, breakpoint-
   on-click) when assembling the audit.
+
+## Story: Introduce Docker Core For Container Orchestration
+
+Status: To Do
+
+### Problem
+
+Container lifecycle is scattered across the workspace.
+`windlass-local::DockerClient` owns the bollard event watcher and exposes
+ad-hoc operations (`restart_gluetun`, `stop_dependent_containers`,
+`start_dependent_containers`, `fetch_and_dump_all_logs`).  Legacy
+`windlass-core::handlers::vpn` decides *when* to call those operations and
+emits the corresponding `Action::*` variants.  The new `VpnMachine` owns
+§35's dependent-orchestration logic (stale-namespace check, restart-storm
+circuit-breaker, per-dependent `RestartContainer`/`InspectDependent`
+actions, `dependent_names` config) even though "which containers share
+Gluetun's namespace" is not a VPN concern — it's a Docker-stack concern.
+The operator's existing `docker-compose.yml` runs a separate `autoheal`
+sidecar that restarts unhealthy containers because Windlass does not yet
+provide that itself.
+
+The consequence: §36 step 1 (drop legacy `windlass-core/src/handlers/
+vpn.rs`) cannot land safely.  Removing the legacy handler would silently
+lose log-dump on crash, stop-dependents before Gluetun restart, the
+Gluetun restart itself, start-dependents on recovery, and the "Gluetun
+died" Critical alert — none of which the new path emits today (`VpnAction
+::WriteCrashDump` and `RestartContainer` are stubs in
+`windlass/src/shell/vpn_shell.rs`; no `VpnAction` covers fleet
+stop/start/restart at all).
+
+### User Story
+
+As the maintainer, I want one core that owns container lifecycle
+(start/stop/restart/inspect/log-dump), the dependent registry, and
+autoheal-style restarts, so VPN core stays focused on VPN state and the
+operator stack collapses to a single Windlass process with no separate
+autoheal sidecar.
+
+### Acceptance Criteria
+
+- A new `windlass-docker-core` crate exists with a `DockerMachine` on the
+  generic service runtime, exposing the standard `Event` / `Command` /
+  `Action` / `Publish` / `Topic` / `Response` surface.
+- Docker core owns the dependent registry.  Populated via
+  `DockerClient::discover_dependents()` (containers using `network_mode:
+  service:gluetun`), refreshed on Docker `start`/`stop`/`die` events, and
+  queryable via a `DockerCommand::ListDependents` request.
+- Docker core exposes fleet commands `StopDependents` and
+  `StartDependents`, and per-name commands `RestartContainer { name }`,
+  `StopContainer { name }`, `StartContainer { name }`, `DumpLogs { name }`,
+  and `DumpAllLogs`.
+- Docker core owns the bollard event watcher.  It consumes Docker daemon
+  events and produces `DockerEvent::ContainerHealthy { name } /
+  ContainerUnhealthy { name } / ContainerStopped { name } /
+  ContainerStarted { name }`.
+- Docker core publishes rising-edge `DockerPublish::ContainerCrashed
+  { name } / ContainerHealthy { name } / LogsDumped { name, path } /
+  Stopped { name } / Started { name }`.
+- §35 logic (stale-namespace check, restart-storm circuit-breaker, the
+  per-dependent restart action) migrates from `windlass-vpn-core` to
+  `windlass-docker-core`.  VPN core publishes a new `VpnPublish::
+  HealthySince { at: DateTime<Utc> }` rising-edge signal so Docker core
+  can compare against dependent `started_at`.  All §35 property tests
+  move with the logic.
+- Autoheal subsume: Docker core auto-restarts containers in a configured
+  allowlist on `ContainerUnhealthy`, gated by the §35 circuit-breaker.
+  The operator can remove the `autoheal` sidecar from
+  `docker-compose.yml`.
+- VPN core no longer references `DockerClient` directly.  Its existing
+  `VpnEvent::ContainerHealthy / ContainerUnhealthy` events are produced
+  by the domain translating `DockerPublish::ContainerHealthy { name:
+  gluetun_anchor } / ContainerCrashed { name: gluetun_anchor }` into
+  `VpnCommand` inputs (or equivalent), so VPN core's surface stays
+  unchanged while its inputs come from Docker core.
+- VPN core publishes a new rising-edge `VpnPublish::Crashed` (sibling to
+  `Disconnected`) so the domain can drive crash recovery exactly once
+  per healthy→unhealthy transition.
+- Domain orchestrates Gluetun crash recovery.  On `VpnPublish::Crashed`:
+  emit `WindlassAction::Docker(DumpLogs { gluetun })`,
+  `Docker(StopDependents)`, `Docker(RestartContainer { gluetun })`, and
+  `SendAlert(Critical, "Gluetun died")`.  On `VpnPublish::Connected`
+  rising-edge: emit `Docker(StartDependents)`.
+- `just check` passes, the frontend build passes, and `just integration`
+  passes.
+
+Core invariants (for story 10):
+
+- DOCKER-1: `ContainerCrashed { name }` is published exactly once per
+  healthy→unhealthy transition for a given container.  Re-observing
+  unhealthy without an intervening healthy is a no-op.
+- DOCKER-2: The autoheal restart path emits at most `max_restarts_per_
+  window` `RestartContainer` actions per container within
+  `restart_window_duration`; further restarts are suppressed and a
+  `RestartStorm` publish fires once per trip.
+- DOCKER-3: `StartDependents` is a no-op when the dependent registry is
+  empty; `StopDependents` is a no-op when no dependent is running.
+- DOCKER-4: A dependent's `started_at < gluetun.healthy_since` produces
+  exactly one `DependentNetworkUntrusted { name }` publish per stale
+  observation; the trusted publish fires only on rising-edge recovery.
+
+### Implementation Notes
+
+- Ship as a sequence of small PRs in this order: (1) scaffold the
+  `windlass-docker-core` crate with command/event/action/publish enums
+  and an empty machine; (2) wire the bollard event watcher and shell
+  dispatch (start/stop/restart/inspect/dump), with no behaviour change
+  yet (the legacy VPN path still owns decisions); (3) migrate §35 logic
+  (stale-namespace, circuit-breaker, dependent registry) from VPN core,
+  including the property tests; (4) wire crash-recovery orchestration in
+  `windlass-domain-core` (new `VpnPublish::Crashed`, domain emits the
+  Docker fleet actions and the Critical alert); (5) subsume autoheal
+  (configured allowlist + circuit-breakered restart on unhealthy); (6)
+  remove VPN core's direct `DockerClient` usage and make domain the
+  translator for Gluetun-specific events.  After all six land, §36 step 1
+  (drop legacy `windlass-core/src/handlers/vpn.rs`) is a small follow-up.
+- The crash-recovery sequencing question (does the machine wait for
+  `LogsDumped` before stopping dependents, or fire them in parallel?)
+  should be decided in PR 4.  Legacy behaviour is sequential; parallel
+  is cheaper and the dump is best-effort anyway.
+- Cross-link to [[project-domain-cores]].  Update
+  `docs/legacy-retirement-plan.md` to mark vpn.rs as blocked on §38 and
+  to note that the rest of §36 (mam/qbit/monitoring/download/compliance)
+  is unaffected.
+- Out of scope: replacing `discover_dependents()`'s heuristic (containers
+  sharing Gluetun's network namespace) with explicit operator config.
+  The heuristic matches the operator's compose layout today; revisit
+  only if it stops working.

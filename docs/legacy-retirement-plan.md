@@ -43,14 +43,14 @@ sole decision-makers.
 
 | File | Lines | Coverage | Risk | Notes |
 |---|---:|---|---|---|
-| `vpn.rs`        |  161 | Full       | Low    | VpnMachine + §5/§31/§33/§35 cover every decision. |
+| `vpn.rs`        |  161 | Partial    | Medium | Decision logic covered by VpnMachine + §5/§31/§33/§35, **but** crash-recovery side-effects (log dump, stop/start dependents, Gluetun restart, "Gluetun died" alert) are not emitted by the new path. **Blocked on §38** (Docker core). |
 | `mam.rs`        |   92 | Full       | Low    | MamMachine + §7/§27/§28/§30/§32. |
 | `qbit.rs`       |  178 | Full*      | Low    | QbitMachine + §6 et al.  Excludes the compliance pass (handled separately). |
 | `monitoring.rs` |  103 | Partial    | Medium | Most decisions in new cores; the `on_wakeup` dispatcher needs an audit. |
 | `download.rs`   |  247 | Partial    | Medium | §29's `TryAddTorrent` covers the autonomous path; manual-UI add path may still rely on legacy. |
 | `compliance.rs` |  242 | Partial    | **High** | DB-write path for `/api/v1/torrents` is the coupling. See below. |
 
-### `vpn.rs` (Low risk)
+### `vpn.rs` (Medium risk — blocked on §38)
 
 Handlers: `on_init`, `on_docker_gluetun_died`, `on_logs_dumped`,
 `on_docker_gluetun_healthy`, `on_port_file_read_ok`,
@@ -60,12 +60,31 @@ New-core equivalent: `VpnMachine`'s `Init`, `ContainerHealthy`,
 `ContainerUnhealthy`, `PortFileChanged`, `StateReadFailed` arms, plus the
 §31/§33/§35 extensions.
 
-**Cutover step:** in `service_events.rs`, the legacy → ServiceEvent
-translation already maps each Docker/port event to the right
-`VpnEvent`.  Removing the legacy handler is a matter of dropping the
-match arms in `windlass-core/src/lib.rs` and verifying the existing
-shell-side action emission (`VpnAction::InspectContainer` etc.) covers
-what `process_legacy_event` used to emit.
+**Gap identified after initial audit:**  the legacy handler emits five
+side-effect actions on Gluetun crash recovery that the new path does not
+produce:
+
+- `Action::FetchAndDumpAllLogs` (logs on every crash) — new
+  `VpnAction::WriteCrashDump` is a stub in `vpn_shell.rs`.
+- `Action::StopDependentContainers` / `Action::StartDependentContainers`
+  — no `VpnAction` covers fleet stop/start at all; §35's per-dependent
+  `RestartContainer` is also a stub.
+- `Action::RestartGluetun` — no equivalent on `VpnAction`.
+- `Action::SendAlert(Critical, "Gluetun died")` — domain core emits
+  alerts on IP-mismatch / dependent-untrusted / restart-storm but not on
+  plain crash.
+
+These belong in a new Docker core rather than in VPN core (operator
+preference: "dependents are not a VPN concern").  This is now §38 in
+operator-readiness.md.
+
+**Cutover step (post-§38):** in `service_events.rs`, the legacy →
+ServiceEvent translation already maps each Docker/port event to the
+right `VpnEvent`.  After §38 lands, removing the legacy handler is a
+matter of dropping the match arms in `windlass-core/src/lib.rs` and
+verifying the shell-side action emission (`VpnAction::InspectContainer`
+plus Docker-core fleet commands routed via domain) covers what
+`process_legacy_event` used to emit.
 
 ### `mam.rs` (Low risk)
 
@@ -172,9 +191,13 @@ because every other check is already in the new cores.
 
 ## Cutover order
 
-1. **vpn.rs** — smallest blast radius, full coverage.  Remove the
-   legacy `Event::*` arms that map to VPN events; let the service-events
-   bridge keep doing the translation until step 7.
+0. **§38: introduce Docker core** — prerequisite for step 1.  Until
+   Docker core owns container lifecycle (start/stop/restart/dump) and
+   domain emits the crash-recovery alert, removing `vpn.rs` would lose
+   real behaviour.  See operator-readiness.md §38.
+1. **vpn.rs** — after §38 lands.  Remove the legacy `Event::*` arms
+   that map to VPN events; let the service-events bridge keep doing
+   the translation until step 7.
 2. **mam.rs** — same shape, slightly larger event set.
 3. **qbit.rs** (excluding compliance-related preferences flow) —
    careful with `on_qbit_preferences_received`; the `max_active_torrents`
