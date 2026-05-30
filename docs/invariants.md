@@ -207,6 +207,39 @@ new `VpnTopic::PublicIp`.  New action: `VerifyPublicIp`.  New timer:
   `PublicIpVerificationDegraded` iff this bump crosses
   `public_ip_verify_failure_threshold` from below.  Total. → F
 
+### VPN machine additions (§33)
+
+State additions: `last_mam_verified_ip: Option<VpnIp>`,
+`mam_verification_failures: u32`.  Both tracked independently from the §31
+ifconfig.co counterparts so a per-source degraded signal can fire.
+
+New events: `MamIpVerified { info: VerifiedIpInfo }`,
+`MamIpVerifyFailed { reason }`.  New action: `VerifyMamIp`.  New publish:
+`MamIpVerificationDegraded { consecutive_failures, last_reason }` on the
+existing `VpnTopic::PublicIp`.
+
+`VpnPublish::PublicIpMismatch` gains `source: VerificationSource` so the
+alert names which check disagreed (VPN-9 is updated accordingly — the
+predicate is unchanged but the publish carries `source` from the event
+type that produced it).
+
+The 6h `PublicIpVerify` timer now fires **both** `VerifyPublicIp` and
+`VerifyMamIp` per tick, and `PublicIpFromFile` (rising edge) triggers
+both immediately too.
+
+- **VPN-11 [safety]** *(MAM-jsonIp verification — §33)*
+  `MamIpVerified { info }` publishes exactly one
+  `PublicIpMismatch { source: MamJsonIp }` iff `observed_ip` is set and
+  differs from `info.ip`.  Resets `mam_verification_failures` to 0 and
+  records `last_mam_verified_ip = Some(info.ip)`.  Mirrors VPN-9 for the
+  MAM source.  Total invariant. → B
+- **VPN-12 [safety]** *(MAM-jsonIp failure rising edge — §33)*
+  `MamIpVerifyFailed { reason }` increments `mam_verification_failures`
+  by 1 (saturating) and publishes exactly one
+  `MamIpVerificationDegraded` iff this bump crosses
+  `public_ip_verify_failure_threshold` from below.  Mirrors VPN-10 for the
+  MAM source.  Total. → F
+
 Shell contracts:
 
 - `StateRead { connected: false, port: Some(_) }` is not expected from the
@@ -644,6 +677,26 @@ this default and wire the real comparison.
   publishes — the MAM core's MAM-16 dedup decides whether
   `UpdateSeedbox` actually fires.  `Vpn(PublicIpUnavailable)` flips
   `admission.vpn_ip_compliant` to `None` with one Activity publish.
+
+### Domain machine additions (§33)
+
+- **DOM-23 [safety]** *(source-named mismatch alert — §33)* For both
+  `Vpn(PublicIpMismatch { source: IfConfigCo })` (the §31 case, now
+  recategorised under DOM-23 too) and `Vpn(PublicIpMismatch
+  { source: MamJsonIp })` (the §33 case), the handler emits exactly one
+  `Db(RecordAlert { priority: Critical })`, one `Db(RecordActivity)`, and
+  one `Activity` publish.  The alert title, body, and activity-source
+  label all carry the source so the operator can distinguish an
+  ifconfig.co edge case from a MAM compliance issue.  The handler also
+  flips `admission.vpn_ip_compliant` to `Some(false)`.  Total invariant.
+  Subsumes DOM-21. → A, B
+- **DOM-24 [safety]** *(MAM-source verification-degraded warning — §33)*
+  `Vpn(MamIpVerificationDegraded { consecutive_failures, last_reason })`
+  emits one `Db(RecordAlert { priority: Warning })`, one
+  `Db(RecordActivity)`, and one `Activity` publish.  Does **not** flip
+  `admission.vpn_ip_compliant`.  Mirrors DOM-22 for the MAM source —
+  independent so a `MamIpVerificationDegraded` alert can fire even when
+  ifconfig.co is healthy.  Total invariant. → F
 
 ### Resolved (§26 → §29)
 

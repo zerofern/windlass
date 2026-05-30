@@ -1328,7 +1328,7 @@ the dynamic-seedbox endpoint past its 1/hour limit.
 
 ## Story: VPN Multi-Source IP Verification (ifconfig.co + MAM jsonIp)
 
-Status: To Do
+Status: Done
 
 ### Problem
 

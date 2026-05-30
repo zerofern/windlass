@@ -257,7 +257,8 @@ mod tests {
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
-                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
+                    | VpnPublish::PublicIpVerificationDegraded { .. }
+                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }
@@ -348,7 +349,8 @@ mod tests {
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
-                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
+                    | VpnPublish::PublicIpVerificationDegraded { .. }
+                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }

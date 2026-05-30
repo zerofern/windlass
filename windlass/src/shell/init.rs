@@ -163,6 +163,7 @@ pub(super) async fn init_shell(
             // the VPN exit IP, not the host's public IP.
             vpn_proxy_url: config.gluetun_proxy_url.clone(),
             public_ip_verify_url: None,
+            mam_ip_verify_url: None,
         },
     )
     .await;
@@ -287,7 +288,8 @@ pub(super) async fn init_shell(
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
-                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
+                    | VpnPublish::PublicIpVerificationDegraded { .. }
+                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }

@@ -13,6 +13,11 @@ use windlass_vpn_core::{VerifiedIpInfo, VpnAction, VpnEvent};
 /// `VpnShellConfig::public_ip_verify_url`.
 const DEFAULT_PUBLIC_IP_VERIFY_URL: &str = "https://ifconfig.co/json";
 
+/// §33: default MAM `/json/jsonIp.php` endpoint.  Configurable via
+/// `VpnShellConfig::mam_ip_verify_url`.  Uses the `t.` subdomain because
+/// it's the same host MAM publishes for dynamic-seedbox tooling.
+const DEFAULT_MAM_IP_VERIFY_URL: &str = "https://t.myanonamouse.net/json/jsonIp.php";
+
 #[derive(Deserialize)]
 struct IfConfigResponse {
     ip: String,
@@ -22,6 +27,15 @@ struct IfConfigResponse {
     country: Option<String>,
     #[serde(default)]
     hostname: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MamJsonIpResponse {
+    ip: String,
+    #[serde(rename = "ASN", default)]
+    asn: Option<u32>,
+    #[serde(rename = "AS", default)]
+    as_org: Option<String>,
 }
 
 pub struct VpnShellConfig {
@@ -35,6 +49,9 @@ pub struct VpnShellConfig {
     /// §31: ifconfig.co (or equivalent) JSON endpoint.  `None` uses the
     /// default `https://ifconfig.co/json`.
     pub public_ip_verify_url: Option<String>,
+    /// §33: MAM `/json/jsonIp.php` endpoint.  `None` uses the default
+    /// `https://t.myanonamouse.net/json/jsonIp.php`.
+    pub mam_ip_verify_url: Option<String>,
 }
 
 pub struct VpnShell {
@@ -43,6 +60,7 @@ pub struct VpnShell {
     vpn_port_file: String,
     http: Arc<reqwest::Client>,
     public_ip_verify_url: String,
+    mam_ip_verify_url: String,
 }
 
 impl Shell for VpnShell {
@@ -66,6 +84,9 @@ impl Shell for VpnShell {
             public_ip_verify_url: config
                 .public_ip_verify_url
                 .unwrap_or_else(|| DEFAULT_PUBLIC_IP_VERIFY_URL.to_string()),
+            mam_ip_verify_url: config
+                .mam_ip_verify_url
+                .unwrap_or_else(|| DEFAULT_MAM_IP_VERIFY_URL.to_string()),
         }
     }
 
@@ -121,6 +142,18 @@ impl Shell for VpnShell {
                     let _ = tx.send(Timed::now(event));
                 });
             }
+            // §33: MAM /json/jsonIp.php verification through the same
+            // Gluetun-routed client.  Independent failure path so a flaky
+            // ifconfig.co doesn't poison the MAM-side counter.
+            VpnAction::VerifyMamIp => {
+                let http = self.http.clone();
+                let url = self.mam_ip_verify_url.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let event = verify_mam_ip(&http, &url).await;
+                    let _ = tx.send(Timed::now(event));
+                });
+            }
             VpnAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
@@ -159,6 +192,45 @@ async fn verify_public_ip(http: &reqwest::Client, url: &str) -> VpnEvent {
                             asn: body.asn_org,
                             country: body.country,
                             hostname: body.hostname,
+                        },
+                    },
+                },
+            }
+        }
+    }
+}
+
+/// §33: same shape as `verify_public_ip` but hits MAM's
+/// `/json/jsonIp.php`.  Maps to `MamIpVerified`/`MamIpVerifyFailed` so the
+/// VPN core can track the per-source failure counter independently.
+async fn verify_mam_ip(http: &reqwest::Client, url: &str) -> VpnEvent {
+    match http.get(url).send().await {
+        Err(e) => VpnEvent::MamIpVerifyFailed {
+            reason: format!("request: {e}"),
+        },
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                return VpnEvent::MamIpVerifyFailed {
+                    reason: format!("HTTP {status}"),
+                };
+            }
+            match resp.json::<MamJsonIpResponse>().await {
+                Err(e) => VpnEvent::MamIpVerifyFailed {
+                    reason: format!("parse: {e}"),
+                },
+                Ok(body) => match body.ip.parse::<std::net::Ipv4Addr>() {
+                    Err(e) => VpnEvent::MamIpVerifyFailed {
+                        reason: format!("ip parse: {e}"),
+                    },
+                    // MAM only reports IP/ASN/AS, not country or hostname —
+                    // pad the other fields with None.
+                    Ok(ip) => VpnEvent::MamIpVerified {
+                        info: VerifiedIpInfo {
+                            ip: VpnIp(ip),
+                            asn: body.as_org,
+                            country: None,
+                            hostname: body.asn.map(|n| format!("AS{n}")),
                         },
                     },
                 },

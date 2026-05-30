@@ -32,6 +32,20 @@ pub struct VerifiedIpInfo {
     pub hostname: Option<String>,
 }
 
+/// §33: which external check produced a `PublicIpMismatch`.
+///
+/// `IfConfigCo` is the §31 source: ifconfig.co/json reports the public IP
+/// the open internet sees us as.  `MamJsonIp` is the §33 source: MAM's
+/// own `/json/jsonIp.php` reports the IP MAM sees us coming from.  The two
+/// usually agree, but when they diverge the alert names the source so the
+/// operator can tell a public-internet edge case from a MAM-compliance
+/// problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerificationSource {
+    IfConfigCo,
+    MamJsonIp,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VpnCommand {
     StartMonitoring,
@@ -76,6 +90,20 @@ pub enum VpnEvent {
     PublicIpVerifyFailed {
         reason: String,
     },
+    /// §33: a `VerifyMamIp` action returned a usable response from MAM's
+    /// `/json/jsonIp.php` endpoint.  Same shape as `PublicIpVerified` —
+    /// the core compares the IP against `observed_ip` and publishes
+    /// `PublicIpMismatch { source: MamJsonIp }` on disagreement.
+    MamIpVerified {
+        info: VerifiedIpInfo,
+    },
+    /// §33: a `VerifyMamIp` action could not produce a result.  Same
+    /// failure-counter semantics as `PublicIpVerifyFailed` but tracked
+    /// independently so a per-source `MamIpVerificationDegraded` publish
+    /// can fire even when ifconfig.co is healthy.
+    MamIpVerifyFailed {
+        reason: String,
+    },
     StateRead {
         connected: bool,
         port: Option<VpnPort>,
@@ -95,6 +123,10 @@ pub enum VpnAction {
     /// current public IP through the Gluetun proxy (default endpoint:
     /// ifconfig.co/json).
     VerifyPublicIp,
+    /// §33: ask the VPN shell to call MAM's `/json/jsonIp.php` through
+    /// the Gluetun proxy.  Fired in parallel with `VerifyPublicIp` so the
+    /// 6h timer covers both verification sources.
+    VerifyMamIp,
     ScheduleTimer {
         timer: VpnTimer,
         after: Duration,
@@ -118,17 +150,29 @@ pub enum VpnPublish {
     /// §31: Gluetun deleted the IP file or the VPN is disconnected.
     /// Clears `admission.vpn_ip_compliant` in the domain.
     PublicIpUnavailable,
-    /// §31: the most recent ifconfig.co verification reports a different IP
-    /// than Gluetun's file — a potential leak.  Flips the §29
-    /// `vpn_ip_compliant` gate to `Some(false)` and fires a `Critical` alert.
+    /// §31 + §33: a verification source reports a different IP than
+    /// Gluetun's file — a potential leak.  `source` names which check
+    /// disagreed so the operator can tell ifconfig.co edge cases from
+    /// MAM-compliance problems.  Flips the §29 `vpn_ip_compliant` gate
+    /// to `Some(false)` and fires a `Critical` alert.
     PublicIpMismatch {
         file_ip: VpnIp,
         verified_ip: VpnIp,
+        source: VerificationSource,
     },
     /// §31: ifconfig.co verification has failed at least
     /// `public_ip_verify_failure_threshold` consecutive times.
     /// Surfaces as a `Warning` alert without blocking admission.
     PublicIpVerificationDegraded {
+        consecutive_failures: u32,
+        last_reason: String,
+    },
+    /// §33: MAM `/json/jsonIp.php` verification has failed at least
+    /// `public_ip_verify_failure_threshold` consecutive times.
+    /// Surfaces as a `Warning` alert without blocking admission —
+    /// independent of `PublicIpVerificationDegraded` so we can tell
+    /// "ifconfig.co flaky" from "MAM unreachable from us".
+    MamIpVerificationDegraded {
         consecutive_failures: u32,
         last_reason: String,
     },
@@ -150,7 +194,8 @@ impl HasTopic<VpnTopic> for VpnPublish {
             Self::PublicIpObserved { .. }
             | Self::PublicIpUnavailable
             | Self::PublicIpMismatch { .. }
-            | Self::PublicIpVerificationDegraded { .. } => VpnTopic::PublicIp,
+            | Self::PublicIpVerificationDegraded { .. }
+            | Self::MamIpVerificationDegraded { .. } => VpnTopic::PublicIp,
         }
     }
 }
@@ -177,6 +222,12 @@ pub struct VpnMachine {
     /// §31: once true, the self-perpetuating `PublicIpVerify` timer chain
     /// is running.  Armed on the first verification attempt.
     verify_chain_scheduled: bool,
+    /// §33: last IP reported by MAM's `/json/jsonIp.php` verification.
+    last_mam_verified_ip: Option<VpnIp>,
+    /// §33: consecutive MAM-side failure count.  Tracked independently
+    /// from `verification_failures` so per-source degraded signals are
+    /// possible (ifconfig.co healthy ⇄ MAM unreachable, or vice versa).
+    mam_verification_failures: u32,
 }
 
 impl VpnMachine {
@@ -199,6 +250,12 @@ impl VpnMachine {
     pub const fn last_verified_ip(&self) -> Option<VpnIp> {
         self.last_verified_ip
     }
+
+    /// Returns the most recent IP MAM's `/json/jsonIp.php` reported (§33).
+    #[must_use]
+    pub const fn last_mam_verified_ip(&self) -> Option<VpnIp> {
+        self.last_mam_verified_ip
+    }
 }
 
 impl Machine for VpnMachine {
@@ -219,6 +276,8 @@ impl Machine for VpnMachine {
             last_verified_ip: None,
             verification_failures: 0,
             verify_chain_scheduled: false,
+            last_mam_verified_ip: None,
+            mam_verification_failures: 0,
         }
     }
 
@@ -261,6 +320,8 @@ impl Machine for VpnMachine {
                 }
                 self.last_verified_ip = None;
                 self.verification_failures = 0;
+                self.last_mam_verified_ip = None;
+                self.mam_verification_failures = 0;
                 Outcome {
                     actions: vec![VpnAction::ScheduleTimer {
                         timer: VpnTimer::HealthPoll,
@@ -329,7 +390,10 @@ impl Machine for VpnMachine {
                     return Outcome::none();
                 }
                 self.observed_ip = Some(ip);
-                let mut actions = vec![VpnAction::VerifyPublicIp];
+                // §31 + §33: trigger immediate verification on both sources
+                // after a fresh file IP.  The 6h timer continues to handle
+                // the no-change case for both checks in parallel.
+                let mut actions = vec![VpnAction::VerifyPublicIp, VpnAction::VerifyMamIp];
                 if !self.verify_chain_scheduled {
                     self.verify_chain_scheduled = true;
                     actions.push(VpnAction::ScheduleTimer {
@@ -342,8 +406,9 @@ impl Machine for VpnMachine {
                     publish: vec![VpnPublish::PublicIpObserved { ip }],
                 }
             }
-            // §31: Gluetun deleted the IP file.  Clear observed_ip and
-            // surface the unavailable signal — same shape as a disconnect.
+            // §31: Gluetun deleted the IP file.  Clear observed_ip and the
+            // per-source verification state; surface the unavailable
+            // signal — same shape as a disconnect.
             VpnEvent::PublicIpFileUnavailable => {
                 if self.observed_ip.is_none() {
                     return Outcome::none();
@@ -351,14 +416,16 @@ impl Machine for VpnMachine {
                 self.observed_ip = None;
                 self.last_verified_ip = None;
                 self.verification_failures = 0;
+                self.last_mam_verified_ip = None;
+                self.mam_verification_failures = 0;
                 Outcome {
                     actions: Vec::new(),
                     publish: vec![VpnPublish::PublicIpUnavailable],
                 }
             }
-            // §31 / VPN-9: verification succeeded.  Reset the failure
-            // counter and compare with the file IP — mismatch is a leak
-            // warning.
+            // §31 / VPN-9: ifconfig.co verification succeeded.  Reset the
+            // failure counter and compare with the file IP — mismatch is a
+            // leak warning.
             VpnEvent::PublicIpVerified { info } => {
                 self.verification_failures = 0;
                 self.last_verified_ip = Some(info.ip);
@@ -369,6 +436,29 @@ impl Machine for VpnMachine {
                     publish.push(VpnPublish::PublicIpMismatch {
                         file_ip,
                         verified_ip: info.ip,
+                        source: VerificationSource::IfConfigCo,
+                    });
+                }
+                Outcome {
+                    actions: Vec::new(),
+                    publish,
+                }
+            }
+            // §33 / VPN-11: MAM `/json/jsonIp.php` verification succeeded.
+            // Same shape as `PublicIpVerified` but tracks the MAM-side
+            // counter and publishes with `VerificationSource::MamJsonIp`
+            // on disagreement.
+            VpnEvent::MamIpVerified { info } => {
+                self.mam_verification_failures = 0;
+                self.last_mam_verified_ip = Some(info.ip);
+                let mut publish = Vec::new();
+                if let Some(file_ip) = self.observed_ip
+                    && file_ip != info.ip
+                {
+                    publish.push(VpnPublish::PublicIpMismatch {
+                        file_ip,
+                        verified_ip: info.ip,
+                        source: VerificationSource::MamJsonIp,
                     });
                 }
                 Outcome {
@@ -377,7 +467,7 @@ impl Machine for VpnMachine {
                 }
             }
             // §31 / VPN-10: rising-edge degraded publish on persistent
-            // verification failure.  Threshold is configurable; default 3.
+            // ifconfig.co failure.  Threshold is configurable; default 3.
             VpnEvent::PublicIpVerifyFailed { reason } => {
                 let threshold = self.config.public_ip_verify_failure_threshold;
                 let before = self.verification_failures;
@@ -394,12 +484,36 @@ impl Machine for VpnMachine {
                     publish,
                 }
             }
-            // §31: self-perpetuating verification heartbeat.  Always emits
-            // one `VerifyPublicIp` + re-schedules itself, so a dropped
-            // response or shell error cannot kill the chain.
+            // §33 / VPN-12: same rising-edge pattern for the MAM source.
+            // Counter is independent of `verification_failures` so a
+            // per-source degraded signal can fire even when the other
+            // source is healthy.
+            VpnEvent::MamIpVerifyFailed { reason } => {
+                let threshold = self.config.public_ip_verify_failure_threshold;
+                let before = self.mam_verification_failures;
+                self.mam_verification_failures = before.saturating_add(1);
+                let mut publish = Vec::new();
+                if threshold > 0
+                    && before < threshold
+                    && self.mam_verification_failures >= threshold
+                {
+                    publish.push(VpnPublish::MamIpVerificationDegraded {
+                        consecutive_failures: self.mam_verification_failures,
+                        last_reason: reason,
+                    });
+                }
+                Outcome {
+                    actions: Vec::new(),
+                    publish,
+                }
+            }
+            // §31 + §33: self-perpetuating verification heartbeat.  Fires
+            // both checks per tick + re-schedules unconditionally so a
+            // dropped response cannot kill the chain.
             VpnEvent::TimerFired(VpnTimer::PublicIpVerify) => Outcome {
                 actions: vec![
                     VpnAction::VerifyPublicIp,
+                    VpnAction::VerifyMamIp,
                     VpnAction::ScheduleTimer {
                         timer: VpnTimer::PublicIpVerify,
                         after: self.config.public_ip_verify_interval,
@@ -689,6 +803,8 @@ mod prop_tests {
             proptest::option::of(any_vpn_ip()),
             0u32..=10u32,
             any::<bool>(),
+            proptest::option::of(any_vpn_ip()),
+            0u32..=10u32,
         )
             .prop_map(
                 |(
@@ -698,6 +814,8 @@ mod prop_tests {
                     last_verified_ip,
                     verification_failures,
                     verify_chain_scheduled,
+                    last_mam_verified_ip,
+                    mam_verification_failures,
                 )| {
                     let mut machine = VpnMachine::new(
                         VpnConfig {
@@ -715,6 +833,8 @@ mod prop_tests {
                     machine.last_verified_ip = last_verified_ip;
                     machine.verification_failures = verification_failures;
                     machine.verify_chain_scheduled = verify_chain_scheduled;
+                    machine.last_mam_verified_ip = last_mam_verified_ip;
+                    machine.mam_verification_failures = mam_verification_failures;
                     machine
                 },
             )
@@ -749,6 +869,8 @@ mod prop_tests {
             Just(VpnEvent::PublicIpFileUnavailable),
             any_verified_ip_info().prop_map(|info| VpnEvent::PublicIpVerified { info }),
             any::<String>().prop_map(|reason| VpnEvent::PublicIpVerifyFailed { reason }),
+            any_verified_ip_info().prop_map(|info| VpnEvent::MamIpVerified { info }),
+            any::<String>().prop_map(|reason| VpnEvent::MamIpVerifyFailed { reason }),
             (any::<bool>(), proptest::option::of(any_vpn_port()))
                 .prop_map(|(connected, port)| VpnEvent::StateRead { connected, port }),
             any::<String>().prop_map(|reason| VpnEvent::StateReadFailed { reason }),
