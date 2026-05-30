@@ -15,6 +15,94 @@ struct DynamicSeedboxResponse {
     success: bool,
     msg: String,
     ip: String,
+    /// §32: ASN number MAM has recorded for this IP.  Mousehole's
+    /// dedup compares against this.  Present in every documented
+    /// dynamic-seedbox response (success or error).
+    #[serde(rename = "ASN", default)]
+    asn: u32,
+    /// §32: AS organization name (e.g. "Mullvad AB").  Carried for
+    /// logging and as input to future ASN-aware dedup work.
+    #[serde(rename = "AS", default)]
+    as_org: String,
+}
+
+/// §32: typed enumeration of the known `msg` values MAM returns from the
+/// dynamic-seedbox endpoint.  Captured from the official API docs to avoid
+/// brittle substring matching across the call sites.
+///
+/// `Other(String)` carries any future or undocumented message verbatim so
+/// the operator can still see what MAM said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DynamicSeedboxMsg {
+    Completed,
+    NoChange,
+    LastChangeTooRecent,
+    NoSessionCookie,
+    InvalidSession,
+    InvalidSessionIpMismatch,
+    InvalidSessionAsnMismatch,
+    InvalidSessionInvalidCookie,
+    InvalidSessionOther,
+    IncorrectSessionTypeNotAllowed,
+    IncorrectSessionTypeNonApi,
+    Other(String),
+}
+
+impl DynamicSeedboxMsg {
+    fn from_msg(raw: &str) -> Self {
+        // MAM's casing is inconsistent ("Completed" vs "No change" vs
+        // "Last change too recent"); normalise to lowercase for matching.
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "completed" => Self::Completed,
+            "no change" => Self::NoChange,
+            "last change too recent" => Self::LastChangeTooRecent,
+            "no session cookie" => Self::NoSessionCookie,
+            "invalid session" => Self::InvalidSession,
+            "invalid session - ip mismatch" => Self::InvalidSessionIpMismatch,
+            "invalid session - asn mismatch" => Self::InvalidSessionAsnMismatch,
+            "invalid session - invalid cookie" => Self::InvalidSessionInvalidCookie,
+            "invalid session - other" => Self::InvalidSessionOther,
+            "incorrect session type - not allowed this function" => {
+                Self::IncorrectSessionTypeNotAllowed
+            }
+            "incorrect session type - non-api session" => Self::IncorrectSessionTypeNonApi,
+            _ => Self::Other(raw.to_string()),
+        }
+    }
+}
+
+/// §32: typed seedbox-update outcome.
+///
+/// Carries the registered IP/ASN/AS that MAM reports back on every call —
+/// these are the source of truth for "what MAM has on file" and feed the
+/// Mousehole-style dedup logic.  The shell forwards these fields to the
+/// MAM core via the extended `Event::MamUpdateSuccess`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicSeedboxOutcome {
+    pub msg: DynamicSeedboxMsg,
+    pub success: bool,
+    pub ip: Option<VpnIp>,
+    pub asn: Option<u32>,
+    pub as_org: Option<String>,
+}
+
+/// §32: typed result of `fetch_mam_ip()` — MAM's view of our current IP
+/// and ASN, returned from `/json/jsonIp.php`.  Used by §31's verification
+/// path to cross-check Gluetun's file against what MAM sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MamIpInfo {
+    pub ip: VpnIp,
+    pub asn: u32,
+    pub as_org: String,
+}
+
+#[derive(Deserialize)]
+struct JsonIpResponse {
+    ip: String,
+    #[serde(rename = "ASN", default)]
+    asn: u32,
+    #[serde(rename = "AS", default)]
+    as_org: String,
 }
 
 /// §28: typed failure surface for `fetch_mam_status`.
@@ -102,8 +190,16 @@ pub struct MamClient {
     check_session_url: String,
     seedbox_url: String,
     load_url: String,
+    /// §32: `/json/jsonIp.php` endpoint MAM uses to report what *it* sees as
+    /// our IP/ASN/AS.  Used by the VPN-core verification path as a second
+    /// source alongside `ifconfig.co`.
+    json_ip_url: String,
     torrent_base_url: String,
     last_request_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// §32: timestamp of the last successful (or attempted) call to the
+    /// dynamic-seedbox endpoint.  Enforces MAM's documented 1-hour rolling
+    /// limit on top of the existing 400 ms inter-request guard.
+    last_seedbox_call_at: Arc<Mutex<Option<std::time::Instant>>>,
     on_http: HttpObserver,
 }
 
@@ -132,9 +228,15 @@ impl MamClient {
             session: Arc::new(Mutex::new(session)),
             check_session_url: "https://www.myanonamouse.net/json/checkCookie.php".into(),
             seedbox_url,
-            load_url,
+            // §32: switch to `?clientStats=` so MAM actually returns the
+            // `connectable` field.  Without this our §28 NotConnectable
+            // publish fires in steady state because the field is absent.
+            // We accept the 30-min server-side cache as the trade-off.
+            load_url: ensure_client_stats(load_url),
+            json_ip_url: "https://t.myanonamouse.net/json/jsonIp.php".into(),
             torrent_base_url: "https://www.myanonamouse.net".into(),
             last_request_at: Arc::new(Mutex::new(None)),
+            last_seedbox_call_at: Arc::new(Mutex::new(None)),
             on_http,
         })
     }
@@ -166,11 +268,59 @@ impl MamClient {
         Ok(())
     }
 
+    /// §32: returns MAM's view of our current IP/ASN via `/json/jsonIp.php`.
+    ///
+    /// Unlike `fetch_mam_status`, this endpoint requires no session and is
+    /// rate-limited at 1/minute server-side.  Used by the §31 verification
+    /// path as a second source alongside `ifconfig.co/json` — the two
+    /// together catch a wider class of routing/proxy edge cases.
+    ///
+    /// # Errors
+    /// Returns `MamFetchError::Unreachable` on transport failure or
+    /// `MamFetchError::StatusFailed` on a non-success HTTP response or a
+    /// parse error.
+    pub async fn fetch_mam_ip(&self) -> Result<MamIpInfo, MamFetchError> {
+        if !self.check_rate_limit() {
+            return Err(MamFetchError::LocalRateLimit);
+        }
+        let result = self.client.get(&self.json_ip_url).send().await;
+        match result {
+            Err(e) => Err(MamFetchError::Unreachable(e.to_string())),
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    return Err(MamFetchError::StatusFailed(format!("HTTP {status}")));
+                }
+                let raw = resp.text().await.unwrap_or_default();
+                self.emit_http(&self.json_ip_url, status.as_u16(), &raw);
+                match serde_json::from_str::<JsonIpResponse>(&raw) {
+                    Err(e) => Err(MamFetchError::StatusFailed(format!("parse: {e}"))),
+                    Ok(body) => match body.ip.trim().parse::<std::net::Ipv4Addr>() {
+                        Err(e) => Err(MamFetchError::StatusFailed(format!("ip parse: {e}"))),
+                        Ok(ip) => Ok(MamIpInfo {
+                            ip: VpnIp(ip),
+                            asn: body.asn,
+                            as_org: body.as_org,
+                        }),
+                    },
+                }
+            }
+        }
+    }
+
     /// Registers the current VPN IP with MAM via the dynamic seedbox endpoint.
     ///
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn update_seedbox(&self) -> Event {
+        // §32: enforce MAM's documented 1-hour rolling rate limit
+        // client-side.  Without this guard our retry/heartbeat paths can
+        // hit the dynamic-seedbox endpoint repeatedly during normal
+        // operation and accumulate `Last change too recent` rejections.
+        if !self.check_seedbox_call_rate_limit() {
+            warn!("MAM dynamic-seedbox 1h client-side rate limit triggered");
+            return Event::MamRateLimitViolation { at: Utc::now() };
+        }
         if !self.check_rate_limit() {
             return Event::MamRateLimitViolation { at: Utc::now() };
         }
@@ -309,6 +459,20 @@ impl MamClient {
         true
     }
 
+    /// §32: enforces the documented 1-hour rolling rate limit on
+    /// `dynamicSeedbox.php` client-side.  Returns `true` if the call may
+    /// proceed.  Increments the timestamp on a successful gate.
+    fn check_seedbox_call_rate_limit(&self) -> bool {
+        let mut last = self.last_seedbox_call_at.lock().unwrap();
+        if let Some(t) = *last
+            && t.elapsed() < std::time::Duration::from_hours(1)
+        {
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+        true
+    }
+
     fn emit_http(&self, url: &str, response_status: u16, response_body: &str) {
         (self.on_http)(HttpExchange {
             module: "mam".into(),
@@ -350,26 +514,57 @@ impl MamClient {
                 let raw = resp.text().await.unwrap_or_default();
                 self.emit_http(&self.seedbox_url, status, &raw);
                 match serde_json::from_str::<DynamicSeedboxResponse>(&raw) {
-                    Ok(body) if body.success => {
-                        info!("MAM seedbox: {}", body.msg);
-                        (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
-                    }
-                    Ok(body) if body.msg.contains("ASN mismatch") => {
-                        let ip = body
-                            .ip
-                            .trim()
-                            .parse()
-                            .map_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED), VpnIp);
-                        warn!("MAM ASN mismatch: ip={}", ip.0);
-                        (Event::MamAsnMismatch { at: Utc::now(), ip }, new_session)
-                    }
-                    Ok(body) => {
-                        warn!("MAM seedbox non-success: {}", body.msg);
-                        (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
-                    }
                     Err(e) => {
                         warn!("MAM seedbox response parse failed: {e}");
-                        (Event::MamUpdateSuccess { at: Utc::now() }, new_session)
+                        (
+                            Event::MamUpdateSuccess {
+                                at: Utc::now(),
+                                registered_ip: None,
+                                registered_asn: None,
+                                registered_as: None,
+                            },
+                            new_session,
+                        )
+                    }
+                    Ok(body) => {
+                        let msg = DynamicSeedboxMsg::from_msg(&body.msg);
+                        let registered_ip =
+                            body.ip.trim().parse::<std::net::Ipv4Addr>().ok().map(VpnIp);
+                        let registered_asn = (body.asn != 0).then_some(body.asn);
+                        let registered_as = (!body.as_org.is_empty()).then(|| body.as_org.clone());
+                        // §30: ASN mismatch routed as a distinct compliance
+                        // signal (typed match — was substring-matching).
+                        if msg == DynamicSeedboxMsg::InvalidSessionAsnMismatch {
+                            let ip =
+                                registered_ip.unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
+                            warn!("MAM ASN mismatch: ip={}", ip.0);
+                            return (Event::MamAsnMismatch { at: Utc::now(), ip }, new_session);
+                        }
+                        if body.success {
+                            info!(
+                                "MAM seedbox {}: ip={:?} asn={:?} as={:?}",
+                                body.msg, registered_ip, registered_asn, registered_as
+                            );
+                        } else {
+                            warn!(
+                                "MAM seedbox non-success {}: ip={:?} asn={:?}",
+                                body.msg, registered_ip, registered_asn
+                            );
+                        }
+                        // §32: regardless of `Success`, MAM returns the IP
+                        // it currently has registered — carry it through so
+                        // the MAM core can dedup against it.  Failures still
+                        // surface as `MamUpdateSuccess` here for now (matches
+                        // pre-§32 behaviour); future work can distinguish.
+                        (
+                            Event::MamUpdateSuccess {
+                                at: Utc::now(),
+                                registered_ip,
+                                registered_asn,
+                                registered_as,
+                            },
+                            new_session,
+                        )
                     }
                 }
             }
@@ -515,6 +710,18 @@ fn extract_mam_cookie(resp: &reqwest::Response) -> Option<String> {
         }
     }
     None
+}
+
+/// §32: appends `?clientStats=` to a `/jsonLoad.php` URL if not already
+/// present.  Per MAM's API docs the `connectable` field is only returned
+/// when this query parameter is set; without it our §28 `NotConnectable`
+/// publish fires in steady state because the field is absent.
+fn ensure_client_stats(url: String) -> String {
+    if url.contains("clientStats") {
+        return url;
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}clientStats=")
 }
 
 #[cfg(test)]

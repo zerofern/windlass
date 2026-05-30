@@ -115,7 +115,14 @@ pub enum MamEvent {
     AsnMismatch {
         ip: VpnIp,
     },
-    SeedboxUpdated,
+    /// §32: successful dynamic-seedbox response.  Carries the IP/ASN/AS MAM
+    /// reports as currently registered for the account.  All three are
+    /// optional because the legacy bridge cannot always populate them.
+    SeedboxUpdated {
+        registered_ip: Option<VpnIp>,
+        registered_asn: Option<u32>,
+        registered_as: Option<String>,
+    },
     SeedboxUpdateFailed {
         reason: String,
     },
@@ -282,6 +289,17 @@ pub struct MamMachine {
     /// `StaleRegistrationRefresh` timer.  Set on the first
     /// `ObservedIpChanged`, never cleared.
     stale_chain_scheduled: bool,
+    /// §32: IP MAM reported on the last successful dynamic-seedbox call —
+    /// "what MAM has on file for us right now".  This is Mousehole's primary
+    /// dedup target: `ObservedIpChanged { ip }` skips `UpdateSeedbox` iff
+    /// `registered_ip == Some(ip)`.
+    registered_ip: Option<VpnIp>,
+    /// §32: ASN MAM reported on the last successful dynamic-seedbox call.
+    /// Carried for logging and future ASN-aware dedup.
+    registered_asn: Option<u32>,
+    /// §32: AS organization name from the last successful dynamic-seedbox
+    /// call.  Carried for logging.
+    registered_as: Option<String>,
 }
 
 impl MamMachine {
@@ -323,6 +341,20 @@ impl MamMachine {
     #[must_use]
     pub const fn observed_ip(&self) -> Option<VpnIp> {
         self.observed_ip
+    }
+
+    /// Returns the IP MAM has recorded on the last successful seedbox
+    /// update (§32) — the primary Mousehole-style dedup target.
+    #[must_use]
+    pub const fn registered_ip(&self) -> Option<VpnIp> {
+        self.registered_ip
+    }
+
+    /// Returns the ASN MAM has recorded on the last successful seedbox
+    /// update (§32).
+    #[must_use]
+    pub const fn registered_asn(&self) -> Option<u32> {
+        self.registered_asn
     }
 
     /// Returns `true` once the `KeepAlive` chain has been started (§27).
@@ -428,6 +460,9 @@ impl Machine for MamMachine {
             asn_state: AsnState::Unknown,
             observed_ip: None,
             stale_chain_scheduled: false,
+            registered_ip: None,
+            registered_asn: None,
+            registered_as: None,
         }
     }
 
@@ -591,10 +626,28 @@ impl Machine for MamMachine {
                     publish,
                 }
             }
-            MamEvent::SeedboxUpdated => {
+            MamEvent::SeedboxUpdated {
+                registered_ip,
+                registered_asn,
+                registered_as,
+            } => {
                 let port = self.desired_seedbox_port;
                 if let Some(p) = port {
                     self.seedbox_port = Some(p);
+                }
+                // §32: record MAM's view of what's currently registered.
+                // These overwrite whatever we had before — MAM's response is
+                // the source of truth for "the IP MAM has on file".  Carry
+                // through `None` honestly: a parse failure means we don't
+                // know, and the next dedup falls back to observed_ip.
+                if registered_ip.is_some() {
+                    self.registered_ip = registered_ip;
+                }
+                if registered_asn.is_some() {
+                    self.registered_asn = registered_asn;
+                }
+                if registered_as.is_some() {
+                    self.registered_as = registered_as;
                 }
                 let mut publish: Vec<MamPublish> = port
                     .map(|p| MamPublish::SeedboxPortReady { port: p })
@@ -668,15 +721,20 @@ impl Machine for MamMachine {
                 }
                 vec![MamAction::UpdateSeedbox]
             }
-            // §31 / MAM-16: dedup observed-IP-driven updates.  Only emit
-            // `UpdateSeedbox` when the IP genuinely changes (Mousehole's
-            // `getUpdateReason` style).  Also arms the self-perpetuating
-            // 24h stale-registration timer on the first observation.
+            // §31 / MAM-16 + §32: Mousehole-style dedup.  Skip
+            // `UpdateSeedbox` when MAM has already recorded this IP
+            // (`registered_ip == Some(ip)`).  The `observed_ip` check is now
+            // a fallback for the boot window before any successful seedbox
+            // call has populated `registered_ip`.  Also arms the
+            // self-perpetuating 24h stale-registration timer on the first
+            // observation.
             MamCommand::ObservedIpChanged { ip } => {
-                if self.observed_ip == Some(ip) {
+                let already_registered = self.registered_ip == Some(ip);
+                let already_observed = self.observed_ip == Some(ip);
+                self.observed_ip = Some(ip);
+                if already_registered || already_observed {
                     return Self::outcome(Vec::new(), MamResponse::Accepted);
                 }
-                self.observed_ip = Some(ip);
                 let mut actions = vec![MamAction::UpdateSeedbox];
                 if !self.stale_chain_scheduled {
                     self.stale_chain_scheduled = true;
@@ -775,7 +833,14 @@ mod tests {
         // Set a desired port so the machine knows which port was converged.
         let _ = machine.handle_command(Instant::now(), MamCommand::EnsureSeedboxPort { port });
 
-        let out = handle(&mut machine, MamEvent::SeedboxUpdated);
+        let out = handle(
+            &mut machine,
+            MamEvent::SeedboxUpdated {
+                registered_ip: None,
+                registered_asn: None,
+                registered_as: None,
+            },
+        );
 
         assert_eq!(machine.seedbox_port(), Some(port));
         // §30: the first SeedboxUpdated also publishes AsnAccepted (rising
@@ -864,7 +929,14 @@ mod tests {
         let mut machine = machine();
         let port = VpnPort::try_new(51_820).unwrap();
         let _ = machine.handle_command(Instant::now(), MamCommand::EnsureSeedboxPort { port });
-        let _ = handle(&mut machine, MamEvent::SeedboxUpdated);
+        let _ = handle(
+            &mut machine,
+            MamEvent::SeedboxUpdated {
+                registered_ip: None,
+                registered_asn: None,
+                registered_as: None,
+            },
+        );
 
         let out = machine.handle_command(Instant::now(), MamCommand::EnsureSeedboxPort { port });
 
@@ -1431,7 +1503,11 @@ mod prop_tests {
             any::<[u8; 4]>().prop_map(|b| MamEvent::AsnMismatch {
                 ip: VpnIp(std::net::Ipv4Addr::from(b)),
             }),
-            Just(MamEvent::SeedboxUpdated),
+            Just(MamEvent::SeedboxUpdated {
+                registered_ip: None,
+                registered_asn: None,
+                registered_as: None,
+            }),
             any::<String>().prop_map(|reason| MamEvent::SeedboxUpdateFailed { reason }),
             (0u64..=3600).prop_map(|s| MamEvent::RateLimited {
                 retry_after: Duration::from_secs(s)
@@ -1852,7 +1928,11 @@ mod prop_tests {
             let pre = machine.asn_state();
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::SeedboxUpdated),
+                Timed::now(MamEvent::SeedboxUpdated {
+                    registered_ip: None,
+                    registered_asn: None,
+                    registered_as: None,
+                }),
             );
             prop_assert_eq!(machine.asn_state(), AsnState::Accepted);
             let accepted_count = out
@@ -1913,6 +1993,60 @@ mod prop_tests {
                 prop_assert!(machine.stale_chain_scheduled);
                 prop_assert_eq!(machine.observed_ip(), Some(ip));
             }
+        }
+
+        // MAM-18 [safety] (§32): Mousehole-style registered_ip dedup.
+        // `ObservedIpChanged { ip }` skips `UpdateSeedbox` when MAM has
+        // already recorded this IP (`registered_ip == Some(ip)`), even if
+        // `observed_ip` differs.  Total.
+        #[test]
+        fn observed_ip_changed_dedups_against_registered_ip(
+            mut machine in any_mam_machine(),
+            ip_bytes in any::<[u8; 4]>(),
+        ) {
+            let ip = VpnIp(std::net::Ipv4Addr::from(ip_bytes));
+            // Force registered_ip == ip so the dedup must fire.
+            machine.registered_ip = Some(ip);
+            let out = machine.handle_command(
+                Instant::now(),
+                MamCommand::ObservedIpChanged { ip },
+            );
+            let update_count = out.actions.iter()
+                .filter(|a| matches!(a, MamAction::UpdateSeedbox))
+                .count();
+            prop_assert_eq!(update_count, 0,
+                "MAM-18: skip UpdateSeedbox when MAM already has this IP");
+        }
+
+        // MAM-19 [safety] (§32): SeedboxUpdated stores the registered
+        // IP/ASN/AS reported by MAM, overwriting prior state.  Honest
+        // `None` carry-through: missing fields don't clobber prior values.
+        #[test]
+        fn seedbox_updated_records_registered_meta(
+            mut machine in any_mam_machine(),
+            new_ip_bytes in proptest::option::of(any::<[u8; 4]>()),
+            new_asn in proptest::option::of(any::<u32>()),
+            new_as in proptest::option::of(any::<String>()),
+        ) {
+            let new_ip = new_ip_bytes
+                .map(|b| VpnIp(std::net::Ipv4Addr::from(b)));
+            let pre_registered_ip = machine.registered_ip;
+            let pre_registered_asn = machine.registered_asn;
+            let pre_registered_as = machine.registered_as.clone();
+            machine.handle(Instant::now(), Timed::now(
+                MamEvent::SeedboxUpdated {
+                    registered_ip: new_ip,
+                    registered_asn: new_asn,
+                    registered_as: new_as.clone(),
+                },
+            ));
+            // None means "no fresh info" — keep the old value.
+            let expected_ip = if new_ip.is_some() { new_ip } else { pre_registered_ip };
+            let expected_asn = if new_asn.is_some() { new_asn } else { pre_registered_asn };
+            let expected_as = if new_as.is_some() { new_as } else { pre_registered_as };
+            prop_assert_eq!(machine.registered_ip, expected_ip);
+            prop_assert_eq!(machine.registered_asn, expected_asn);
+            prop_assert_eq!(machine.registered_as, expected_as);
         }
 
         // MAM-17 [safety] (§31): TimerFired(StaleRegistrationRefresh)

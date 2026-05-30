@@ -51,9 +51,19 @@ impl Shell for MamShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let event = match client.update_seedbox().await {
-                        windlass_core::events::Event::MamUpdateSuccess { .. } => {
-                            MamEvent::SeedboxUpdated
-                        }
+                        // §32: forward the registered IP/ASN/AS the legacy
+                        // event carries so the MAM core can dedup further
+                        // updates against MAM's view of "what's registered".
+                        windlass_core::events::Event::MamUpdateSuccess {
+                            registered_ip,
+                            registered_asn,
+                            registered_as,
+                            ..
+                        } => MamEvent::SeedboxUpdated {
+                            registered_ip,
+                            registered_asn,
+                            registered_as,
+                        },
                         windlass_core::events::Event::MamRateLimitViolation { .. } => {
                             MamEvent::RateLimited {
                                 retry_after: Duration::from_secs(1),

@@ -79,9 +79,18 @@ pub(super) fn legacy_to_service_events(
                 })]
             },
         ),
-        Event::MamUpdateSuccess { .. } => {
+        Event::MamUpdateSuccess {
+            registered_ip,
+            registered_asn,
+            registered_as,
+            ..
+        } => {
             if forwarded_port.is_some() {
-                vec![ServiceEvent::Mam(MamEvent::SeedboxUpdated)]
+                vec![ServiceEvent::Mam(MamEvent::SeedboxUpdated {
+                    registered_ip: *registered_ip,
+                    registered_asn: *registered_asn,
+                    registered_as: registered_as.clone(),
+                })]
             } else {
                 Vec::new()
             }

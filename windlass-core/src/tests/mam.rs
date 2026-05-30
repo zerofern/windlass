@@ -14,7 +14,15 @@ fn mam_update_success_sends_ok_alert() {
         ip: ip(),
         port: port(),
     };
-    let outcome = state.process_event(Event::MamUpdateSuccess { at: now() }, now());
+    let outcome = state.process_event(
+        Event::MamUpdateSuccess {
+            at: now(),
+            registered_ip: None,
+            registered_asn: None,
+            registered_as: None,
+        },
+        now(),
+    );
     let actions = outcome.actions;
     assert!(outcome.state_changed);
     assert!(matches!(state.mam, MamState::Synced { .. }));
@@ -30,7 +38,15 @@ fn mam_update_success_sends_ok_alert() {
 #[test]
 fn mam_update_success_is_noop_when_vpn_not_connected() {
     let mut state = SystemState::initial();
-    let outcome = state.process_event(Event::MamUpdateSuccess { at: now() }, now());
+    let outcome = state.process_event(
+        Event::MamUpdateSuccess {
+            at: now(),
+            registered_ip: None,
+            registered_asn: None,
+            registered_as: None,
+        },
+        now(),
+    );
     let actions = outcome.actions;
     assert!(!outcome.state_changed);
     assert_eq!(state.mam, MamState::Unknown);

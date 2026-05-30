@@ -84,8 +84,19 @@ pub enum Event {
         code: HttpStatusCode,
     },
 
+    /// Successful dynamic-seedbox update.  §32 added the registered IP/ASN/AS
+    /// fields MAM returns on success so the MAM core can dedup further
+    /// updates against the known-registered IP (Mousehole semantics).  All
+    /// three are optional for backward compatibility with legacy emitters
+    /// that don't carry the metadata.
     MamUpdateSuccess {
         at: DateTime<Utc>,
+        #[serde(default)]
+        registered_ip: Option<VpnIp>,
+        #[serde(default)]
+        registered_asn: Option<u32>,
+        #[serde(default)]
+        registered_as: Option<String>,
     },
     MamAsnMismatch {
         at: DateTime<Utc>,
@@ -190,7 +201,7 @@ impl Event {
             | Self::QbitApiError { at, .. }
             | Self::QbitPortSyncSuccess { at }
             | Self::QbitPortSyncFailed { at, .. }
-            | Self::MamUpdateSuccess { at }
+            | Self::MamUpdateSuccess { at, .. }
             | Self::MamAsnMismatch { at, .. }
             | Self::MamUnreachable { at, .. }
             | Self::MamStatusObserved { at, .. }

@@ -196,7 +196,10 @@ fn any_qbit_events() -> impl Strategy<Value = Event> {
 fn any_mam_events() -> impl Strategy<Value = Event> {
     prop_oneof![
         Just(Event::MamUpdateSuccess {
-            at: DateTime::UNIX_EPOCH
+            at: DateTime::UNIX_EPOCH,
+            registered_ip: None,
+            registered_asn: None,
+            registered_as: None,
         }),
         any_vpn_ip().prop_map(|ip| Event::MamAsnMismatch {
             at: DateTime::UNIX_EPOCH,

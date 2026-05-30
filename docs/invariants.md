@@ -512,6 +512,31 @@ New command: `MamCommand::ObservedIpChanged { ip }`.  New timer:
   `ScheduleTimer { StaleRegistrationRefresh }` — the chain cannot die
   from a dropped result or shell error.  Mirrors QBIT-3 / MAM-9. → F
 
+### MAM machine additions (§32)
+
+State additions: `registered_ip: Option<VpnIp>`, `registered_asn: Option<u32>`,
+`registered_as: Option<String>` — MAM's own report of what's currently
+recorded for the account.  Populated from successful (or even informational)
+dynamic-seedbox responses; carried through the legacy bridge via the
+extended `Event::MamUpdateSuccess`.
+
+`MamEvent::SeedboxUpdated` now carries `{ registered_ip, registered_asn,
+registered_as }` so the MAM core stores MAM's view alongside the
+domain-forwarded `observed_ip`.
+
+- **MAM-18 [safety]** *(registered-IP dedup — §32)*
+  `MamCommand::ObservedIpChanged { ip }` emits zero `UpdateSeedbox` actions
+  when `registered_ip == Some(ip)` (MAM has already recorded this IP).
+  Combined with MAM-16 (the §31 `observed_ip` dedup), the predicate becomes
+  Mousehole's: skip if already registered, fall back to skip-if-already-
+  observed during the boot window before the first successful dynamic-
+  seedbox call. Total invariant. → A, F
+- **MAM-19 [safety]** *(registered-meta storage — §32)* `SeedboxUpdated
+  { registered_ip, registered_asn, registered_as }` overwrites
+  `self.registered_*` only when the matching field is `Some`.  A `None`
+  carries through honestly — a malformed MAM response does not clobber
+  prior known-good values.  Total invariant. → A
+
 ### qBit machine additions (§29)
 
 - **QBIT-19 [safety]** *(quota positive signal — §29)* `TorrentsListed`

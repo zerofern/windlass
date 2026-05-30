@@ -56,10 +56,11 @@ Implement these stories one at a time, in this order:
 29. Enforce fail-closed download admission control (composite gate).
 30. Block MAM automation on VPN IP non-compliance.
 31. Mousehole-style proactive dynamic-seedbox update on IP change.
-32. Parse MAM's registered IP from `/jsonLoad.php` and dedup updates against it.
-33. Review and harden the integration-test suite.
-34. Make dependent-container orchestration safe under Gluetun.
-35. Fully port legacy `windlass-core` to the per-system cores and remove it.
+32. Dedup updates against MAM-registered IP (Mousehole parity).
+33. VPN multi-source IP verification (ifconfig.co + MAM jsonIp).
+34. Review and harden the integration-test suite.
+35. Make dependent-container orchestration safe under Gluetun.
+36. Fully port legacy `windlass-core` to the per-system cores and remove it.
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -1251,58 +1252,135 @@ if MamEvent::TimerFired(StaleRegistrationRefresh):
   as soon as the IP moves, so MAM never sees a mismatch in normal
   rotations.
 
-## Story: Parse MAM's Registered IP And Dedup Updates Against It
+## Story: Dedup Updates Against MAM-Registered IP (Mousehole Parity)
+
+Status: Done
+
+### Problem
+
+§31 dedups `UpdateSeedbox` against the *VPN-observed* IP. Mousehole's
+`getUpdateReason` instead compares against what MAM has *registered*
+(`lastMamResponse.body.ip` / `body.ASN`). The two diverge in real failure
+modes: if a previous `UpdateSeedbox` failed but the operator's observed IP
+still equals the new value, the §31 dedup would skip the next attempt even
+though MAM still has the old IP on file.
+
+A second blocker was discovered while investigating: our `/jsonLoad.php`
+parse silently fails on VIP responses (`ratio: "∞"`) and never returns the
+`connectable` field at all without `?clientStats=`, so §28's
+`NotConnectable` publish has been firing in steady state.
+
+A third blocker: MAM's dynamic-seedbox endpoint is rate-limited at 1/hour
+(rolling). Our retry paths can exceed that today, accumulating `Last
+change too recent` rejections.
+
+### User Story
+
+As the operator user, I want Windlass to skip the `UpdateSeedbox` call when
+MAM already has my current IP on file, hit `/jsonLoad.php` with the right
+query parameter so connectability isn't constantly false, and never hammer
+the dynamic-seedbox endpoint past its 1/hour limit.
+
+### Acceptance Criteria
+
+- Extend `DynamicSeedboxResponse` to parse `ASN: u32` and `AS: String`
+  (Mousehole's documented schema).
+- Add a typed `DynamicSeedboxMsg` enum covering the documented `msg`
+  values (`Completed`, `No change`, `Last change too recent`, the five
+  `Invalid session - …` variants, the two `Incorrect session type - …`
+  variants, plus `Other(String)` for forward compatibility). Replace the
+  current substring match on `"ASN mismatch"`.
+- Extend `Event::MamUpdateSuccess` with
+  `Option<{registered_ip, registered_asn, registered_as}>` so the legacy
+  bridge can carry MAM's view through to the MAM core.
+- Extend `MamEvent::SeedboxUpdated` with the same trio. The MAM core
+  stores them as `registered_ip` / `registered_asn` / `registered_as`.
+- `MamCommand::ObservedIpChanged { ip }` skips `UpdateSeedbox` when
+  `registered_ip == Some(ip)` (primary dedup), with the §31 `observed_ip`
+  check now functioning as a fallback during the boot window before any
+  successful dynamic-seedbox response.
+- The MAM client enforces a client-side 1/hour rate limit on
+  `update_seedbox()` to match MAM's documented server limit. Calls within
+  the window return `Event::MamRateLimitViolation`.
+- Switch `fetch_mam_status` to `/jsonLoad.php?clientStats=` so the
+  `connectable` field is actually populated. Accept the documented 30-min
+  server-side cache as the trade-off.
+- Add `MamClient::fetch_mam_ip()` hitting `/json/jsonIp.php` (MAM's own
+  IP-check endpoint). Returns `MamIpInfo { ip, asn, as_org }`. Used by
+  the follow-up story §33 (VPN multi-source verification).
+- Capture the full endpoint surface plus Mousehole/MLM references in
+  `docs/mam-api.md` so future stories don't re-derive the API.
+- Add `MAM-18`/`MAM-19` to `docs/invariants.md` and cover them with
+  property tests.
+
+### Implementation Notes
+
+- Use of `/json/jsonIp.php` from the VPN core (multi-source mismatch
+  detection) is split out into §33 to keep this commit focused on the
+  MAM-side dedup and rate-limit fixes.
+- The §31 stale-registration timer is unchanged: a 24h refresh still
+  forces `UpdateSeedbox` regardless of dedup state, because Mousehole's
+  STALE_RESPONSE_SECONDS exists for cookie/session freshness too.
+- The `/jsonLoad.php` ratio field can be a string for VIPs (`"∞"`).
+  Today our `ratio: f64` parse fails the whole struct in that case; the
+  fix is tracked separately — this story only changes the URL, not the
+  field shape.
+
+## Story: VPN Multi-Source IP Verification (ifconfig.co + MAM jsonIp)
 
 Status: To Do
 
 ### Problem
 
-§31 dedups `UpdateSeedbox` calls against the *VPN-observed* IP, but it does
-not yet dedup against what MAM has *registered* for our account. Mousehole's
-`getUpdateReason` compares `hostInfo.ip` against
-`lastMamResponse.response.body.ip` (and `body.ASN`). To match that, we need
-the MAM core to know what MAM thinks our current IP is, so we can skip the
-update on the cases where the file IP, the verified IP, and the MAM-recorded
-IP all already agree.
+§31 added `ifconfig.co/json` as a verification source against Gluetun's
+IP file. §32 added a MAM client method `fetch_mam_ip()` hitting
+`/json/jsonIp.php` — MAM's own report of what IP it sees us coming from.
+Today the VPN core's verification path only uses ifconfig.co. Bringing in
+the MAM endpoint as a second source catches a wider class of edge cases:
 
-The blocker is that we don't know which field in MAM's `/jsonLoad.php`
-response carries the registered IP. Mousehole's source references
-`response.body.ip`; we'd want to confirm by inspecting a real response with
-the user before parsing.
+- ifconfig.co cached, Gluetun rotated → ifconfig vs file disagree, MAM
+  agrees with file → likely ifconfig cache, not a leak.
+- Gluetun file correct, ifconfig.co fine, MAM still has old IP → MAM
+  hasn't yet been told (or §32's 1/h rate limit blocks us) → wait.
+- File vs MAM disagree, ifconfig.co agrees with MAM → likely a Gluetun
+  file-update lag or a stale write.
 
 ### User Story
 
-As the operator user, I want Windlass to skip the `UpdateSeedbox` call on
-keep-alive ticks when the IP I'm coming from already matches what MAM has
-recorded for me, so the dynamic-seedbox endpoint is only hit when something
-actually needs updating.
+As the operator user, I want Windlass to cross-check Gluetun's reported
+IP against both `ifconfig.co` and MAM's `/json/jsonIp.php`, naming which
+source disagrees so I can tell a public-internet edge case from a MAM
+compliance issue.
 
 ### Acceptance Criteria
 
-- Extend `JsonLoadResponse` with the MAM-registered IP field (and ASN if
-  available — useful for the future ASN-aware dedup story).
-- Extend `MamStatusResult` with `registered_ip: Option<Ipv4Addr>` and
-  `registered_asn: Option<String>`.
-- The MAM core stores `registered_ip` whenever `StatusFetched` arrives.
-- `MamCommand::ObservedIpChanged { ip }` only emits `UpdateSeedbox` when
-  `observed_ip != registered_ip`. When they match, the command is a no-op
-  (still re-arms the stale-registration timer on first observation).
-- The `StaleRegistrationRefresh` timer continues to force an update once
-  per 24h regardless of dedup state.
-- Add invariants to `docs/invariants.md` and cover them with property
-  tests.
+- The VPN core adds `VpnEvent::MamIpVerified { info: VerifiedIpInfo }`
+  (the existing `PublicIpVerified` continues to carry ifconfig.co
+  results).
+- New action `VpnAction::VerifyMamIp` — same shape as `VerifyPublicIp`.
+- The 6h `PublicIpVerify` timer fires **both** `VerifyPublicIp` and
+  `VerifyMamIp` per tick.
+- `VpnPublish::PublicIpMismatch` gains a `source: VerificationSource`
+  field (`IfConfigCo | MamJsonIp`) so the alert names which check
+  disagreed with Gluetun's file.
+- State additions: `last_mam_verified_ip: Option<VpnIp>`,
+  `mam_verification_failures: u32`. The §31 ifconfig.co-side counters
+  remain separate so a per-source degraded signal is possible.
+- New publish: `VpnPublish::MamIpVerificationDegraded { … }` (parallel to
+  the existing `PublicIpVerificationDegraded`).
+- Add invariants for both verification paths and the multi-source
+  mismatch.
+- Update `docs/mam-api.md` if anything about the `/json/jsonIp.php`
+  shape needs sharpening after first-real-call testing.
 
 ### Implementation Notes
 
-- The field name needs an investigation step. Plan: run a real
-  `fetch_mam_status` against the user's account, capture the JSON, identify
-  the IP field together. Likely candidates based on the Mousehole codebase:
-  `ip`, `IP`, `host_ip`. ASN field may be `ASN`, `asn`, `asn_org`.
-- Until the field name is confirmed, the §31 implementation is correct and
-  safe — it just doesn't take the full Mousehole-equivalent dedup shortcut.
-- The §31 retry-path tightening already covers the
-  "desired_seedbox_port == seedbox_port" case; this story adds the IP-side
-  dedup on top.
+- `MamClient::fetch_mam_ip()` already exists from §32 — just needs a
+  shell dispatcher. Use the same `VerifiedIpInfo` struct.
+- Multi-source mismatch logic: each verified event compares against the
+  Gluetun file IP; mismatches publish with their source enum. We do *not*
+  compare ifconfig.co vs MAM directly today — that's a follow-up if it
+  proves useful.
 
 ## Story: Review And Harden The Integration-Test Suite
 
