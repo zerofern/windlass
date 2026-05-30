@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 windlass-db      = { workspace = true }
 windlass-db-core = { workspace = true }
+windlass-docker-core = { workspace = true }
 windlass-domain-core = { workspace = true }
 windlass-machine = { workspace = true }
 windlass-mam-core = { workspace = true }
@@ -24,7 +25,9 @@ windlass-local   = { workspace = true }
 windlass-clients = { workspace = true }
 windlass-web     = { workspace = true }
 axum             = { workspace = true }
+bollard          = { workspace = true }
 chrono           = { workspace = true }
+futures-util     = { workspace = true }
 tokio            = { workspace = true }
 anyhow           = { workspace = true }
 tracing          = { workspace = true }

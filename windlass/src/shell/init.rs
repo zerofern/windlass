@@ -18,6 +18,7 @@ use windlass_local::{docker, vpn_files};
 use windlass_types::{VpnPort, WakeupId};
 
 use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand, DbMachine, DbPublish, DbTopic};
+use windlass_docker_core::{DockerConfig, DockerMachine};
 use windlass_domain_core::{
     WindlassConfig, WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic,
 };
@@ -28,6 +29,7 @@ use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
 use super::db_shell::DbShell;
+use super::docker_shell::{DockerShell, DockerShellConfig};
 use super::domain_shell::{DomainShell, DomainShellConfig};
 use super::mam_shell::MamShell;
 use super::qbit_shell::QbitShell;
@@ -145,6 +147,40 @@ pub(super) async fn init_shell(
         .subscribe
         .send((vec![DbTopic::Failures, DbTopic::Results], db_pub_tx))
         .expect("db pub subscription");
+
+    // §38 PR 2: spawn DockerShell + DockerMachine.  No consumer of its
+    // publishes or issuer of its commands yet — the runtime lives so PR 3
+    // (§35 migration) and PR 4 (crash-recovery orchestration) can wire it
+    // in without re-shaping init.
+    let (docker_handles, _docker_join) = windlass_machine::spawn::<DockerMachine, DockerShell>(
+        DockerConfig {
+            gluetun_anchor: docker.gluetun_anchor.clone(),
+        },
+        DockerShellConfig {
+            docker: docker.clone(),
+        },
+    )
+    .await;
+    {
+        use windlass_docker_core::{DockerPublish, DockerTopic};
+        let (docker_pub_tx, mut docker_pub_rx) = mpsc::channel::<DockerPublish>(128);
+        docker_handles
+            .subscribe
+            .send((
+                vec![DockerTopic::Lifecycle, DockerTopic::Logs],
+                docker_pub_tx,
+            ))
+            .expect("docker pub subscription");
+        tokio::spawn(async move {
+            while let Some(publish) = docker_pub_rx.recv().await {
+                tracing::debug!(?publish, "docker-core publish (PR2 drain)");
+            }
+        });
+    }
+    // Keep the command sender alive across the rest of init so it doesn't
+    // drop and tear down the machine.  PR 4 will move this into the domain
+    // shell config.
+    let _docker_commands = docker_handles.commands.clone();
 
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         VpnConfig {

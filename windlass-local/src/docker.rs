@@ -70,6 +70,15 @@ impl DockerClient {
         ))
     }
 
+    /// Returns a reference to the underlying bollard handle so callers
+    /// outside this crate (e.g. `windlass-docker-core`'s shell) can issue
+    /// daemon operations directly without going through the legacy
+    /// `DockerClient` methods.
+    #[must_use]
+    pub const fn bollard(&self) -> &Docker {
+        &self.inner
+    }
+
     // ── Boot helpers ──────────────────────────────────────────────────────────
 
     pub async fn is_gluetun_healthy(&self) -> bool {
