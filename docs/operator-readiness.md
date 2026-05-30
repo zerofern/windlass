@@ -56,8 +56,10 @@ Implement these stories one at a time, in this order:
 29. Enforce fail-closed download admission control (composite gate).
 30. Block MAM automation on VPN IP non-compliance.
 31. Mousehole-style proactive dynamic-seedbox update on IP change.
-32. Make dependent-container orchestration safe under Gluetun.
-33. Fully port legacy `windlass-core` to the per-system cores and remove it.
+32. Parse MAM's registered IP from `/jsonLoad.php` and dedup updates against it.
+33. Review and harden the integration-test suite.
+34. Make dependent-container orchestration safe under Gluetun.
+35. Fully port legacy `windlass-core` to the per-system cores and remove it.
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -1150,7 +1152,7 @@ Mam(AsnMismatch { ip }) emits:
 
 ## Story: Mousehole-Style Proactive Dynamic-Seedbox Update On IP Change
 
-Status: To Do
+Status: Done
 
 ### Problem
 
@@ -1248,6 +1250,109 @@ if MamEvent::TimerFired(StaleRegistrationRefresh):
   noticing an alert and registering an ASN, Windlass calls `update_seedbox`
   as soon as the IP moves, so MAM never sees a mismatch in normal
   rotations.
+
+## Story: Parse MAM's Registered IP And Dedup Updates Against It
+
+Status: To Do
+
+### Problem
+
+§31 dedups `UpdateSeedbox` calls against the *VPN-observed* IP, but it does
+not yet dedup against what MAM has *registered* for our account. Mousehole's
+`getUpdateReason` compares `hostInfo.ip` against
+`lastMamResponse.response.body.ip` (and `body.ASN`). To match that, we need
+the MAM core to know what MAM thinks our current IP is, so we can skip the
+update on the cases where the file IP, the verified IP, and the MAM-recorded
+IP all already agree.
+
+The blocker is that we don't know which field in MAM's `/jsonLoad.php`
+response carries the registered IP. Mousehole's source references
+`response.body.ip`; we'd want to confirm by inspecting a real response with
+the user before parsing.
+
+### User Story
+
+As the operator user, I want Windlass to skip the `UpdateSeedbox` call on
+keep-alive ticks when the IP I'm coming from already matches what MAM has
+recorded for me, so the dynamic-seedbox endpoint is only hit when something
+actually needs updating.
+
+### Acceptance Criteria
+
+- Extend `JsonLoadResponse` with the MAM-registered IP field (and ASN if
+  available — useful for the future ASN-aware dedup story).
+- Extend `MamStatusResult` with `registered_ip: Option<Ipv4Addr>` and
+  `registered_asn: Option<String>`.
+- The MAM core stores `registered_ip` whenever `StatusFetched` arrives.
+- `MamCommand::ObservedIpChanged { ip }` only emits `UpdateSeedbox` when
+  `observed_ip != registered_ip`. When they match, the command is a no-op
+  (still re-arms the stale-registration timer on first observation).
+- The `StaleRegistrationRefresh` timer continues to force an update once
+  per 24h regardless of dedup state.
+- Add invariants to `docs/invariants.md` and cover them with property
+  tests.
+
+### Implementation Notes
+
+- The field name needs an investigation step. Plan: run a real
+  `fetch_mam_status` against the user's account, capture the JSON, identify
+  the IP field together. Likely candidates based on the Mousehole codebase:
+  `ip`, `IP`, `host_ip`. ASN field may be `ASN`, `asn`, `asn_org`.
+- Until the field name is confirmed, the §31 implementation is correct and
+  safe — it just doesn't take the full Mousehole-equivalent dedup shortcut.
+- The §31 retry-path tightening already covers the
+  "desired_seedbox_port == seedbox_port" case; this story adds the IP-side
+  dedup on top.
+
+## Story: Review And Harden The Integration-Test Suite
+
+Status: To Do
+
+### Problem
+
+The cross-system invariants implemented through §29–§31 (admission gate,
+ASN-mismatch detection, public-IP observation, leak-detection mismatch)
+rely on many small per-machine property tests. The end-to-end integration
+tests (`just integration`) have not been reviewed for coverage in a while
+and may not exercise the new control flow: a Gluetun IP change driving a
+MAM seedbox update, an ifconfig.co mismatch flipping the §29 gate, the
+full TryAddTorrent → admission predicate → `Qbit(AddTorrent)` path.
+
+Before §34 (the Gluetun orchestration story) and §35 (the legacy
+`windlass-core` retirement), the integration tests should be hardened so
+the cutover doesn't regress live behavior.
+
+### User Story
+
+As the maintainer, I want the integration-test suite reviewed and
+extended so it covers the operator behaviors introduced in §27–§31, so
+the §35 legacy-removal cutover can be performed with confidence.
+
+### Acceptance Criteria
+
+- Audit existing integration tests in `windlass/tests` (and any other
+  `tests/` directories) for coverage gaps against the operator-readiness
+  stories that have already shipped.
+- Identify untested cross-system flows; produce a punch list. Likely
+  candidates: §27 keep-alive heartbeat under simulated outages, §28
+  Unreachable vs NotConnectable distinction, §29 admission-gate
+  composition under realistic publish sequences, §30 ASN-mismatch
+  rejection round-trip, §31 IP-change-driven UpdateSeedbox + leak-
+  detection mismatch.
+- Add the missing scenarios as integration tests (or document why a
+  particular flow is intentionally tested only at the property-test
+  layer).
+- Confirm `just integration` runs clean on every covered scenario.
+- Update `docs/invariants.md` with any new invariants that emerge from
+  the audit.
+
+### Implementation Notes
+
+- Cross-reference the per-story property tests so we don't duplicate
+  what's already exercised at the machine layer; the integration suite
+  is about wiring + ordering across machines.
+- This story should land before §34/§35 so the cutover has a safety
+  net.
 
 ## Story: Make Dependent-Container Orchestration Safe Under Gluetun
 

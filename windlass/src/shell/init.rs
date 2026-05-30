@@ -151,18 +151,28 @@ pub(super) async fn init_shell(
             health_poll_interval: Duration::from_secs(30),
             unhealthy_poll_interval: Duration::from_secs(5),
             port_read_retry_interval: Duration::from_millis(500),
+            // §31: ifconfig.co verification cadence + threshold.
+            public_ip_verify_interval: Duration::from_hours(6),
+            public_ip_verify_failure_threshold: 3,
         },
         VpnShellConfig {
             docker: docker.clone(),
             vpn_ip_file: config.vpn_ip_file.clone(),
             vpn_port_file: config.vpn_port_file.clone(),
+            // §31: route ifconfig.co through Gluetun so the verified IP is
+            // the VPN exit IP, not the host's public IP.
+            vpn_proxy_url: config.gluetun_proxy_url.clone(),
+            public_ip_verify_url: None,
         },
     )
     .await;
     let (vpn_pub_tx, mut vpn_pub_rx) = mpsc::channel::<VpnPublish>(128);
     vpn_handles
         .subscribe
-        .send((vec![VpnTopic::Connectivity, VpnTopic::Port], vpn_pub_tx))
+        .send((
+            vec![VpnTopic::Connectivity, VpnTopic::Port, VpnTopic::PublicIp],
+            vpn_pub_tx,
+        ))
         .expect("vpn pub subscription");
 
     let (qbit_handles, _qbit_join) = windlass_machine::spawn::<QbitMachine, QbitShell>(
@@ -205,6 +215,9 @@ pub(super) async fn init_shell(
             // alert threshold; see MamConfig docs).
             keep_alive_interval: windlass_mam_core::DEFAULT_KEEP_ALIVE_INTERVAL,
             keep_alive_failure_threshold: windlass_mam_core::DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD,
+            // §31 stale-registration refresh — 24h cookie/registration
+            // refresh, mirrors Mousehole's STALE_RESPONSE_SECONDS.
+            stale_registration_interval: windlass_mam_core::DEFAULT_STALE_REGISTRATION_INTERVAL,
         },
         mam.clone(),
     )
@@ -270,7 +283,11 @@ pub(super) async fn init_shell(
                             *g = None;
                         }
                     }
-                    VpnPublish::Connected => {}
+                    VpnPublish::Connected
+                    | VpnPublish::PublicIpObserved { .. }
+                    | VpnPublish::PublicIpUnavailable
+                    | VpnPublish::PublicIpMismatch { .. }
+                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }

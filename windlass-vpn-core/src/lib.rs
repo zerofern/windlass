@@ -1,17 +1,35 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
-use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
-use windlass_types::VpnPort;
+use windlass_types::{VpnIp, VpnPort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnConfig {
     pub health_poll_interval: Duration,
     pub unhealthy_poll_interval: Duration,
     pub port_read_retry_interval: Duration,
+    /// §31: cadence of the self-perpetuating ifconfig.co verification
+    /// timer. Default: 6 hours.
+    pub public_ip_verify_interval: Duration,
+    /// §31: number of consecutive verification failures before publishing
+    /// `PublicIpVerificationDegraded`. Default: 3.
+    pub public_ip_verify_failure_threshold: u32,
+}
+
+/// §31: VPN verification payload from ifconfig.co/json.
+///
+/// Only `ip` is currently consumed by the rest of the machine; the other
+/// fields (`asn`, `country`, `hostname`) ride along for logging and the
+/// future ASN-aware dedup story.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedIpInfo {
+    pub ip: VpnIp,
+    pub asn: Option<String>,
+    pub country: Option<String>,
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +43,8 @@ pub enum VpnCommand {
 pub enum VpnTimer {
     HealthPoll,
     PortReadRetry,
+    /// §31: self-perpetuating ifconfig.co verification cadence (default 6h).
+    PublicIpVerify,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,8 +55,26 @@ pub enum VpnEvent {
     PortFileChanged {
         port: VpnPort,
     },
-    PublicIpChanged {
-        ip: Ipv4Addr,
+    /// §31: the Gluetun-managed IP file has a new value.  Gluetun writes
+    /// this instantly on every VPN-state change and deletes the file when
+    /// disconnected (see `PublicIpFileUnavailable`).
+    PublicIpFromFile {
+        ip: VpnIp,
+    },
+    /// §31: Gluetun deleted the IP file — the VPN is disconnected.
+    /// The shell sends this when the file disappears so the core can
+    /// clear `observed_ip` without waiting for `ContainerUnhealthy`.
+    PublicIpFileUnavailable,
+    /// §31: a `VerifyPublicIp` action completed and ifconfig.co returned
+    /// usable data.
+    PublicIpVerified {
+        info: VerifiedIpInfo,
+    },
+    /// §31: a `VerifyPublicIp` action could not produce a result.  Treated
+    /// as transient up to `public_ip_verify_failure_threshold`, then
+    /// surfaces `PublicIpVerificationDegraded`.
+    PublicIpVerifyFailed {
+        reason: String,
     },
     StateRead {
         connected: bool,
@@ -53,21 +91,55 @@ pub enum VpnAction {
     InspectContainer,
     ReadPortFiles,
     StartMonitoring,
-    ScheduleTimer { timer: VpnTimer, after: Duration },
+    /// §31: ask the VPN shell to perform an HTTP verification of the
+    /// current public IP through the Gluetun proxy (default endpoint:
+    /// ifconfig.co/json).
+    VerifyPublicIp,
+    ScheduleTimer {
+        timer: VpnTimer,
+        after: Duration,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VpnPublish {
     Connected,
     Disconnected,
-    PortReady { port: VpnPort },
+    PortReady {
+        port: VpnPort,
+    },
     PortUnavailable,
+    /// §31: published on the rising edge of an observed-IP change, sourced
+    /// from the Gluetun-managed file.  The domain forwards this to the
+    /// MAM core's `ObservedIpChanged` command.
+    PublicIpObserved {
+        ip: VpnIp,
+    },
+    /// §31: Gluetun deleted the IP file or the VPN is disconnected.
+    /// Clears `admission.vpn_ip_compliant` in the domain.
+    PublicIpUnavailable,
+    /// §31: the most recent ifconfig.co verification reports a different IP
+    /// than Gluetun's file — a potential leak.  Flips the §29
+    /// `vpn_ip_compliant` gate to `Some(false)` and fires a `Critical` alert.
+    PublicIpMismatch {
+        file_ip: VpnIp,
+        verified_ip: VpnIp,
+    },
+    /// §31: ifconfig.co verification has failed at least
+    /// `public_ip_verify_failure_threshold` consecutive times.
+    /// Surfaces as a `Warning` alert without blocking admission.
+    PublicIpVerificationDegraded {
+        consecutive_failures: u32,
+        last_reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VpnTopic {
     Connectivity,
     Port,
+    /// §31: public-IP observation + verification topic.
+    PublicIp,
 }
 
 impl HasTopic<VpnTopic> for VpnPublish {
@@ -75,6 +147,10 @@ impl HasTopic<VpnTopic> for VpnPublish {
         match self {
             Self::Connected | Self::Disconnected => VpnTopic::Connectivity,
             Self::PortReady { .. } | Self::PortUnavailable => VpnTopic::Port,
+            Self::PublicIpObserved { .. }
+            | Self::PublicIpUnavailable
+            | Self::PublicIpMismatch { .. }
+            | Self::PublicIpVerificationDegraded { .. } => VpnTopic::PublicIp,
         }
     }
 }
@@ -89,6 +165,18 @@ pub struct VpnMachine {
     config: VpnConfig,
     connected: bool,
     port: Option<VpnPort>,
+    /// §31: last IP from the Gluetun file.  `None` when disconnected or
+    /// before the first file read.
+    observed_ip: Option<VpnIp>,
+    /// §31: last IP reported by ifconfig.co verification.  Used to detect
+    /// file-vs-verification mismatches.
+    last_verified_ip: Option<VpnIp>,
+    /// §31: consecutive ifconfig.co failure count.  Reset on the next
+    /// successful verification.
+    verification_failures: u32,
+    /// §31: once true, the self-perpetuating `PublicIpVerify` timer chain
+    /// is running.  Armed on the first verification attempt.
+    verify_chain_scheduled: bool,
 }
 
 impl VpnMachine {
@@ -100,6 +188,16 @@ impl VpnMachine {
     #[must_use]
     pub const fn port(&self) -> Option<VpnPort> {
         self.port
+    }
+
+    #[must_use]
+    pub const fn observed_ip(&self) -> Option<VpnIp> {
+        self.observed_ip
+    }
+
+    #[must_use]
+    pub const fn last_verified_ip(&self) -> Option<VpnIp> {
+        self.last_verified_ip
     }
 }
 
@@ -117,9 +215,17 @@ impl Machine for VpnMachine {
             config,
             connected: false,
             port: None,
+            observed_ip: None,
+            last_verified_ip: None,
+            verification_failures: 0,
+            verify_chain_scheduled: false,
         }
     }
 
+    // §31 added several new arms (file-IP, verification, mismatch, timer);
+    // the function is long because the event set grew, not because any arm
+    // is complex.
+    #[allow(clippy::too_many_lines)]
     fn handle(
         &mut self,
         _now: Instant,
@@ -146,12 +252,21 @@ impl Machine for VpnMachine {
             VpnEvent::ContainerUnhealthy => {
                 self.connected = false;
                 self.port = None;
+                let mut publish = vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable];
+                // §31: clear observed_ip on disconnect; surface the
+                // unavailable signal so the domain can clear the §29 gate.
+                if self.observed_ip.is_some() {
+                    self.observed_ip = None;
+                    publish.push(VpnPublish::PublicIpUnavailable);
+                }
+                self.last_verified_ip = None;
+                self.verification_failures = 0;
                 Outcome {
                     actions: vec![VpnAction::ScheduleTimer {
                         timer: VpnTimer::HealthPoll,
                         after: self.config.unhealthy_poll_interval,
                     }],
-                    publish: vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable],
+                    publish,
                 }
             }
             VpnEvent::PortFileChanged { port } => {
@@ -176,9 +291,16 @@ impl Machine for VpnMachine {
                     // A disconnected VPN never holds a forwarded port, regardless
                     // of what the shell reports. Mirror ContainerUnhealthy (VPN-1).
                     self.port = None;
+                    let mut publish = vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable];
+                    if self.observed_ip.is_some() {
+                        self.observed_ip = None;
+                        publish.push(VpnPublish::PublicIpUnavailable);
+                    }
+                    self.last_verified_ip = None;
+                    self.verification_failures = 0;
                     Outcome {
                         actions: Vec::new(),
-                        publish: vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable],
+                        publish,
                     }
                 }
             }
@@ -197,7 +319,94 @@ impl Machine for VpnMachine {
                 actions: vec![VpnAction::ReadPortFiles],
                 publish: Vec::new(),
             },
-            VpnEvent::PublicIpChanged { .. } => Outcome::none(),
+            // §31 / VPN-8: rising-edge IP-from-file signal.  When the file
+            // value changes, publish `PublicIpObserved` and trigger an
+            // immediate ifconfig.co verification.  Re-observing the same IP
+            // is a no-op.  Also arms the self-perpetuating verification
+            // timer the first time we ever see an IP.
+            VpnEvent::PublicIpFromFile { ip } => {
+                if self.observed_ip == Some(ip) {
+                    return Outcome::none();
+                }
+                self.observed_ip = Some(ip);
+                let mut actions = vec![VpnAction::VerifyPublicIp];
+                if !self.verify_chain_scheduled {
+                    self.verify_chain_scheduled = true;
+                    actions.push(VpnAction::ScheduleTimer {
+                        timer: VpnTimer::PublicIpVerify,
+                        after: self.config.public_ip_verify_interval,
+                    });
+                }
+                Outcome {
+                    actions,
+                    publish: vec![VpnPublish::PublicIpObserved { ip }],
+                }
+            }
+            // §31: Gluetun deleted the IP file.  Clear observed_ip and
+            // surface the unavailable signal — same shape as a disconnect.
+            VpnEvent::PublicIpFileUnavailable => {
+                if self.observed_ip.is_none() {
+                    return Outcome::none();
+                }
+                self.observed_ip = None;
+                self.last_verified_ip = None;
+                self.verification_failures = 0;
+                Outcome {
+                    actions: Vec::new(),
+                    publish: vec![VpnPublish::PublicIpUnavailable],
+                }
+            }
+            // §31 / VPN-9: verification succeeded.  Reset the failure
+            // counter and compare with the file IP — mismatch is a leak
+            // warning.
+            VpnEvent::PublicIpVerified { info } => {
+                self.verification_failures = 0;
+                self.last_verified_ip = Some(info.ip);
+                let mut publish = Vec::new();
+                if let Some(file_ip) = self.observed_ip
+                    && file_ip != info.ip
+                {
+                    publish.push(VpnPublish::PublicIpMismatch {
+                        file_ip,
+                        verified_ip: info.ip,
+                    });
+                }
+                Outcome {
+                    actions: Vec::new(),
+                    publish,
+                }
+            }
+            // §31 / VPN-10: rising-edge degraded publish on persistent
+            // verification failure.  Threshold is configurable; default 3.
+            VpnEvent::PublicIpVerifyFailed { reason } => {
+                let threshold = self.config.public_ip_verify_failure_threshold;
+                let before = self.verification_failures;
+                self.verification_failures = before.saturating_add(1);
+                let mut publish = Vec::new();
+                if threshold > 0 && before < threshold && self.verification_failures >= threshold {
+                    publish.push(VpnPublish::PublicIpVerificationDegraded {
+                        consecutive_failures: self.verification_failures,
+                        last_reason: reason,
+                    });
+                }
+                Outcome {
+                    actions: Vec::new(),
+                    publish,
+                }
+            }
+            // §31: self-perpetuating verification heartbeat.  Always emits
+            // one `VerifyPublicIp` + re-schedules itself, so a dropped
+            // response or shell error cannot kill the chain.
+            VpnEvent::TimerFired(VpnTimer::PublicIpVerify) => Outcome {
+                actions: vec![
+                    VpnAction::VerifyPublicIp,
+                    VpnAction::ScheduleTimer {
+                        timer: VpnTimer::PublicIpVerify,
+                        after: self.config.public_ip_verify_interval,
+                    },
+                ],
+                publish: Vec::new(),
+            },
         }
     }
 
@@ -232,6 +441,8 @@ mod tests {
                 health_poll_interval: Duration::from_secs(2),
                 unhealthy_poll_interval: Duration::from_millis(250),
                 port_read_retry_interval: Duration::from_millis(500),
+                public_ip_verify_interval: Duration::from_secs(6 * 60 * 60),
+                public_ip_verify_failure_threshold: 3,
             },
             Instant::now(),
         )
@@ -455,14 +666,13 @@ mod tests {
 
 #[cfg(test)]
 mod prop_tests {
-    use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
     use windlass_machine::{Machine, Timed};
-    use windlass_types::VpnPort;
+    use windlass_types::{VpnIp, VpnPort};
 
-    use crate::{VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
+    use crate::{VerifiedIpInfo, VpnAction, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
 
     fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
         (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
@@ -472,19 +682,61 @@ mod prop_tests {
     // including ones a real event history would not reach). VPN-2 is a *total*
     // invariant, so it must hold even on unreachable states.
     fn any_vpn_machine() -> impl Strategy<Value = VpnMachine> {
-        (any::<bool>(), proptest::option::of(any_vpn_port())).prop_map(|(connected, port)| {
-            let mut machine = VpnMachine::new(
-                VpnConfig {
-                    health_poll_interval: Duration::from_secs(2),
-                    unhealthy_poll_interval: Duration::from_millis(250),
-                    port_read_retry_interval: Duration::from_millis(500),
+        (
+            any::<bool>(),
+            proptest::option::of(any_vpn_port()),
+            proptest::option::of(any_vpn_ip()),
+            proptest::option::of(any_vpn_ip()),
+            0u32..=10u32,
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    connected,
+                    port,
+                    observed_ip,
+                    last_verified_ip,
+                    verification_failures,
+                    verify_chain_scheduled,
+                )| {
+                    let mut machine = VpnMachine::new(
+                        VpnConfig {
+                            health_poll_interval: Duration::from_secs(2),
+                            unhealthy_poll_interval: Duration::from_millis(250),
+                            port_read_retry_interval: Duration::from_millis(500),
+                            public_ip_verify_interval: Duration::from_secs(6 * 60 * 60),
+                            public_ip_verify_failure_threshold: 3,
+                        },
+                        Instant::now(),
+                    );
+                    machine.connected = connected;
+                    machine.port = port;
+                    machine.observed_ip = observed_ip;
+                    machine.last_verified_ip = last_verified_ip;
+                    machine.verification_failures = verification_failures;
+                    machine.verify_chain_scheduled = verify_chain_scheduled;
+                    machine
                 },
-                Instant::now(),
-            );
-            machine.connected = connected;
-            machine.port = port;
-            machine
-        })
+            )
+    }
+
+    fn any_vpn_ip() -> impl Strategy<Value = VpnIp> {
+        any::<[u8; 4]>().prop_map(|b| VpnIp(std::net::Ipv4Addr::from(b)))
+    }
+
+    fn any_verified_ip_info() -> impl Strategy<Value = VerifiedIpInfo> {
+        (
+            any_vpn_ip(),
+            proptest::option::of(any::<String>()),
+            proptest::option::of(any::<String>()),
+            proptest::option::of(any::<String>()),
+        )
+            .prop_map(|(ip, asn, country, hostname)| VerifiedIpInfo {
+                ip,
+                asn,
+                country,
+                hostname,
+            })
     }
 
     fn any_vpn_event() -> impl Strategy<Value = VpnEvent> {
@@ -493,14 +745,16 @@ mod prop_tests {
             Just(VpnEvent::ContainerHealthy),
             Just(VpnEvent::ContainerUnhealthy),
             any_vpn_port().prop_map(|port| VpnEvent::PortFileChanged { port }),
-            any::<[u8; 4]>().prop_map(|b| VpnEvent::PublicIpChanged {
-                ip: Ipv4Addr::from(b)
-            }),
+            any_vpn_ip().prop_map(|ip| VpnEvent::PublicIpFromFile { ip }),
+            Just(VpnEvent::PublicIpFileUnavailable),
+            any_verified_ip_info().prop_map(|info| VpnEvent::PublicIpVerified { info }),
+            any::<String>().prop_map(|reason| VpnEvent::PublicIpVerifyFailed { reason }),
             (any::<bool>(), proptest::option::of(any_vpn_port()))
                 .prop_map(|(connected, port)| VpnEvent::StateRead { connected, port }),
             any::<String>().prop_map(|reason| VpnEvent::StateReadFailed { reason }),
             Just(VpnEvent::TimerFired(VpnTimer::HealthPoll)),
             Just(VpnEvent::TimerFired(VpnTimer::PortReadRetry)),
+            Just(VpnEvent::TimerFired(VpnTimer::PublicIpVerify)),
         ]
     }
 
@@ -524,6 +778,105 @@ mod prop_tests {
                     prop_assert_eq!(machine.port(), Some(*port));
                 }
             }
+        }
+
+        // VPN-8 [safety] (§31): rising-edge `PublicIpObserved`.
+        // `PublicIpFromFile { ip }` publishes exactly one
+        // `PublicIpObserved` iff `pre.observed_ip != Some(ip)`, and zero
+        // otherwise.  After the call, `observed_ip == Some(ip)`.  Total
+        // invariant.
+        #[test]
+        fn public_ip_observed_publishes_on_rising_edge_only(
+            mut machine in any_vpn_machine(),
+            ip in any_vpn_ip(),
+        ) {
+            let pre = machine.observed_ip();
+            let out = machine.handle(Instant::now(), Timed::now(
+                VpnEvent::PublicIpFromFile { ip },
+            ));
+            prop_assert_eq!(machine.observed_ip(), Some(ip));
+            let observed_count = out.publish.iter()
+                .filter(|p| matches!(p, VpnPublish::PublicIpObserved { .. }))
+                .count();
+            if pre == Some(ip) {
+                prop_assert_eq!(observed_count, 0);
+            } else {
+                prop_assert_eq!(observed_count, 1);
+            }
+        }
+
+        // VPN-9 [safety] (§31): `PublicIpVerified` publishes
+        // `PublicIpMismatch` iff the verified IP differs from the held
+        // `observed_ip`, and `observed_ip` is set.  Total.
+        #[test]
+        fn public_ip_mismatch_publishes_iff_disagree(
+            mut machine in any_vpn_machine(),
+            info in any_verified_ip_info(),
+        ) {
+            let pre_observed = machine.observed_ip();
+            let out = machine.handle(Instant::now(), Timed::now(
+                VpnEvent::PublicIpVerified { info: info.clone() },
+            ));
+            let mismatch_count = out.publish.iter()
+                .filter(|p| matches!(p, VpnPublish::PublicIpMismatch { .. }))
+                .count();
+            let should_mismatch = pre_observed.is_some()
+                && pre_observed != Some(info.ip);
+            if should_mismatch {
+                prop_assert_eq!(mismatch_count, 1);
+            } else {
+                prop_assert_eq!(mismatch_count, 0);
+            }
+            // The post-state always records the verified IP.
+            prop_assert_eq!(machine.last_verified_ip(), Some(info.ip));
+        }
+
+        // VPN-10 [safety] (§31): rising-edge
+        // `PublicIpVerificationDegraded` publish on threshold-crossing
+        // failure.  Total.
+        #[test]
+        fn public_ip_verification_degraded_on_rising_edge(
+            mut machine in any_vpn_machine(),
+            reason in any::<String>(),
+        ) {
+            let threshold = machine.config.public_ip_verify_failure_threshold;
+            let pre = machine.verification_failures;
+            let out = machine.handle(Instant::now(), Timed::now(
+                VpnEvent::PublicIpVerifyFailed { reason },
+            ));
+            let degraded_count = out.publish.iter()
+                .filter(|p| matches!(p, VpnPublish::PublicIpVerificationDegraded { .. }))
+                .count();
+            let crossed = threshold > 0
+                && pre < threshold
+                && pre.saturating_add(1) >= threshold;
+            if crossed {
+                prop_assert_eq!(degraded_count, 1);
+            } else {
+                prop_assert_eq!(degraded_count, 0);
+            }
+        }
+
+        // §31: TimerFired(PublicIpVerify) always emits exactly one
+        // VerifyPublicIp + re-schedules.  Total.
+        #[test]
+        fn public_ip_verify_timer_always_reschedules(
+            mut machine in any_vpn_machine(),
+        ) {
+            let out = machine.handle(Instant::now(), Timed::now(
+                VpnEvent::TimerFired(VpnTimer::PublicIpVerify),
+            ));
+            let verify_count = out.actions.iter()
+                .filter(|a| matches!(a, VpnAction::VerifyPublicIp))
+                .count();
+            let reschedule_count = out.actions.iter()
+                .filter(|a| matches!(
+                    a,
+                    VpnAction::ScheduleTimer { timer: VpnTimer::PublicIpVerify, .. }
+                ))
+                .count();
+            prop_assert_eq!(verify_count, 1);
+            prop_assert_eq!(reschedule_count, 1);
         }
     }
 }

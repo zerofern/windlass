@@ -253,7 +253,11 @@ mod tests {
                             *g = None;
                         }
                     }
-                    VpnPublish::Connected => {}
+                    VpnPublish::Connected
+                    | VpnPublish::PublicIpObserved { .. }
+                    | VpnPublish::PublicIpUnavailable
+                    | VpnPublish::PublicIpMismatch { .. }
+                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }
@@ -340,7 +344,11 @@ mod tests {
                             *g = None;
                         }
                     }
-                    VpnPublish::Connected => {}
+                    VpnPublish::Connected
+                    | VpnPublish::PublicIpObserved { .. }
+                    | VpnPublish::PublicIpUnavailable
+                    | VpnPublish::PublicIpMismatch { .. }
+                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }

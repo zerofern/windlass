@@ -20,6 +20,10 @@ pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_mins(5);
 /// Default consecutive-failure threshold for `KeepAliveDegraded` (§27).
 pub const DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD: u32 = 3;
 
+/// §31: default stale-registration refresh interval.  Matches Mousehole's
+/// `STALE_RESPONSE_SECONDS` (86 400 s = 1 day).
+pub const DEFAULT_STALE_REGISTRATION_INTERVAL: Duration = Duration::from_hours(24);
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MamConfig {
     pub status_retry: Duration,
@@ -39,13 +43,27 @@ pub struct MamConfig {
     /// `KeepAliveDegraded` (§27).  `0` disables the alert.
     /// Default: `3` (`DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD`).
     pub keep_alive_failure_threshold: u32,
+    /// §31: cadence of the self-perpetuating stale-registration refresh
+    /// (`UpdateSeedbox` forced even when the observed IP is stable).
+    /// Default: 24 hours (`DEFAULT_STALE_REGISTRATION_INTERVAL`,
+    /// mirrors Mousehole's `STALE_RESPONSE_SECONDS`).
+    pub stale_registration_interval: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MamCommand {
     EnsureAuthenticated,
-    EnsureSeedboxPort { port: VpnPort },
+    EnsureSeedboxPort {
+        port: VpnPort,
+    },
     RefreshStatus,
+    /// §31: the domain forwards this when the VPN core publishes a fresh
+    /// `PublicIpObserved`.  On a real change, MAM emits `UpdateSeedbox`
+    /// and arms the stale-registration chain.  No-op if the IP matches
+    /// the last observed value.
+    ObservedIpChanged {
+        ip: VpnIp,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +72,9 @@ pub enum MamTimer {
     RateLimitExpired,
     /// §27: self-perpetuating heartbeat that drives recurring `FetchStatus`.
     KeepAlive,
+    /// §31: 24h refresh that re-runs `UpdateSeedbox` even when nothing
+    /// changed, so the session cookie stays fresh.
+    StaleRegistrationRefresh,
 }
 
 // `MamEvent` cannot derive `Eq` because `StatusFetched` carries `ratio: f64`,
@@ -253,6 +274,14 @@ pub struct MamMachine {
     /// value is `Unknown` — domain admission stays blocked until a
     /// `SeedboxUpdated` arrives or a `Mismatched` is observed.
     asn_state: AsnState,
+    /// §31: most recent IP forwarded from the VPN core's
+    /// `PublicIpObserved` publish via the `ObservedIpChanged` command.
+    /// `None` before the first observation or after a disconnect.
+    observed_ip: Option<VpnIp>,
+    /// §31: chain-starts-once guard for the
+    /// `StaleRegistrationRefresh` timer.  Set on the first
+    /// `ObservedIpChanged`, never cleared.
+    stale_chain_scheduled: bool,
 }
 
 impl MamMachine {
@@ -288,6 +317,12 @@ impl MamMachine {
     #[must_use]
     pub const fn asn_state(&self) -> AsnState {
         self.asn_state
+    }
+
+    /// Returns the most recent observed VPN IP (§31).
+    #[must_use]
+    pub const fn observed_ip(&self) -> Option<VpnIp> {
+        self.observed_ip
     }
 
     /// Returns `true` once the `KeepAlive` chain has been started (§27).
@@ -391,6 +426,8 @@ impl Machine for MamMachine {
             keep_alive_scheduled: false,
             consecutive_status_failures: 0,
             asn_state: AsnState::Unknown,
+            observed_ip: None,
+            stale_chain_scheduled: false,
         }
     }
 
@@ -420,6 +457,21 @@ impl Machine for MamMachine {
                     MamAction::ScheduleTimer {
                         timer: MamTimer::KeepAlive,
                         after: self.config.keep_alive_interval,
+                    },
+                ],
+                publish: Vec::new(),
+            },
+            // §31 / MAM-17: stale-registration refresh.  Mousehole's
+            // `STALE_RESPONSE_SECONDS` analog — force a `UpdateSeedbox`
+            // once per `stale_registration_interval` even when the IP is
+            // unchanged, so the MAM session cookie stays fresh.  Always
+            // re-schedules itself.
+            MamEvent::TimerFired(MamTimer::StaleRegistrationRefresh) => Outcome {
+                actions: vec![
+                    MamAction::UpdateSeedbox,
+                    MamAction::ScheduleTimer {
+                        timer: MamTimer::StaleRegistrationRefresh,
+                        after: self.config.stale_registration_interval,
                     },
                 ],
                 publish: Vec::new(),
@@ -616,6 +668,25 @@ impl Machine for MamMachine {
                 }
                 vec![MamAction::UpdateSeedbox]
             }
+            // §31 / MAM-16: dedup observed-IP-driven updates.  Only emit
+            // `UpdateSeedbox` when the IP genuinely changes (Mousehole's
+            // `getUpdateReason` style).  Also arms the self-perpetuating
+            // 24h stale-registration timer on the first observation.
+            MamCommand::ObservedIpChanged { ip } => {
+                if self.observed_ip == Some(ip) {
+                    return Self::outcome(Vec::new(), MamResponse::Accepted);
+                }
+                self.observed_ip = Some(ip);
+                let mut actions = vec![MamAction::UpdateSeedbox];
+                if !self.stale_chain_scheduled {
+                    self.stale_chain_scheduled = true;
+                    actions.push(MamAction::ScheduleTimer {
+                        timer: MamTimer::StaleRegistrationRefresh,
+                        after: self.config.stale_registration_interval,
+                    });
+                }
+                actions
+            }
         };
         Self::outcome(actions, MamResponse::Accepted)
     }
@@ -638,6 +709,7 @@ mod tests {
                 min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
                 keep_alive_interval: Duration::from_secs(300),
                 keep_alive_failure_threshold: 3,
+                stale_registration_interval: Duration::from_secs(86_400),
             },
             Instant::now(),
         )
@@ -1202,6 +1274,7 @@ mod tests {
                 min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
                 keep_alive_interval: Duration::from_secs(300),
                 keep_alive_failure_threshold: 0,
+                stale_registration_interval: Duration::from_secs(86_400),
             },
             Instant::now(),
         );
@@ -1230,7 +1303,9 @@ mod prop_tests {
     use windlass_machine::{Machine, Timed};
     use windlass_types::{VpnIp, VpnPort};
 
-    use crate::{AsnState, MamAction, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer};
+    use crate::{
+        AsnState, MamAction, MamCommand, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer,
+    };
 
     fn any_vpn_port() -> impl Strategy<Value = VpnPort> {
         (1u16..=u16::MAX).prop_map(|p| VpnPort::try_new(p).unwrap())
@@ -1255,6 +1330,7 @@ mod prop_tests {
             // making the timer constant explode in failure-burst proptests.
             1u64..=600u64,
             0u32..=10u32,
+            1u64..=86_400u64,
         )
             .prop_map(
                 |(
@@ -1262,12 +1338,14 @@ mod prop_tests {
                     min_upload_buffer_bytes,
                     keep_alive_secs,
                     keep_alive_failure_threshold,
+                    stale_secs,
                 )| MamConfig {
                     status_retry: Duration::from_secs(5),
                     min_global_ratio,
                     min_upload_buffer_bytes,
                     keep_alive_interval: Duration::from_secs(keep_alive_secs),
                     keep_alive_failure_threshold,
+                    stale_registration_interval: Duration::from_secs(stale_secs),
                 },
             )
     }
@@ -1284,27 +1362,33 @@ mod prop_tests {
 
     fn any_mam_machine() -> impl Strategy<Value = MamMachine> {
         (
-            any_mam_config(),
-            any::<bool>(),
-            proptest::option::of(any_vpn_port()),
-            proptest::option::of(any_vpn_port()),
-            any_ratio(),
-            any_buffer(),
-            any::<bool>(),
-            0u32..=20u32,
-            any_asn_state(),
+            (
+                any_mam_config(),
+                any::<bool>(),
+                proptest::option::of(any_vpn_port()),
+                proptest::option::of(any_vpn_port()),
+                any_ratio(),
+                any_buffer(),
+                any::<bool>(),
+                0u32..=20u32,
+                any_asn_state(),
+            ),
+            (proptest::option::of(any::<[u8; 4]>()), any::<bool>()),
         )
             .prop_map(
                 |(
-                    config,
-                    authenticated,
-                    seedbox_port,
-                    desired_seedbox_port,
-                    ratio,
-                    upload_credit_bytes,
-                    keep_alive_scheduled,
-                    consecutive_status_failures,
-                    asn_state,
+                    (
+                        config,
+                        authenticated,
+                        seedbox_port,
+                        desired_seedbox_port,
+                        ratio,
+                        upload_credit_bytes,
+                        keep_alive_scheduled,
+                        consecutive_status_failures,
+                        asn_state,
+                    ),
+                    (observed_ip_bytes, stale_chain_scheduled),
                 )| {
                     let mut machine = MamMachine::new(config, Instant::now());
                     machine.authenticated = authenticated;
@@ -1315,6 +1399,9 @@ mod prop_tests {
                     machine.keep_alive_scheduled = keep_alive_scheduled;
                     machine.consecutive_status_failures = consecutive_status_failures;
                     machine.asn_state = asn_state;
+                    machine.observed_ip =
+                        observed_ip_bytes.map(|b| VpnIp(std::net::Ipv4Addr::from(b)));
+                    machine.stale_chain_scheduled = stale_chain_scheduled;
                     machine
                 },
             )
@@ -1352,6 +1439,7 @@ mod prop_tests {
             Just(MamEvent::TimerFired(MamTimer::StatusRetry)),
             Just(MamEvent::TimerFired(MamTimer::RateLimitExpired)),
             Just(MamEvent::TimerFired(MamTimer::KeepAlive)),
+            Just(MamEvent::TimerFired(MamTimer::StaleRegistrationRefresh)),
         ]
     }
 
@@ -1779,6 +1867,76 @@ mod prop_tests {
                 prop_assert_eq!(accepted_count, 1,
                     "rising edge must publish exactly one AsnAccepted");
             }
+        }
+
+        // MAM-16 [safety] (§31): ObservedIpChanged dedups against the
+        // last observed IP.  When ip == observed_ip the command emits
+        // zero actions; otherwise it emits one UpdateSeedbox and (on
+        // first observation) arms the StaleRegistrationRefresh chain.
+        #[test]
+        fn observed_ip_changed_dedups_against_held_observed_ip(
+            mut machine in any_mam_machine(),
+            ip_bytes in any::<[u8; 4]>(),
+        ) {
+            let ip = VpnIp(std::net::Ipv4Addr::from(ip_bytes));
+            let pre_observed = machine.observed_ip();
+            let pre_chain = machine.stale_chain_scheduled;
+            let out = machine.handle_command(
+                Instant::now(),
+                MamCommand::ObservedIpChanged { ip },
+            );
+            let update_count = out.actions.iter()
+                .filter(|a| matches!(a, MamAction::UpdateSeedbox))
+                .count();
+            let schedule_count = out.actions.iter()
+                .filter(|a| matches!(
+                    a,
+                    MamAction::ScheduleTimer {
+                        timer: MamTimer::StaleRegistrationRefresh, ..
+                    }
+                ))
+                .count();
+            if pre_observed == Some(ip) {
+                prop_assert_eq!(update_count, 0,
+                    "ObservedIpChanged must dedup when ip matches");
+                prop_assert_eq!(schedule_count, 0);
+            } else {
+                prop_assert_eq!(update_count, 1,
+                    "fresh observed IP must emit one UpdateSeedbox");
+                if pre_chain {
+                    prop_assert_eq!(schedule_count, 0,
+                        "stale chain already armed → no re-schedule");
+                } else {
+                    prop_assert_eq!(schedule_count, 1,
+                        "first observation arms the stale-registration timer");
+                }
+                prop_assert!(machine.stale_chain_scheduled);
+                prop_assert_eq!(machine.observed_ip(), Some(ip));
+            }
+        }
+
+        // MAM-17 [safety] (§31): TimerFired(StaleRegistrationRefresh)
+        // always emits exactly one UpdateSeedbox + re-schedules.  Total.
+        #[test]
+        fn stale_refresh_timer_always_reschedules(
+            mut machine in any_mam_machine(),
+        ) {
+            let out = machine.handle(Instant::now(), Timed::now(
+                MamEvent::TimerFired(MamTimer::StaleRegistrationRefresh),
+            ));
+            let update_count = out.actions.iter()
+                .filter(|a| matches!(a, MamAction::UpdateSeedbox))
+                .count();
+            let reschedule_count = out.actions.iter()
+                .filter(|a| matches!(
+                    a,
+                    MamAction::ScheduleTimer {
+                        timer: MamTimer::StaleRegistrationRefresh, ..
+                    }
+                ))
+                .count();
+            prop_assert_eq!(update_count, 1);
+            prop_assert_eq!(reschedule_count, 1);
         }
     }
 }

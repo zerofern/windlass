@@ -379,6 +379,38 @@ impl Machine for WindlassMachine {
                 self.state.forwarded_port = None;
                 self.publish_state()
             }
+            // §31: VPN observed a fresh public IP from the Gluetun file.
+            // Forward to MAM so it can issue UpdateSeedbox (deduped against
+            // the last observed IP) and arm the stale-registration timer.
+            WindlassEvent::Vpn(VpnPublish::PublicIpObserved { ip }) => Outcome {
+                actions: vec![WindlassAction::Mam(MamCommand::ObservedIpChanged { ip })],
+                publish: Vec::new(),
+            },
+            // §31: VPN disconnected or Gluetun deleted the IP file.  Clear
+            // the §29 admission gate to its unknown default — autograb is
+            // blocked until the next PublicIpObserved.
+            WindlassEvent::Vpn(VpnPublish::PublicIpUnavailable) => {
+                self.admission.vpn_ip_compliant = None;
+                self.publish_state_with_activity(
+                    "VPN public IP unavailable — admission blocked".to_string(),
+                )
+            }
+            // §31 / DOM-21: file-vs-verified mismatch — strong leak signal.
+            // Flip the §29 gate and fire a Critical alert.
+            WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
+                file_ip,
+                verified_ip,
+            }) => {
+                self.admission.vpn_ip_compliant = Some(false);
+                Self::on_public_ip_mismatch(file_ip, verified_ip)
+            }
+            // §31 / DOM-22: persistent ifconfig.co failure.  Warning alert
+            // + Activity, does NOT block admission (Gluetun file is still
+            // trusted as the IP source).
+            WindlassEvent::Vpn(VpnPublish::PublicIpVerificationDegraded {
+                consecutive_failures,
+                last_reason,
+            }) => Self::on_public_ip_verification_degraded(consecutive_failures, &last_reason),
             WindlassEvent::Qbit(QbitPublish::Ready) => {
                 self.state.qbit = ServiceStatus::Ready;
                 self.publish_state()
@@ -811,6 +843,88 @@ impl WindlassMachine {
                     at: chrono::Utc::now(),
                     source: ActivitySource::Domain,
                     action: "upload_health_degraded".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles `Vpn(PublicIpMismatch)` (DOM-21 / §31).
+    ///
+    /// Gluetun's file IP and ifconfig.co's verified IP disagree — strong
+    /// indicator that traffic is leaking around the VPN, exactly the
+    /// scenario the operator does not want.  Emits one
+    /// `RecordAlert(Critical)`, one `RecordActivity`, and one `Activity`
+    /// publish.  The caller has already flipped
+    /// `admission.vpn_ip_compliant` to `Some(false)`.
+    fn on_public_ip_mismatch(
+        file_ip: VpnIp,
+        verified_ip: VpnIp,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!(
+            "Gluetun reports the VPN exit as {} but ifconfig.co reports we \
+             appear as {}. Treat as a potential leak; autograb is blocked \
+             until verification recovers.",
+            file_ip.0, verified_ip.0,
+        );
+        let message = format!(
+            "VPN IP mismatch: file={} verified={}",
+            file_ip.0, verified_ip.0,
+        );
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Critical,
+                    title: "VPN public IP mismatch".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Vpn,
+                    action: "vpn_public_ip_mismatch".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles `Vpn(PublicIpVerificationDegraded)` (DOM-22 / §31).
+    ///
+    /// ifconfig.co has been unreachable for at least the configured
+    /// failure threshold.  Surface as a `Warning` — Gluetun's file is
+    /// still the source of truth, so admission is not blocked.
+    fn on_public_ip_verification_degraded(
+        consecutive_failures: u32,
+        last_reason: &str,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!(
+            "Public-IP verification (ifconfig.co) failed {consecutive_failures} \
+             times in a row. Last reason: {last_reason}. The Gluetun-reported \
+             IP is still the source of truth; admission is unaffected.",
+        );
+        let message = format!(
+            "VPN public-IP verification degraded: {consecutive_failures} \
+             consecutive failures (last: {last_reason})",
+        );
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Warning,
+                    title: "VPN IP verification failing".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Vpn,
+                    action: "vpn_public_ip_verification_degraded".to_string(),
                     book_id: None,
                     detail: Some(message.clone()),
                     metadata: serde_json::Value::Null,
@@ -2511,6 +2625,79 @@ mod prop_tests {
                 "DOM-20: must publish exactly one Activity");
 
             prop_assert_eq!(machine.admission().vpn_ip_compliant, Some(false));
+        }
+
+        // DOM-21 [safety] (§31): Vpn(PublicIpMismatch) emits exactly one
+        // RecordAlert(Critical) + RecordActivity + Activity publish, and
+        // flips admission.vpn_ip_compliant to Some(false).  Total.
+        #[test]
+        fn public_ip_mismatch_emits_critical_alert_and_blocks_admission(
+            mut machine in any_windlass_machine(),
+            file_ip_bytes in any::<[u8; 4]>(),
+            verified_ip_bytes in any::<[u8; 4]>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::{AlertPriority, VpnIp};
+
+            let file_ip = VpnIp(std::net::Ipv4Addr::from(file_ip_bytes));
+            let verified_ip = VpnIp(std::net::Ipv4Addr::from(verified_ip_bytes));
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
+                    file_ip,
+                    verified_ip,
+                })),
+            );
+
+            let critical_count = out.actions.iter().filter(|a| matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Critical,
+                    ..
+                }))
+            )).count();
+            prop_assert_eq!(critical_count, 1);
+
+            let activity_count = out.publish.iter().filter(|p| matches!(
+                p, WindlassPublish::Activity { .. }
+            )).count();
+            prop_assert_eq!(activity_count, 1);
+
+            prop_assert_eq!(machine.admission().vpn_ip_compliant, Some(false));
+        }
+
+        // DOM-22 [safety] (§31): Vpn(PublicIpVerificationDegraded) emits
+        // exactly one RecordAlert(Warning) + RecordActivity + Activity, but
+        // does NOT block admission (Gluetun's file is still the source of
+        // truth).  Total.
+        #[test]
+        fn public_ip_verification_degraded_emits_warning_only(
+            mut machine in any_windlass_machine(),
+            consecutive_failures in any::<u32>(),
+            last_reason in any::<String>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let pre_compliant = machine.admission().vpn_ip_compliant;
+            let out = machine.handle(
+                Instant::now(),
+                Timed::now(WindlassEvent::Vpn(VpnPublish::PublicIpVerificationDegraded {
+                    consecutive_failures,
+                    last_reason,
+                })),
+            );
+
+            let warning_count = out.actions.iter().filter(|a| matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Warning,
+                    ..
+                }))
+            )).count();
+            prop_assert_eq!(warning_count, 1);
+            // Verification failure must not flip the admission gate.
+            prop_assert_eq!(machine.admission().vpn_ip_compliant, pre_compliant);
         }
     }
 }

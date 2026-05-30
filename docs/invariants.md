@@ -168,8 +168,44 @@ State: `connected: bool`, `port: Option<VpnPort>`.
   timer, mutates no state, publishes nothing. → F
 - **VPN-6 [safety]** Health polling is side-effect free on state:
   `TimerFired(HealthPoll)` emits only `InspectContainer`. → F
-- **VPN-7 [safety]** `PublicIpChanged` is currently a no-op. (Will gain meaning
-  with the IP-compliance gate, §30 / Guarantee A.) → A (future)
+- **VPN-7 [safety]** *(superseded by §31)*  The legacy no-op
+  `PublicIpChanged` event was renamed to `PublicIpFromFile` and gained
+  rising-edge semantics (VPN-8).  This bullet is retained for git-history
+  context only.
+
+### VPN machine additions (§31)
+
+State additions: `observed_ip: Option<VpnIp>` (IP from Gluetun's file —
+trusted source of truth), `last_verified_ip: Option<VpnIp>` (last
+ifconfig.co result), `verification_failures: u32`,
+`verify_chain_scheduled: bool`.
+
+Config additions: `public_ip_verify_interval` (default 6h),
+`public_ip_verify_failure_threshold` (default 3).
+
+New events: `PublicIpFromFile { ip }`, `PublicIpFileUnavailable`,
+`PublicIpVerified { info: VerifiedIpInfo }`,
+`PublicIpVerifyFailed { reason }`.  New publishes:
+`PublicIpObserved { ip }`, `PublicIpUnavailable`,
+`PublicIpMismatch { file_ip, verified_ip }`,
+`PublicIpVerificationDegraded { consecutive_failures, last_reason }` on
+new `VpnTopic::PublicIp`.  New action: `VerifyPublicIp`.  New timer:
+`VpnTimer::PublicIpVerify` (self-perpetuating).
+
+- **VPN-8 [safety]** *(public-IP rising edge — §31)* `PublicIpFromFile
+  { ip }` publishes exactly one `PublicIpObserved { ip }` iff
+  `pre.observed_ip != Some(ip)`, and zero otherwise.  After the call,
+  `observed_ip == Some(ip)`.  Total invariant. → A, B
+- **VPN-9 [safety]** *(file-vs-verified mismatch — §31)*
+  `PublicIpVerified { info }` publishes exactly one
+  `PublicIpMismatch { file_ip, verified_ip }` iff `observed_ip` is set
+  and differs from `info.ip`.  Resets `verification_failures` to 0 and
+  records `last_verified_ip = Some(info.ip)`.  Total. → B
+- **VPN-10 [safety]** *(verification-failure rising edge — §31)*
+  `PublicIpVerifyFailed { reason }` increments `verification_failures`
+  by 1 (saturating) and publishes exactly one
+  `PublicIpVerificationDegraded` iff this bump crosses
+  `public_ip_verify_failure_threshold` from below.  Total. → F
 
 Shell contracts:
 
@@ -450,6 +486,32 @@ transition of `asn_state`.
   publishes zero.  The `SeedboxPortReady` publish (MAM-5) is independent
   and unaffected by this rule.  Total invariant. → A
 
+### MAM machine additions (§31)
+
+State additions: `observed_ip: Option<VpnIp>` (forwarded from the VPN
+core via the domain), `stale_chain_scheduled: bool` (chain-starts-once
+guard for the 24h refresh).
+
+Config additions: `stale_registration_interval` (default 24h —
+`DEFAULT_STALE_REGISTRATION_INTERVAL`, mirrors Mousehole's
+`STALE_RESPONSE_SECONDS`).
+
+New command: `MamCommand::ObservedIpChanged { ip }`.  New timer:
+`MamTimer::StaleRegistrationRefresh`.
+
+- **MAM-16 [safety]** *(observed-IP dedup — §31)*
+  `MamCommand::ObservedIpChanged { ip }` emits exactly one
+  `UpdateSeedbox` action iff `pre.observed_ip != Some(ip)`, and zero
+  otherwise (Mousehole's `getUpdateReason` dedup style).  On the first
+  fresh observation (`!pre.stale_chain_scheduled`), also emits exactly
+  one `ScheduleTimer { StaleRegistrationRefresh }`.  Subsequent fresh
+  observations do not re-arm the chain.  Total. → A
+- **MAM-17 [liveness]** *(stale-registration heartbeat — §31)*
+  `TimerFired(StaleRegistrationRefresh)` always emits exactly one
+  `UpdateSeedbox` action and exactly one
+  `ScheduleTimer { StaleRegistrationRefresh }` — the chain cannot die
+  from a dropped result or shell error.  Mirrors QBIT-3 / MAM-9. → F
+
 ### qBit machine additions (§29)
 
 - **QBIT-19 [safety]** *(quota positive signal — §29)* `TorrentsListed`
@@ -533,6 +595,30 @@ this default and wire the real comparison.
   The §29 stub default for `vpn_ip_compliant` (`Some(true)`) is now
   replaced by the real fail-closed default `None`; admission stays blocked
   until MAM confirms acceptance.
+
+### Domain machine additions (§31)
+
+- **DOM-21 [safety]** *(public-IP leak alert — §31)*
+  `Vpn(PublicIpMismatch { file_ip, verified_ip })` emits exactly one
+  `Db(RecordAlert { priority: Critical, title: "VPN public IP mismatch" })`,
+  one `Db(RecordActivity { source: Vpn, action: "vpn_public_ip_mismatch" })`,
+  and one `Activity` publish.  The handler also flips
+  `admission.vpn_ip_compliant` to `Some(false)`, hard-stopping autograb
+  until the next consistent verification (or §30's `AsnAccepted`).  Total
+  invariant. → A, B
+- **DOM-22 [safety]** *(verification-degraded warning — §31)*
+  `Vpn(PublicIpVerificationDegraded { consecutive_failures, last_reason })`
+  emits exactly one `Db(RecordAlert { priority: Warning })`, one
+  `Db(RecordActivity)`, and one `Activity` publish.  Does **not** flip
+  `admission.vpn_ip_compliant` — Gluetun's file is still the source of
+  truth for the IP, so a transient ifconfig.co outage must not block
+  autograb on its own.  Total invariant. → F
+
+  Counterpart: `Vpn(PublicIpObserved { ip })` forwards as one
+  `Mam(MamCommand::ObservedIpChanged { ip })` action and emits no
+  publishes — the MAM core's MAM-16 dedup decides whether
+  `UpdateSeedbox` actually fires.  `Vpn(PublicIpUnavailable)` flips
+  `admission.vpn_ip_compliant` to `None` with one Activity publish.
 
 ### Resolved (§26 → §29)
 
