@@ -58,7 +58,7 @@ Implement these stories one at a time, in this order:
 31. Mousehole-style proactive dynamic-seedbox update on IP change.
 32. Dedup updates against MAM-registered IP (Mousehole parity).
 33. VPN multi-source IP verification (ifconfig.co + MAM jsonIp).
-34. Review and harden the integration-test suite.
+34. Rebuild the integration-test suite around a real Docker stack (needs planning).
 35. Make dependent-container orchestration safe under Gluetun.
 36. Fully port legacy `windlass-core` to the per-system cores and remove it.
 37. Review and consolidate the debug-mode workflow (open scope, discuss when picked up).
@@ -1383,58 +1383,105 @@ compliance issue.
   compare ifconfig.co vs MAM directly today — that's a follow-up if it
   proves useful.
 
-## Story: Review And Harden The Integration-Test Suite
+## Story: Rebuild The Integration-Test Suite Around A Real Docker Stack
 
-Status: In Progress (audit complete, see `docs/integration-test-audit.md`)
+Status: Needs planning (fresh session — see notes below)
 
 ### Problem
 
-The cross-system invariants implemented through §29–§31 (admission gate,
-ASN-mismatch detection, public-IP observation, leak-detection mismatch)
-rely on many small per-machine property tests. The end-to-end integration
-tests (`just integration`) have not been reviewed for coverage in a while
-and may not exercise the new control flow: a Gluetun IP change driving a
-MAM seedbox update, an ifconfig.co mismatch flipping the §29 gate, the
-full TryAddTorrent → admission predicate → `Qbit(AddTorrent)` path.
+The existing integration suite runs Windlass against a chaos-controller
+that injects partial responses into mock qBit/MAM endpoints.  That's
+fine for smoke-checking "system stays alive" but it doesn't exercise
+the real Docker / Gluetun / qBittorrent / MAM topology operators
+actually deploy.  Nine months of operator-readiness work (§19–§35) has
+landed without integration coverage of the wiring across real
+containers; §36's cutover from the legacy `windlass-core` decision
+loop is high-risk to attempt against the current suite.
 
-Before §35 (the Gluetun orchestration story) and §36 (the legacy
-`windlass-core` retirement), the integration tests should be hardened so
-the cutover doesn't regress live behavior.
+`docs/integration-test-audit.md` (§34 phase 1) covers **what** to test
+— per-story coverage gaps and a punch list of recommended scenarios.
+This story is **how** to test: an integration harness rebuild that
+runs Windlass against a real `docker compose` stack including a fake
+MAM server with full API coverage.
 
 ### User Story
 
-As the maintainer, I want the integration-test suite reviewed and
-extended so it covers the operator behaviors introduced in §27–§31, so
-the §35 legacy-removal cutover can be performed with confidence.
+As the maintainer, I want `just integration` to spin up a real Docker
+stack — Gluetun, qBittorrent, a fake MAM server, Windlass — exercise
+the operator's behaviors against that stack end-to-end, and tear it
+down, so every operator-readiness story has integration coverage
+beyond the property-test layer and the §36 cutover is safe.
 
 ### Acceptance Criteria
 
-- Audit existing integration tests in `windlass/tests` (and any other
-  `tests/` directories) for coverage gaps against the operator-readiness
-  stories that have already shipped.
-- Identify untested cross-system flows; produce a punch list. Likely
-  candidates: §27 keep-alive heartbeat under simulated outages, §28
-  Unreachable vs NotConnectable distinction, §29 admission-gate
-  composition under realistic publish sequences, §30 ASN-mismatch
-  rejection round-trip, §31 IP-change-driven UpdateSeedbox + leak-
-  detection mismatch.
-- Add the missing scenarios as integration tests (or document why a
-  particular flow is intentionally tested only at the property-test
-  layer).
-- Confirm `just integration` runs clean on every covered scenario.
-- Update `docs/invariants.md` with any new invariants that emerge from
-  the audit.
+Deliberately open — this story needs a fresh planning session with the
+user before any code work.  Sketch of the target shape:
+
+- **Real `docker compose` stack** for integration tests, replacing the
+  current mock-via-chaos-controller approach.  Stack includes:
+  - **Gluetun** (real container, controllable via chaos hooks for
+    health up/down, IP/port file rewrites).
+  - **qBittorrent** (real container behind Gluetun's network
+    namespace, controllable login + preference state).
+  - **Fake MAM server** (a Rust service in `windlass-testkit/` or a
+    new crate) with **full API coverage**:
+    - `/json/checkCookie.php`
+    - `/jsonLoad.php` (with `?clientStats=` and `?snatch_summary=`)
+    - `/json/dynamicSeedbox.php` (all documented `msg` responses)
+    - `/json/jsonIp.php`
+    - `/tor/js/loadSearchJSONbasic.php`
+    - `/tor/download.php/{hash}`
+    - `/json/bonusBuy.php`
+    - `/json/loadUserDetailsTorrents.php`
+  - **Postgres** (already present) + **Windlass** itself.
+- The fake MAM server is **scriptable** per test — set the response
+  for each endpoint, record incoming requests, replay scenarios from
+  `docs/mam-api.md`.
+- Each integration test sets up the scenario it needs (rather than
+  the current implicit-state approach) and asserts on outcomes
+  observable at the operator surface: API responses, DB writes,
+  qBittorrent state, Gluetun-file state.
+- The full punch list from `docs/integration-test-audit.md` is
+  implementable on top of the new harness.
+- `just integration` runs the whole thing from a clean state, in
+  reasonable time (sub-5-minutes for the full suite is a goal, not a
+  hard rule).
+- Document the harness in `docs/integration-tests.md` so adding new
+  scenarios is a known workflow.
 
 ### Implementation Notes
 
-- Cross-reference the per-story property tests so we don't duplicate
-  what's already exercised at the machine layer; the integration suite
-  is about wiring + ordering across machines.
-- This story should land before §35/§36 so the cutover has a safety
-  net.
-- Audit findings are captured in `docs/integration-test-audit.md`; the
-  follow-up test-writing work tracks against §36's per-handler cutover
-  commits.
+This story is **tabled pending a fresh planning session** with the
+user.  Topics to settle in that session:
+
+1. Crate layout — is the fake MAM server a binary in
+   `windlass-testkit/`, its own crate, or part of `windlass-debug`?
+2. How the test harness drives the Docker stack — `bollard` from the
+   test process, `docker compose` CLI, or `testcontainers`?
+3. Whether the chaos controller stays for the in-process scenarios
+   it already serves (`mam-not-connectable`, `mam-asn-mismatch`,
+   `mam-rate-limit`) or is fully retired in favour of the fake-MAM
+   programmable responses.
+4. Test parallelism — one shared stack vs per-test stacks; whether
+   tests cooperate via DB cleanup or get fresh schemas.
+5. Coverage strategy for the **librarian** stories (autograb /
+   linker) once their cores land — same harness or separate?
+6. CI shape — `just integration` running locally is one thing; the
+   GitHub-Actions side needs Docker-in-Docker or self-hosted runner
+   considerations.
+7. Whether the existing `windlass-clients/tests/qbit_integration.rs`
+   harness folds into the new stack or stays a focused
+   client-against-real-qbit suite.
+
+### Predecessors
+
+- `docs/integration-test-audit.md` — coverage gaps per shipped story,
+  prioritised in three tiers.  The new harness should make every Tier
+  1 / Tier 2 test from that doc implementable.
+- `docs/legacy-retirement-plan.md` — §36 cutover plan; the new
+  integration suite is the safety net for the per-handler steps in
+  that doc (especially the torrent-records persistence path that
+  gates compliance.rs removal).
 
 ## Story: Make Dependent-Container Orchestration Safe Under Gluetun
 
