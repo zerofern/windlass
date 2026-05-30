@@ -240,6 +240,53 @@ both immediately too.
   `public_ip_verify_failure_threshold` from below.  Mirrors VPN-10 for the
   MAM source.  Total. → F
 
+### VPN machine additions (§35)
+
+State additions: `healthy_since: Option<DateTime<Utc>>` (bumped on every
+unhealthy → healthy transition; cleared on the reverse), `dependents:
+HashMap<String, DependentState>` (per-container `started_at` +
+`network_trusted`), `restart_window: VecDeque<DateTime>` (sliding-window
+of restart timestamps), `incident_id: u64` (bumped per incident),
+`crash_dump_emitted_for_current_incident: bool` (dedup flag).
+
+Config additions: `dependent_names`, `max_restarts_per_window` (default 3),
+`restart_window_duration` (default 10 min).
+
+New event: `DependentInspected { name, started_at }`.  New actions:
+`InspectDependent { name }`, `RestartContainer { name }`,
+`WriteCrashDump { incident_id }`.  New publishes:
+`DependentNetworkUntrusted`, `DependentNetworkTrusted`, `RestartStorm` on
+new `VpnTopic::Orchestration`.
+
+- **VPN-13 [safety]** *(stale-namespace detection — §35)* When
+  `DependentInspected` arrives with `started_at < healthy_since`, the
+  machine sets the dependent's `network_trusted = false` and publishes
+  exactly one `DependentNetworkUntrusted`.  Subject to VPN-15, it also
+  emits exactly one `RestartContainer { name }` action.  When
+  `started_at >= healthy_since`, the machine sets `network_trusted =
+  true` and on the rising edge publishes one `DependentNetworkTrusted`.
+  Total invariant. → B
+- **VPN-14 [safety]** *(no premature start — §35)* The machine never
+  emits `StartContainer` while `!self.connected` or
+  `admission.vpn_ip_compliant != Some(true)`.  Today the VPN core does
+  not own a `StartContainer` action (deferred to the engineering wiring
+  that activates the §35 stubs); the invariant is structural — the
+  start-action variant does not exist in `VpnAction`, so the contrapositive
+  is type-enforced.  → B
+- **VPN-15 [safety]** *(restart circuit breaker — §35)* Every
+  `RestartContainer` action emitted by the stale-namespace path is
+  preceded by a `restart_window` prune (sliding-window of duration
+  `restart_window_duration`).  An action is emitted iff the post-prune
+  count is strictly below `max_restarts_per_window`; otherwise the
+  machine publishes `RestartStorm { window_count, max }` instead.  Total
+  invariant. → F
+- **VPN-16 [safety]** *(crash-dump dedup — §35)* `WriteCrashDump
+  { incident_id }` is emitted at most once per incident: it fires only
+  when the circuit breaker trips and
+  `crash_dump_emitted_for_current_incident == false`, after which the
+  flag is set.  The flag is reset on the next `ContainerHealthy` rising
+  edge (which also bumps `incident_id`).  Total invariant. → F
+
 Shell contracts:
 
 - `StateRead { connected: false, port: Some(_) }` is not expected from the
@@ -697,6 +744,24 @@ this default and wire the real comparison.
   `admission.vpn_ip_compliant`.  Mirrors DOM-22 for the MAM source —
   independent so a `MamIpVerificationDegraded` alert can fire even when
   ifconfig.co is healthy.  Total invariant. → F
+
+### Domain machine additions (§35)
+
+- **DOM-25 [safety]** *(stale-namespace alert routing — §35)*
+  `Vpn(DependentNetworkUntrusted { name, dependent_started_at,
+  gluetun_healthy_since })` emits exactly one `Db(RecordAlert
+  { priority: Critical, title: "Dependent `<name>` network untrusted" })`,
+  one `Db(RecordActivity { source: Vpn, action:
+  "vpn_dependent_network_untrusted" })`, and one `Activity` publish.
+  Also flips `admission.vpn_ip_compliant` to `Some(false)`.  Counterpart
+  `Vpn(DependentNetworkTrusted { name })` emits one `RecordActivity` +
+  one `Activity`, no alert; does not change `vpn_ip_compliant` on its
+  own.  Total invariant. → A, B
+- **DOM-26 [safety]** *(restart-storm alert routing — §35)*
+  `Vpn(RestartStorm { window_count, max })` emits one `Db(RecordAlert
+  { priority: Critical, title: "Dependent restart storm" })`, one
+  `Db(RecordActivity)`, and one `Activity` publish.  Flips
+  `admission.vpn_ip_compliant` to `Some(false)`.  Total invariant. → F
 
 ### Resolved (§26 → §29)
 

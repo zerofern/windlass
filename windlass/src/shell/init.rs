@@ -154,6 +154,13 @@ pub(super) async fn init_shell(
             // §31: ifconfig.co verification cadence + threshold.
             public_ip_verify_interval: Duration::from_hours(6),
             public_ip_verify_failure_threshold: 3,
+            // §35: dependent container names + restart circuit-breaker
+            // settings.  Default: no dependents wired yet, which keeps
+            // the §35 invariants benign until the docker-compose layer
+            // declares the actual dependent set.
+            dependent_names: Vec::new(),
+            max_restarts_per_window: 3,
+            restart_window_duration: Duration::from_mins(10),
         },
         VpnShellConfig {
             docker: docker.clone(),
@@ -171,7 +178,12 @@ pub(super) async fn init_shell(
     vpn_handles
         .subscribe
         .send((
-            vec![VpnTopic::Connectivity, VpnTopic::Port, VpnTopic::PublicIp],
+            vec![
+                VpnTopic::Connectivity,
+                VpnTopic::Port,
+                VpnTopic::PublicIp,
+                VpnTopic::Orchestration,
+            ],
             vpn_pub_tx,
         ))
         .expect("vpn pub subscription");
@@ -289,7 +301,10 @@ pub(super) async fn init_shell(
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
                     | VpnPublish::PublicIpVerificationDegraded { .. }
-                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
+                    | VpnPublish::MamIpVerificationDegraded { .. }
+                    | VpnPublish::DependentNetworkUntrusted { .. }
+                    | VpnPublish::DependentNetworkTrusted { .. }
+                    | VpnPublish::RestartStorm { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }

@@ -61,6 +61,7 @@ Implement these stories one at a time, in this order:
 34. Review and harden the integration-test suite.
 35. Make dependent-container orchestration safe under Gluetun.
 36. Fully port legacy `windlass-core` to the per-system cores and remove it.
+37. Review and consolidate the debug-mode workflow (open scope, discuss when picked up).
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
 
@@ -1434,7 +1435,7 @@ the §35 legacy-removal cutover can be performed with confidence.
 
 ## Story: Make Dependent-Container Orchestration Safe Under Gluetun
 
-Status: To Do
+Status: Done
 
 ### Problem
 
@@ -1565,3 +1566,46 @@ actually guard what runs in production.
   whole torrent-details pipeline (fetch → new core → DB upsert → UI read) in one
   coordinated step rather than per-decision, to avoid legacy and new cores both
   acting on the same torrent list.
+
+## Story: Review And Consolidate Debug-Mode Workflow
+
+Status: To Do
+
+### Problem
+
+The debug-mode workflow — event/action history, pause, breakpoints, replay —
+has accumulated over many stories (§1, §10, §14, §15, plus implicit support
+from every service-runtime story).  Each core now goes through the generic
+service runtime and feeds the debug pipeline, but no story has revisited the
+operator-facing surface as a whole.  Before operator-readiness wraps, we
+should look at debug mode end-to-end with fresh eyes: what works, what's
+useful, what's stale, what should change shape.
+
+### User Story
+
+As the operator user, I want the debug-mode UX (and its underlying event/
+action history, pause, breakpoint, and replay primitives) reviewed as a
+single coherent feature so the pieces that matter are sharpened and the
+pieces that don't are dropped or reshaped.
+
+### Acceptance Criteria
+
+Deliberately open.  Real scope to be agreed when the story is picked up.
+Likely candidates:
+
+- Audit what debug mode currently surfaces vs what an operator actually
+  uses while diagnosing a problem.
+- Decide whether per-core event/action streams are the right shape, or
+  whether a cross-system causal view (e.g. "all events touching torrent
+  X") is more useful.
+- Revisit breakpoints: are they used in practice, and if so on what?
+- Revisit replay: still a goal, or a victim of the per-system migration?
+- Decide whether the debug page lives in the operator UI long-term or
+  moves behind a feature flag/dev build.
+
+### Implementation Notes
+
+- This is a *review* story; discuss before any large code change.
+- Cross-reference the debug-mode bits sprinkled through the earlier
+  stories (initial UI snapshot, event/action queue visibility, breakpoint-
+  on-click) when assembling the audit.

@@ -1,12 +1,15 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_types::{VpnIp, VpnPort};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `VpnConfig` is no longer `Copy` (§35 adds a `Vec<String>` of dependent
+// names) but stays cloneable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnConfig {
     pub health_poll_interval: Duration,
     pub unhealthy_poll_interval: Duration,
@@ -17,6 +20,18 @@ pub struct VpnConfig {
     /// §31: number of consecutive verification failures before publishing
     /// `PublicIpVerificationDegraded`. Default: 3.
     pub public_ip_verify_failure_threshold: u32,
+    /// §35: container names of every dependent that shares Gluetun's
+    /// network namespace (e.g. `qbittorrent`, `mlm`).  Used by the stale-
+    /// namespace check.  An empty list disables the §35 orchestration
+    /// invariants (useful for tests).
+    pub dependent_names: Vec<String>,
+    /// §35: maximum number of `RestartContainer` actions emitted within
+    /// `restart_window_duration` before the circuit breaker trips and
+    /// further restart actions are blocked.  Default: 3.
+    pub max_restarts_per_window: u32,
+    /// §35: sliding-window duration for the restart circuit breaker.
+    /// Default: 10 minutes.
+    pub restart_window_duration: Duration,
 }
 
 /// §31: VPN verification payload from ifconfig.co/json.
@@ -30,6 +45,21 @@ pub struct VerifiedIpInfo {
     pub asn: Option<String>,
     pub country: Option<String>,
     pub hostname: Option<String>,
+}
+
+/// §35: per-dependent container state tracked by the VPN core for the
+/// stale-namespace and premature-start invariants.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependentState {
+    /// When the container was last observed to have started (from
+    /// Docker's `State.StartedAt` field).  `None` before the first
+    /// successful inspection.
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `true` once the dependent has been observed to have started at or
+    /// after the current `gluetun.healthy_since`.  Reset to `false` on
+    /// every Gluetun-healthy transition until the next inspection
+    /// confirms a fresh start.
+    pub network_trusted: bool,
 }
 
 /// §33: which external check produced a `PublicIpMismatch`.
@@ -104,6 +134,12 @@ pub enum VpnEvent {
     MamIpVerifyFailed {
         reason: String,
     },
+    /// §35: Docker `inspect` reported a dependent's `StartedAt`
+    /// timestamp.  `None` means the container is not running.
+    DependentInspected {
+        name: String,
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
     StateRead {
         connected: bool,
         port: Option<VpnPort>,
@@ -127,6 +163,24 @@ pub enum VpnAction {
     /// the Gluetun proxy.  Fired in parallel with `VerifyPublicIp` so the
     /// 6h timer covers both verification sources.
     VerifyMamIp,
+    /// §35: ask the shell to inspect a dependent container's
+    /// `StartedAt`.  The shell maps this to a Docker inspect call and
+    /// answers with `DependentInspected`.
+    InspectDependent {
+        name: String,
+    },
+    /// §35: restart a dependent container.  Only emitted when the
+    /// circuit breaker (`restart_window`) permits.  Used for the
+    /// stale-namespace recovery path.
+    RestartContainer {
+        name: String,
+    },
+    /// §35: write a crash dump for the current incident.  Suppressed
+    /// after the first emission per incident (`crash_dump_emitted_for_
+    /// current_incident`).
+    WriteCrashDump {
+        incident_id: u64,
+    },
     ScheduleTimer {
         timer: VpnTimer,
         after: Duration,
@@ -176,6 +230,30 @@ pub enum VpnPublish {
         consecutive_failures: u32,
         last_reason: String,
     },
+    /// §35: a dependent container's `started_at` predates the current
+    /// Gluetun `healthy_since` — its network namespace is stale and
+    /// traffic from it may be leaking outside the VPN.  Domain routes
+    /// this to a `Critical` alert and the §29 admission gate.
+    DependentNetworkUntrusted {
+        name: String,
+        dependent_started_at: chrono::DateTime<chrono::Utc>,
+        gluetun_healthy_since: chrono::DateTime<chrono::Utc>,
+    },
+    /// §35: the restart circuit breaker tripped — `max_restarts_per_
+    /// window` restarts have been emitted within
+    /// `restart_window_duration`.  Further `RestartContainer` actions
+    /// are blocked until the window slides.  Domain routes to a
+    /// `Critical` alert.
+    RestartStorm {
+        window_count: u32,
+        max: u32,
+    },
+    /// §35: a dependent's `started_at` is now at-or-after
+    /// `gluetun.healthy_since` — the namespace is trusted again.
+    /// Domain uses this to clear the per-dependent admission block.
+    DependentNetworkTrusted {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +262,8 @@ pub enum VpnTopic {
     Port,
     /// §31: public-IP observation + verification topic.
     PublicIp,
+    /// §35: Gluetun stack-orchestration topic.
+    Orchestration,
 }
 
 impl HasTopic<VpnTopic> for VpnPublish {
@@ -196,6 +276,9 @@ impl HasTopic<VpnTopic> for VpnPublish {
             | Self::PublicIpMismatch { .. }
             | Self::PublicIpVerificationDegraded { .. }
             | Self::MamIpVerificationDegraded { .. } => VpnTopic::PublicIp,
+            Self::DependentNetworkUntrusted { .. }
+            | Self::DependentNetworkTrusted { .. }
+            | Self::RestartStorm { .. } => VpnTopic::Orchestration,
         }
     }
 }
@@ -228,6 +311,26 @@ pub struct VpnMachine {
     /// from `verification_failures` so per-source degraded signals are
     /// possible (ifconfig.co healthy ⇄ MAM unreachable, or vice versa).
     mam_verification_failures: u32,
+    /// §35: timestamp at which Gluetun transitioned to healthy.  Reset
+    /// whenever Gluetun goes unhealthy.  Compared against
+    /// `DependentState::started_at` for the stale-namespace check.
+    healthy_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// §35: per-dependent container state.  Populated from
+    /// `DependentInspected` events.
+    dependents: HashMap<String, DependentState>,
+    /// §35: sliding-window of recent `RestartContainer` action times for
+    /// the circuit breaker.  Times older than `restart_window_duration`
+    /// are pruned on every check.
+    restart_window: VecDeque<chrono::DateTime<chrono::Utc>>,
+    /// §35: identifier for the current incident (a contiguous run of
+    /// problems triggered by the same Gluetun-unhealthy event).  Bumps on
+    /// every Gluetun-unhealthy → healthy transition so the dedup flag
+    /// gets a fresh allowance per incident.
+    incident_id: u64,
+    /// §35: `true` once the current incident has produced a
+    /// `WriteCrashDump` action, suppressing further dumps until the next
+    /// incident.  Reset when `incident_id` bumps.
+    crash_dump_emitted_for_current_incident: bool,
 }
 
 impl VpnMachine {
@@ -256,6 +359,27 @@ impl VpnMachine {
     pub const fn last_mam_verified_ip(&self) -> Option<VpnIp> {
         self.last_mam_verified_ip
     }
+
+    /// Returns when Gluetun was last observed to transition to healthy
+    /// (§35).  `None` until the first healthy transition or after an
+    /// unhealthy reset.
+    #[must_use]
+    pub const fn healthy_since(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.healthy_since
+    }
+
+    /// Returns the current incident id (§35).  Bumped on every
+    /// Gluetun-unhealthy → healthy transition.
+    #[must_use]
+    pub const fn incident_id(&self) -> u64 {
+        self.incident_id
+    }
+
+    /// Returns per-dependent state (§35), keyed by container name.
+    #[must_use]
+    pub const fn dependents(&self) -> &HashMap<String, DependentState> {
+        &self.dependents
+    }
 }
 
 impl Machine for VpnMachine {
@@ -278,6 +402,11 @@ impl Machine for VpnMachine {
             verify_chain_scheduled: false,
             last_mam_verified_ip: None,
             mam_verification_failures: 0,
+            healthy_since: None,
+            dependents: HashMap::new(),
+            restart_window: VecDeque::new(),
+            incident_id: 0,
+            crash_dump_emitted_for_current_incident: false,
         }
     }
 
@@ -296,15 +425,35 @@ impl Machine for VpnMachine {
                 publish: Vec::new(),
             },
             VpnEvent::ContainerHealthy => {
+                let was_unhealthy = !self.connected;
                 self.connected = true;
+                // §35: rising-edge unhealthy → healthy.  Record
+                // `healthy_since`, bump the incident id (so the next
+                // crash-dump dedup gets a fresh allowance), reset the
+                // dump flag, and reset per-dependent trust until the
+                // next inspection.
+                if was_unhealthy {
+                    self.healthy_since = Some(chrono::Utc::now());
+                    self.incident_id = self.incident_id.saturating_add(1);
+                    self.crash_dump_emitted_for_current_incident = false;
+                    for state in self.dependents.values_mut() {
+                        state.network_trusted = false;
+                    }
+                }
+                let mut actions = vec![
+                    VpnAction::ReadPortFiles,
+                    VpnAction::ScheduleTimer {
+                        timer: VpnTimer::HealthPoll,
+                        after: self.config.health_poll_interval,
+                    },
+                ];
+                // §35: ask the shell to inspect every dependent so the
+                // stale-namespace check can run.
+                for name in &self.config.dependent_names {
+                    actions.push(VpnAction::InspectDependent { name: name.clone() });
+                }
                 Outcome {
-                    actions: vec![
-                        VpnAction::ReadPortFiles,
-                        VpnAction::ScheduleTimer {
-                            timer: VpnTimer::HealthPoll,
-                            after: self.config.health_poll_interval,
-                        },
-                    ],
+                    actions,
                     publish: vec![VpnPublish::Connected],
                 }
             }
@@ -322,6 +471,15 @@ impl Machine for VpnMachine {
                 self.verification_failures = 0;
                 self.last_mam_verified_ip = None;
                 self.mam_verification_failures = 0;
+                // §35: clear healthy_since — every dependent's network
+                // is now considered untrusted until the next healthy
+                // transition and inspection.  Don't drop the dependents
+                // map (we still want their last-known started_at) but
+                // mark them untrusted.
+                self.healthy_since = None;
+                for state in self.dependents.values_mut() {
+                    state.network_trusted = false;
+                }
                 Outcome {
                     actions: vec![VpnAction::ScheduleTimer {
                         timer: VpnTimer::HealthPoll,
@@ -521,6 +679,77 @@ impl Machine for VpnMachine {
                 ],
                 publish: Vec::new(),
             },
+            // §35 / VPN-13: stale-namespace detection.  A dependent
+            // whose StartedAt predates Gluetun's healthy_since may be on
+            // a stale network namespace; emit `RestartContainer` and
+            // publish `DependentNetworkUntrusted`.  Circuit breaker
+            // (VPN-15) blocks the restart action if the window cap is
+            // reached.  Crash dump dedup (VPN-16) emits at most one
+            // `WriteCrashDump` per incident.
+            VpnEvent::DependentInspected { name, started_at } => {
+                let entry = self.dependents.entry(name.clone()).or_default();
+                entry.started_at = started_at;
+                let Some(healthy_since) = self.healthy_since else {
+                    // Gluetun isn't healthy → we have no anchor.  Update
+                    // the recorded started_at but make no decision.
+                    return Outcome::none();
+                };
+                let Some(dep_started_at) = started_at else {
+                    // Dependent not running.  Trust flag stays false.
+                    entry.network_trusted = false;
+                    return Outcome::none();
+                };
+                if dep_started_at >= healthy_since {
+                    // Fresh namespace — trust it.  Rising-edge publish.
+                    let was_untrusted = !entry.network_trusted;
+                    entry.network_trusted = true;
+                    return Outcome {
+                        actions: Vec::new(),
+                        publish: if was_untrusted {
+                            vec![VpnPublish::DependentNetworkTrusted { name }]
+                        } else {
+                            Vec::new()
+                        },
+                    };
+                }
+                // Stale namespace.  Mark untrusted and request restart
+                // (if the circuit breaker allows).
+                entry.network_trusted = false;
+                let mut actions = Vec::new();
+                let now = chrono::Utc::now();
+                let window = chrono::Duration::from_std(self.config.restart_window_duration)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(0));
+                while let Some(front) = self.restart_window.front() {
+                    if now.signed_duration_since(*front) > window {
+                        self.restart_window.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                let max = self.config.max_restarts_per_window;
+                let window_count = u32::try_from(self.restart_window.len()).unwrap_or(u32::MAX);
+                let mut publish = vec![VpnPublish::DependentNetworkUntrusted {
+                    name: name.clone(),
+                    dependent_started_at: dep_started_at,
+                    gluetun_healthy_since: healthy_since,
+                }];
+                if max == 0 || window_count < max {
+                    actions.push(VpnAction::RestartContainer { name });
+                    self.restart_window.push_back(now);
+                } else {
+                    // VPN-15: circuit breaker tripped.  Suppress the
+                    // restart, publish RestartStorm, and emit a crash
+                    // dump iff we haven't already this incident.
+                    publish.push(VpnPublish::RestartStorm { window_count, max });
+                    if !self.crash_dump_emitted_for_current_incident {
+                        self.crash_dump_emitted_for_current_incident = true;
+                        actions.push(VpnAction::WriteCrashDump {
+                            incident_id: self.incident_id,
+                        });
+                    }
+                }
+                Outcome { actions, publish }
+            }
         }
     }
 
@@ -557,6 +786,9 @@ mod tests {
                 port_read_retry_interval: Duration::from_millis(500),
                 public_ip_verify_interval: Duration::from_secs(6 * 60 * 60),
                 public_ip_verify_failure_threshold: 3,
+                dependent_names: Vec::new(),
+                max_restarts_per_window: 3,
+                restart_window_duration: Duration::from_mins(10),
             },
             Instant::now(),
         )
@@ -824,6 +1056,9 @@ mod prop_tests {
                             port_read_retry_interval: Duration::from_millis(500),
                             public_ip_verify_interval: Duration::from_secs(6 * 60 * 60),
                             public_ip_verify_failure_threshold: 3,
+                            dependent_names: Vec::new(),
+                            max_restarts_per_window: 3,
+                            restart_window_duration: Duration::from_mins(10),
                         },
                         Instant::now(),
                     );
@@ -871,6 +1106,15 @@ mod prop_tests {
             any::<String>().prop_map(|reason| VpnEvent::PublicIpVerifyFailed { reason }),
             any_verified_ip_info().prop_map(|info| VpnEvent::MamIpVerified { info }),
             any::<String>().prop_map(|reason| VpnEvent::MamIpVerifyFailed { reason }),
+            // §35: DependentInspected with arbitrary names + started_at.
+            // The Utc::now() snapshot is fine since the predicates only
+            // compare against healthy_since (also a chrono timestamp).
+            (any::<String>(), proptest::option::of(0i64..=3_600i64)).prop_map(|(name, offset)| {
+                VpnEvent::DependentInspected {
+                    name,
+                    started_at: offset.map(|s| chrono::Utc::now() + chrono::Duration::seconds(s)),
+                }
+            }),
             (any::<bool>(), proptest::option::of(any_vpn_port()))
                 .prop_map(|(connected, port)| VpnEvent::StateRead { connected, port }),
             any::<String>().prop_map(|reason| VpnEvent::StateReadFailed { reason }),

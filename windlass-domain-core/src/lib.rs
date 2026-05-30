@@ -419,6 +419,34 @@ impl Machine for WindlassMachine {
                 consecutive_failures,
                 last_reason,
             }) => Self::on_mam_ip_verification_degraded(consecutive_failures, &last_reason),
+            // §35 / DOM-25: stale-namespace dependent — Critical alert +
+            // admission block.  The VPN core has already requested the
+            // restart; the Critical signal makes the operator aware.
+            WindlassEvent::Vpn(VpnPublish::DependentNetworkUntrusted {
+                name,
+                dependent_started_at,
+                gluetun_healthy_since,
+            }) => {
+                self.admission.vpn_ip_compliant = Some(false);
+                Self::on_dependent_network_untrusted(
+                    &name,
+                    dependent_started_at,
+                    gluetun_healthy_since,
+                )
+            }
+            // §35: dependent's namespace is fresh again.  No alert, just
+            // an activity note; admission stays blocked until §31/§32/§33
+            // re-confirm the IP/ASN gates (kept separate from
+            // orchestration trust).
+            WindlassEvent::Vpn(VpnPublish::DependentNetworkTrusted { name }) => {
+                Self::on_dependent_network_trusted(&name)
+            }
+            // §35 / DOM-26: restart circuit breaker tripped.  Critical
+            // alert + Activity; admission stays blocked.
+            WindlassEvent::Vpn(VpnPublish::RestartStorm { window_count, max }) => {
+                self.admission.vpn_ip_compliant = Some(false);
+                Self::on_restart_storm(window_count, max)
+            }
             WindlassEvent::Qbit(QbitPublish::Ready) => {
                 self.state.qbit = ServiceStatus::Ready;
                 self.publish_state()
@@ -947,6 +975,108 @@ impl WindlassMachine {
                     at: chrono::Utc::now(),
                     source: ActivitySource::Vpn,
                     action: "vpn_mam_ip_verification_degraded".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles `Vpn(DependentNetworkUntrusted)` (DOM-25 / §35).
+    ///
+    /// A dependent container's network namespace is stale (it started
+    /// before the current Gluetun health window).  Emits one
+    /// `RecordAlert(Critical)`, one `RecordActivity`, and one `Activity`
+    /// publish.  Caller has already flipped
+    /// `admission.vpn_ip_compliant` to `Some(false)`.
+    fn on_dependent_network_untrusted(
+        name: &str,
+        dependent_started_at: chrono::DateTime<chrono::Utc>,
+        gluetun_healthy_since: chrono::DateTime<chrono::Utc>,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!(
+            "Dependent container `{name}` started at {dependent_started_at} \
+             before Gluetun became healthy at {gluetun_healthy_since}. Its \
+             network namespace may be stale; the VPN core has requested a \
+             restart. Autograb is blocked until trust recovers.",
+        );
+        let message = format!(
+            "dependent `{name}` on stale namespace (started {dependent_started_at}, \
+             gluetun healthy_since {gluetun_healthy_since})",
+        );
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Critical,
+                    title: format!("Dependent `{name}` network untrusted"),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Vpn,
+                    action: "vpn_dependent_network_untrusted".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                })),
+            ],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles `Vpn(DependentNetworkTrusted)` (DOM-25 counterpart / §35).
+    ///
+    /// The dependent's namespace is fresh again.  No alert; just an
+    /// activity note so the operator can see recovery.  Admission stays
+    /// where it was (§31/§32/§33 own the IP-side gate).
+    fn on_dependent_network_trusted(name: &str) -> Outcome<WindlassAction, WindlassPublish> {
+        let message = format!("dependent `{name}` network trusted (fresh namespace)");
+        Outcome {
+            actions: vec![WindlassAction::Db(DbCommand::RecordActivity(
+                ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Vpn,
+                    action: "vpn_dependent_network_trusted".to_string(),
+                    book_id: None,
+                    detail: Some(message.clone()),
+                    metadata: serde_json::Value::Null,
+                },
+            ))],
+            publish: vec![WindlassPublish::Activity { message }],
+        }
+    }
+
+    /// Handles `Vpn(RestartStorm)` (DOM-26 / §35).
+    ///
+    /// The restart circuit breaker tripped — the VPN core is refusing
+    /// to emit further `RestartContainer` actions until the window
+    /// slides.  Operator must intervene.  Emits one
+    /// `RecordAlert(Critical)`, one `RecordActivity`, and one
+    /// `Activity` publish.  Admission stays blocked.
+    fn on_restart_storm(window_count: u32, max: u32) -> Outcome<WindlassAction, WindlassPublish> {
+        let body = format!(
+            "Restart circuit breaker tripped: {window_count} dependent \
+             restarts in the current window (limit {max}). Further \
+             RestartContainer actions are suppressed and a crash dump \
+             has been requested (deduped per incident).  Investigate \
+             before clearing.",
+        );
+        let message = format!("restart storm: {window_count} restarts >= cap {max}");
+        Outcome {
+            actions: vec![
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    at: chrono::Utc::now(),
+                    priority: AlertPriority::Critical,
+                    title: "Dependent restart storm".to_string(),
+                    body,
+                })),
+                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                    at: chrono::Utc::now(),
+                    source: ActivitySource::Vpn,
+                    action: "vpn_restart_storm".to_string(),
                     book_id: None,
                     detail: Some(message.clone()),
                     metadata: serde_json::Value::Null,
@@ -2832,6 +2962,64 @@ mod prop_tests {
             )).count();
             prop_assert_eq!(warning_count, 1);
             prop_assert_eq!(machine.admission().vpn_ip_compliant, pre_compliant);
+        }
+
+        // DOM-25 [safety] (§35): DependentNetworkUntrusted emits one
+        // Critical alert + RecordActivity + Activity, and flips
+        // admission to Some(false).  Total.
+        #[test]
+        fn dependent_network_untrusted_emits_critical_and_blocks(
+            mut machine in any_windlass_machine(),
+            name in any::<String>(),
+            healthy_offset in 0i64..=3_600i64,
+            dep_offset in 0i64..=3_600i64,
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let healthy = chrono::Utc::now() - chrono::Duration::seconds(healthy_offset);
+            let started = chrono::Utc::now() - chrono::Duration::seconds(dep_offset + healthy_offset);
+            let out = machine.handle(Instant::now(), Timed::now(
+                WindlassEvent::Vpn(VpnPublish::DependentNetworkUntrusted {
+                    name,
+                    dependent_started_at: started,
+                    gluetun_healthy_since: healthy,
+                }),
+            ));
+            let critical = out.actions.iter().filter(|a| matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Critical,
+                    ..
+                }))
+            )).count();
+            prop_assert_eq!(critical, 1);
+            prop_assert_eq!(machine.admission().vpn_ip_compliant, Some(false));
+        }
+
+        // DOM-26 [safety] (§35): RestartStorm → Critical + admission
+        // block.
+        #[test]
+        fn restart_storm_emits_critical_and_blocks(
+            mut machine in any_windlass_machine(),
+            window_count in any::<u32>(),
+            max in any::<u32>(),
+        ) {
+            use windlass_db_core::{AlertRecord, DbCommand};
+            use windlass_types::AlertPriority;
+
+            let out = machine.handle(Instant::now(), Timed::now(
+                WindlassEvent::Vpn(VpnPublish::RestartStorm { window_count, max }),
+            ));
+            let critical = out.actions.iter().filter(|a| matches!(
+                a,
+                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
+                    priority: AlertPriority::Critical,
+                    ..
+                }))
+            )).count();
+            prop_assert_eq!(critical, 1);
+            prop_assert_eq!(machine.admission().vpn_ip_compliant, Some(false));
         }
     }
 }

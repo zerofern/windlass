@@ -3397,6 +3397,7 @@ dependencies = [
 name = "windlass-vpn-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "proptest",
  "serde",
  "windlass-machine",
