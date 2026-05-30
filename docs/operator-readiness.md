@@ -1502,7 +1502,7 @@ isolation.
 
 ## Story: Fully Port Legacy `windlass-core` To Per-System Cores And Remove It
 
-Status: To Do
+Status: In Progress (audit complete, see `docs/legacy-retirement-plan.md`)
 
 ### Problem
 
