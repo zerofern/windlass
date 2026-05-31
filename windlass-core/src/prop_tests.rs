@@ -332,14 +332,13 @@ proptest! {
         prop_assert!(elapsed < deadline, "50-event sequence took {:?}", elapsed);
     }
 
-    // 4. DockerGluetunDied always clears qbit and mam — regardless of prior
-    //    active state. Prevents stale state from surviving a VPN death.
-    #[test]
-    fn gluetun_death_always_clears_qbit_and_mam(mut state in any_active_state()) {
-        state.process_event(Event::DockerGluetunDied { at: DateTime::UNIX_EPOCH }, Utc::now());
-        prop_assert_eq!(state.qbit, QbitState::Offline);
-        prop_assert_eq!(state.mam, MamState::Unknown);
-    }
+    // §36 step 1: the legacy "DockerGluetunDied clears qbit/mam" invariant
+    // was owned by the retired `handlers/vpn.rs::on_docker_gluetun_died`.
+    // The equivalent in the new architecture is `VpnPublish::Crashed` →
+    // domain DOM-27 + Docker(StopDependents); per-system clears happen in
+    // each new core's own `ContainerUnhealthy` handler.  Nothing in the
+    // legacy `process_event` path mutates state on `DockerGluetunDied`
+    // anymore, so this test is dropped rather than re-asserted.
 
     // 6. ASN blocked always suppresses recovery — no actions emitted
     //    when MAM is blocked, regardless of other state.

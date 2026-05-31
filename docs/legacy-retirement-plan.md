@@ -195,9 +195,14 @@ because every other check is already in the new cores.
    owns container lifecycle; domain emits the crash-recovery alert via
    DOM-27 on VpnPublish::Crashed; autoheal subsumed; VPN core no longer
    references DockerClient.  See operator-readiness.md §38.
-1. **vpn.rs** — now unblocked.  Remove the legacy `Event::*` arms
-   that map to VPN events; let the service-events bridge keep doing
-   the translation until step 7.
+1. **vpn.rs** — DONE (2026-05-31).  Legacy `handlers/vpn.rs` deleted;
+   `Event::Init / DockerGluetunDied / LogsDumped / DockerGluetunHealthy /
+   PortFileReadResult` dispatches in `windlass-core/src/lib.rs` now
+   no-op.  `service_events.rs` continues to translate those events into
+   `VpnEvent::*` for `VpnMachine`; crash recovery runs through §38's
+   DOM-27 path.  Legacy `state.vpn` stays at `VpnState::Stopped`;
+   remaining legacy handlers' `VpnState::Connected` branches no-op until
+   their own retirement (steps 2-5).
 2. **mam.rs** — same shape, slightly larger event set.
 3. **qbit.rs** (excluding compliance-related preferences flow) —
    careful with `on_qbit_preferences_received`; the `max_active_torrents`

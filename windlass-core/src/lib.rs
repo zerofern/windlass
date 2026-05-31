@@ -42,24 +42,24 @@ impl SystemState {
         let before_state = self.clone();
 
         let actions = match event {
-            // ── Initialisation ────────────────────────────────────────────────
-            Event::Init {
-                is_gluetun_healthy,
-                port_files,
-                ..
-            } => self.on_init(is_gluetun_healthy, port_files),
-
-            // ── Workflow A: VPN Drop Recovery ─────────────────────────────────
-            Event::DockerGluetunDied { .. } => self.on_docker_gluetun_died(),
-            Event::LogsDumped { .. } => self.on_logs_dumped(),
-            Event::DockerGluetunHealthy { .. } => self.on_docker_gluetun_healthy(),
-
-            // ── Workflow B: Port Sync & Tracker Update ────────────────────────
-            Event::PortFileReadResult {
-                result: Ok((ip, port)),
-                ..
-            } => self.on_port_file_read_ok(ip, port),
-            Event::PortFileReadResult { result: Err(e), .. } => handlers::on_port_file_read_err(&e),
+            // ── §36 step 1: legacy VPN handlers retired ───────────────────────
+            // Initialisation, Workflow A (VPN drop recovery), and the
+            // Workflow B port-file event are now owned by the new cores:
+            //   * `service_events.rs` translates these legacy events into
+            //     `VpnEvent::Init / ContainerHealthy / ContainerUnhealthy /
+            //     PortFileChanged / StateReadFailed` for `VpnMachine`.
+            //   * Crash recovery (log dump, fleet stop/restart/start,
+            //     "Gluetun died" Critical) is driven by §38's domain
+            //     DOM-27/DOM-28 path on `VpnPublish::Crashed/Recovered`.
+            // Legacy `state.vpn` stays at `VpnState::Stopped`; remaining
+            // legacy handlers that gate on `VpnState::Connected` (qbit.rs,
+            // mam.rs) no-op those branches.  Those handlers are retired in
+            // §36 steps 2-5.
+            Event::Init { .. }
+            | Event::DockerGluetunDied { .. }
+            | Event::LogsDumped { .. }
+            | Event::DockerGluetunHealthy { .. }
+            | Event::PortFileReadResult { .. } => Vec::new(),
             Event::QbitAuthSuccess { cookie, .. } => self.on_qbit_auth_success(cookie),
             Event::QbitConnectionRefused { .. } => self.on_qbit_connection_refused(),
             Event::QbitAuthFailed { .. } => self.on_qbit_auth_failed(),
