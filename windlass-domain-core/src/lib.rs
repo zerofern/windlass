@@ -14,9 +14,13 @@ use windlass_qbit_core::{QbitCommand, QbitPublish};
 use windlass_types::{AlertPriority, MamTorrentId, VpnIp, VpnPort};
 use windlass_vpn_core::{VerificationSource, VpnCommand, VpnPublish};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `WindlassConfig` is no longer `Copy` (§38 adds `gluetun_anchor: String`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindlassConfig {
     pub snapshot_interval: Duration,
+    /// §38: name of the Gluetun anchor container.  Used to address
+    /// `Docker(RestartContainer { name })` during crash recovery.
+    pub gluetun_anchor: String,
 }
 
 // `WindlassEvent` cannot derive `Eq` because `MamPublish::UploadHealthDegraded`
@@ -51,6 +55,10 @@ pub enum WindlassAction {
     Qbit(QbitCommand),
     Mam(MamCommand),
     Db(DbCommand),
+    /// §38: command the Docker core (e.g. `StopDependents`,
+    /// `RestartContainer`, `DumpAllLogs`).  Used by the crash-recovery
+    /// orchestration on `Vpn(Crashed)` / `Vpn(Recovered)`.
+    Docker(windlass_docker_core::DockerCommand),
     SaveSystemSnapshot(SystemStateView),
     SendAlert {
         priority: AlertPriority,
@@ -372,6 +380,39 @@ impl Machine for WindlassMachine {
                 self.state.vpn = ServiceStatus::Degraded;
                 self.state.forwarded_port = None;
                 self.publish_state()
+            }
+            // §38 / DOM-27: rising-edge VPN crash drives the full Docker
+            // crash-recovery sequence — dump logs, stop dependents,
+            // restart Gluetun — plus a Critical alert so the operator
+            // knows.  Fires exactly once per VPN healthy → unhealthy
+            // transition (VPN-17).
+            WindlassEvent::Vpn(VpnPublish::Crashed) => {
+                use windlass_docker_core::DockerCommand;
+                Outcome {
+                    actions: vec![
+                        WindlassAction::Docker(DockerCommand::DumpAllLogs),
+                        WindlassAction::Docker(DockerCommand::StopDependents),
+                        WindlassAction::Docker(DockerCommand::RestartContainer {
+                            name: self.config.gluetun_anchor.clone(),
+                        }),
+                        WindlassAction::SendAlert {
+                            priority: AlertPriority::Critical,
+                            title: "Gluetun died".to_string(),
+                            body: "💀 Gluetun crashed.  Dumping logs, stopping dependents, and restarting.".to_string(),
+                        },
+                    ],
+                    publish: Vec::new(),
+                }
+            }
+            // §38 / DOM-28: rising-edge VPN recovery starts dependents
+            // back up.  Fires exactly once per unhealthy → healthy
+            // transition (VPN-18).
+            WindlassEvent::Vpn(VpnPublish::Recovered) => {
+                use windlass_docker_core::DockerCommand;
+                Outcome {
+                    actions: vec![WindlassAction::Docker(DockerCommand::StartDependents)],
+                    publish: Vec::new(),
+                }
             }
             WindlassEvent::Vpn(VpnPublish::PortReady { port }) => {
                 self.state.forwarded_port = Some(port);
@@ -1300,6 +1341,7 @@ mod tests {
         WindlassMachine::new(
             WindlassConfig {
                 snapshot_interval: Duration::from_secs(60),
+                gluetun_anchor: "gluetun".to_string(),
             },
             Instant::now(),
         )
@@ -2109,6 +2151,52 @@ mod tests {
         assert!(out.publish.is_empty(), "AsnAccepted emits no publishes");
         assert_eq!(machine.admission().vpn_ip_compliant, Some(true));
     }
+
+    // ── §38 / DOM-27 + DOM-28: VPN crash-recovery orchestration ──────────
+
+    #[test]
+    fn vpn_crashed_drives_dump_stop_restart_and_critical_alert() {
+        // DOM-27: rising-edge Vpn(Crashed) emits the full crash-recovery
+        // fan-out in order: DumpAllLogs, StopDependents, RestartContainer
+        // (anchor), SendAlert(Critical).
+        use windlass_docker_core::DockerCommand;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+        let out = handle(&mut machine, WindlassEvent::Vpn(VpnPublish::Crashed));
+
+        assert_eq!(out.actions.len(), 4, "expected 4 crash-recovery actions");
+        assert!(matches!(
+            out.actions[0],
+            WindlassAction::Docker(DockerCommand::DumpAllLogs)
+        ));
+        assert!(matches!(
+            out.actions[1],
+            WindlassAction::Docker(DockerCommand::StopDependents)
+        ));
+        assert!(matches!(
+            &out.actions[2],
+            WindlassAction::Docker(DockerCommand::RestartContainer { name }) if name == "gluetun"
+        ));
+        assert!(matches!(
+            &out.actions[3],
+            WindlassAction::SendAlert { priority, .. } if *priority == AlertPriority::Critical
+        ));
+    }
+
+    #[test]
+    fn vpn_recovered_drives_start_dependents() {
+        // DOM-28: rising-edge Vpn(Recovered) emits StartDependents only.
+        use windlass_docker_core::DockerCommand;
+
+        let mut machine = machine();
+        let out = handle(&mut machine, WindlassEvent::Vpn(VpnPublish::Recovered));
+
+        assert_eq!(
+            out.actions,
+            vec![WindlassAction::Docker(DockerCommand::StartDependents)]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2155,6 +2243,7 @@ mod prop_tests {
                 let mut machine = WindlassMachine::new(
                     WindlassConfig {
                         snapshot_interval: Duration::from_secs(60),
+                        gluetun_anchor: "gluetun".to_string(),
                     },
                     Instant::now(),
                 );
@@ -2240,6 +2329,8 @@ mod prop_tests {
         prop_oneof![
             Just(VpnPublish::Connected),
             Just(VpnPublish::Disconnected),
+            Just(VpnPublish::Crashed),
+            Just(VpnPublish::Recovered),
             any_vpn_port().prop_map(|port| VpnPublish::PortReady { port }),
             Just(VpnPublish::PortUnavailable),
         ]

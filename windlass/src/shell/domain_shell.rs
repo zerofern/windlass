@@ -6,6 +6,7 @@ use tokio::sync::oneshot;
 use chrono::Utc;
 use serde_json::json;
 use windlass_db_core::{AlertRecord, DbCommand, DbMachine, DbResponse, SystemSnapshotRecord};
+use windlass_docker_core::{DockerMachine, DockerResponse};
 use windlass_domain_core::{WindlassAction, WindlassEvent};
 use windlass_machine::{Command, Shell, Timed};
 use windlass_mam_core::{MamMachine, MamResponse};
@@ -19,13 +20,14 @@ pub struct DomainShellConfig {
     pub vpn: UnboundedSender<Command<VpnMachine>>,
     pub qbit: UnboundedSender<Command<QbitMachine>>,
     pub mam: UnboundedSender<Command<MamMachine>>,
+    pub docker: UnboundedSender<Command<DockerMachine>>,
 }
 
 /// Imperative shell for the `WindlassMachine` domain runtime.
 ///
 /// Routes each `WindlassAction` to the appropriate downstream runtime:
 /// - `Db(cmd)` → DB command channel (fire-and-forget oneshot).
-/// - `Vpn/Qbit/Mam(cmd)` → respective command channels (fire-and-forget).
+/// - `Vpn/Qbit/Mam/Docker(cmd)` → respective command channels.
 /// - `ScheduleTimer` → tokio sleep that sends `Timed<WindlassEvent::TimerFired>`
 ///   back through the domain event channel, preserving the scheduled fire time.
 pub struct DomainShell {
@@ -33,6 +35,7 @@ pub struct DomainShell {
     vpn: UnboundedSender<Command<VpnMachine>>,
     qbit: UnboundedSender<Command<QbitMachine>>,
     mam: UnboundedSender<Command<MamMachine>>,
+    docker: UnboundedSender<Command<DockerMachine>>,
 }
 
 impl Shell for DomainShell {
@@ -46,6 +49,7 @@ impl Shell for DomainShell {
             vpn: config.vpn,
             qbit: config.qbit,
             mam: config.mam,
+            docker: config.docker,
         }
     }
 
@@ -92,6 +96,10 @@ impl Shell for DomainShell {
             WindlassAction::Mam(cmd) => {
                 let (reply_tx, _reply_rx) = oneshot::channel::<MamResponse>();
                 let _ = self.mam.send((cmd, reply_tx));
+            }
+            WindlassAction::Docker(cmd) => {
+                let (reply_tx, _reply_rx) = oneshot::channel::<DockerResponse>();
+                let _ = self.docker.send((cmd, reply_tx));
             }
             WindlassAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();

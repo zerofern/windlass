@@ -176,6 +176,16 @@ pub enum VpnPublish {
         consecutive_failures: u32,
         last_reason: String,
     },
+    /// §38 / VPN-17: rising-edge healthy → unhealthy transition.
+    /// Sibling to `Disconnected`, which is idempotent and fires on every
+    /// health poll while down.  Domain reacts to this exactly-once signal
+    /// to drive crash recovery (log dump, stop dependents, restart
+    /// Gluetun, Critical alert).
+    Crashed,
+    /// §38 / VPN-18: rising-edge unhealthy → healthy transition.  Sibling
+    /// to `Connected`, which is idempotent.  Domain reacts to this once
+    /// per real recovery to start dependents back up.
+    Recovered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,7 +199,9 @@ pub enum VpnTopic {
 impl HasTopic<VpnTopic> for VpnPublish {
     fn topic(&self) -> VpnTopic {
         match self {
-            Self::Connected | Self::Disconnected => VpnTopic::Connectivity,
+            Self::Connected | Self::Disconnected | Self::Crashed | Self::Recovered => {
+                VpnTopic::Connectivity
+            }
             Self::PortReady { .. } | Self::PortUnavailable => VpnTopic::Port,
             Self::PublicIpObserved { .. }
             | Self::PublicIpUnavailable
@@ -296,7 +308,14 @@ impl Machine for VpnMachine {
                 publish: Vec::new(),
             },
             VpnEvent::ContainerHealthy => {
+                let was_unhealthy = !self.connected;
                 self.connected = true;
+                let mut publish = vec![VpnPublish::Connected];
+                if was_unhealthy {
+                    // §38: rising-edge recovery signal so domain can drive
+                    // the post-crash StartDependents fan-out exactly once.
+                    publish.push(VpnPublish::Recovered);
+                }
                 Outcome {
                     actions: vec![
                         VpnAction::ReadPortFiles,
@@ -305,13 +324,20 @@ impl Machine for VpnMachine {
                             after: self.config.health_poll_interval,
                         },
                     ],
-                    publish: vec![VpnPublish::Connected],
+                    publish,
                 }
             }
             VpnEvent::ContainerUnhealthy => {
+                let was_connected = self.connected;
                 self.connected = false;
                 self.port = None;
                 let mut publish = vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable];
+                if was_connected {
+                    // §38: rising-edge crash signal so domain can drive
+                    // log dump + StopDependents + RestartGluetun + Critical
+                    // alert exactly once per crash.
+                    publish.push(VpnPublish::Crashed);
+                }
                 // §31: clear observed_ip on disconnect; surface the
                 // unavailable signal so the domain can clear the §29 gate.
                 if self.observed_ip.is_some() {
@@ -592,7 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn healthy_container_publishes_connected_and_reads_port_files() {
+    fn healthy_container_from_cold_publishes_connected_and_recovered() {
+        // §38 / VPN-18: rising-edge Recovered fires the first time we see
+        // healthy (cold start counts — was_unhealthy is true by default).
         let mut machine = machine();
 
         let out = handle(&mut machine, VpnEvent::ContainerHealthy);
@@ -608,11 +636,27 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(out.publish, vec![VpnPublish::Connected]);
+        assert_eq!(
+            out.publish,
+            vec![VpnPublish::Connected, VpnPublish::Recovered]
+        );
     }
 
     #[test]
-    fn unhealthy_container_publishes_disconnected_and_schedules_fast_poll() {
+    fn repeat_healthy_does_not_republish_recovered() {
+        // §38 / VPN-18: Recovered is rising-edge only.
+        let mut machine = machine();
+        handle(&mut machine, VpnEvent::ContainerHealthy);
+        let out = handle(&mut machine, VpnEvent::ContainerHealthy);
+        assert!(!out.publish.contains(&VpnPublish::Recovered));
+        assert!(out.publish.contains(&VpnPublish::Connected));
+    }
+
+    #[test]
+    fn unhealthy_from_cold_publishes_disconnected_only() {
+        // §38 / VPN-17: Crashed only fires on healthy→unhealthy.  From a
+        // cold (never-connected) machine, ContainerUnhealthy publishes
+        // Disconnected/PortUnavailable but NOT Crashed.
         let mut machine = machine();
 
         let out = handle(&mut machine, VpnEvent::ContainerUnhealthy);
@@ -629,6 +673,18 @@ mod tests {
             out.publish,
             vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
         );
+    }
+
+    #[test]
+    fn healthy_then_unhealthy_publishes_crashed_once() {
+        // §38 / VPN-17: rising-edge healthy→unhealthy fires Crashed once.
+        let mut machine = machine();
+        handle(&mut machine, VpnEvent::ContainerHealthy);
+        let out = handle(&mut machine, VpnEvent::ContainerUnhealthy);
+        assert!(out.publish.contains(&VpnPublish::Crashed));
+        // Re-observing unhealthy is a no-op for Crashed.
+        let out2 = handle(&mut machine, VpnEvent::ContainerUnhealthy);
+        assert!(!out2.publish.contains(&VpnPublish::Crashed));
     }
 
     #[test]

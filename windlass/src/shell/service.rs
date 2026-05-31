@@ -254,6 +254,8 @@ mod tests {
                         }
                     }
                     VpnPublish::Connected
+                    | VpnPublish::Crashed
+                    | VpnPublish::Recovered
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
@@ -309,17 +311,21 @@ mod tests {
         let (db_cmd_tx, _db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
         let (vpn_cmd_tx, _vpn_cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
 
+        let (docker_cmd_tx, _docker_cmd_rx) =
+            mpsc::unbounded_channel::<Command<windlass_docker_core::DockerMachine>>();
         let domain_shell_cfg = crate::shell::domain_shell::DomainShellConfig {
             db: db_cmd_tx,
             vpn: vpn_cmd_tx,
             qbit: qbit_cmd_tx,
             mam: mam_cmd_tx,
+            docker: docker_cmd_tx,
         };
 
         let (domain_handles, _domain_join) =
             windlass_machine::spawn::<WindlassMachine, crate::shell::domain_shell::DomainShell>(
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
+                    gluetun_anchor: "gluetun".to_string(),
                 },
                 domain_shell_cfg,
             )
@@ -346,6 +352,8 @@ mod tests {
                         }
                     }
                     VpnPublish::Connected
+                    | VpnPublish::Crashed
+                    | VpnPublish::Recovered
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
@@ -563,17 +571,21 @@ mod tests {
         let (db_cmd_tx, _db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
         let (vpn_cmd_tx, _vpn_cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
 
+        let (docker_cmd_tx, _docker_cmd_rx) =
+            mpsc::unbounded_channel::<Command<windlass_docker_core::DockerMachine>>();
         let domain_shell_cfg = crate::shell::domain_shell::DomainShellConfig {
             db: db_cmd_tx,
             vpn: vpn_cmd_tx,
             qbit: qbit_cmd_tx,
             mam: mam_cmd_tx,
+            docker: docker_cmd_tx,
         };
 
         let (domain_handles, _domain_join) =
             windlass_machine::spawn::<WindlassMachine, crate::shell::domain_shell::DomainShell>(
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
+                    gluetun_anchor: "gluetun".to_string(),
                 },
                 domain_shell_cfg,
             )
@@ -620,17 +632,21 @@ mod tests {
         let (db_cmd_tx, _db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
         let (vpn_cmd_tx, _vpn_cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
 
+        let (docker_cmd_tx, _docker_cmd_rx) =
+            mpsc::unbounded_channel::<Command<windlass_docker_core::DockerMachine>>();
         let domain_shell_cfg = crate::shell::domain_shell::DomainShellConfig {
             db: db_cmd_tx,
             vpn: vpn_cmd_tx,
             qbit: qbit_cmd_tx,
             mam: mam_cmd_tx,
+            docker: docker_cmd_tx,
         };
 
         let (domain_handles, _domain_join) =
             windlass_machine::spawn::<WindlassMachine, crate::shell::domain_shell::DomainShell>(
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
+                    gluetun_anchor: "gluetun".to_string(),
                 },
                 domain_shell_cfg,
             )

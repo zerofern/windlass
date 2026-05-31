@@ -176,10 +176,6 @@ pub(super) async fn init_shell(
             docker_pub_tx,
         ))
         .expect("docker pub subscription");
-    // Keep the command sender alive across the rest of init so it doesn't
-    // drop and tear down the machine.  PR 4 will move this into the domain
-    // shell config.
-    let _docker_commands = docker_handles.commands.clone();
 
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         VpnConfig {
@@ -277,12 +273,14 @@ pub(super) async fn init_shell(
     let (domain_handles, _domain_join) = windlass_machine::spawn::<WindlassMachine, DomainShell>(
         WindlassConfig {
             snapshot_interval: Duration::from_secs(config.compliance_poll_interval_secs),
+            gluetun_anchor: docker.gluetun_anchor.clone(),
         },
         DomainShellConfig {
             db: db_handles.commands.clone(),
             vpn: vpn_handles.commands.clone(),
             qbit: qbit_handles.commands.clone(),
             mam: mam_handles.commands.clone(),
+            docker: docker_handles.commands.clone(),
         },
     )
     .await;
@@ -320,6 +318,8 @@ pub(super) async fn init_shell(
                         }
                     }
                     VpnPublish::Connected
+                    | VpnPublish::Crashed
+                    | VpnPublish::Recovered
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
