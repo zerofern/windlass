@@ -7,7 +7,7 @@
 //! Scope is operator-readiness §38.  See `docs/operator-readiness.md` and
 //! `docs/legacy-retirement-plan.md` for the migration sequence.
 //!
-//! # Current scope (PRs 1-3)
+//! # Current scope (PRs 1-5)
 //!
 //! - Public surface (`DockerCommand` / `Event` / `Action` / `Publish` /
 //!   `Topic` / `Response` / `Config`).
@@ -19,11 +19,14 @@
 //! - Restart circuit-breaker (DOCKER-2): suppresses further restarts after
 //!   `max_restarts_per_window`, publishes `RestartStorm` once per trip,
 //!   and emits a one-shot `DumpLogs` fan-out (anchor + dependents) per
-//!   incident.
-//!
-//! Autoheal-style health-driven restarts arrive in PR 5; crash-recovery
-//! domain orchestration (the "Gluetun died" alert, fleet stop+restart) in
-//! PR 4.
+//!   incident.  Shared between the stale-namespace path and the autoheal
+//!   path so a single restart budget covers both.
+//! - Autoheal subsume (PR 5, DOCKER-5): when
+//!   `DockerConfig::autoheal_dependents` is `true`, every unhealthy
+//!   event for a known dependent triggers a circuit-breakered restart.
+//!   The anchor is excluded — VPN-core-driven crash recovery handles
+//!   that via the domain.  Operator can remove the standalone `autoheal`
+//!   compose sidecar.
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 use std::collections::{HashMap, VecDeque};
@@ -46,6 +49,12 @@ pub struct DockerConfig {
     pub max_restarts_per_window: u32,
     /// §35: sliding-window length for the restart circuit breaker.
     pub restart_window_duration: Duration,
+    /// §38 PR 5: when `true`, `ContainerUnhealthy` events for any known
+    /// dependent trigger a `RestartContainer` (gated by the §35 circuit
+    /// breaker).  Subsumes the standalone `autoheal` sidecar.  The anchor
+    /// is excluded — anchor crash recovery is driven by the VPN core's
+    /// `Crashed` publish via the domain.
+    pub autoheal_dependents: bool,
 }
 
 impl Default for DockerConfig {
@@ -54,6 +63,7 @@ impl Default for DockerConfig {
             gluetun_anchor: "gluetun".to_string(),
             max_restarts_per_window: 3,
             restart_window_duration: Duration::from_mins(10),
+            autoheal_dependents: false,
         }
     }
 }
@@ -325,6 +335,38 @@ impl DockerMachine {
             }
         }
     }
+
+    /// §35 / §38 PR 5: try to emit a `RestartContainer { name }` action,
+    /// gated by the circuit breaker.  When the breaker trips, returns the
+    /// `RestartStorm` publish plus a one-shot `DumpLogs` fan-out (anchor +
+    /// known dependents) deduped to once per incident.
+    ///
+    /// Shared by the stale-namespace path (`ContainerStarted` for a stale
+    /// dependent) and the autoheal path (`ContainerUnhealthy` for a known
+    /// dependent), so a single restart budget covers both.
+    fn try_restart(&mut self, name: String) -> (Vec<DockerAction>, Vec<DockerPublish>) {
+        let now = Utc::now();
+        self.prune_restart_window(now);
+        let max = self.config.max_restarts_per_window;
+        let window_count = u32::try_from(self.restart_window.len()).unwrap_or(u32::MAX);
+        if max == 0 || window_count < max {
+            self.restart_window.push_back(now);
+            (vec![DockerAction::RestartContainer { name }], Vec::new())
+        } else {
+            let mut actions = Vec::new();
+            let publish = vec![DockerPublish::RestartStorm { window_count, max }];
+            if !self.crash_dump_emitted_for_current_incident {
+                self.crash_dump_emitted_for_current_incident = true;
+                actions.push(DockerAction::DumpLogs {
+                    name: self.config.gluetun_anchor.clone(),
+                });
+                for dep_name in self.dependents.clone() {
+                    actions.push(DockerAction::DumpLogs { name: dep_name });
+                }
+            }
+            (actions, publish)
+        }
+    }
 }
 
 impl Machine for DockerMachine {
@@ -397,24 +439,35 @@ impl Machine for DockerMachine {
                 let was_unhealthy = entry.health == ContainerHealth::Unhealthy;
                 entry.health = ContainerHealth::Unhealthy;
                 let mut publish = Vec::new();
+                let mut actions = Vec::new();
                 if name == self.config.gluetun_anchor {
                     let was_anchor_healthy = self.anchor_healthy_since.is_some();
                     if was_anchor_healthy {
                         // Rising-edge anchor crash — clear healthy_since
-                        // and mark every dependent untrusted.
+                        // and mark every dependent untrusted.  Anchor
+                        // restart is driven by the VPN core via the
+                        // domain's DOM-27 path; Docker core does not
+                        // restart the anchor itself to avoid double-fire.
                         self.anchor_healthy_since = None;
                         for dep in self.containers.values_mut() {
                             dep.network_trusted = false;
                         }
                         publish.push(DockerPublish::ContainerCrashed { name });
                     }
-                } else if !was_unhealthy {
-                    publish.push(DockerPublish::ContainerCrashed { name });
+                } else {
+                    if !was_unhealthy {
+                        publish.push(DockerPublish::ContainerCrashed { name: name.clone() });
+                    }
+                    // §38 PR 5 / DOCKER-5: autoheal subsume.  When
+                    // enabled, every unhealthy event for a known
+                    // dependent triggers a circuit-breakered restart.
+                    if self.config.autoheal_dependents && self.dependents.contains(&name) {
+                        let (restart_actions, restart_publish) = self.try_restart(name);
+                        actions.extend(restart_actions);
+                        publish.extend(restart_publish);
+                    }
                 }
-                Outcome {
-                    actions: Vec::new(),
-                    publish,
-                }
+                Outcome { actions, publish }
             }
             DockerEvent::ContainerStopped { name } => {
                 let entry = self.containers.entry(name.clone()).or_default();
@@ -452,32 +505,9 @@ impl Machine for DockerMachine {
                             dependent_started_at: started_at,
                             gluetun_healthy_since: healthy_since,
                         });
-                        // Circuit breaker (DOCKER-2): suppress restart
-                        // if `max` restarts have already fired within
-                        // the window.
-                        let now = Utc::now();
-                        self.prune_restart_window(now);
-                        let max = self.config.max_restarts_per_window;
-                        let window_count =
-                            u32::try_from(self.restart_window.len()).unwrap_or(u32::MAX);
-                        if max == 0 || window_count < max {
-                            actions.push(DockerAction::RestartContainer { name });
-                            self.restart_window.push_back(now);
-                        } else {
-                            publish.push(DockerPublish::RestartStorm { window_count, max });
-                            if !self.crash_dump_emitted_for_current_incident {
-                                self.crash_dump_emitted_for_current_incident = true;
-                                // Legacy parity: dump anchor + every
-                                // known dependent so the operator gets
-                                // the full stack for diagnosis.
-                                actions.push(DockerAction::DumpLogs {
-                                    name: self.config.gluetun_anchor.clone(),
-                                });
-                                for dep_name in self.dependents.clone() {
-                                    actions.push(DockerAction::DumpLogs { name: dep_name });
-                                }
-                            }
-                        }
+                        let (restart_actions, restart_publish) = self.try_restart(name);
+                        actions.extend(restart_actions);
+                        publish.extend(restart_publish);
                     }
                 }
                 Outcome { actions, publish }
@@ -881,9 +911,8 @@ mod tests {
         // RestartStorm and emits DumpLogs fan-out once.
         let mut m = DockerMachine::new(
             DockerConfig {
-                gluetun_anchor: "gluetun".to_string(),
                 max_restarts_per_window: 3,
-                restart_window_duration: Duration::from_secs(600),
+                ..DockerConfig::default()
             },
             Instant::now(),
         );
@@ -957,9 +986,8 @@ mod tests {
     fn new_incident_resets_dump_dedup() {
         let mut m = DockerMachine::new(
             DockerConfig {
-                gluetun_anchor: "gluetun".to_string(),
                 max_restarts_per_window: 1,
-                restart_window_duration: Duration::from_secs(600),
+                ..DockerConfig::default()
             },
             Instant::now(),
         );
@@ -1006,6 +1034,156 @@ mod tests {
         );
         assert_eq!(m.incident_id(), 2);
         assert!(!m.crash_dump_emitted_for_current_incident);
+    }
+
+    // ── §38 PR 5 / DOCKER-5: autoheal subsume ───────────────────────────────
+
+    #[test]
+    fn autoheal_disabled_does_not_restart_unhealthy_dependent() {
+        // Default config has autoheal_dependents=false → no RestartContainer.
+        let mut m = machine();
+        discover(&mut m, &["qbittorrent"]);
+        let out = handle(
+            &mut m,
+            DockerEvent::ContainerUnhealthy {
+                name: "qbittorrent".to_string(),
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, DockerAction::RestartContainer { .. })),
+            "autoheal off: no RestartContainer"
+        );
+        assert!(out.publish.contains(&DockerPublish::ContainerCrashed {
+            name: "qbittorrent".to_string()
+        }));
+    }
+
+    fn autoheal_machine() -> DockerMachine {
+        DockerMachine::new(
+            DockerConfig {
+                gluetun_anchor: "gluetun".to_string(),
+                max_restarts_per_window: 3,
+                restart_window_duration: Duration::from_secs(600),
+                autoheal_dependents: true,
+            },
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn autoheal_enabled_restarts_unhealthy_dependent() {
+        let mut m = autoheal_machine();
+        discover(&mut m, &["qbittorrent"]);
+        let out = handle(
+            &mut m,
+            DockerEvent::ContainerUnhealthy {
+                name: "qbittorrent".to_string(),
+            },
+        );
+        assert!(out.actions.contains(&DockerAction::RestartContainer {
+            name: "qbittorrent".to_string()
+        }));
+    }
+
+    #[test]
+    fn autoheal_does_not_restart_anchor() {
+        // The anchor is excluded from autoheal — VPN core drives the
+        // anchor's crash recovery via the domain.
+        let mut m = autoheal_machine();
+        discover(&mut m, &["qbittorrent"]);
+        let out = handle(
+            &mut m,
+            DockerEvent::ContainerUnhealthy {
+                name: "gluetun".to_string(),
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, DockerAction::RestartContainer { .. })),
+            "anchor must not be auto-restarted by Docker core"
+        );
+    }
+
+    #[test]
+    fn autoheal_does_not_restart_unknown_container() {
+        // Only containers in the dependent registry are autoheal-eligible.
+        let mut m = autoheal_machine();
+        discover(&mut m, &["qbittorrent"]);
+        let out = handle(
+            &mut m,
+            DockerEvent::ContainerUnhealthy {
+                name: "some-other-container".to_string(),
+            },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, DockerAction::RestartContainer { .. })),
+            "unknown container must not be auto-restarted"
+        );
+    }
+
+    #[test]
+    fn autoheal_shares_restart_budget_with_stale_namespace() {
+        // Both paths feed the same restart_window — a mixed burst trips
+        // the breaker per the shared budget.
+        let mut m = DockerMachine::new(
+            DockerConfig {
+                gluetun_anchor: "gluetun".to_string(),
+                max_restarts_per_window: 2,
+                restart_window_duration: Duration::from_secs(600),
+                autoheal_dependents: true,
+            },
+            Instant::now(),
+        );
+        discover(&mut m, &["qbittorrent", "mlm"]);
+        m.anchor_healthy_since = Some(started_at(1000));
+
+        // Stale-namespace restart (counts: 1).
+        let out1 = handle(
+            &mut m,
+            DockerEvent::ContainerStarted {
+                name: "qbittorrent".to_string(),
+                started_at: started_at(500),
+            },
+        );
+        assert!(out1.actions.contains(&DockerAction::RestartContainer {
+            name: "qbittorrent".to_string()
+        }));
+
+        // Autoheal restart (counts: 2).
+        let out2 = handle(
+            &mut m,
+            DockerEvent::ContainerUnhealthy {
+                name: "mlm".to_string(),
+            },
+        );
+        assert!(out2.actions.contains(&DockerAction::RestartContainer {
+            name: "mlm".to_string()
+        }));
+
+        // 3rd attempt trips the breaker — either path.
+        let out3 = handle(
+            &mut m,
+            DockerEvent::ContainerUnhealthy {
+                name: "qbittorrent".to_string(),
+            },
+        );
+        assert!(
+            !out3
+                .actions
+                .iter()
+                .any(|a| matches!(a, DockerAction::RestartContainer { .. })),
+            "3rd restart suppressed by shared budget"
+        );
+        assert!(
+            out3.publish
+                .iter()
+                .any(|p| matches!(p, DockerPublish::RestartStorm { .. }))
+        );
     }
 
     #[test]

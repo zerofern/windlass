@@ -158,6 +158,10 @@ pub(super) async fn init_shell(
             // window.  Defaults preserved from the VPN-core era.
             max_restarts_per_window: 3,
             restart_window_duration: Duration::from_mins(10),
+            // §38 PR 5: subsume the autoheal sidecar.  Docker core
+            // restarts any unhealthy dependent (circuit-breakered).
+            // Anchor crash recovery stays with the VPN→domain path.
+            autoheal_dependents: true,
         },
         DockerShellConfig {
             docker: docker.clone(),
