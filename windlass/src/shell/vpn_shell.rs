@@ -154,35 +154,6 @@ impl Shell for VpnShell {
                     let _ = tx.send(Timed::now(event));
                 });
             }
-            // §35 stub: docker inspect for dependent's StartedAt.
-            // TODO: wire a bollard inspect_container call that maps
-            // `State.StartedAt` to a chrono::DateTime<Utc> and emits
-            // `VpnEvent::DependentInspected`.  Currently a no-op so the
-            // VPN core's stale-namespace predicate is exercisable from
-            // tests without the Docker engine.
-            VpnAction::InspectDependent { name } => {
-                tracing::info!(
-                    "VpnAction::InspectDependent stub for {name} (§35 bollard wiring TODO)"
-                );
-            }
-            // §35 stub: docker container restart.
-            // TODO: bollard `restart_container({ t: 0 })` for the named
-            // dependent.  Current no-op leaves the operator to restart
-            // manually based on the Critical alert.
-            VpnAction::RestartContainer { name } => {
-                tracing::warn!(
-                    "VpnAction::RestartContainer stub for {name} (§35 bollard wiring TODO)"
-                );
-            }
-            // §35 stub: write a crash dump (logs/state snapshot) for the
-            // current incident.  TODO: wire the existing
-            // `FetchAndDumpAllLogs` infrastructure into the new core
-            // path.  Current no-op keeps the dedup invariant testable.
-            VpnAction::WriteCrashDump { incident_id } => {
-                tracing::warn!(
-                    "VpnAction::WriteCrashDump stub for incident {incident_id} (§35 dump wiring TODO)"
-                );
-            }
             VpnAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {

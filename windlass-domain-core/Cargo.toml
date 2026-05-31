@@ -9,6 +9,7 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 windlass-db-core   = { workspace = true }
 windlass-disk-core = { workspace = true }
+windlass-docker-core = { workspace = true }
 windlass-machine   = { workspace = true }
 windlass-mam-core  = { workspace = true }
 windlass-qbit-core = { workspace = true }

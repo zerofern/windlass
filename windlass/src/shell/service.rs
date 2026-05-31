@@ -258,10 +258,7 @@ mod tests {
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
                     | VpnPublish::PublicIpVerificationDegraded { .. }
-                    | VpnPublish::MamIpVerificationDegraded { .. }
-                    | VpnPublish::DependentNetworkUntrusted { .. }
-                    | VpnPublish::DependentNetworkTrusted { .. }
-                    | VpnPublish::RestartStorm { .. } => {}
+                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }
@@ -353,10 +350,7 @@ mod tests {
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
                     | VpnPublish::PublicIpVerificationDegraded { .. }
-                    | VpnPublish::MamIpVerificationDegraded { .. }
-                    | VpnPublish::DependentNetworkUntrusted { .. }
-                    | VpnPublish::DependentNetworkTrusted { .. }
-                    | VpnPublish::RestartStorm { .. } => {}
+                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
             }

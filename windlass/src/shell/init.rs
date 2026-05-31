@@ -148,35 +148,34 @@ pub(super) async fn init_shell(
         .send((vec![DbTopic::Failures, DbTopic::Results], db_pub_tx))
         .expect("db pub subscription");
 
-    // §38 PR 2: spawn DockerShell + DockerMachine.  No consumer of its
-    // publishes or issuer of its commands yet — the runtime lives so PR 3
-    // (§35 migration) and PR 4 (crash-recovery orchestration) can wire it
-    // in without re-shaping init.
+    // §38 PR 2-3: spawn DockerShell + DockerMachine.  §35's stale-
+    // namespace and restart-storm circuit-breaker now live here.  PR 4
+    // (crash-recovery orchestration) will route publishes to the domain.
     let (docker_handles, _docker_join) = windlass_machine::spawn::<DockerMachine, DockerShell>(
         DockerConfig {
             gluetun_anchor: docker.gluetun_anchor.clone(),
+            // §35: restart circuit-breaker — 3 restarts per 10-minute
+            // window.  Defaults preserved from the VPN-core era.
+            max_restarts_per_window: 3,
+            restart_window_duration: Duration::from_mins(10),
         },
         DockerShellConfig {
             docker: docker.clone(),
         },
     )
     .await;
-    {
-        use windlass_docker_core::{DockerPublish, DockerTopic};
-        let (docker_pub_tx, mut docker_pub_rx) = mpsc::channel::<DockerPublish>(128);
-        docker_handles
-            .subscribe
-            .send((
-                vec![DockerTopic::Lifecycle, DockerTopic::Logs],
-                docker_pub_tx,
-            ))
-            .expect("docker pub subscription");
-        tokio::spawn(async move {
-            while let Some(publish) = docker_pub_rx.recv().await {
-                tracing::debug!(?publish, "docker-core publish (PR2 drain)");
-            }
-        });
-    }
+    let (docker_pub_tx, mut docker_pub_rx) =
+        mpsc::channel::<windlass_docker_core::DockerPublish>(128);
+    docker_handles
+        .subscribe
+        .send((
+            vec![
+                windlass_docker_core::DockerTopic::Lifecycle,
+                windlass_docker_core::DockerTopic::Logs,
+            ],
+            docker_pub_tx,
+        ))
+        .expect("docker pub subscription");
     // Keep the command sender alive across the rest of init so it doesn't
     // drop and tear down the machine.  PR 4 will move this into the domain
     // shell config.
@@ -190,13 +189,6 @@ pub(super) async fn init_shell(
             // §31: ifconfig.co verification cadence + threshold.
             public_ip_verify_interval: Duration::from_hours(6),
             public_ip_verify_failure_threshold: 3,
-            // §35: dependent container names + restart circuit-breaker
-            // settings.  Default: no dependents wired yet, which keeps
-            // the §35 invariants benign until the docker-compose layer
-            // declares the actual dependent set.
-            dependent_names: Vec::new(),
-            max_restarts_per_window: 3,
-            restart_window_duration: Duration::from_mins(10),
         },
         VpnShellConfig {
             docker: docker.clone(),
@@ -214,12 +206,7 @@ pub(super) async fn init_shell(
     vpn_handles
         .subscribe
         .send((
-            vec![
-                VpnTopic::Connectivity,
-                VpnTopic::Port,
-                VpnTopic::PublicIp,
-                VpnTopic::Orchestration,
-            ],
+            vec![VpnTopic::Connectivity, VpnTopic::Port, VpnTopic::PublicIp],
             vpn_pub_tx,
         ))
         .expect("vpn pub subscription");
@@ -337,12 +324,23 @@ pub(super) async fn init_shell(
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
                     | VpnPublish::PublicIpVerificationDegraded { .. }
-                    | VpnPublish::MamIpVerificationDegraded { .. }
-                    | VpnPublish::DependentNetworkUntrusted { .. }
-                    | VpnPublish::DependentNetworkTrusted { .. }
-                    | VpnPublish::RestartStorm { .. } => {}
+                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
+            }
+        });
+    }
+
+    // ── Docker forwarder task ─────────────────────────────────────────────────
+    // §38 PR 3: drains Docker-core publishes (lifecycle + logs) and injects
+    // them into the domain event channel.  Domain currently consumes only
+    // the §35 stale-namespace / RestartStorm publishes; the others are
+    // forwarded so PR 4 can wire crash-recovery without re-shaping init.
+    {
+        let domain_ev_tx = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = docker_pub_rx.recv().await {
+                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Docker(publish)));
             }
         });
     }

@@ -7,6 +7,7 @@ use windlass_db_core::{
     ActivityRecord, ActivitySource, AlertRecord, DbCommand, DownloadStateChange, DownloadStatus,
 };
 use windlass_disk_core::DiskPublish;
+use windlass_docker_core::DockerPublish;
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
@@ -27,7 +28,15 @@ pub enum WindlassEvent {
     Qbit(QbitPublish),
     Mam(MamPublish),
     Disk(DiskPublish),
-    DbFailed { operation: String, message: String },
+    /// §38: Docker-core lifecycle publishes — container crashed/healthy,
+    /// stop/start results, log dumps, and the migrated §35 stale-namespace
+    /// signals (`DependentNetworkUntrusted` / `DependentNetworkTrusted` /
+    /// `RestartStorm`).
+    Docker(DockerPublish),
+    DbFailed {
+        operation: String,
+        message: String,
+    },
     TimerFired(WindlassTimer),
 }
 
@@ -419,10 +428,11 @@ impl Machine for WindlassMachine {
                 consecutive_failures,
                 last_reason,
             }) => Self::on_mam_ip_verification_degraded(consecutive_failures, &last_reason),
-            // §35 / DOM-25: stale-namespace dependent — Critical alert +
-            // admission block.  The VPN core has already requested the
-            // restart; the Critical signal makes the operator aware.
-            WindlassEvent::Vpn(VpnPublish::DependentNetworkUntrusted {
+            // §35 / DOM-25 (§38 migrated to Docker core): stale-namespace
+            // dependent — Critical alert + admission block.  Docker core
+            // has already requested the restart; the Critical signal makes
+            // the operator aware.
+            WindlassEvent::Docker(DockerPublish::DependentNetworkUntrusted {
                 name,
                 dependent_started_at,
                 gluetun_healthy_since,
@@ -434,19 +444,30 @@ impl Machine for WindlassMachine {
                     gluetun_healthy_since,
                 )
             }
-            // §35: dependent's namespace is fresh again.  No alert, just
-            // an activity note; admission stays blocked until §31/§32/§33
-            // re-confirm the IP/ASN gates (kept separate from
-            // orchestration trust).
-            WindlassEvent::Vpn(VpnPublish::DependentNetworkTrusted { name }) => {
+            // §35 (§38 migrated to Docker core): dependent's namespace is
+            // fresh again.  Activity only; admission stays blocked until
+            // §31/§32/§33 re-confirm the IP/ASN gates.
+            WindlassEvent::Docker(DockerPublish::DependentNetworkTrusted { name }) => {
                 Self::on_dependent_network_trusted(&name)
             }
-            // §35 / DOM-26: restart circuit breaker tripped.  Critical
-            // alert + Activity; admission stays blocked.
-            WindlassEvent::Vpn(VpnPublish::RestartStorm { window_count, max }) => {
+            // §35 / DOM-26 (§38 migrated to Docker core): restart circuit
+            // breaker tripped.  Critical alert + Activity; admission stays
+            // blocked.
+            WindlassEvent::Docker(DockerPublish::RestartStorm { window_count, max }) => {
                 self.admission.vpn_ip_compliant = Some(false);
                 Self::on_restart_storm(window_count, max)
             }
+            // §38: other DockerPublish variants are not (yet) consumed
+            // by domain.  ContainerCrashed/Healthy will be wired in PR 4
+            // (crash-recovery orchestration); Stopped/Started/LogsDumped
+            // are informational for now.
+            WindlassEvent::Docker(
+                DockerPublish::ContainerCrashed { .. }
+                | DockerPublish::ContainerHealthy { .. }
+                | DockerPublish::Stopped { .. }
+                | DockerPublish::Started { .. }
+                | DockerPublish::LogsDumped { .. },
+            ) => Outcome::none(),
             WindlassEvent::Qbit(QbitPublish::Ready) => {
                 self.state.qbit = ServiceStatus::Ready;
                 self.publish_state()
@@ -2308,6 +2329,31 @@ mod prop_tests {
         ]
     }
 
+    fn any_docker_publish() -> impl Strategy<Value = windlass_docker_core::DockerPublish> {
+        use windlass_docker_core::DockerPublish;
+        prop_oneof![
+            any::<String>().prop_map(|name| DockerPublish::ContainerCrashed { name }),
+            any::<String>().prop_map(|name| DockerPublish::ContainerHealthy { name }),
+            any::<String>().prop_map(|name| DockerPublish::Stopped { name }),
+            any::<String>().prop_map(|name| DockerPublish::Started {
+                name,
+                started_at: chrono::Utc::now(),
+            }),
+            (any::<String>(), any::<String>())
+                .prop_map(|(name, path)| DockerPublish::LogsDumped { name, path }),
+            (any::<String>(), 0i64..=3_600i64, 0i64..=3_600i64).prop_map(|(name, dep, healthy)| {
+                DockerPublish::DependentNetworkUntrusted {
+                    name,
+                    dependent_started_at: chrono::Utc::now() - chrono::Duration::seconds(dep),
+                    gluetun_healthy_since: chrono::Utc::now() - chrono::Duration::seconds(healthy),
+                }
+            }),
+            any::<String>().prop_map(|name| DockerPublish::DependentNetworkTrusted { name }),
+            (any::<u32>(), any::<u32>())
+                .prop_map(|(window_count, max)| DockerPublish::RestartStorm { window_count, max }),
+        ]
+    }
+
     fn any_windlass_event() -> impl Strategy<Value = WindlassEvent> {
         prop_oneof![
             Just(WindlassEvent::Init),
@@ -2315,6 +2361,7 @@ mod prop_tests {
             any_qbit_publish().prop_map(WindlassEvent::Qbit),
             any_mam_publish().prop_map(WindlassEvent::Mam),
             any_disk_publish().prop_map(WindlassEvent::Disk),
+            any_docker_publish().prop_map(WindlassEvent::Docker),
             (any::<String>(), any::<String>())
                 .prop_map(|(operation, message)| WindlassEvent::DbFailed { operation, message }),
             Just(WindlassEvent::TimerFired(WindlassTimer::Snapshot)),
@@ -2980,7 +3027,7 @@ mod prop_tests {
             let healthy = chrono::Utc::now() - chrono::Duration::seconds(healthy_offset);
             let started = chrono::Utc::now() - chrono::Duration::seconds(dep_offset + healthy_offset);
             let out = machine.handle(Instant::now(), Timed::now(
-                WindlassEvent::Vpn(VpnPublish::DependentNetworkUntrusted {
+                WindlassEvent::Docker(windlass_docker_core::DockerPublish::DependentNetworkUntrusted {
                     name,
                     dependent_started_at: started,
                     gluetun_healthy_since: healthy,
@@ -3009,7 +3056,7 @@ mod prop_tests {
             use windlass_types::AlertPriority;
 
             let out = machine.handle(Instant::now(), Timed::now(
-                WindlassEvent::Vpn(VpnPublish::RestartStorm { window_count, max }),
+                WindlassEvent::Docker(windlass_docker_core::DockerPublish::RestartStorm { window_count, max }),
             ));
             let critical = out.actions.iter().filter(|a| matches!(
                 a,
