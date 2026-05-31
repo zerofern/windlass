@@ -43,7 +43,7 @@ sole decision-makers.
 
 | File | Lines | Coverage | Risk | Notes |
 |---|---:|---|---|---|
-| `vpn.rs`        |  161 | Partial    | Medium | Decision logic covered by VpnMachine + §5/§31/§33/§35, **but** crash-recovery side-effects (log dump, stop/start dependents, Gluetun restart, "Gluetun died" alert) are not emitted by the new path. **Blocked on §38** (Docker core). |
+| `vpn.rs`        |  161 | Full       | Low    | §38 (Docker core) lands the crash-recovery side-effects (Docker(DumpAllLogs/StopDependents/RestartContainer{anchor}) + SendAlert(Critical "Gluetun died")) via the domain's DOM-27/DOM-28 handlers on VpnPublish::Crashed/Recovered. **Unblocked.** |
 | `mam.rs`        |   92 | Full       | Low    | MamMachine + §7/§27/§28/§30/§32. |
 | `qbit.rs`       |  178 | Full*      | Low    | QbitMachine + §6 et al.  Excludes the compliance pass (handled separately). |
 | `monitoring.rs` |  103 | Partial    | Medium | Most decisions in new cores; the `on_wakeup` dispatcher needs an audit. |
@@ -191,11 +191,11 @@ because every other check is already in the new cores.
 
 ## Cutover order
 
-0. **§38: introduce Docker core** — prerequisite for step 1.  Until
-   Docker core owns container lifecycle (start/stop/restart/dump) and
-   domain emits the crash-recovery alert, removing `vpn.rs` would lose
-   real behaviour.  See operator-readiness.md §38.
-1. **vpn.rs** — after §38 lands.  Remove the legacy `Event::*` arms
+0. **§38: introduce Docker core** — DONE (2026-05-31).  Docker core
+   owns container lifecycle; domain emits the crash-recovery alert via
+   DOM-27 on VpnPublish::Crashed; autoheal subsumed; VPN core no longer
+   references DockerClient.  See operator-readiness.md §38.
+1. **vpn.rs** — now unblocked.  Remove the legacy `Event::*` arms
    that map to VPN events; let the service-events bridge keep doing
    the translation until step 7.
 2. **mam.rs** — same shape, slightly larger event set.

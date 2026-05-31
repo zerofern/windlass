@@ -1663,7 +1663,7 @@ Likely candidates:
 
 ## Story: Introduce Docker Core For Container Orchestration
 
-Status: To Do
+Status: Done (2026-05-31, PRs 1-6 of 6)
 
 ### Problem
 
