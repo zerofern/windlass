@@ -400,9 +400,21 @@ impl Machine for DockerMachine {
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
-            DockerEvent::Init
-            | DockerEvent::LogsDumped { .. }
-            | DockerEvent::LogsDumpFailed { .. } => Outcome::none(),
+            // §38 PR 6: at startup, seed the registry and probe the
+            // anchor's health so VPN core gets the initial
+            // ContainerHealthy/Unhealthy signal without polling Docker
+            // itself.  The bollard event watcher then takes over for
+            // ongoing state changes.
+            DockerEvent::Init => Outcome {
+                actions: vec![
+                    DockerAction::DiscoverDependents,
+                    DockerAction::InspectContainer {
+                        name: self.config.gluetun_anchor.clone(),
+                    },
+                ],
+                publish: Vec::new(),
+            },
+            DockerEvent::LogsDumped { .. } | DockerEvent::LogsDumpFailed { .. } => Outcome::none(),
             DockerEvent::DependentsDiscovered { names } => {
                 self.dependents = names;
                 Outcome::none()
@@ -601,10 +613,21 @@ mod tests {
     }
 
     #[test]
-    fn init_is_a_no_op() {
+    fn init_seeds_discovery_and_anchor_inspect() {
+        // §38 PR 6: Init must drive an initial DiscoverDependents and
+        // anchor InspectContainer so VPN core gets a boot-time health
+        // signal without polling Docker itself.
         let mut m = machine();
         let out = m.handle(Instant::now(), Timed::now(DockerEvent::Init));
-        assert!(out.actions.is_empty());
+        assert_eq!(
+            out.actions,
+            vec![
+                DockerAction::DiscoverDependents,
+                DockerAction::InspectContainer {
+                    name: "gluetun".to_string()
+                },
+            ]
+        );
         assert!(out.publish.is_empty());
         assert!(m.dependents().is_empty());
     }

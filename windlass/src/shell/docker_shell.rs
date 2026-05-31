@@ -80,12 +80,24 @@ impl Shell for DockerShell {
                 let docker = self.docker.bollard().clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    let started_at = inspect_started_at(&docker, &name).await;
+                    // §38 PR 6: also probe health here so domain can
+                    // forward an initial ContainerHealthy/Unhealthy to
+                    // the VPN core at boot, replacing the legacy
+                    // VpnShell `is_gluetun_healthy()` poll.
+                    let (started_at, healthy) = inspect_state(&docker, &name).await;
                     if let Some(started_at) = started_at {
                         let _ = tx.send(Timed::now(DockerEvent::ContainerStarted {
-                            name,
+                            name: name.clone(),
                             started_at,
                         }));
+                    }
+                    if let Some(healthy) = healthy {
+                        let event = if healthy {
+                            DockerEvent::ContainerHealthy { name }
+                        } else {
+                            DockerEvent::ContainerUnhealthy { name }
+                        };
+                        let _ = tx.send(Timed::now(event));
                     }
                 });
             }
@@ -178,6 +190,28 @@ async fn inspect_started_at(docker: &Docker, name: &str) -> Option<DateTime<Utc>
     let info = docker.inspect_container(name, None).await.ok()?;
     let raw = info.state?.started_at?;
     DateTime::parse_from_rfc3339(&raw).ok().map(Into::into)
+}
+
+/// §38 PR 6: single inspect that returns both `StartedAt` and the
+/// container's health classification, so `DockerAction::InspectContainer`
+/// can fan out to `ContainerStarted` and `ContainerHealthy/Unhealthy`
+/// from a single Docker round-trip.  Either field is `None` if Docker
+/// did not report it.
+async fn inspect_state(docker: &Docker, name: &str) -> (Option<DateTime<Utc>>, Option<bool>) {
+    let Ok(info) = docker.inspect_container(name, None).await else {
+        return (None, None);
+    };
+    let state = info.state;
+    let started_at = state
+        .as_ref()
+        .and_then(|s| s.started_at.as_deref())
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(Into::into);
+    let healthy = state
+        .and_then(|s| s.health)
+        .and_then(|h| h.status)
+        .map(|status| status == bollard::models::HealthStatusEnum::HEALTHY);
+    (started_at, healthy)
 }
 
 /// Single-container log capture.  Mirrors the existing

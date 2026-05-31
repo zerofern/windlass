@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
-use windlass_local::{docker::DockerClient, vpn_files};
+use windlass_local::vpn_files;
 use windlass_machine::{Shell, Timed};
 use windlass_types::VpnIp;
 use windlass_vpn_core::{VerifiedIpInfo, VpnAction, VpnEvent};
@@ -39,7 +39,6 @@ struct MamJsonIpResponse {
 }
 
 pub struct VpnShellConfig {
-    pub docker: DockerClient,
     pub vpn_ip_file: String,
     pub vpn_port_file: String,
     /// §31: HTTP proxy that routes through Gluetun for the public-IP
@@ -55,7 +54,6 @@ pub struct VpnShellConfig {
 }
 
 pub struct VpnShell {
-    docker: DockerClient,
     vpn_ip_file: String,
     vpn_port_file: String,
     http: Arc<reqwest::Client>,
@@ -77,7 +75,6 @@ impl Shell for VpnShell {
         }
         let http = builder.build().expect("reqwest client for ifconfig.co");
         Self {
-            docker: config.docker,
             vpn_ip_file: config.vpn_ip_file,
             vpn_port_file: config.vpn_port_file,
             http: Arc::new(http),
@@ -93,18 +90,14 @@ impl Shell for VpnShell {
     fn dispatch(&mut self, action: VpnAction, event_tx: &UnboundedSender<Timed<VpnEvent>>) {
         match action {
             VpnAction::StartMonitoring => {}
-            VpnAction::InspectContainer => {
-                let docker = self.docker.clone();
-                let tx = event_tx.clone();
-                tokio::spawn(async move {
-                    let event = if docker.is_gluetun_healthy().await {
-                        VpnEvent::ContainerHealthy
-                    } else {
-                        VpnEvent::ContainerUnhealthy
-                    };
-                    let _ = tx.send(Timed::now(event));
-                });
-            }
+            // §38 PR 6: Docker core (via its own bollard watcher +
+            // boot-time anchor inspect) is now the source of
+            // ContainerHealthy/Unhealthy.  Domain forwards them as
+            // VpnCommand, so this action no longer needs to drive a
+            // poll.  Kept as a no-op so the VPN machine's existing
+            // emit sites (Init / HealthPoll timer / RefreshState) stay
+            // stable; a follow-up can drop them from the enum.
+            VpnAction::InspectContainer => {}
             VpnAction::ReadPortFiles => {
                 let ip_file = self.vpn_ip_file.clone();
                 let port_file = self.vpn_port_file.clone();

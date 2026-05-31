@@ -498,14 +498,35 @@ impl Machine for WindlassMachine {
                 self.admission.vpn_ip_compliant = Some(false);
                 Self::on_restart_storm(window_count, max)
             }
-            // §38: other DockerPublish variants are not (yet) consumed
-            // by domain.  ContainerCrashed/Healthy will be wired in PR 4
-            // (crash-recovery orchestration); Stopped/Started/LogsDumped
-            // are informational for now.
+            // §38 PR 6: Docker-core anchor lifecycle drives VPN core.
+            // Translate per-name publishes for the anchor into
+            // VpnCommand variants so VPN core no longer polls Docker
+            // directly.  Non-anchor lifecycle is informational here;
+            // PR 4's crash-recovery path already covers the anchor
+            // alert via VpnPublish::Crashed.
+            WindlassEvent::Docker(DockerPublish::ContainerHealthy { name }) => {
+                if name == self.config.gluetun_anchor {
+                    Outcome {
+                        actions: vec![WindlassAction::Vpn(VpnCommand::ContainerHealthy)],
+                        publish: Vec::new(),
+                    }
+                } else {
+                    Outcome::none()
+                }
+            }
+            WindlassEvent::Docker(DockerPublish::ContainerCrashed { name }) => {
+                if name == self.config.gluetun_anchor {
+                    Outcome {
+                        actions: vec![WindlassAction::Vpn(VpnCommand::ContainerUnhealthy)],
+                        publish: Vec::new(),
+                    }
+                } else {
+                    Outcome::none()
+                }
+            }
+            // Other DockerPublish variants are informational only.
             WindlassEvent::Docker(
-                DockerPublish::ContainerCrashed { .. }
-                | DockerPublish::ContainerHealthy { .. }
-                | DockerPublish::Stopped { .. }
+                DockerPublish::Stopped { .. }
                 | DockerPublish::Started { .. }
                 | DockerPublish::LogsDumped { .. },
             ) => Outcome::none(),

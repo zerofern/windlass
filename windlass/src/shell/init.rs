@@ -191,7 +191,6 @@ pub(super) async fn init_shell(
             public_ip_verify_failure_threshold: 3,
         },
         VpnShellConfig {
-            docker: docker.clone(),
             vpn_ip_file: config.vpn_ip_file.clone(),
             vpn_port_file: config.vpn_port_file.clone(),
             // §31: route ifconfig.co through Gluetun so the verified IP is

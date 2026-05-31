@@ -51,6 +51,15 @@ pub enum VpnCommand {
     StartMonitoring,
     RefreshState,
     ReadForwardedPort,
+    /// §38 PR 6: Domain forwards `DockerPublish::ContainerHealthy {
+    /// name == anchor }` as this command so VPN core no longer needs to
+    /// poll Docker directly.  Treated identically to `VpnEvent::
+    /// ContainerHealthy`.
+    ContainerHealthy,
+    /// §38 PR 6: Domain forwards `DockerPublish::ContainerCrashed {
+    /// name == anchor }` as this command.  Treated identically to
+    /// `VpnEvent::ContainerUnhealthy`.
+    ContainerUnhealthy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,17 +561,33 @@ impl Machine for VpnMachine {
 
     fn handle_command(
         &mut self,
-        _now: Instant,
+        now: Instant,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
-        let actions = match cmd {
-            VpnCommand::StartMonitoring => {
-                vec![VpnAction::StartMonitoring, VpnAction::InspectContainer]
+        // §38 PR 6: ContainerHealthy/Unhealthy commands delegate to the
+        // event handler so domain-routed Docker publishes share the same
+        // state-machine logic (rising-edge Crashed/Recovered, port reset,
+        // etc.) as the legacy poll-driven events.
+        match cmd {
+            VpnCommand::ContainerHealthy => {
+                let out = self.handle(now, Timed::new(now, VpnEvent::ContainerHealthy));
+                Self::outcome_with_publish(out.actions, out.publish, VpnResponse::Accepted)
             }
-            VpnCommand::RefreshState => vec![VpnAction::InspectContainer],
-            VpnCommand::ReadForwardedPort => vec![VpnAction::ReadPortFiles],
-        };
-        Self::outcome(actions, VpnResponse::Accepted)
+            VpnCommand::ContainerUnhealthy => {
+                let out = self.handle(now, Timed::new(now, VpnEvent::ContainerUnhealthy));
+                Self::outcome_with_publish(out.actions, out.publish, VpnResponse::Accepted)
+            }
+            VpnCommand::StartMonitoring => Self::outcome(
+                vec![VpnAction::StartMonitoring, VpnAction::InspectContainer],
+                VpnResponse::Accepted,
+            ),
+            VpnCommand::RefreshState => {
+                Self::outcome(vec![VpnAction::InspectContainer], VpnResponse::Accepted)
+            }
+            VpnCommand::ReadForwardedPort => {
+                Self::outcome(vec![VpnAction::ReadPortFiles], VpnResponse::Accepted)
+            }
+        }
     }
 }
 
