@@ -29,7 +29,7 @@ use actions::Action;
 use chrono::{DateTime, Utc};
 use events::Event;
 use types::SystemState;
-use windlass_types::{MamStatus, WakeupId};
+use windlass_types::WakeupId;
 
 /// The pure functional core. No I/O, no async, no side effects.
 /// All state transitions and action scheduling happen here.
@@ -67,26 +67,19 @@ impl SystemState {
             Event::QbitPortSyncSuccess { .. } => self.on_qbit_port_sync_success(),
             Event::QbitPortSyncFailed { code, .. } => self.on_qbit_port_sync_failed(code),
 
-            // ── MAM ───────────────────────────────────────────────────────────
-            Event::MamUpdateSuccess { .. } => self.on_mam_update_success(),
-            Event::MamAsnMismatch { ip, .. } => self.on_mam_asn_mismatch(ip),
-
-            // ── Workflow C: Heartbeat & Recovery ──────────────────────────────
-            Event::MamStatusObserved {
-                status: MamStatus::Connectable,
-                ..
-            } => self.on_mam_connectable(),
-            // §28: legacy bridge treats `Event::MamUnreachable` (new) the
-            // same as the existing `MamStatus::NotConnectable | Unreachable`
-            // bucket — degraded MAM service.  The new per-system MAM core
-            // (which is retiring this legacy path per story 32) handles the
-            // distinct Unreachable vs NotConnectable signals properly via
-            // MAM-11/12 and DOM-15/16.
-            Event::MamStatusObserved {
-                status: MamStatus::NotConnectable | MamStatus::Unreachable,
-                ..
-            }
-            | Event::MamUnreachable { .. } => self.on_mam_not_connectable(),
+            // ── §36 step 2: legacy MAM handlers retired ───────────────────────
+            // `service_events.rs` translates these events into
+            // `MamEvent::SeedboxUpdated / StatusFailed / StatusFetched /
+            // Unreachable / RateLimited` for `MamMachine`.  Critical alerts
+            // (ASN mismatch, NotConnectable, Unreachable) are emitted by
+            // domain on `MamPublish::*` via DOM-15/16/17/20.  The legacy
+            // "NAT frozen" hard-recovery path is intentionally retired —
+            // §38's DOM-27 owns Gluetun restart on real crashes, and the
+            // operator no longer needs MAM-NotConnectable to also restart.
+            Event::MamUpdateSuccess { .. }
+            | Event::MamAsnMismatch { .. }
+            | Event::MamStatusObserved { .. }
+            | Event::MamUnreachable { .. } => Vec::new(),
 
             // ── Monitoring ────────────────────────────────────────────────────
             Event::DiskSpaceObserved { space, .. } => handlers::on_disk_space_observed(space),

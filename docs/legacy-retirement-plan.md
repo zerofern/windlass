@@ -86,7 +86,7 @@ verifying the shell-side action emission (`VpnAction::InspectContainer`
 plus Docker-core fleet commands routed via domain) covers what
 `process_legacy_event` used to emit.
 
-### `mam.rs` (Low risk)
+### `mam.rs` (Low risk — DONE 2026-05-31)
 
 Handlers: `on_mam_update_success`, `on_mam_asn_mismatch`,
 `on_mam_connectable`, `on_mam_not_connectable`.
@@ -96,9 +96,13 @@ New-core equivalent: `MamMachine` arms.  §30 already routes
 `Unreachable`/`NotConnectable` (DOM-15/16), §32 carries
 registered IP/ASN/AS in `SeedboxUpdated` (MAM-18/19).
 
-**Cutover step:** same shape as VPN — drop legacy match arms; the
-service-events bridge already routes the legacy events to their MAM-core
-equivalents.
+**Cutover step (DONE):** legacy `handlers/mam.rs` deleted; the four
+event dispatches (`MamUpdateSuccess` / `MamAsnMismatch` /
+`MamStatusObserved` / `MamUnreachable`) now no-op.  The legacy
+"NAT frozen" hard-recovery path that set `state.vpn =
+VpnState::DumpingLogs` and emitted `FetchAndDumpAllLogs` is
+intentionally retired — §38's DOM-27 owns Gluetun restart on real
+crashes; MAM `NotConnectable` no longer drives a stack restart.
 
 ### `qbit.rs` (Low risk)
 
@@ -203,6 +207,11 @@ because every other check is already in the new cores.
    DOM-27 path.  Legacy `state.vpn` stays at `VpnState::Stopped`;
    remaining legacy handlers' `VpnState::Connected` branches no-op until
    their own retirement (steps 2-5).
+2. **mam.rs** — DONE (2026-05-31).  Legacy `handlers/mam.rs` deleted;
+   `MamUpdateSuccess / MamAsnMismatch / MamStatusObserved / MamUnreachable`
+   dispatches now no-op.  `MamMachine` (via the bridge) drives the real
+   behaviour; domain DOM-15/16/17/20 cover the alerts.  The legacy
+   "NAT frozen" hard-recovery is retired (see §36 step 2 notes).
 2. **mam.rs** — same shape, slightly larger event set.
 3. **qbit.rs** (excluding compliance-related preferences flow) —
    careful with `on_qbit_preferences_received`; the `max_active_torrents`
