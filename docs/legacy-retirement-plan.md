@@ -113,11 +113,23 @@ Handlers: `on_qbit_auth_success`, `on_qbit_connection_refused`,
 New-core equivalent: `QbitMachine` arms.  QBIT-1 (cookie gate), QBIT-2/3
 (refresh chain), QBIT-4/6/7 (port convergence), QBIT-5 (failure backoff),
 QBIT-12/20 (privacy), QBIT-17/18/19 (quota), QBIT-21 (AddTorrent
-cookie gate).
+cookie gate).  `max_active_torrents` is fully in the new core via the
+QbitMachine's own `ReadPreferences` action (not the legacy event).
 
-**Cutover step:** drop legacy arms.  *Caveat:* `on_qbit_preferences_received`
-takes `max_active_torrents` and feeds the legacy active-limit logic in
-`compliance.rs` — that flow gets retired together with compliance (below).
+**Gaps to port before retirement** (2026-06-01 audit):
+
+| Legacy behaviour                                | New-path status |
+|-------------------------------------------------|---|
+| `SendAlert(Critical, "qBit auth failed")` on `Event::QbitAuthFailed` | **Gap** — `AuthFailed` collapses all 3 failure modes; only an Activity entry fires today. |
+| `SendAlert(Warning, "qBit port sync failed")` after 3 retries  | **Gap** — `ListenPortSetFailed` retries via SyncRetry timer without attempt counter. |
+| `WriteActivity("qbit_authenticated")` on auth success           | **Gap** — domain on `QbitPublish::Ready` sets `ServiceStatus::Ready` but no Activity entry. |
+| `WriteActivity("port_synced")` on port sync success             | **Gap** — domain on `QbitPublish::ListenPortReady` sets admission gate but no Activity entry. |
+| `ScheduleWakeup(CompliancePoll)` after port sync                | Covered — QbitMachine's `TorrentRefresh` timer self-drives torrent monitoring (§6/QBIT-2/3). |
+| `max_active_torrents` storage for compliance                    | Covered — already in new path via `QbitAction::ReadPreferences`. |
+
+**Cutover step:** port the 4 gaps (auth-rejected Critical, port-sync
+persistent failure Warning, two rising-edge Activity entries), then
+drop the legacy arms.
 
 ### `monitoring.rs` (Medium risk)
 
@@ -128,13 +140,24 @@ New-core equivalent: mostly `DiskMachine` (§22) for the free-space
 signal, `QbitMachine`'s `TorrentRefresh` chain (§6) for the periodic
 torrent fetch, MAM core (§28) for rate-limit handling.
 
-**Gap to verify:**
-- `on_wakeup(WakeupId)` dispatches against a `WakeupId` enum.  Each
-  variant needs a confirmed new-core equivalent (or removal).  Specifically
-  audit: heartbeat wakeup, disk-check wakeup, compliance-poll wakeup.
-- `on_new_torrents_observed` writes per-torrent metadata; verify the
-  new path covers this (likely via `QbitPublish::TorrentsUpdated` +
-  DB-core persistence).
+**Gaps to port before retirement** (2026-06-01 audit):
+
+| Legacy behaviour | New-path status |
+|---|---|
+| `SendAlert(Info, "New torrents")` on `on_new_torrents_observed` (when fresh names appear) | **Gap** — QbitMachine publishes `TorrentsUpdated { hashes }` but no Info alert; domain does not emit one. |
+| `SendAlert(Warning, "Low disk space")` at <50 GB | **Likely covered** — DiskMachine publishes `BelowFloor`; verify domain emits a Warning alert. |
+| `SendAlert(Critical, "MAM rate limit")` on rate-limit violation | **Gap** — bridge routes to `MamEvent::RateLimited`; MamMachine handles backoff but no Critical alert in domain on rate-limit. |
+| `ScheduleWakeup(Heartbeat/DiskCheck/TorrentCheck/CompliancePoll/...)` | Mostly filtered or covered by new self-driving timers; verify per-WakeupId during step 4. |
+
+### `compliance.rs` shared state mutation (gap noted at audit time)
+
+`on_qbit_torrent_details_received` writes
+`self.torrents = torrents.into_iter().map(...).collect();` — populates
+the legacy in-memory torrent index that several legacy handlers
+(`on_delete_torrent_requested`, `on_manual_download_requested` quota
+check, `check_active_limit`) read.  Equivalent state lives in the new
+`QbitMachine`; legacy reads of `self.torrents` will become stale until
+those handlers are retired.
 
 ### `download.rs` (Medium risk)
 
@@ -145,15 +168,16 @@ New-core equivalent: §29 introduced `WindlassCommand::TryAddTorrent`
 which goes through the composite admission predicate and routes to
 `QbitCommand::AddTorrent` on success.
 
-**Gap to verify:**
-- The manual-download UI endpoint (web route) currently emits the
-  legacy `Event::ManualDownloadRequested`.  It should be migrated to
-  emit `WindlassCommand::TryAddTorrent { candidate }` instead, with the
-  web layer constructing the `DownloadCandidate` from the MAM-id.
-- The `Event::TorrentAddedToQbit` / `TorrentAddFailed` post-conditions
-  (which the legacy path turns into activity + alerts) need new-core
-  equivalents in the qBit-shell `AddTorrent` action handler (currently
-  stubbed for librarian A1).
+**Gaps to port before retirement** (2026-06-01 audit):
+
+| Legacy behaviour | New-path status |
+|---|---|
+| Web route emits `Event::ManualDownloadRequested` | **Gap** — route must emit `WindlassCommand::TryAddTorrent { candidate }`; web layer builds `DownloadCandidate` from MAM-id. |
+| `WriteActivity("download_blocked")` on blacklisted | **Gap** — §29 admission predicate publishes an `Activity` reason on rejection but does not emit a structured `download_blocked` entry with mam_id detail. |
+| `SendAlert(Warning, "Download blocked — quota full")` | **Gap** — §29 publishes the rejection reason as Activity; no Warning alert today. |
+| `SendAlert(Warning, "Download blocked — qBit not ready")` | **Gap** — same as above. |
+| `SendAlert(Info, "Download started") + WriteActivity("torrent_added") + UpsertTorrentRecords(stub)` on add success | **Gap** — `QbitAction::AddTorrent` is stubbed (librarian A1); no post-conditions wired. |
+| `SendAlert(Warning, "Download failed") + WriteActivity("torrent_add_failed")` | **Gap** — same as above. |
 
 ### `compliance.rs` (HIGH risk)
 
@@ -166,7 +190,8 @@ active-limit) **plus** writes the `torrents` DB table that
 |------------------------------------|---------------------|---|
 | `check_new_torrents` (no-partials) | §21 / QBIT-10       | Covered |
 | `check_dead_torrents`              | §20 / QBIT-9 + DOM-8 | Covered |
-| `check_hnr_at_risk` (alerts)       | §19 / QBIT-8 (mostly — alert path differs) | Mostly covered; verify alert shape parity |
+| `check_hnr_at_risk` (alerts)       | §19 / QBIT-8 (mostly — alert path differs) | **Verify** Critical "HnR at risk" alert in new path |
+| `on_delete_torrent_requested` HnR lock alert | new download path | **Gap** — Warning "HnR lock — cannot delete" alert not yet in new manual-delete flow |
 | `check_quota`                      | §25 / QBIT-17/18/19 + DOM-12 | Covered |
 | `check_active_limit`               | §24 / QBIT-14/15/16 + DOM-11 | Covered |
 | `Action::UpsertTorrentRecords`     | **Gap** — no new-core path yet | **Blocker** |
