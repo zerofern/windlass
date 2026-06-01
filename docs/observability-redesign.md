@@ -12,8 +12,8 @@ a single event loop) to **observability** (an always-on view of the
 running system, with optional per-core gates for stepping). "Debug"
 disappears as a name throughout. The canonical operator-facing spec
 `docs/debug-mode.md` describes a system that no longer exists; it
-retires and is replaced by `docs/observability.md` as part of this
-work (§37j).
+will be retired and replaced by `docs/observability.md` as part of
+this work (§37j).
 
 ---
 
@@ -58,10 +58,13 @@ and "Engineering contracts" below.
     **Reveal** button; revealed values are session-only and never
     persisted. The default `/observability` page is safe to
     screenshot. Auth on the route is a separate later story.
-15. **Separation is a hard goal.** A bug in `windlass-observability`
-    cannot corrupt machine state, drop or reorder events, or block
-    action/publish dispatch — its blast radius is bounded to "hang
-    a runtime at a gate" or "lose timeline visibility."
+15. **Separation is a hard goal.** A bug in *passive observation*
+    (rings, indices, SSE, snapshot serializer, log layer) cannot
+    corrupt machine state, drop or reorder events, or delay
+    action/publish dispatch. Dispatch may *only* be delayed by an
+    explicit configured gate (event, outcome, or HTTP). A bug's
+    blast radius is bounded to "hang a runtime at a gate" or
+    "lose timeline visibility."
 16. **Seven cores, not six**: VPN, qBit, MAM, DB, disk, Docker,
     Domain — Domain runs on the service runtime (per
     operator-readiness §8).
@@ -159,6 +162,10 @@ pub trait Machine: Sized {
 Owned snapshot, not a borrow. A machine may expose a smaller
 projection than its full internal state — e.g. omit caches, large
 buffers, or fields that hold secrets. No `Clone` on the state.
+`Send + 'static` is required because the snapshot is handed to the
+observation serialization worker on a separate task; without those
+bounds the controller cannot batch JSON serialization off the
+runtime hot path.
 
 ### `Timed<E>` causal extension
 
@@ -189,6 +196,31 @@ Constructors at call sites: `Timed::from_action(now, action_id, e)`,
 `Timed::from_publish(now, publish_id, e)`,
 `Timed::external(now, cause, e)`.
 
+Runtime-side and wire-side cause types are deliberately split.
+Runtime uses zero-copy variants (`&'static str` for timer names,
+`PathBuf` for watcher paths); the controller serializes into a
+wire counterpart with everything as `String`:
+
+```rust
+pub enum StoredEventCause {
+    Action(Uuid),
+    Publish(Uuid),
+    External(StoredExternalCause),
+}
+
+pub enum StoredExternalCause {
+    Timer { name: String },
+    FileWatcher { path: String },
+    DockerEvent { kind: String },
+    ManualCommand,
+    Init,
+    Unknown,
+}
+```
+
+This keeps `PathBuf` serialization decisions out of the frontend
+contract.
+
 ### Envelopes — IDs assigned by the runtime, after `handle`
 
 `Machine::handle` stays pure. The runtime envelopes after it
@@ -206,32 +238,52 @@ property tests stay unchanged.
 
 ```rust
 let timed = event_rx.recv().await?;
+let event_variant = timed.variant_name();           // &'static str
+let event_cause = timed.cause.clone();              // EventCause: Clone
+
+// One JSON serialization per event, reused by gate_event and
+// observed_step. Avoids a second serialization and lets us hand the
+// payload to observed_step after `handle` has moved `timed`.
+let event_json = serde_json::to_value(&timed.inner)
+    .unwrap_or(serde_json::Value::Null);
+
 self.tap.gate_event(self.core_id, &EventGateView {
-    variant: timed.variant_name(),
-    cause: timed.cause,
-    event: &timed.inner,
+    variant: event_variant,
+    cause: &event_cause,
+    event: &event_json,
 }).await;
 
 let t0 = Instant::now();
-let outcome = self.machine.handle(t0, timed);
-let duration = t0.elapsed();
+let outcome = self.machine.handle(t0, timed);       // moves timed
+let duration = t0.elapsed();                        // monotonic
 
-let actions = envelope_each(outcome.actions);     // Uuid::new_v4 per item
-let publishes = envelope_each(outcome.publish);
+let step_id = Uuid::new_v4();
+let actions = envelope_each(outcome.actions);       // Uuid::new_v4 per item
+let publishes = envelope_each(outcome.publishes);   // Outcome::publish → publishes (rename, §37d)
+
 self.tap.gate_outcome(self.core_id, &OutcomeGateView {
-    source_event_variant: timed.variant_name(),
+    source_event_variant: event_variant,
     actions: &actions, publishes: &publishes,
 }).await;
 
-self.apply(&actions, &publishes);                 // threads IDs into shell + fanout
+// Register backward-causal indices BEFORE dispatch so an HTTP
+// exchange captured during `apply` already finds its parent
+// step_id. Lightweight: two hashmap inserts, no serialization, no
+// allocation beyond the inserts. Subject to the same no-block /
+// no-panic / no-fail contract as observed_step (EC-1, EC-8).
+self.tap.reserve_step_ids(self.core_id, step_id, &actions, &publishes);
+
+self.apply(&actions, &publishes);                   // threads IDs into shell + fanout
 
 let snapshot = self.machine.state_snapshot();
 self.tap.observed_step(self.core_id, &StepRecordView {
-    step_id: Uuid::new_v4(),
-    at: Utc::now(), duration,
+    step_id,
+    recorded_at: Utc::now(),                        // wall clock — for SSE / wire
+    duration,                                       // monotonic — Instant delta
     kind: StepKind::Event,
-    event_variant: timed.variant_name(),
-    event: &timed.inner, event_cause: timed.cause,
+    event_variant,
+    event: &event_json,                             // reused
+    event_cause: &event_cause,
     state_after: &snapshot,
     actions: &actions, publishes: &publishes,
 });
@@ -241,7 +293,13 @@ Order matters: **apply happens before observed_step.** A panic, slow
 serialization, or full ring inside `observed_step` cannot prevent the
 outcome from being applied. The gates (`gate_event`, `gate_outcome`,
 `gate_request`) are the explicit "stop before this happens" points;
-`observed_step` is post-hoc record only.
+`observed_step` is post-hoc record only. `reserve_step_ids` bridges
+the gap so HTTP exchanges captured between dispatch and the record's
+arrival on the SSE bus still resolve to a known parent.
+
+`recorded_at` is wall clock (for the wire); `duration` is monotonic
+(captured via `Instant::elapsed`). Wall clock is never used for
+duration arithmetic.
 
 ### `RuntimeTap` (runtime-side)
 
@@ -254,8 +312,22 @@ pub trait RuntimeTap: Send + Sync {
     async fn gate_event(&self, core: CoreId, view: &EventGateView<'_>);
 
     /// Park between handle and apply, with the full outcome visible.
-    /// Returns immediately when no outcome-variant breakpoint matches.
+    /// Returns immediately when no action- or publish-variant
+    /// breakpoint matches.
     async fn gate_outcome(&self, core: CoreId, view: &OutcomeGateView<'_>);
+
+    /// Register `action_id → step_id` and `publish_id → step_id`
+    /// index entries BEFORE dispatch, so HTTP exchanges captured
+    /// during `apply` already find their parent. Two hashmap
+    /// inserts at most; must not block, must not panic, must not
+    /// fail. (EC-8.)
+    fn reserve_step_ids(
+        &self,
+        core: CoreId,
+        step_id: Uuid,
+        actions: &[ActionEnvelope<impl erased_serde::Serialize>],
+        publishes: &[PublishEnvelope<impl erased_serde::Serialize>],
+    );
 
     /// Fire-and-forget. Must not block, must not panic, must drop
     /// (not backpressure) when overloaded. See "Engineering contracts."
@@ -329,12 +401,35 @@ pub struct StoredHttpExchange {
     pub at: DateTime<Utc>,
     pub method: String,
     pub url: String,
-    pub request_headers: Vec<(String, RedactedString)>,
+    pub request_headers: Vec<(String, MaybeSecret)>,
     pub request_body: BodyCapture,
     pub response_status: u16,
-    pub response_headers: Vec<(String, RedactedString)>,
+    pub response_headers: Vec<(String, MaybeSecret)>,
     pub response_body: BodyCapture,
     pub duration_ms: u64,
+}
+
+/// Each header value is either plaintext (passed through unchanged
+/// on the wire) or a secret slot. The server-side type holds
+/// cleartext; the wire form below never does.
+pub enum MaybeSecret {
+    Plain(String),
+    Secret(ServerSecretSlot),
+}
+
+/// Server-side secret holder, lives in the ring alongside the
+/// containing record. NOT the wire form.
+pub struct ServerSecretSlot {
+    pub cleartext: String,
+    pub reveal_id: Uuid,
+}
+
+/// Wire form emitted for any ServerSecretSlot by the SSE serializer.
+/// Cleartext never appears.
+#[derive(Serialize)]
+pub struct WireRedacted {
+    pub redacted: bool,    // always true
+    pub reveal_id: Uuid,
 }
 
 pub enum BodyCapture {
@@ -346,9 +441,10 @@ pub enum BodyCapture {
 }
 ```
 
-`RedactedString` is the wire form: by default serializes to
-`"[REDACTED]"` with an opaque `reveal_id`; the UI uses `reveal_id`
-to request cleartext via a dedicated endpoint (see "Secrets").
+`ServerSecretSlot` lives only server-side, inside the ring. The
+SSE serializer rewrites every `ServerSecretSlot` to `WireRedacted`
+on the wire; the UI uses `reveal_id` to request cleartext via a
+dedicated endpoint (see "Secrets").
 
 ### `CoreStatus` — explicit pause-state machine
 
@@ -411,17 +507,22 @@ on slow clients; never backpressures the runtime.
   config types. Default `Debug`/`Display`/`Serialize` impls keep
   them out of logs and ordinary serializations.
 - On capture into a `StoredHttpExchange` or `StoredStepRecord`,
-  secret-typed fields land server-side as `RedactedString { value:
-  String, reveal_id: Uuid }`. The cleartext is held in the ring
+  secret-typed fields land server-side as `ServerSecretSlot {
+  cleartext, reveal_id }`. The cleartext is held in the ring
   alongside the rest of the record.
-- The SSE wire form serializes `RedactedString` as
-  `{"redacted": true, "reveal_id": "..."}`. The UI shows a
-  `[Reveal]` button.
+- The SSE wire form rewrites every `ServerSecretSlot` to
+  `WireRedacted { redacted: true, reveal_id }` — cleartext never
+  appears on the wire. The UI shows a `[Reveal]` button.
 - Clicking `[Reveal]` posts
   `POST /api/v1/observability/reveal/{reveal_id}` and the server
   responds with the cleartext for that one field of that one
   record. The UI holds the result in memory for the current page
   session only (cleared on navigation away or reload).
+- **Reveal IDs are unguessable (UUIDv4), single-field (one
+  `reveal_id` maps to one cleartext slot, not a whole record),
+  and invalidated when the parent record is evicted from the
+  ring.** A `POST` against an evicted or unknown `reveal_id`
+  returns `410 Gone`, never cleartext.
 - Known classes redacted at capture without case-by-case opt-in:
   - HTTP `Authorization`, `Cookie`, `Set-Cookie` headers.
   - MAM session cookie wherever it appears in a body.
@@ -465,9 +566,12 @@ they hold.
 
 When a `StoredStepRecord` leaves a ring (count or byte budget),
 every `action_id` and `publish_id` it owned is removed from the
-controller's indices, plus from the React-side mirror via an
-explicit `Evicted { ids }` SSE message. The UI shows "parent
-evicted" rather than producing dangling jumps.
+controller's indices, every `reveal_id` it owned is invalidated,
+plus the React-side mirror is updated via an explicit
+`Evicted { step_ids, action_ids, publish_ids, reveal_ids }` SSE
+message. The UI shows "parent evicted" rather than producing
+dangling jumps; the reveal endpoint returns `410 Gone` for any
+evicted `reveal_id`.
 
 ### EC-4 — Body budgets are enforced at capture
 
@@ -495,6 +599,23 @@ sequence. Validated by acceptance test #1.
 `Uuid::new_v4` is called inside `ServiceRuntime`, not inside
 `Machine::handle` or `Machine::handle_command`. Property tests
 remain pure-function tests.
+
+### EC-8 — `reserve_step_ids` runs before `apply`
+
+`reserve_step_ids` registers `action_id → step_id` and
+`publish_id → step_id` in the controller's indices before the
+runtime calls `self.apply(...)`. This guarantees that an HTTP
+exchange captured during dispatch (via `HttpTap::observed_exchange`)
+finds a non-empty index entry and can show its parent step in
+the UI as soon as the full `StoredStepRecord` arrives.
+
+`reserve_step_ids` is a passive-observation method by the rules
+of EC-1: no `await`, no panic across the boundary, no allocation
+beyond the two hashmap inserts. If reservation fails (e.g.
+shared-mutex contention beyond the budget), the failure is
+swallowed and a per-core `reservation_failures_total` counter is
+incremented; HTTP exchanges captured during that window render
+as `parent: unknown` rather than blocking dispatch.
 
 ---
 
@@ -555,11 +676,22 @@ diff work.
 
 ### P6 — Breakpoints are per-variant; one flat list
 
-Event variants, action variants, publish variants, and HTTP-URL
-patterns. The controller routes each breakpoint to the owning core's
-gate: event variants → `gate_event`; action/publish variants →
-`gate_outcome` (this is the v1 reason `gate_outcome` exists at all);
-HTTP URL patterns → `gate_request`.
+Four kinds of breakpoint, all rendered as a single flat searchable
+list:
+
+- **Event-variant** breakpoints — enforced at `gate_event`.
+- **Action-variant** breakpoints — enforced at `gate_outcome`
+  (parks the whole outcome batch when any action of a matching
+  variant is present).
+- **Publish-variant** breakpoints — enforced at `gate_outcome`
+  (same parking semantics, for publishes).
+- **HTTP-URL pattern** breakpoints — enforced at `gate_request`.
+
+This is the v1 reason `gate_outcome` exists at all: without it,
+action and publish breakpoints would have nowhere to park before
+dispatch. The controller maintains a `variant → CoreId` registry
+populated at startup so each breakpoint is routed to the owning
+core's gate.
 
 ### P7 — MAM rate-limit guardrail = "HTTP tap flips MAM's pause"
 
@@ -585,6 +717,27 @@ not after. The bad request never leaves the host.
 
 ## Frontend layout (v1 sketch)
 
+### UI principles
+
+- The default view answers: what is running, what is parked, and
+  whether capture is lossy.
+- The cores rail is the control surface; the timeline is the
+  explanation surface.
+- Collapsed rows are scan-first: time, variant, duration, counts,
+  state-delta summary.
+- Expanded rows are tabbed: Summary, Event, Actions, Publishes,
+  State Δ, State JSON, HTTP.
+- Cross-core navigation always leaves a breadcrumb/filter chip
+  with a clear action.
+- Secrets are redacted by default; revealed secrets can be hidden
+  individually or all at once.
+- Breakpoints live in a drawer; active breakpoint count is shown
+  globally.
+- HTTP/log panels follow context: selected step > selected core >
+  all.
+
+### Layout
+
 One page, three regions plus a header.
 
 ```
@@ -607,7 +760,7 @@ One page, three regions plus a header.
 │                               │  │   • FetchStatus  → MAM /jsonLoad.php│
 │ Breakpoints: [manage…]        │  │       200, 75ms  [view req/res]     │
 │                               │  │   publishes: 0                      │
-│ Drops: 0 step, 0 http, 0 trunc│  │   state Δ: last_status_at +1.0s     │
+│ Loss: 0 dropped, 0 truncated  │  │   state Δ: last_status_at +1.0s     │
 │                               │  │                                     │
 │                               │  │ 18:42:15.001  AuthSucceeded   …     │
 └───────────────────────────────┘  └─────────────────────────────────────┘
@@ -634,11 +787,40 @@ Click behaviors (the causal graph by hand):
   cleartext from `POST /api/v1/observability/reveal/{reveal_id}`;
   value visible until the next navigation/reload.
 
-Drops/truncation counters are visible on the cores rail and per-row.
+### Supporting surfaces
 
-Not on the page: queue editing, inject, reorder, delete, dryrun,
-state-diff against legacy `SystemState`, "Enable Debug Mode"
-toggle, operator/maintainer mode toggle, merged cross-core stream.
+- **Expanded-row tabs.** Summary (the one-liner expanded with
+  cause and counts), Event (full event JSON), Actions (envelope
+  list with nested HTTP exchanges), Publishes (envelope list
+  with downstream-event jump links), State Δ (changed-leaf diff
+  against the previous record's `state_after`), State JSON
+  (full `state_after` for this record + side-by-side previous),
+  HTTP (just this step's exchanges, sourced from the cross-core
+  ring by `action_id`).
+- **Bottom panels follow context.** When a step is selected, the
+  HTTP and Logs tabs filter to that step. When only a core is
+  selected, they filter to that core. With nothing selected, they
+  show everything. A breadcrumb chip in each panel announces the
+  current filter and offers `[Clear]`.
+- **Breakpoints drawer.** Opens from the cores-rail `[manage…]`
+  link or a keyboard shortcut. A single flat searchable list of
+  event / action / publish variants and HTTP-URL patterns. The
+  header shows a `BP: N active` badge so the operator knows the
+  system can stop without visiting the drawer.
+- **Revealed secrets.** Each cleartext value, once revealed, shows
+  a `[hide]` affordance for individual hiding. The header has a
+  `[Hide all revealed]` button that clears every revealed slot in
+  the current session. Reveal state never persists across
+  navigation or reload.
+- **Loss counters** (dropped, truncated, reservation failures)
+  are visible on the cores rail and per-row when relevant. A
+  non-zero counter is highlighted.
+
+### Not on the page
+
+Queue editing, inject, reorder, delete, dryrun, state-diff
+against legacy `SystemState`, "Enable Debug Mode" toggle,
+operator/maintainer mode toggle, merged cross-core stream.
 
 ---
 
@@ -654,9 +836,10 @@ max_request_body_bytes        = "64KiB"
 max_response_body_bytes       = "256KiB"
 ```
 
-Defaults match these literals. All keys honor SI byte suffixes
-(`KiB`, `MiB`). Rings enforce both `*_per_core` count and `*_bytes`
-budget, whichever is reached first. Body caps trigger
+Defaults match these literals. Byte-budget keys honor IEC binary
+suffixes (`KiB` = 1024 B, `MiB` = 1024 KiB). Rings enforce both
+the `*_per_core` count budget and the `*_bytes` byte budget,
+whichever is reached first. Body caps trigger
 `BodyCapture::Truncated` with `original_len` preserved.
 
 `PAUSE_ON_START` env var (boot-time only):
@@ -678,10 +861,17 @@ Every story below must keep these passing once they're written in
    `NullRuntimeTap + NullHttpTap` vs running with the live taps
    produces the same machine state, the same `Outcome`s, and the
    same publish order over the same event sequence. (EC-6)
-2. **Observer cannot block dispatch.** Simulate: full ring, closed
-   SSE channel, slow serializer, tap panic (contained). Event
-   handling and `apply` still proceed. The only place the runtime
-   may park is an explicit gate. (EC-1, EC-5)
+2. **Observer cannot block dispatch.** Simulate, in separate
+   tests: (a) full step-record ring, (b) closed SSE channel,
+   (c) slow JSON serialization worker, (d) tap method panic
+   (caught at the trait boundary), (e) full HTTP-exchange ring.
+   Expected: the runtime continues handling events and applying
+   outcomes at full speed; the per-core drop / truncate / panic
+   counters advance; the only place forward progress halts is
+   an explicit `gate_*` call. Specifically, `observed_*` and
+   `reserve_step_ids` write to bounded internal channels that
+   drop on overflow — they do not perform serialization or SSE
+   work inline on the runtime task. (EC-1, EC-5, EC-8)
 3. **Per-core pause isolation.** Pause MAM, feed events to MAM
    and qBit. MAM parks at the event gate; qBit continues to
    completion.
@@ -731,9 +921,11 @@ where there is no shared API churn.
    other story.
 2. **§37a — `secrecy::SecretString` adoption.** Wrap MAM cookie,
    qBit password, any other in-code secrets. Custom serializer
-   produces `RedactedString { value, reveal_id }` for the
-   observability path only; defaults to `[REDACTED]` everywhere
-   else. May land in parallel with §37b once §37pre is signed off.
+   produces `ServerSecretSlot { cleartext, reveal_id }`
+   server-side and `WireRedacted { redacted: true, reveal_id }`
+   on the SSE wire; defaults to `[REDACTED]` everywhere else
+   (logs, debug formatting, generic JSON). May land in parallel
+   with §37b once §37pre is signed off.
 3. **§37b — `Machine::state_snapshot`.** Add `type StateSnapshot:
    Serialize + Send + 'static` and `fn state_snapshot(&self) ->
    Self::StateSnapshot`. Each machine implements an initially
@@ -744,12 +936,15 @@ where there is no shared API churn.
    site. Subscriber bridges that translate publish → event in
    another core set the cause to `Publish(publish_id)`. Must
    complete before §37f.
-5. **§37d — `RuntimeTap` + envelopes + event/outcome gates.**
-   Create `windlass-observability` crate. Add
-   `tap: Arc<dyn RuntimeTap>` to `ServiceRuntime`; `NullRuntimeTap`
-   default. Implement `ObservabilityController` with per-core
-   pause flag, step semaphore, `CoreStatus`. Add envelope
-   construction, `gate_event` and `gate_outcome`. Drop
+5. **§37d — `RuntimeTap` + envelopes + event/outcome gates +
+   `reserve_step_ids`.** Create `windlass-observability` crate.
+   Add `tap: Arc<dyn RuntimeTap>` to `ServiceRuntime`;
+   `NullRuntimeTap` default. Implement `ObservabilityController`
+   with per-core pause flag, step semaphore, `CoreStatus`. Add
+   envelope construction, `gate_event`, `gate_outcome`,
+   `reserve_step_ids` (called pre-`apply`), and `observed_step`
+   (called post-`apply`). Rename `machine::Outcome::publish` →
+   `Outcome::publishes` (one-line breaking change). Drop
    `DebugDispatcher` and `DebuggableEventStream`. Depends on §37c.
 6. **§37e — `HttpTap` + HTTP gate.** Replace `HttpObserver` with
    `HttpTap` in `windlass-types`. Update `MamClient`,
