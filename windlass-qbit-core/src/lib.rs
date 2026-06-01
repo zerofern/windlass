@@ -314,6 +314,27 @@ pub enum QbitPublish {
     TorrentRecords {
         records: Vec<TorrentRecord>,
     },
+    /// §36 step 7 (ported from legacy `check_hnr_at_risk`): a torrent
+    /// has downloaded content but is stalled or errored before the
+    /// HnR seed-time threshold.  Fired for every at-risk torrent on
+    /// every `TorrentsListed` cycle — domain debounces with rising-
+    /// edge tracking or accept the operator-visible spam (legacy
+    /// parity).  Domain DOM-41 fires a Critical alert.
+    HnRAtRisk {
+        hash: TorrentHash,
+        name: windlass_types::TorrentName,
+        seed_time: Duration,
+        required: Duration,
+    },
+    /// §36 step 7 (ported from legacy `on_delete_torrent_requested`):
+    /// the operator asked to delete a torrent that is HnR-unsatisfied;
+    /// the qBit core refused.  Domain DOM-42 fires a Warning alert.
+    DeleteBlockedHnRLock {
+        hash: TorrentHash,
+        name: windlass_types::TorrentName,
+        seed_time: Duration,
+        required: Duration,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,7 +365,9 @@ impl HasTopic<QbitTopic> for QbitPublish {
             | Self::NewTorrentsAdded { .. }
             | Self::TorrentAdded { .. }
             | Self::TorrentAddFailed { .. }
-            | Self::TorrentRecords { .. } => QbitTopic::Torrents,
+            | Self::TorrentRecords { .. }
+            | Self::HnRAtRisk { .. }
+            | Self::DeleteBlockedHnRLock { .. } => QbitTopic::Torrents,
             Self::BannedPrivacySettingsObserved { .. } | Self::PrivacyClean => QbitTopic::Privacy,
             Self::QueueOrchestrated { .. } => QbitTopic::Queue,
             Self::UnsatisfiedQuotaCritical { .. }
@@ -855,6 +878,28 @@ impl Machine for QbitMachine {
                     QbitPublish::TorrentRecords { records },
                 ];
 
+                // §36 step 7 (ported from legacy `check_hnr_at_risk`):
+                // emit one `HnRAtRisk` publish for each torrent that has
+                // downloaded content but is stalled/errored before the
+                // HnR seed-time threshold.  Fires every cycle for legacy
+                // parity — domain DOM-41 turns it into a Critical alert.
+                for t in self.torrents.values() {
+                    if t.downloaded_bytes > 0
+                        && t.seed_time < self.config.hnr_seed_time
+                        && matches!(
+                            t.state,
+                            TorrentState::StalledUploading | TorrentState::Error,
+                        )
+                    {
+                        publish.push(QbitPublish::HnRAtRisk {
+                            hash: t.hash.clone(),
+                            name: t.name.clone(),
+                            seed_time: t.seed_time,
+                            required: self.config.hnr_seed_time,
+                        });
+                    }
+                }
+
                 // §36 step 4: rising-edge new-torrent notification (ported
                 // from legacy `on_new_torrents_observed`).  Domain fires
                 // an Info alert.
@@ -980,7 +1025,26 @@ impl Machine for QbitMachine {
                 })
             }
             QbitCommand::DeleteTorrent { hash } => {
-                return Self::outcome(self.authorize_delete(&hash), QbitResponse::Accepted);
+                // §36 step 7: surface a publish when the HnR seed-time
+                // lock blocks the manual-delete path (ported from legacy
+                // `on_delete_torrent_requested`).  Dead-torrent autodelete
+                // uses `authorize_delete` directly and stays silent — the
+                // zero-byte path is always satisfied.
+                let actions = self.authorize_delete(&hash);
+                if actions.is_empty()
+                    && let Some(t) = self.torrents.get(&hash)
+                    && t.downloaded_bytes > 0
+                    && t.seed_time < self.config.hnr_seed_time
+                {
+                    let publish = vec![QbitPublish::DeleteBlockedHnRLock {
+                        hash: hash.clone(),
+                        name: t.name.clone(),
+                        seed_time: t.seed_time,
+                        required: self.config.hnr_seed_time,
+                    }];
+                    return Self::outcome_with_publish(actions, publish, QbitResponse::Accepted);
+                }
+                return Self::outcome(actions, QbitResponse::Accepted);
             }
             QbitCommand::EvictOneForDiskPressure => {
                 return Self::outcome(self.evict_one_for_disk_pressure(), QbitResponse::Accepted);

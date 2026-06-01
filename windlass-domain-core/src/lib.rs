@@ -736,6 +736,57 @@ impl Machine for WindlassMachine {
                     .collect(),
                 publish: Vec::new(),
             },
+            // §36 step 7 / DOM-41: Critical "HnR at risk" alert (ported
+            // from legacy `check_hnr_at_risk`).  Fires per at-risk
+            // torrent per `TorrentsListed` cycle — matches legacy spam
+            // rate; a future story may add rising-edge dedup.
+            WindlassEvent::Qbit(QbitPublish::HnRAtRisk {
+                hash: _,
+                name,
+                seed_time,
+                required,
+            }) => {
+                let hours_done = seed_time.as_secs() / 3600;
+                let hours_required = required.as_secs() / 3600;
+                let hours_left = hours_required.saturating_sub(hours_done);
+                Outcome {
+                    actions: vec![WindlassAction::SendAlert {
+                        priority: AlertPriority::Critical,
+                        title: "HnR at risk".to_string(),
+                        body: format!(
+                            "{}: stalled with {hours_done}h seeding, {hours_left}h required",
+                            name.0,
+                        ),
+                    }],
+                    publish: Vec::new(),
+                }
+            }
+            // §36 step 7 / DOM-42: Warning "HnR lock — cannot delete"
+            // alert (ported from legacy `on_delete_torrent_requested`).
+            // qBit core has already refused the delete; this surfaces
+            // the reason to the operator.
+            WindlassEvent::Qbit(QbitPublish::DeleteBlockedHnRLock {
+                hash: _,
+                name,
+                seed_time,
+                required,
+            }) => {
+                let hours_done = seed_time.as_secs() / 3600;
+                let hours_required = required.as_secs() / 3600;
+                let hours_left = hours_required.saturating_sub(hours_done);
+                Outcome {
+                    actions: vec![WindlassAction::SendAlert {
+                        priority: AlertPriority::Warning,
+                        title: "HnR lock — cannot delete".to_string(),
+                        body: format!(
+                            "{}: {hours_done}h seeded, {hours_left}h remaining. \
+                             Manual deletion blocked to protect your HnR.",
+                            name.0,
+                        ),
+                    }],
+                    publish: Vec::new(),
+                }
+            }
             // §36 step 5 / DOM-35: MAM finished fetching the `.torrent`
             // bytes for a manual or librarian-driven admission.  Forward
             // to qBit as `AddTorrent { mam_id, bytes }`.

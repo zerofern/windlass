@@ -275,8 +275,21 @@ because every other check is already in the new cores.
    `torrents` DB row + UI rely on.  qBit shell populates `name` from
    `QbitTorrentDetails`; service-events bridge passes through legacy
    torrent names; `/api/v1/torrents` (Torrent Monitor UI) keeps
-   reading the same table.  Compliance.rs `Action::UpsertTorrentRecords`
-   blocker resolved — step 7 can now proceed.
+   reading the same table.
+
+7. **compliance.rs** — DONE (2026-06-01).  Legacy
+   `handlers/compliance.rs` + `tests/compliance.rs` deleted; the
+   entire `tests/` module dropped (all legacy handler tests were
+   already gone).  `Event::QbitTorrentDetailsReceived /
+   QbitPreferencesReceived / QbitPreferencesFailed /
+   DeleteTorrentRequested` dispatches now no-op.  QbitMachine gains
+   `QbitPublish::HnRAtRisk` (fired per at-risk torrent per
+   `TorrentsListed` cycle for legacy parity) and
+   `QbitPublish::DeleteBlockedHnRLock` (fired from the
+   `DeleteTorrent` command path when the HnR seed-time gate
+   refuses).  Domain DOM-41 fires the Critical "HnR at risk"
+   alert; DOM-42 fires the Warning "HnR lock — cannot delete"
+   alert.  `handlers/mod.rs` is now header-only.
 
 5. **download.rs** — DONE (2026-06-01).  Legacy `handlers/download.rs`
    deleted; `Event::ManualDownloadRequested / TorrentAddedToQbit /

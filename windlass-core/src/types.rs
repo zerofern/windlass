@@ -137,6 +137,9 @@ impl PartialEq for SystemState {
 impl Eq for SystemState {}
 
 impl SystemState {
+    // §36 step 7: every caller was removed with the legacy handlers.
+    // Kept until step 8 deletes the legacy crate entirely.
+    #[allow(dead_code)]
     pub(crate) const fn mark_changed(&mut self) {
         self.version = self.version.wrapping_add(1);
     }

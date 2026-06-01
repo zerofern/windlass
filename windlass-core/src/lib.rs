@@ -18,9 +18,6 @@ pub struct EventOutcome {
 }
 
 #[cfg(test)]
-mod tests;
-
-#[cfg(test)]
 mod prop_tests;
 
 mod handlers;
@@ -113,22 +110,25 @@ impl SystemState {
             | Event::Wakeup { .. }
             | Event::MamRateLimitViolation { .. } => Vec::new(),
 
-            // ── Compliance ────────────────────────────────────────────────────
-            Event::QbitTorrentDetailsReceived { torrents, .. } => {
-                self.on_qbit_torrent_details_received(torrents)
-            }
-            // §36 step 3: legacy `state.max_active_torrents` updates
-            // retired.  `QbitMachine` reads max_active_torrents from its
-            // own `ReadPreferences` action.  Legacy `compliance.rs::
-            // check_active_limit` will see `state.max_active_torrents = 5`
-            // (SystemState::initial default) until compliance.rs is
-            // retired in §36 step 7; in practice this means legacy
-            // queue orchestration is inert with fewer than 5 active
-            // torrents — the new core's QBIT-14/15/16 path is authoritative.
-            Event::QbitPreferencesReceived { .. } | Event::QbitPreferencesFailed { .. } => {
-                Vec::new()
-            }
-            Event::DeleteTorrentRequested { hash, .. } => self.on_delete_torrent_requested(hash),
+            // ── §36 step 7: legacy compliance handlers retired ────────────────
+            // The 5 legacy compliance checks live in the new path:
+            //   * check_new_torrents  → §21 / QBIT-10 (SetAllFilesPriority)
+            //   * check_dead_torrents → §20 / QBIT-9 + DOM-8 (DeleteTorrent
+            //     + BlacklistMamId via DeadTorrentRemoved publish)
+            //   * check_hnr_at_risk   → §36 step 7 / DOM-41 via
+            //     `QbitPublish::HnRAtRisk` (Critical alert)
+            //   * check_quota         → §25 / QBIT-17/18/19 + DOM-12
+            //   * check_active_limit  → §24 / QBIT-14/15/16 + DOM-11
+            //   * `Action::UpsertTorrentRecords` → §36 step 6 / DOM-40 via
+            //     `QbitPublish::TorrentRecords`
+            //   * `on_delete_torrent_requested` HnR-lock alert →
+            //     §36 step 7 / DOM-42 via `DeleteBlockedHnRLock`
+            // `Event::QbitPreferencesReceived` / `QbitPreferencesFailed`
+            // were already no-ops since step 3.
+            Event::QbitTorrentDetailsReceived { .. }
+            | Event::QbitPreferencesReceived { .. }
+            | Event::QbitPreferencesFailed { .. }
+            | Event::DeleteTorrentRequested { .. } => Vec::new(),
 
             // ── §36 step 5: legacy manual-download handlers retired ───────────
             // The web route now sends `WindlassCommand::ManualDownload`
