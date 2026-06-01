@@ -723,6 +723,19 @@ impl Machine for WindlassMachine {
             }
             WindlassEvent::Qbit(QbitPublish::TorrentsUpdated { .. })
             | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
+            // §36 step 6 / DOM-40: persist the full qBit snapshot to the
+            // `torrents` DB table that backs `/api/v1/torrents` + the
+            // Torrent Monitor UI.  Ported from legacy
+            // `Action::UpsertTorrentRecords` in `compliance.rs`.  Fans
+            // out one `DbCommand::UpsertTorrent` per record so the DB
+            // actor's existing per-row upsert path stays unchanged.
+            WindlassEvent::Qbit(QbitPublish::TorrentRecords { records }) => Outcome {
+                actions: records
+                    .into_iter()
+                    .map(|r| WindlassAction::Db(DbCommand::UpsertTorrent(to_db_record(&r))))
+                    .collect(),
+                publish: Vec::new(),
+            },
             // §36 step 5 / DOM-35: MAM finished fetching the `.torrent`
             // bytes for a manual or librarian-driven admission.  Forward
             // to qBit as `AddTorrent { mam_id, bytes }`.
@@ -1076,6 +1089,38 @@ impl Machine for WindlassMachine {
             // emit a Warning alert.
             WindlassCommand::ManualDownload { mam_id } => self.handle_manual_download(mam_id),
         }
+    }
+}
+
+/// §36 step 6: translate a `windlass_types::TorrentRecord` (qBit feed
+/// shape) into the `windlass_db_core::TorrentRecord` (DB upsert shape).
+/// Mirrors the legacy `compliance.rs::upsert_torrent_records` translation
+/// so the `torrents` table schema is unchanged.
+fn to_db_record(r: &windlass_types::TorrentRecord) -> windlass_db_core::TorrentRecord {
+    use windlass_db_core::TorrentStateRecord;
+    use windlass_types::TorrentState;
+    let state = match &r.state {
+        TorrentState::Downloading => TorrentStateRecord::Downloading,
+        TorrentState::StalledDownloading => TorrentStateRecord::StalledDownloading,
+        TorrentState::Uploading => TorrentStateRecord::Uploading,
+        TorrentState::StalledUploading => TorrentStateRecord::StalledUploading,
+        TorrentState::ForcedUpload => TorrentStateRecord::ForcedUpload,
+        TorrentState::PausedDownloading => TorrentStateRecord::PausedDownloading,
+        TorrentState::PausedUploading => TorrentStateRecord::PausedUploading,
+        TorrentState::Error => TorrentStateRecord::Error,
+        TorrentState::Other(s) => TorrentStateRecord::Unknown(s.clone()),
+    };
+    let seeding_time_secs = i64::try_from(r.seed_time.as_secs()).unwrap_or(i64::MAX);
+    let downloaded_bytes = i64::try_from(r.downloaded_bytes).unwrap_or(i64::MAX);
+    windlass_db_core::TorrentRecord {
+        hash: r.hash.clone(),
+        book_id: None,
+        mam_id: r.mam_id,
+        name: r.name.0.clone(),
+        state,
+        seeding_time_secs,
+        downloaded_bytes,
+        seen_at: r.seen_at,
     }
 }
 
@@ -2565,6 +2610,48 @@ mod tests {
         ));
     }
 
+    // ── §36 step 6 / DOM-40: torrent-records persistence ─────────────────
+
+    #[test]
+    fn torrent_records_fan_out_one_upsert_per_record() {
+        use windlass_db_core::DbCommand;
+        use windlass_qbit_core::QbitPublish;
+        use windlass_types::{TorrentHash, TorrentName, TorrentRecord, TorrentState};
+
+        let mut machine = machine();
+        let records = vec![
+            TorrentRecord {
+                hash: TorrentHash("a".repeat(40)),
+                downloaded_bytes: 1024,
+                seed_time: std::time::Duration::from_secs(60),
+                state: TorrentState::Uploading,
+                mam_id: None,
+                name: TorrentName("foo.epub".to_string()),
+                seen_at: chrono::Utc::now(),
+            },
+            TorrentRecord {
+                hash: TorrentHash("b".repeat(40)),
+                downloaded_bytes: 0,
+                seed_time: std::time::Duration::ZERO,
+                state: TorrentState::Downloading,
+                mam_id: None,
+                name: TorrentName("bar.epub".to_string()),
+                seen_at: chrono::Utc::now(),
+            },
+        ];
+        let out = handle(
+            &mut machine,
+            WindlassEvent::Qbit(QbitPublish::TorrentRecords { records }),
+        );
+        assert_eq!(out.actions.len(), 2);
+        for action in &out.actions {
+            assert!(
+                matches!(action, WindlassAction::Db(DbCommand::UpsertTorrent(_))),
+                "expected UpsertTorrent action, got {action:?}"
+            );
+        }
+    }
+
     #[test]
     fn vpn_recovered_drives_start_dependents() {
         // DOM-28: rising-edge Vpn(Recovered) emits StartDependents only.
@@ -2752,7 +2839,27 @@ mod prop_tests {
             }),
             prop::collection::vec(any_torrent_hash(), 1..=4)
                 .prop_map(|hashes| QbitPublish::NewTorrentsAdded { hashes }),
+            (any_mam_id(), any_torrent_hash())
+                .prop_map(|(mam_id, hash)| QbitPublish::TorrentAdded { mam_id, hash }),
+            (any_mam_id(), any::<String>())
+                .prop_map(|(mam_id, reason)| QbitPublish::TorrentAddFailed { mam_id, reason }),
+            prop::collection::vec(any_torrent_record(), 0..=4)
+                .prop_map(|records| QbitPublish::TorrentRecords { records }),
         ]
+    }
+
+    fn any_torrent_record() -> impl Strategy<Value = windlass_types::TorrentRecord> {
+        (any_torrent_hash(), any::<u64>(), 0u64..=1_000_000).prop_map(
+            |(hash, downloaded_bytes, seed_secs)| windlass_types::TorrentRecord {
+                hash,
+                downloaded_bytes,
+                seed_time: Duration::from_secs(seed_secs),
+                state: windlass_types::TorrentState::Downloading,
+                mam_id: None,
+                name: windlass_types::TorrentName(String::new()),
+                seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            },
+        )
     }
 
     /// Ratio constrained to `0.0..=10.0` to avoid NaN/Infinity.

@@ -137,6 +137,7 @@ pub(super) fn legacy_to_service_events(
             retry_after: Duration::from_secs(1),
         })],
         Event::QbitTorrentDetailsReceived { torrents, .. } => {
+            let now = chrono::Utc::now();
             vec![ServiceEvent::Qbit(QbitEvent::TorrentsListed {
                 torrents: torrents
                     .iter()
@@ -146,6 +147,8 @@ pub(super) fn legacy_to_service_events(
                         seed_time: Duration::from_secs(torrent.seeding_time_secs),
                         state: legacy_torrent_state_to_torrent_state(&torrent.state),
                         mam_id: torrent.mam_id,
+                        name: torrent.name.clone(),
+                        seen_at: now,
                     })
                     .collect(),
             })]

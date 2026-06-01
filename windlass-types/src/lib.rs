@@ -232,6 +232,15 @@ pub struct TorrentRecord {
     pub seed_time: Duration,
     pub state: TorrentState,
     pub mam_id: Option<MamTorrentId>,
+    /// §36 step 6: human-readable torrent name from qBittorrent.  Used
+    /// by the Torrent Monitor UI and persisted into the `torrents` DB
+    /// table.  May be empty when the source bridge doesn't carry it
+    /// (e.g. legacy `Event::QbitTorrentDetailsReceived` translation).
+    pub name: TorrentName,
+    /// §36 step 6: timestamp of the qBittorrent observation that
+    /// produced this record.  Persisted into the `torrents` table for
+    /// freshness-based UI sorting.
+    pub seen_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A MAM torrent ID parsed from the torrent's comment field.

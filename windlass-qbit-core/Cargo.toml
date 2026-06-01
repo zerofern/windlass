@@ -9,4 +9,5 @@ windlass-machine = { workspace = true }
 windlass-types   = { workspace = true }
 
 [dev-dependencies]
+chrono   = { workspace = true }
 proptest = { workspace = true }

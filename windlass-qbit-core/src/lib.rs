@@ -305,6 +305,15 @@ pub enum QbitPublish {
         mam_id: MamTorrentId,
         reason: String,
     },
+    /// §36 step 6 (ported from legacy `Action::UpsertTorrentRecords`):
+    /// full torrent snapshot for the DB persistence path that backs
+    /// `/api/v1/torrents` and the Torrent Monitor UI.  Domain routes
+    /// this to `DbCommand::UpsertTorrent` per record.  Fired on every
+    /// `TorrentsListed` event so the table tracks live qBittorrent
+    /// state (including seed_time, downloaded_bytes, state, name).
+    TorrentRecords {
+        records: Vec<TorrentRecord>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,7 +343,8 @@ impl HasTopic<QbitTopic> for QbitPublish {
             | Self::DeadTorrentRemoved { .. }
             | Self::NewTorrentsAdded { .. }
             | Self::TorrentAdded { .. }
-            | Self::TorrentAddFailed { .. } => QbitTopic::Torrents,
+            | Self::TorrentAddFailed { .. }
+            | Self::TorrentRecords { .. } => QbitTopic::Torrents,
             Self::BannedPrivacySettingsObserved { .. } | Self::PrivacyClean => QbitTopic::Privacy,
             Self::QueueOrchestrated { .. } => QbitTopic::Queue,
             Self::UnsatisfiedQuotaCritical { .. }
@@ -834,7 +844,16 @@ impl Machine for QbitMachine {
                 self.torrents = torrents.into_iter().map(|t| (t.hash.clone(), t)).collect();
 
                 let mut actions = Vec::new();
-                let mut publish = vec![QbitPublish::TorrentsUpdated { hashes }];
+                // §36 step 6: snapshot the full record set for the DB
+                // persistence path (DOM-40 routes this to per-record
+                // `DbCommand::UpsertTorrent`).  Use `self.torrents` so
+                // the publish carries the canonical state stored in the
+                // machine, not the input vec.
+                let records: Vec<TorrentRecord> = self.torrents.values().cloned().collect();
+                let mut publish = vec![
+                    QbitPublish::TorrentsUpdated { hashes },
+                    QbitPublish::TorrentRecords { records },
+                ];
 
                 // §36 step 4: rising-edge new-torrent notification (ported
                 // from legacy `on_new_torrents_observed`).  Domain fires
@@ -1018,6 +1037,8 @@ mod tests {
             seed_time: Duration::from_secs(seed_secs),
             state: TorrentState::Uploading,
             mam_id: None,
+            name: windlass_types::TorrentName(String::new()),
+            seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         }
     }
 
@@ -1450,6 +1471,8 @@ mod tests {
             seed_time: Duration::ZERO,
             state: TorrentState::StalledDownloading,
             mam_id: None,
+            name: windlass_types::TorrentName(String::new()),
+            seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         }
     }
 
@@ -1493,6 +1516,8 @@ mod tests {
                     seed_time: Duration::ZERO,
                     state: TorrentState::Downloading,
                     mam_id: None,
+                    name: windlass_types::TorrentName(String::new()),
+                    seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
                 }],
             },
         );
@@ -1525,6 +1550,8 @@ mod tests {
                     seed_time: Duration::ZERO,
                     state: TorrentState::StalledDownloading,
                     mam_id: None,
+                    name: windlass_types::TorrentName(String::new()),
+                    seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
                 }],
             },
         );
@@ -1909,6 +1936,8 @@ mod tests {
             seed_time: Duration::from_secs(seed_secs),
             state: TorrentState::Uploading,
             mam_id: None,
+            name: windlass_types::TorrentName(String::new()),
+            seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         }
     }
 
@@ -1919,6 +1948,8 @@ mod tests {
             seed_time: Duration::from_secs(3600), // 1h < 72h
             state: TorrentState::PausedUploading,
             mam_id: None,
+            name: windlass_types::TorrentName(String::new()),
+            seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         }
     }
 
@@ -2120,6 +2151,8 @@ mod tests {
             seed_time: Duration::from_secs(3600), // 1h
             state: TorrentState::Uploading,
             mam_id: None,
+            name: windlass_types::TorrentName(String::new()),
+            seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         }
     }
 
@@ -2355,6 +2388,8 @@ mod prop_tests {
                     seed_time: Duration::from_secs(seed_secs),
                     state,
                     mam_id,
+                    name: windlass_types::TorrentName(String::new()),
+                    seen_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
                 },
             )
     }

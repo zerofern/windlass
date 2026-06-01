@@ -3375,6 +3375,7 @@ dependencies = [
 name = "windlass-qbit-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "proptest",
  "serde",
  "windlass-machine",
@@ -3401,6 +3402,7 @@ dependencies = [
 name = "windlass-types"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "nutype",
  "secrecy",
  "serde",

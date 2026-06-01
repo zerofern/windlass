@@ -115,6 +115,7 @@ impl Shell for QbitShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let details = client.list_torrent_details(&cookie).await;
+                    let now = chrono::Utc::now();
                     let torrents: Vec<TorrentRecord> = details
                         .into_iter()
                         .map(|d| TorrentRecord {
@@ -123,6 +124,8 @@ impl Shell for QbitShell {
                             seed_time: Duration::from_secs(d.seeding_time_secs),
                             state: qbit_state_to_torrent_state(d.state),
                             mam_id: d.mam_id,
+                            name: d.name,
+                            seen_at: now,
                         })
                         .collect();
                     let _ = tx.send(Timed::now(QbitEvent::TorrentsListed { torrents }));

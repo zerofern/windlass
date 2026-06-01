@@ -194,7 +194,7 @@ active-limit) **plus** writes the `torrents` DB table that
 | `on_delete_torrent_requested` HnR lock alert | new download path | **Gap** — Warning "HnR lock — cannot delete" alert not yet in new manual-delete flow |
 | `check_quota`                      | §25 / QBIT-17/18/19 + DOM-12 | Covered |
 | `check_active_limit`               | §24 / QBIT-14/15/16 + DOM-11 | Covered |
-| `Action::UpsertTorrentRecords`     | **Gap** — no new-core path yet | **Blocker** |
+| `Action::UpsertTorrentRecords`     | §36 step 6: `QbitPublish::TorrentRecords` → domain DOM-40 → `Db(UpsertTorrent)` | **DONE 2026-06-01** |
 
 **Persistence gap.**  Today the legacy `Action::UpsertTorrentRecords`
 writes the `torrents` table on every `QbitTorrentDetailsReceived`
@@ -266,6 +266,18 @@ because every other check is already in the new cores.
    Critical "MAM rate limit" alert.  `Event::Wakeup` is now a no-op
    for every `WakeupId` (each had a self-driving timer in the relevant
    core or no remaining consumer).
+6. **Torrent-records persistence** — DONE (2026-06-01).  New
+   `QbitPublish::TorrentRecords { records }` fired on every
+   `TorrentsListed`; domain DOM-40 fans out
+   `DbCommand::UpsertTorrent` per record.  `windlass-types::
+   TorrentRecord` gains `name: TorrentName` + `seen_at:
+   DateTime<Utc>` so the new feed carries the fields the legacy
+   `torrents` DB row + UI rely on.  qBit shell populates `name` from
+   `QbitTorrentDetails`; service-events bridge passes through legacy
+   torrent names; `/api/v1/torrents` (Torrent Monitor UI) keeps
+   reading the same table.  Compliance.rs `Action::UpsertTorrentRecords`
+   blocker resolved — step 7 can now proceed.
+
 5. **download.rs** — DONE (2026-06-01).  Legacy `handlers/download.rs`
    deleted; `Event::ManualDownloadRequested / TorrentAddedToQbit /
    TorrentAddFailed` dispatches now no-op.  Web route now sends
