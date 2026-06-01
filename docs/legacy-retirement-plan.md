@@ -277,6 +277,18 @@ because every other check is already in the new cores.
    torrent names; `/api/v1/torrents` (Torrent Monitor UI) keeps
    reading the same table.
 
+8. **Drop the shadow** — DONE (2026-06-01).  The shell event loop no
+   longer runs `process_legacy_event` or `dispatch_event`.  The loop
+   now reads each event, sends it through `service_cores.observe` (the
+   bridge that routes to the per-system new cores), and that's it.
+   Dead helper modules `actions.rs`, `compliance.rs`, `download.rs`
+   under `windlass/src/shell/` deleted.  Legacy `Event` type stays as
+   the bridge protocol the I/O sites already use (Docker watcher, VPN
+   files, MAM/qBit clients).  Legacy `SystemState` is frozen at
+   `initial()` — the operator's old dashboard SSE shows a stale view;
+   step 9 migrates the SSE to the new `WindlassPublish::SystemState`
+   shape and deletes `windlass-core`.
+
 7. **compliance.rs** — DONE (2026-06-01).  Legacy
    `handlers/compliance.rs` + `tests/compliance.rs` deleted; the
    entire `tests/` module dropped (all legacy handler tests were
