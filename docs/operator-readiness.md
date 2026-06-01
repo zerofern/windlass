@@ -61,7 +61,9 @@ Implement these stories one at a time, in this order:
 34. Rebuild the integration-test suite around a real Docker stack (needs planning).
 35. Make dependent-container orchestration safe under Gluetun.
 36. Fully port legacy `windlass-core` to the per-system cores and remove it.
-37. Review and consolidate the debug-mode workflow (open scope, discuss when picked up).
+37. Review and consolidate the debug-mode workflow → **observability
+    redesign**. Umbrella story; substories §37pre + §37a–j (see
+    `docs/observability-redesign.md`).
 38. Introduce a Docker core for container orchestration (prerequisite for §36 step 1: legacy `vpn.rs` cutover).
 
 ## Story: Fix Initial UI State Snapshot On SSE Connect
@@ -1630,48 +1632,100 @@ actually guard what runs in production.
   coordinated step rather than per-decision, to avoid legacy and new cores both
   acting on the same torrent list.
 
-## Story: Review And Consolidate Debug-Mode Workflow
+## Story: Observability Redesign (umbrella)
 
-Status: To Do
+Status: Discussion locked (2026-06-01) — see
+`docs/observability-redesign.md`.  Split into substories §37pre
++ §37a–j.  No implementation until §37pre signs off the
+engineering contracts.
 
 ### Problem
 
-The debug-mode workflow — event/action history, pause, breakpoints, replay —
-has accumulated over many stories (§1, §10, §14, §15, plus implicit support
-from every service-runtime story).  Each core now goes through the generic
-service runtime and feeds the debug pipeline, but no story has revisited the
-operator-facing surface as a whole.  Before operator-readiness wraps, we
-should look at debug mode end-to-end with fresh eyes: what works, what's
-useful, what's stale, what should change shape.
+The debug-mode workflow — event/action history, pause, breakpoints
+— was built around a single central event loop and one
+`SystemState`.  Post-§36, the live decision-making runs on seven
+per-system service runtimes.  About 40% of the current `/debug`
+page is structurally wrong (state diff against frozen legacy
+`SystemState`, action timeline that never populates, dead action
+breakpoints, dryrun against legacy state, queue manipulation whose
+mental model is broken).  `windlass-debug` is one of the two
+remaining consumers pinning `windlass-core` per §36.
 
 ### User Story
 
-As the operator user, I want the debug-mode UX (and its underlying event/
-action history, pause, breakpoint, and replay primitives) reviewed as a
-single coherent feature so the pieces that matter are sharpened and the
-pieces that don't are dropped or reshaped.
+As the operator user, I want an always-on observability surface
+that lets me see every event, action, publish, state change, and
+HTTP exchange across all seven cores, jump along the causal graph
+by click, and pause individual cores (or all of them) at well-
+defined gate points — so I can diagnose live without restarting
+and never let the operator ship a request I haven't seen.
 
 ### Acceptance Criteria
 
-Deliberately open.  Real scope to be agreed when the story is picked up.
-Likely candidates:
+The redesign is specified in `docs/observability-redesign.md`.
+Headline shape:
 
-- Audit what debug mode currently surfaces vs what an operator actually
-  uses while diagnosing a problem.
-- Decide whether per-core event/action streams are the right shape, or
-  whether a cross-system causal view (e.g. "all events touching torrent
-  X") is more useful.
-- Revisit breakpoints: are they used in practice, and if so on what?
-- Revisit replay: still a goal, or a victim of the per-system migration?
-- Decide whether the debug page lives in the operator UI long-term or
-  moves behind a feature flag/dev build.
+- Crate `windlass-observability`, route `/observability`, traits
+  `RuntimeTap` + `HttpTap`, `ObservabilityController`.
+- Three per-core gates: event-gate (before `handle`), outcome-gate
+  (after `handle`, before `apply`), HTTP-gate (before
+  `execute`).  Per-action gate deferred.
+- Always-on per-core `StoredStepRecord` rings binding event +
+  actions + publishes + state-after; cross-core HTTP and log
+  rings.  All count + byte budgets, with truncation and drop
+  counters surfaced.
+- Bidirectional causal graph by ID (action_id, publish_id,
+  EventCause), with O(1) backward-lookup indices.
+- `secrecy::Secret<T>` everywhere in code; redacted by default
+  on the wire; per-field Reveal endpoint, session-only on the
+  page.
+- `Machine` gains `type StateSnapshot: Serialize` and
+  `fn state_snapshot(&self) -> Self::StateSnapshot`; IDs are
+  assigned by the runtime, not by the machine.
+- `Shell` trait unchanged.  Separation guarantee: an
+  observability bug cannot corrupt machine state, drop or
+  reorder events, or block action/publish dispatch.
+- Six design-level acceptance tests (observer equivalence;
+  observer cannot block dispatch; per-core pause isolation;
+  HTTP gate prevents send; ring eviction cleans indices;
+  secret behavior) gate the whole umbrella.
+
+### Substories
+
+In sequence (parallel only where called out):
+
+1. **§37pre** — finalize observability contracts.  No code.
+   Lock the engineering contracts (EC-1..7), trait shapes,
+   stored-record formats, timestamp conventions, `CoreStatus`
+   enum, configuration schema, secrets reveal endpoint, and
+   the six acceptance tests.  Blocks every other substory.
+2. **§37a** — `secrecy::SecretString` adoption + redacted
+   serializer.  Parallel with §37b.
+3. **§37b** — `Machine::state_snapshot` + per-machine state
+   refactor.  Parallel with §37a.
+4. **§37c** — `Timed<E>` causal extension (`cause`,
+   `ExternalCause`, constructors, subscriber-bridge wiring).
+5. **§37d** — `RuntimeTap` + envelopes + event/outcome gates
+   + `ObservabilityController` core.
+6. **§37e** — `HttpTap` + HTTP gate + MAM rate-limit guardrail
+   re-wire.
+7. **§37f** — Stored records + always-on rings + indices +
+   SSE shape.
+8. **§37g** — Variant-keyed breakpoint registry.
+9. **§37h** — New `/observability` frontend.
+10. **§37i** — `PAUSE_ON_START` env var.
+11. **§37j** — Rename `windlass-debug` → `windlass-observability`,
+    `/debug` → `/observability`, rewrite `docs/debug-mode.md` as
+    `docs/observability.md`.
 
 ### Implementation Notes
 
-- This is a *review* story; discuss before any large code change.
-- Cross-reference the debug-mode bits sprinkled through the earlier
-  stories (initial UI snapshot, event/action queue visibility, breakpoint-
-  on-click) when assembling the audit.
+- The redesign doc (`docs/observability-redesign.md`) is the
+  source of truth for trait shapes, record formats, engineering
+  contracts, and acceptance tests.  Implementation stories do
+  not re-open those decisions; they implement them.
+- Each substory will get its own entry in this file once
+  §37pre is signed off and individual story scopes are finalised.
 
 ## Story: Introduce Docker Core For Container Orchestration
 
