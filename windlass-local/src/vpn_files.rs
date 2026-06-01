@@ -1,11 +1,15 @@
-use chrono::Utc;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use tokio::sync::mpsc;
 
-use windlass_core::events::Event;
 use windlass_types::{VpnIp, VpnPort};
+
+/// §36 step 9b: typed result for the VPN-file watcher channel.  Replaces
+/// the legacy `windlass_core::Event::PortFileReadResult` shape so
+/// `windlass-local` doesn't depend on the legacy core crate.  Callers map
+/// each variant to `VpnEvent` themselves.
+pub type PortFileResult = Result<(VpnIp, VpnPort), String>;
 
 /// Reads and parses both VPN files.
 ///
@@ -42,7 +46,7 @@ pub fn read_port_files(ip_file: &str, port_file: &str) -> Result<(VpnIp, VpnPort
 pub async fn read_and_watch(
     vpn_ip_file: &str,
     vpn_port_file: &str,
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<PortFileResult>,
 ) -> Result<(VpnIp, VpnPort), String> {
     let result = read_boot_port_files(vpn_ip_file, vpn_port_file).await;
     spawn_file_watcher(vpn_ip_file, vpn_port_file, tx);
@@ -71,7 +75,11 @@ pub async fn read_boot_port_files(
 ///
 /// Collapses the raw inotify storm from a single write into one event per
 /// 100ms window, then reads both VPN files and emits `PortFileReadResult`.
-pub fn spawn_file_watcher(vpn_ip_file: &str, vpn_port_file: &str, tx: mpsc::Sender<Event>) {
+pub fn spawn_file_watcher(
+    vpn_ip_file: &str,
+    vpn_port_file: &str,
+    tx: mpsc::Sender<PortFileResult>,
+) {
     let watch_dir = Path::new(vpn_ip_file).parent().map_or_else(
         || "/tmp/gluetun".to_string(),
         |p| p.to_string_lossy().into_owned(),
@@ -93,7 +101,7 @@ pub fn spawn_file_watcher_inner(
     watch_dir: &str,
     ip_file: String,
     port_file: String,
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<PortFileResult>,
 ) {
     // Capacity 1: if a read is already queued, drop extra signals.
     let (notify_tx, mut notify_rx) = mpsc::channel::<()>(1);
@@ -144,14 +152,7 @@ pub fn spawn_file_watcher_inner(
                 last_sent = None; // force the next Ok to always be forwarded
             }
 
-            if tx
-                .send(Event::PortFileReadResult {
-                    at: Utc::now(),
-                    result,
-                })
-                .await
-                .is_err()
-            {
+            if tx.send(result).await.is_err() {
                 break;
             }
         }
@@ -344,8 +345,8 @@ mod tests {
             .expect("channel closed unexpectedly");
         let expected_port = VpnPort::try_new(51821).unwrap();
         assert!(
-            matches!(event, Event::PortFileReadResult { result: Ok((_, p)), .. } if p == expected_port),
-            "expected PortFileReadResult(Ok(_, 51821)), got {event:?}"
+            matches!(&event, Ok((_, p)) if *p == expected_port),
+            "expected Ok((_, 51821)), got {event:?}"
         );
     }
 
@@ -407,10 +408,7 @@ mod tests {
             events.push(e);
         }
 
-        let err_count = events
-            .iter()
-            .filter(|e| matches!(e, Event::PortFileReadResult { result: Err(_), .. }))
-            .count();
+        let err_count = events.iter().filter(|e| e.is_err()).count();
         assert_eq!(
             err_count, 1,
             "only the first error should be forwarded, got {err_count}"
@@ -422,10 +420,7 @@ mod tests {
             .await
             .expect("timed out waiting for recovery PortFileReadResult")
             .unwrap();
-        assert!(
-            matches!(event, Event::PortFileReadResult { result: Ok(_), .. }),
-            "recovery event should be Ok, got {event:?}"
-        );
+        assert!(event.is_ok(), "recovery event should be Ok, got {event:?}");
     }
 
     #[tokio::test]
@@ -445,16 +440,18 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         std::fs::write(&port_path, "51821").unwrap();
-        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .expect("timed out on first write")
             .unwrap();
+        assert!(first.is_ok(), "first write should be Ok, got {first:?}");
         // Wait for the debounce window to fully settle before the second write.
         tokio::time::sleep(Duration::from_millis(400)).await;
         std::fs::write(&port_path, "51822").unwrap();
-        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        let second = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .expect("timed out on second write — watcher stopped after first event")
             .unwrap();
+        assert!(second.is_ok(), "second write should be Ok, got {second:?}");
     }
 }

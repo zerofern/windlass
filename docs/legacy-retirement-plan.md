@@ -277,6 +277,19 @@ because every other check is already in the new cores.
    torrent names; `/api/v1/torrents` (Torrent Monitor UI) keeps
    reading the same table.
 
+9b. **windlass-local typed events** — DONE (2026-06-01).
+    `vpn_files::spawn_file_watcher` now takes `Sender<PortFileResult>`
+    (typed `Result<(VpnIp, VpnPort), String>`) instead of
+    `Sender<Event>`.  init_shell spawns a forwarder task that maps each
+    typed result into `VpnEvent::PortFileChanged + PublicIpFromFile`
+    on success or `VpnEvent::StateReadFailed` on failure — direct into
+    the VpnMachine event channel; the legacy bridge entry is bypassed.
+    `DockerClient::spawn_event_watcher` + `spawn_health_poll_watcher`
+    deleted (DockerShell owns the bollard watcher since §38 PR 2;
+    legacy path was redundant).  `DockerClient::boot` no longer takes
+    a `tx` channel.  `windlass-core` dep dropped from
+    `windlass-local/Cargo.toml`.
+
 9a. **windlass-clients typed returns** — DONE (2026-06-01).
     `QbitClient::authenticate` / `sync_port` return new
     `QbitAuthResult` / `QbitPortSyncResult` enums in `qbit/types.rs`;

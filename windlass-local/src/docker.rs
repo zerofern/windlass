@@ -1,13 +1,9 @@
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::container::{LogsOptions, RestartContainerOptions};
-use bollard::models::{EventMessageTypeEnum, HealthStatusEnum};
-use chrono::Utc;
+use bollard::models::HealthStatusEnum;
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-
-use windlass_core::events::Event;
 
 // Re-exported so docker_tests.rs (via `use super::*`) can use it in Tier 4 tests.
 pub use bollard::container::StopContainerOptions;
@@ -43,15 +39,16 @@ impl DockerClient {
         })
     }
 
-    /// Connects, probes Gluetun state, discovers dependents, and spawns the
-    /// Docker event watcher. Returns the boot state needed for `Event::Init`.
+    /// Connects, probes Gluetun state, and discovers dependents.  Returns
+    /// the boot snapshot needed for the legacy `Event::Init` bridge.
+    /// §36 step 9b: the legacy bollard event watcher
+    /// (`spawn_event_watcher`) is retired — `DockerShell` (in the
+    /// windlass binary) owns its own watcher that feeds `DockerMachine`
+    /// directly; the legacy path is redundant.
     ///
     /// # Errors
     /// Returns an error if the Docker socket is unavailable.
-    pub async fn boot(
-        dump_dir: String,
-        tx: mpsc::Sender<Event>,
-    ) -> anyhow::Result<(Self, DockerBootInfo)> {
+    pub async fn boot(dump_dir: String) -> anyhow::Result<(Self, DockerBootInfo)> {
         let client = Self::connect(dump_dir)?;
         let is_gluetun_healthy = client.is_gluetun_healthy().await;
         let dependents = client.discover_dependents().await;
@@ -60,7 +57,6 @@ impl DockerClient {
             dependents = ?dependents,
             "Docker ready"
         );
-        client.spawn_event_watcher(tx);
         Ok((
             client,
             DockerBootInfo {
@@ -126,67 +122,6 @@ impl DockerClient {
                     .map(|n| n.trim_start_matches('/').to_string())
             })
             .collect()
-    }
-
-    // ── Background watchers ───────────────────────────────────────────────────
-
-    /// Spawns a background task that streams Docker events and forwards
-    /// Gluetun health/die events to the Core via `tx`.
-    pub fn spawn_event_watcher(&self, tx: mpsc::Sender<Event>) {
-        let docker = self.inner.clone();
-        let anchor = self.gluetun_anchor.clone();
-        spawn_health_poll_watcher(docker.clone(), anchor.clone(), tx.clone());
-        tokio::spawn(async move {
-            loop {
-                let mut stream = docker.events(None::<bollard::system::EventsOptions<String>>);
-                let mut last_err: Option<String> = None;
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Err(e) => {
-                            last_err = Some(e.to_string());
-                        }
-                        Ok(msg) => {
-                            last_err = None;
-                            if msg.typ != Some(EventMessageTypeEnum::CONTAINER) {
-                                continue;
-                            }
-                            let name = msg
-                                .actor
-                                .as_ref()
-                                .and_then(|a| a.attributes.as_ref())
-                                .and_then(|attrs| attrs.get("name"))
-                                .map(String::as_str)
-                                .unwrap_or_default();
-
-                            if name != anchor {
-                                continue;
-                            }
-
-                            let action = msg.action.as_deref().unwrap_or("");
-                            let event = if action.starts_with("health_status: healthy") {
-                                Event::DockerGluetunHealthy { at: Utc::now() }
-                            } else if action.starts_with("health_status: unhealthy")
-                                || action == "die"
-                            {
-                                Event::DockerGluetunDied { at: Utc::now() }
-                            } else {
-                                continue;
-                            };
-
-                            if tx.send(event).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-                if let Some(err) = last_err {
-                    warn!("Docker event stream ended with error: {err}. Reconnecting in 5s...");
-                } else {
-                    warn!("Docker event stream closed cleanly. Reconnecting in 5s...");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        });
     }
 
     // ── Container lifecycle ───────────────────────────────────────────────────
@@ -273,35 +208,6 @@ impl DockerClient {
             }
         }
     }
-}
-
-fn spawn_health_poll_watcher(docker: Docker, anchor: String, tx: mpsc::Sender<Event>) {
-    tokio::spawn(async move {
-        let mut last_healthy: Option<bool> = None;
-        loop {
-            let healthy = docker
-                .inspect_container(&anchor, None)
-                .await
-                .ok()
-                .and_then(|info| info.state)
-                .and_then(|state| state.health)
-                .and_then(|health| health.status)
-                == Some(HealthStatusEnum::HEALTHY);
-
-            let event = match last_healthy.replace(healthy) {
-                Some(true) if !healthy => Some(Event::DockerGluetunDied { at: Utc::now() }),
-                Some(false) if healthy => Some(Event::DockerGluetunHealthy { at: Utc::now() }),
-                _ => None,
-            };
-            if let Some(event) = event
-                && tx.send(event).await.is_err()
-            {
-                return;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    });
 }
 
 #[cfg(test)]

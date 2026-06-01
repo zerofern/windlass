@@ -74,7 +74,7 @@ pub(super) async fn init_shell(
 
     let (tx, rx) = mpsc::channel::<Event>(128);
 
-    let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone(), tx.clone()).await?;
+    let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone()).await?;
 
     let db_pool = DbPool::connect(&config.database_url)
         .await
@@ -84,8 +84,13 @@ pub(super) async fn init_shell(
         .await
         .map_err(|e| anyhow::anyhow!("Database migration failed: {e}"))?;
 
+    // §36 step 9b: vpn_files now emits a typed `PortFileResult`; the
+    // forwarder task is spawned below (after VPN handles exist) to feed
+    // VpnEvent::PortFileChanged / PublicIpFromFile / StateReadFailed
+    // directly into the VpnMachine.
+    let (file_result_tx, file_result_rx) = mpsc::channel::<vpn_files::PortFileResult>(16);
     let port_files =
-        vpn_files::read_and_watch(&config.vpn_ip_file, &config.vpn_port_file, tx.clone()).await;
+        vpn_files::read_and_watch(&config.vpn_ip_file, &config.vpn_port_file, file_result_tx).await;
 
     info!("Windlass started");
 
@@ -231,6 +236,33 @@ pub(super) async fn init_shell(
             vpn_pub_tx,
         ))
         .expect("vpn pub subscription");
+
+    // §36 step 9b: pump vpn_files results (typed) directly into the
+    // VpnMachine.  Replaces the legacy `Event::PortFileReadResult` path
+    // via service_cores.observe — that bridge entry is now redundant.
+    {
+        let vpn_event_tx = vpn_handles.events.clone();
+        let mut file_result_rx = file_result_rx;
+        tokio::spawn(async move {
+            while let Some(result) = file_result_rx.recv().await {
+                match result {
+                    Ok((ip, port)) => {
+                        let _ = vpn_event_tx.send(Timed::now(
+                            windlass_vpn_core::VpnEvent::PortFileChanged { port },
+                        ));
+                        let _ = vpn_event_tx.send(Timed::now(
+                            windlass_vpn_core::VpnEvent::PublicIpFromFile { ip },
+                        ));
+                    }
+                    Err(reason) => {
+                        let _ = vpn_event_tx.send(Timed::now(
+                            windlass_vpn_core::VpnEvent::StateReadFailed { reason },
+                        ));
+                    }
+                }
+            }
+        });
+    }
 
     let (qbit_handles, _qbit_join) = windlass_machine::spawn::<QbitMachine, QbitShell>(
         QbitConfig {
