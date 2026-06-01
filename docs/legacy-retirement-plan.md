@@ -277,6 +277,13 @@ because every other check is already in the new cores.
    torrent names; `/api/v1/torrents` (Torrent Monitor UI) keeps
    reading the same table.
 
+**§36 closed at sub-step 9b** (2026-06-01).  The remaining sub-steps
+require touching the debug-mode crate (covered by §37) and the
+operator dashboard SSE (needs a richer
+`domain-core::SystemStateView` before the React app can migrate
+without losing IP/port detail).  Tracked as follow-ups; `windlass-core`
+stays in the workspace until both land.
+
 9b. **windlass-local typed events** — DONE (2026-06-01).
     `vpn_files::spawn_file_watcher` now takes `Sender<PortFileResult>`
     (typed `Result<(VpnIp, VpnPort), String>`) instead of

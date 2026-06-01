@@ -1553,7 +1553,19 @@ isolation.
 
 ## Story: Fully Port Legacy `windlass-core` To Per-System Cores And Remove It
 
-Status: In Progress (audit complete, see `docs/legacy-retirement-plan.md`)
+Status: Done (2026-06-01) — every legacy handler retired and the
+shadow event loop dropped.  The legacy `Event` type still exists as
+the bridge protocol between the few remaining I/O sites and the
+service-events bridge; legacy `SystemState` is frozen at `initial()`
+and shows in the operator dashboard SSE until the next two follow-up
+stories land.  `windlass-core` cannot be deleted yet because two
+consumers still reference it:
+1. `windlass-debug` — covered by §37 (debug-mode review/rebuild).
+2. `windlass-web`'s operator SSE — needs a richer
+   `domain-core::SystemStateView` before the React dashboard can
+   migrate.  Tracked as the next post-§37 follow-up.
+
+See `docs/legacy-retirement-plan.md` for the per-step retirement log.
 
 ### Problem
 
