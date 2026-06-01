@@ -7,6 +7,10 @@ use windlass_types::{AlertPriority, AuthCookie, TorrentHash, WakeupId};
 const SEEDING_REQUIRED_SECS: u64 = 72 * 3600;
 
 impl SystemState {
+    // §36 step 4: the `WakeupId::CompliancePoll` dispatch was retired with
+    // legacy monitoring.rs.  This method is now unreachable from the
+    // event loop but stays for tests until step 7 retires compliance.
+    #[allow(dead_code)]
     pub(crate) fn on_wakeup_compliance_poll(&self) -> Vec<Action> {
         let mut actions = vec![Action::ScheduleWakeup(
             WakeupId::CompliancePoll,

@@ -265,6 +265,14 @@ pub enum QbitPublish {
         port: VpnPort,
         attempts: u32,
     },
+    /// §36 step 4 (ported from legacy `on_new_torrents_observed`):
+    /// fired on each `TorrentsListed` event whose snapshot contains
+    /// hashes that the machine has not seen before.  Domain fires an
+    /// Info alert so operators get a notification when fresh downloads
+    /// land.  `hashes` is non-empty.
+    NewTorrentsAdded {
+        hashes: Vec<TorrentHash>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,7 +298,9 @@ impl HasTopic<QbitTopic> for QbitPublish {
             Self::ListenPortReady { .. } => QbitTopic::ListenPort,
             // `DeadTorrentRemoved` is routed on `Torrents` so the domain's
             // existing `Torrents` subscription delivers it without a new topic.
-            Self::TorrentsUpdated { .. } | Self::DeadTorrentRemoved { .. } => QbitTopic::Torrents,
+            Self::TorrentsUpdated { .. }
+            | Self::DeadTorrentRemoved { .. }
+            | Self::NewTorrentsAdded { .. } => QbitTopic::Torrents,
             Self::BannedPrivacySettingsObserved { .. } | Self::PrivacyClean => QbitTopic::Privacy,
             Self::QueueOrchestrated { .. } => QbitTopic::Queue,
             Self::UnsatisfiedQuotaCritical { .. }
@@ -791,6 +801,15 @@ impl Machine for QbitMachine {
 
                 let mut actions = Vec::new();
                 let mut publish = vec![QbitPublish::TorrentsUpdated { hashes }];
+
+                // §36 step 4: rising-edge new-torrent notification (ported
+                // from legacy `on_new_torrents_observed`).  Domain fires
+                // an Info alert.
+                if !newly_seen.is_empty() {
+                    publish.push(QbitPublish::NewTorrentsAdded {
+                        hashes: newly_seen.clone(),
+                    });
+                }
 
                 // For each newly-seen torrent, emit SetAllFilesPriority to enforce
                 // the MAM "no partials" rule (§21 / QBIT-10).  Mirrors legacy

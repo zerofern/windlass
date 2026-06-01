@@ -252,6 +252,20 @@ because every other check is already in the new cores.
    `state.max_active_torrents` stays at default 5; legacy
    `compliance.rs::check_active_limit` is inert with fewer than 5
    active torrents until step 7 retires compliance.
+4. **monitoring.rs** — DONE (2026-06-01).  Legacy `handlers/monitoring.rs`
+   deleted; `Event::DiskSpaceObserved / NewTorrentsObserved / Wakeup /
+   MamRateLimitViolation` dispatches now no-op.  `DiskShell` +
+   `DiskMachine` spawned in `init_shell` (50 GiB hard floor);
+   `service_events.rs` bridges `Event::DiskSpaceObserved` to
+   `DiskEvent::DiskSpaceObserved`; domain DOM-9 extended with the
+   Warning "Low disk space" alert + EvictOneForDiskPressure.
+   QbitMachine publishes new `QbitPublish::NewTorrentsAdded { hashes }`
+   on rising-edge newly-seen torrents; domain DOM-33 fires the Info
+   "New torrents" alert (hash-only — `TorrentName` legacy feed retired).
+   Domain DOM-34 extended on `MamPublish::RateLimited` to also fire a
+   Critical "MAM rate limit" alert.  `Event::Wakeup` is now a no-op
+   for every `WakeupId` (each had a self-driving timer in the relevant
+   core or no remaining consumer).
 2. **mam.rs** — same shape, slightly larger event set.
 3. **qbit.rs** (excluding compliance-related preferences flow) —
    careful with `on_qbit_preferences_received`; the `max_active_torrents`

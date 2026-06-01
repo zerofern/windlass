@@ -624,6 +624,34 @@ impl Machine for WindlassMachine {
             }
             WindlassEvent::Qbit(QbitPublish::TorrentsUpdated { .. })
             | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
+            // §36 step 4 / DOM-33: rising-edge new-torrent notification
+            // (ported from legacy `on_new_torrents_observed`).  Hash-only
+            // alert because the new path tracks `TorrentRecord` by hash;
+            // the legacy `TorrentName` feed has been retired.  Operators
+            // get a push notification and look at the Torrent Monitor UI
+            // for human-readable detail.
+            WindlassEvent::Qbit(QbitPublish::NewTorrentsAdded { hashes }) => {
+                let count = hashes.len();
+                let preview = hashes
+                    .iter()
+                    .take(3)
+                    .map(|h| h.0.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let body = if count <= 3 {
+                    format!("🧲 New torrent(s) added: {preview}")
+                } else {
+                    format!("🧲 {count} new torrent(s) added: {preview}, …")
+                };
+                Outcome {
+                    actions: vec![WindlassAction::SendAlert {
+                        priority: AlertPriority::Info,
+                        title: "New torrents".to_string(),
+                        body,
+                    }],
+                    publish: Vec::new(),
+                }
+            }
             // DOM-11: QueueOrchestrated → one RecordActivity + one Activity publish.
             WindlassEvent::Qbit(QbitPublish::QueueOrchestrated {
                 ref paused,
@@ -736,22 +764,52 @@ impl Machine for WindlassMachine {
                 consecutive_failures,
                 last_reason,
             }) => Self::on_keep_alive_degraded(consecutive_failures, &last_reason),
+            // §36 step 4 / DOM-34: rate-limited gets a Critical alert
+            // (ported from legacy `on_mam_rate_limit_violation`).  The
+            // operator needs to know — MAM rate-limit hits typically
+            // mean a config bug or a runaway loop.  Existing admission-
+            // gate and Activity behaviour preserved.
             WindlassEvent::Mam(MamPublish::RateLimited { retry_after }) => {
                 self.state.mam = ServiceStatus::Degraded;
                 self.admission.mam_healthy = false;
-                self.publish_state_with_activity(format!(
+                let mut out = self.publish_state_with_activity(format!(
                     "MAM rate limited for {}s",
                     retry_after.as_secs()
-                ))
+                ));
+                out.actions.push(WindlassAction::SendAlert {
+                    priority: AlertPriority::Critical,
+                    title: "MAM rate limit".to_string(),
+                    body: format!(
+                        "🛑 MAM rate-limit guard triggered (retry after {}s). \
+                         Requests were too fast — investigate before resuming.",
+                        retry_after.as_secs()
+                    ),
+                });
+                out
             }
-            // DOM-9: BelowFloor → one EvictOneForDiskPressure + Activity publish.
-            //        AboveFloor → no action, no publish.
-            WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes }) => Outcome {
-                actions: vec![WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)],
-                publish: vec![WindlassPublish::Activity {
-                    message: format!("Disk pressure: {free_bytes} bytes free — eviction triggered"),
-                }],
-            },
+            // DOM-9 / §36 step 4: BelowFloor → one
+            // EvictOneForDiskPressure + Warning alert (ported from legacy
+            // `on_disk_space_observed`) + Activity publish.
+            // AboveFloor → no action, no publish.
+            #[allow(clippy::cast_precision_loss)]
+            WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes }) => {
+                let gib = free_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                Outcome {
+                    actions: vec![
+                        WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure),
+                        WindlassAction::SendAlert {
+                            priority: AlertPriority::Warning,
+                            title: "Low disk space".to_string(),
+                            body: format!("💾 Low disk space: {gib:.1} GB remaining."),
+                        },
+                    ],
+                    publish: vec![WindlassPublish::Activity {
+                        message: format!(
+                            "Disk pressure: {free_bytes} bytes free — eviction triggered"
+                        ),
+                    }],
+                }
+            }
             WindlassEvent::DbFailed { operation, message } => Outcome {
                 actions: Vec::new(),
                 publish: vec![WindlassPublish::Activity {
@@ -1581,6 +1639,7 @@ mod tests {
     fn disk_below_floor_emits_evict_command_and_activity() {
         use windlass_disk_core::DiskPublish;
         use windlass_qbit_core::QbitCommand;
+        use windlass_types::AlertPriority;
 
         let mut machine = machine();
 
@@ -1591,12 +1650,26 @@ mod tests {
             }),
         );
 
-        assert_eq!(
-            out.actions,
-            vec![WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)],
-            "BelowFloor must emit exactly one EvictOneForDiskPressure command"
+        // §36 step 4: BelowFloor emits EvictOneForDiskPressure + Warning
+        // alert ("Low disk space"); publishes an Activity message.
+        assert_eq!(out.actions.len(), 2, "evict + Warning alert");
+        assert!(
+            out.actions.iter().any(|a| matches!(
+                a,
+                WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)
+            )),
+            "BelowFloor must emit EvictOneForDiskPressure"
         );
-        assert_eq!(out.actions.len(), 1, "exactly one action expected");
+        assert!(
+            out.actions.iter().any(|a| matches!(
+                a,
+                WindlassAction::SendAlert {
+                    priority: AlertPriority::Warning,
+                    ..
+                }
+            )),
+            "BelowFloor must emit Warning alert"
+        );
         assert_eq!(
             out.publish.len(),
             1,
@@ -2463,6 +2536,8 @@ mod prop_tests {
             (any_vpn_port(), any::<u32>()).prop_map(|(port, attempts)| {
                 QbitPublish::ListenPortPersistentFailure { port, attempts }
             }),
+            prop::collection::vec(any_torrent_hash(), 1..=4)
+                .prop_map(|hashes| QbitPublish::NewTorrentsAdded { hashes }),
         ]
     }
 
@@ -2601,19 +2676,32 @@ mod prop_tests {
         // AboveFloor → no actions, no publishes.
         // Total invariant.
         #[test]
-        fn disk_below_floor_produces_exactly_one_evict_and_one_activity(
+        fn disk_below_floor_produces_evict_warning_and_activity(
             mut machine in any_windlass_machine(),
             free_bytes in any::<u64>(),
         ) {
             use windlass_disk_core::DiskPublish;
+            use windlass_types::AlertPriority;
             let out = machine.handle(
                 Instant::now(),
                 Timed::now(WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes })),
             );
-            prop_assert_eq!(out.actions.len(), 1);
+            // §36 step 4: BelowFloor now emits 2 actions (evict + Warning
+            // alert) and 1 Activity publish.
+            prop_assert_eq!(out.actions.len(), 2);
             prop_assert!(
-                matches!(out.actions[0], WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)),
-                "BelowFloor must emit exactly one EvictOneForDiskPressure"
+                out.actions.iter().any(|a| matches!(
+                    a,
+                    WindlassAction::Qbit(QbitCommand::EvictOneForDiskPressure)
+                )),
+                "BelowFloor must emit EvictOneForDiskPressure"
+            );
+            prop_assert!(
+                out.actions.iter().any(|a| matches!(
+                    a,
+                    WindlassAction::SendAlert { priority: AlertPriority::Warning, .. }
+                )),
+                "BelowFloor must emit Warning alert"
             );
             prop_assert_eq!(out.publish.len(), 1);
             prop_assert!(

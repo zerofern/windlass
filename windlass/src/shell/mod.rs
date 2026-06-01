@@ -3,6 +3,7 @@ mod compliance;
 mod config;
 mod db_shell;
 mod dequeue;
+mod disk_shell;
 mod docker_shell;
 mod domain_shell;
 mod download;

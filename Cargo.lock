@@ -3212,6 +3212,7 @@ dependencies = [
  "windlass-db",
  "windlass-db-core",
  "windlass-debug",
+ "windlass-disk-core",
  "windlass-docker-core",
  "windlass-domain-core",
  "windlass-local",

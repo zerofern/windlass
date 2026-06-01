@@ -18,6 +18,7 @@ use windlass_local::{docker, vpn_files};
 use windlass_types::{VpnPort, WakeupId};
 
 use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand, DbMachine, DbPublish, DbTopic};
+use windlass_disk_core::{DiskConfig, DiskMachine, DiskPublish, DiskTopic};
 use windlass_docker_core::{DockerConfig, DockerMachine};
 use windlass_domain_core::{
     WindlassConfig, WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic,
@@ -29,6 +30,7 @@ use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
 use super::db_shell::DbShell;
+use super::disk_shell::DiskShell;
 use super::docker_shell::{DockerShell, DockerShellConfig};
 use super::domain_shell::{DomainShell, DomainShellConfig};
 use super::mam_shell::MamShell;
@@ -180,6 +182,26 @@ pub(super) async fn init_shell(
             docker_pub_tx,
         ))
         .expect("docker pub subscription");
+
+    // §36 step 4: spawn DiskShell + DiskMachine.  DiskShell has no
+    // actions; events arrive via the service-events bridge from
+    // `Event::DiskSpaceObserved`.  Domain DOM-9 consumes
+    // `DiskPublish::BelowFloor` to fire the Warning alert and trigger
+    // disk-pressure eviction.
+    let (disk_handles, _disk_join) = windlass_machine::spawn::<DiskMachine, DiskShell>(
+        // 50 GiB hard floor — mirrors the legacy threshold so the alert
+        // and eviction trigger at the same point.
+        DiskConfig {
+            hard_floor_bytes: 50 * 1_073_741_824,
+        },
+        (),
+    )
+    .await;
+    let (disk_pub_tx, mut disk_pub_rx) = mpsc::channel::<DiskPublish>(128);
+    disk_handles
+        .subscribe
+        .send((vec![DiskTopic::Pressure], disk_pub_tx))
+        .expect("disk pub subscription");
 
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         VpnConfig {
@@ -375,6 +397,19 @@ pub(super) async fn init_shell(
         });
     }
 
+    // ── Disk forwarder task ───────────────────────────────────────────────────
+    // §36 step 4: drains DiskMachine publishes (BelowFloor / AboveFloor)
+    // and injects them into the domain event channel.  Domain DOM-9
+    // handles the Warning alert + eviction.
+    {
+        let domain_ev_tx = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(publish) = disk_pub_rx.recv().await {
+                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Disk(publish)));
+            }
+        });
+    }
+
     // ── DB forwarder task ─────────────────────────────────────────────────────
     // Drains DB publishes.  Failures other than `RecordActivity` are forwarded to
     // the domain event channel as `WindlassEvent::DbFailed`.  `RecordActivity`
@@ -442,6 +477,7 @@ pub(super) async fn init_shell(
         vpn_handles,
         qbit_handles,
         mam_handles,
+        disk_handles,
         forwarded_port,
     );
     let execute_service_actions = config.execute_service_actions;

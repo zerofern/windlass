@@ -4,6 +4,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use windlass_core::events::Event;
 use windlass_db_core::DbMachine;
+use windlass_disk_core::DiskMachine;
 use windlass_domain_core::WindlassMachine;
 use windlass_machine::{Command, ServiceHandles, Timed};
 use windlass_mam_core::MamMachine;
@@ -28,6 +29,7 @@ pub(super) struct ServiceCores {
     vpn: ServiceHandles<VpnMachine>,
     qbit: ServiceHandles<QbitMachine>,
     mam: ServiceHandles<MamMachine>,
+    disk: ServiceHandles<DiskMachine>,
     /// Cached forwarded port, shared with the VPN forwarder task.
     /// Updated by the VPN forwarder on PortReady/PortUnavailable/Disconnected.
     /// Read synchronously by `observe` via the legacy event bridge so that
@@ -44,6 +46,7 @@ impl ServiceCores {
         vpn: ServiceHandles<VpnMachine>,
         qbit: ServiceHandles<QbitMachine>,
         mam: ServiceHandles<MamMachine>,
+        disk: ServiceHandles<DiskMachine>,
         forwarded_port: Arc<Mutex<Option<VpnPort>>>,
     ) -> Self {
         Self {
@@ -52,6 +55,7 @@ impl ServiceCores {
             vpn,
             qbit,
             mam,
+            disk,
             forwarded_port,
         }
     }
@@ -89,6 +93,9 @@ impl ServiceCores {
             ServiceEvent::Mam(event) => {
                 let _ = self.mam.events.send(Timed::new(now, event));
             }
+            ServiceEvent::Disk(event) => {
+                let _ = self.disk.events.send(Timed::new(now, event));
+            }
         }
     }
 }
@@ -100,6 +107,7 @@ mod tests {
 
     use tokio::sync::mpsc;
     use windlass_db_core::{DbEvent, DbMachine, DbPublish};
+    use windlass_disk_core::DiskMachine;
     use windlass_domain_core::{WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic};
     use windlass_machine::{Command, ServiceHandles, Timed};
     use windlass_mam_core::{MamEvent, MamMachine};
@@ -161,6 +169,23 @@ mod tests {
         )
     }
 
+    fn make_disk_handles() -> (
+        ServiceHandles<DiskMachine>,
+        mpsc::UnboundedReceiver<Timed<windlass_disk_core::DiskEvent>>,
+    ) {
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Timed<windlass_disk_core::DiskEvent>>();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Command<DiskMachine>>();
+        let (sub_tx, _sub_rx) = mpsc::unbounded_channel();
+        (
+            ServiceHandles {
+                events: ev_tx,
+                commands: cmd_tx,
+                subscribe: sub_tx,
+            },
+            ev_rx,
+        )
+    }
+
     fn make_mam_handles() -> (
         ServiceHandles<MamMachine>,
         mpsc::UnboundedReceiver<Command<MamMachine>>,
@@ -205,6 +230,7 @@ mod tests {
         let (vpn_handles, _vpn_ev_rx) = make_vpn_handles();
         let (qbit_handles, _qbit_cmd_rx) = make_qbit_handles();
         let (mam_handles, _mam_cmd_rx) = make_mam_handles();
+        let (disk_handles, _disk_ev_rx) = make_disk_handles();
         let forwarded_port = Arc::new(Mutex::new(None));
         let cores = ServiceCores::new(
             domain_handles,
@@ -212,6 +238,7 @@ mod tests {
             vpn_handles,
             qbit_handles,
             mam_handles,
+            disk_handles,
             Arc::clone(&forwarded_port),
         );
         (cores, domain_ev_rx, forwarded_port)

@@ -95,11 +95,23 @@ impl SystemState {
             | Event::MamStatusObserved { .. }
             | Event::MamUnreachable { .. } => Vec::new(),
 
-            // ── Monitoring ────────────────────────────────────────────────────
-            Event::DiskSpaceObserved { space, .. } => handlers::on_disk_space_observed(space),
-            Event::NewTorrentsObserved { torrents, .. } => self.on_new_torrents_observed(torrents),
-            Event::Wakeup { id, .. } => self.on_wakeup(id),
-            Event::MamRateLimitViolation { .. } => handlers::on_mam_rate_limit_violation(),
+            // ── §36 step 4: legacy monitoring handlers retired ────────────────
+            // `service_events.rs` bridges `Event::DiskSpaceObserved` to
+            // `DiskEvent::DiskSpaceObserved` for `DiskMachine`; domain DOM-9
+            // emits the Warning alert and EvictOneForDiskPressure.  The
+            // `Event::NewTorrentsObserved` legacy poll has no new-path
+            // equivalent — QbitMachine's `TorrentRefresh` chain drives the
+            // canonical torrent feed and publishes `NewTorrentsAdded`
+            // (DOM-33 fires the Info alert).  `Event::MamRateLimitViolation`
+            // routes via the bridge to `MamEvent::RateLimited` →
+            // `MamPublish::RateLimited` → DOM-34 (Critical alert).
+            // `Event::Wakeup` is now a no-op: every legacy `WakeupId` has
+            // either a self-driving timer in the relevant core or no
+            // remaining consumer.
+            Event::DiskSpaceObserved { .. }
+            | Event::NewTorrentsObserved { .. }
+            | Event::Wakeup { .. }
+            | Event::MamRateLimitViolation { .. } => Vec::new(),
 
             // ── Compliance ────────────────────────────────────────────────────
             Event::QbitTorrentDetailsReceived { torrents, .. } => {

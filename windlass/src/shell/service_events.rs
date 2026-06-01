@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use windlass_core::events::Event;
+use windlass_disk_core::DiskEvent;
 use windlass_domain_core::WindlassEvent;
 use windlass_mam_core::MamEvent;
 use windlass_qbit_core::QbitEvent;
@@ -12,6 +13,7 @@ pub(super) enum ServiceEvent {
     Vpn(VpnEvent),
     Qbit(QbitEvent),
     Mam(MamEvent),
+    Disk(DiskEvent),
 }
 
 #[allow(clippy::too_many_lines)]
@@ -187,8 +189,18 @@ pub(super) fn legacy_to_service_events(
                 reason: reason.clone(),
             })]
         }
-        Event::DiskSpaceObserved { .. }
-        | Event::NewTorrentsObserved { .. }
+        // §36 step 4: legacy disk-poll feed bridges to DiskMachine.
+        // `Information.get::<byte>()` yields f64; cast to u64 (saturating
+        // at the lower bound — disk free space is non-negative).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Event::DiskSpaceObserved { space, .. } => {
+            use uom::si::information::byte;
+            let free_bytes = space.get::<byte>().max(0.0) as u64;
+            vec![ServiceEvent::Disk(DiskEvent::DiskSpaceObserved {
+                free_bytes,
+            })]
+        }
+        Event::NewTorrentsObserved { .. }
         | Event::LogsDumped { .. }
         | Event::DeleteTorrentRequested { .. }
         | Event::ManualDownloadRequested { .. }
