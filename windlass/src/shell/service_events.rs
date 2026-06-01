@@ -54,7 +54,10 @@ pub(super) fn legacy_to_service_events(
                 cookie: cookie.clone(),
             })]
         }
-        Event::QbitAuthFailed { .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {
+        // §36 step 3: credentials rejection routes to AuthRejected
+        // (Critical alert via domain); transient failures route to
+        // AuthFailed (silent retry).
+        Event::QbitAuthFailed { .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthRejected {
             reason: "qBittorrent rejected credentials".to_string(),
         })],
         Event::QbitConnectionRefused { .. } => vec![ServiceEvent::Qbit(QbitEvent::AuthFailed {

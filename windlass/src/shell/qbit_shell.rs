@@ -29,13 +29,18 @@ impl Shell for QbitShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
+                    // §36 step 3: credentials rejection (`QbitAuthFailed`)
+                    // is a configuration error and routes to `AuthRejected`
+                    // so domain can fire a Critical alert.  Transient
+                    // failures (connection refused, API errors, unexpected
+                    // responses) route to `AuthFailed` for silent retry.
                     let event = match client.authenticate().await {
                         windlass_core::events::Event::QbitAuthSuccess { cookie, .. } => {
                             QbitEvent::AuthSucceeded { cookie }
                         }
                         windlass_core::events::Event::QbitAuthFailed { .. } => {
-                            QbitEvent::AuthFailed {
-                                reason: "credentials rejected".to_string(),
+                            QbitEvent::AuthRejected {
+                                reason: "qBittorrent rejected credentials".to_string(),
                             }
                         }
                         windlass_core::events::Event::QbitConnectionRefused { .. } => {

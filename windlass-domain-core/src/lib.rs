@@ -531,17 +531,91 @@ impl Machine for WindlassMachine {
                 | DockerPublish::LogsDumped { .. },
             ) => Outcome::none(),
             WindlassEvent::Qbit(QbitPublish::Ready) => {
+                // §36 step 3 / DOM-29: rising-edge auth success — emit the
+                // `qbit_authenticated` activity entry that the legacy
+                // `on_qbit_auth_success` produced.  Idempotent
+                // `ServiceStatus::Ready` transitions on every Ready
+                // publish; the activity entry fires only when previously
+                // not Ready.
+                let was_ready = self.state.qbit == ServiceStatus::Ready;
                 self.state.qbit = ServiceStatus::Ready;
-                self.publish_state()
+                let mut out = self.publish_state();
+                if !was_ready {
+                    out.actions
+                        .push(WindlassAction::Db(DbCommand::RecordActivity(
+                            ActivityRecord {
+                                at: chrono::Utc::now(),
+                                source: ActivitySource::Qbit,
+                                action: "authenticated".to_string(),
+                                book_id: None,
+                                detail: None,
+                                metadata: serde_json::json!({}),
+                            },
+                        )));
+                }
+                out
             }
             WindlassEvent::Qbit(QbitPublish::Unavailable { reason }) => {
                 self.state.qbit = ServiceStatus::Degraded;
                 self.publish_state_with_activity(reason)
             }
-            // §29: ListenPortReady drives the qBit-port-synced admission gate.
+            // §36 step 3 / DOM-30: credentials-rejection Critical alert
+            // (ported from legacy `on_qbit_auth_failed`).  qBit will not
+            // auto-recover from bad credentials; the operator must fix
+            // `QBITTORRENT_USER` / `QBITTORRENT_PASS`.
+            WindlassEvent::Qbit(QbitPublish::AuthRejected { reason }) => Outcome {
+                actions: vec![WindlassAction::SendAlert {
+                    priority: AlertPriority::Critical,
+                    title: "qBit auth failed".to_string(),
+                    body: format!(
+                        "🔐 qBittorrent rejected credentials ({reason}). \
+                         Check QBITTORRENT_USER / QBITTORRENT_PASS.",
+                    ),
+                }],
+                publish: Vec::new(),
+            },
+            // §36 step 3 / DOM-31: persistent port-sync failure Warning
+            // (ported from legacy `on_qbit_port_sync_failed` retry-limit
+            // branch).  qBit core has cleared the cookie to force fresh
+            // auth on the next refresh.
+            WindlassEvent::Qbit(QbitPublish::ListenPortPersistentFailure { port, attempts }) => {
+                Outcome {
+                    actions: vec![WindlassAction::SendAlert {
+                        priority: AlertPriority::Warning,
+                        title: "qBit port sync failed".to_string(),
+                        body: format!(
+                            "⚠️ qBittorrent rejecting port {} after {attempts} attempts. \
+                             Forcing re-auth.",
+                            port.into_inner(),
+                        ),
+                    }],
+                    publish: Vec::new(),
+                }
+            }
+            // §29 / §36 step 3 / DOM-32: ListenPortReady drives the qBit-
+            // port-synced admission gate AND emits a rising-edge
+            // `port_synced` activity entry (ported from legacy
+            // `on_qbit_port_sync_success`).
             WindlassEvent::Qbit(QbitPublish::ListenPortReady { port }) => {
+                let was_synced = self.admission.qbit_listen_port == Some(port);
                 self.admission.qbit_listen_port = Some(port);
-                Outcome::none()
+                if was_synced {
+                    Outcome::none()
+                } else {
+                    Outcome {
+                        actions: vec![WindlassAction::Db(DbCommand::RecordActivity(
+                            ActivityRecord {
+                                at: chrono::Utc::now(),
+                                source: ActivitySource::Qbit,
+                                action: "port_synced".to_string(),
+                                book_id: None,
+                                detail: Some(format!("port={}", port.into_inner())),
+                                metadata: serde_json::json!({"port": port.into_inner()}),
+                            },
+                        ))],
+                        publish: Vec::new(),
+                    }
+                }
             }
             // §29: Connectable indicates MAM is healthy for admission.
             WindlassEvent::Mam(MamPublish::Connectable { .. }) => {
@@ -2384,6 +2458,10 @@ mod prop_tests {
             }),
             (any::<u32>(), any::<u32>()).prop_map(|(unsatisfied, limit)| {
                 QbitPublish::UnsatisfiedQuotaApproaching { unsatisfied, limit }
+            }),
+            any::<String>().prop_map(|reason| QbitPublish::AuthRejected { reason }),
+            (any_vpn_port(), any::<u32>()).prop_map(|(port, attempts)| {
+                QbitPublish::ListenPortPersistentFailure { port, attempts }
             }),
         ]
     }

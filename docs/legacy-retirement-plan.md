@@ -237,6 +237,21 @@ because every other check is already in the new cores.
    dispatches now no-op.  `MamMachine` (via the bridge) drives the real
    behaviour; domain DOM-15/16/17/20 cover the alerts.  The legacy
    "NAT frozen" hard-recovery is retired (see §36 step 2 notes).
+3. **qbit.rs** — DONE (2026-06-01).  Legacy `handlers/qbit.rs` deleted;
+   `QbitAuthSuccess / QbitAuthFailed / QbitConnectionRefused /
+   QbitApiError / QbitPortSyncSuccess / QbitPortSyncFailed /
+   QbitPreferencesReceived / QbitPreferencesFailed` dispatches now no-op.
+   QbitMachine gains `QbitEvent::AuthRejected` (credentials-specific),
+   `QbitPublish::AuthRejected` (Critical alert via DOM-30), and
+   `QbitPublish::ListenPortPersistentFailure` (Warning alert via
+   DOM-31, gated by `QbitConfig::max_sync_attempts`).  Domain DOM-29
+   emits the `qbit_authenticated` activity entry on rising-edge
+   `Ready`; DOM-32 emits `port_synced` on rising-edge `ListenPortReady`.
+   `max_active_torrents` reaches the new core via QbitMachine's own
+   `ReadPreferences` action (separate from the legacy event).  Legacy
+   `state.max_active_torrents` stays at default 5; legacy
+   `compliance.rs::check_active_limit` is inert with fewer than 5
+   active torrents until step 7 retires compliance.
 2. **mam.rs** — same shape, slightly larger event set.
 3. **qbit.rs** (excluding compliance-related preferences flow) —
    careful with `on_qbit_preferences_received`; the `max_active_torrents`

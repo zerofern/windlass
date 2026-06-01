@@ -19,6 +19,12 @@ pub struct QbitConfig {
     /// (MAM Rule 2.8).  `0` means the gate is disabled (no limit enforced).
     /// Default for production: 100 (MAM Power User class cap).
     pub unsatisfied_quota_limit: u32,
+    /// §36 step 3 (ported from legacy `QBIT_SYNC_RETRY_LIMIT`): maximum
+    /// number of consecutive `ListenPortSetFailed` events before the
+    /// machine publishes `ListenPortPersistentFailure` (domain alerts
+    /// Warning) and clears the cookie to force re-auth on the next
+    /// refresh.  Default: 3.
+    pub max_sync_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +79,18 @@ pub enum QbitEvent {
     AuthSucceeded {
         cookie: AuthCookie,
     },
+    /// Transient auth failure — connection refused, API error, etc.
+    /// Handled by silent retry with backoff.  Use `AuthRejected` for
+    /// credential rejection.
     AuthFailed {
+        reason: String,
+    },
+    /// §36 step 3 (ported from legacy `on_qbit_auth_failed`):
+    /// qBittorrent rejected our credentials.  Same retry semantics as
+    /// `AuthFailed` but the machine emits a distinct
+    /// `QbitPublish::AuthRejected` so domain can fire a Critical alert
+    /// (qBittorrent will never auto-recover from bad credentials).
+    AuthRejected {
         reason: String,
     },
     PreferencesRead {
@@ -234,6 +251,20 @@ pub enum QbitPublish {
     /// all `false`.  Gives the domain a rising-edge positive signal for the
     /// admission-gate state.
     PrivacyClean,
+    /// §36 step 3: qBittorrent rejected our credentials.  Domain fires a
+    /// Critical alert ("qBit auth failed") so the operator knows to fix
+    /// `QBITTORRENT_USER` / `QBITTORRENT_PASS`.
+    AuthRejected {
+        reason: String,
+    },
+    /// §36 step 3 (ported from legacy `on_qbit_port_sync_failed`):
+    /// `ListenPortSet` has failed `max_sync_attempts` times in a row.  The
+    /// machine clears the cookie (forcing a fresh `Login` on the next
+    /// refresh) and resets the counter.  Domain fires a Warning alert.
+    ListenPortPersistentFailure {
+        port: VpnPort,
+        attempts: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,7 +283,10 @@ pub enum QbitTopic {
 impl HasTopic<QbitTopic> for QbitPublish {
     fn topic(&self) -> QbitTopic {
         match self {
-            Self::Ready | Self::Unavailable { .. } => QbitTopic::Availability,
+            Self::Ready
+            | Self::Unavailable { .. }
+            | Self::AuthRejected { .. }
+            | Self::ListenPortPersistentFailure { .. } => QbitTopic::Availability,
             Self::ListenPortReady { .. } => QbitTopic::ListenPort,
             // `DeadTorrentRemoved` is routed on `Torrents` so the domain's
             // existing `Torrents` subscription delivers it without a new topic.
@@ -308,6 +342,11 @@ pub struct QbitMachine {
     /// also defaults this to `u32::MAX` so bridged events cannot trigger
     /// orchestration on the old code path.
     max_active_torrents: u32,
+    /// §36 step 3: consecutive `ListenPortSetFailed` count.  Resets on a
+    /// successful `ListenPortSet`.  When it hits
+    /// `config.max_sync_attempts` the machine publishes
+    /// `ListenPortPersistentFailure`, clears the cookie, and resets to 0.
+    sync_attempts: u32,
 }
 
 impl QbitMachine {
@@ -578,6 +617,7 @@ impl Machine for QbitMachine {
             // Initialised to MAX so orchestration is disabled until a real
             // PreferencesRead arrives.
             max_active_torrents: u32::MAX,
+            sync_attempts: 0,
         }
     }
 
@@ -628,6 +668,22 @@ impl Machine for QbitMachine {
                 }],
                 publish: vec![QbitPublish::Unavailable { reason }],
             },
+            // §36 step 3: credentials-rejected variant.  Same retry as
+            // `AuthFailed` (qBit may come back if the operator fixes the
+            // credentials live) but the publish carries `AuthRejected` so
+            // domain fires a Critical alert.
+            QbitEvent::AuthRejected { reason } => Outcome {
+                actions: vec![QbitAction::ScheduleTimer {
+                    timer: QbitTimer::AuthRetry,
+                    after: self.config.auth_retry,
+                }],
+                publish: vec![
+                    QbitPublish::Unavailable {
+                        reason: reason.clone(),
+                    },
+                    QbitPublish::AuthRejected { reason },
+                ],
+            },
             QbitEvent::PreferencesRead {
                 listen_port,
                 dht,
@@ -658,11 +714,10 @@ impl Machine for QbitMachine {
 
                 Outcome { actions, publish }
             }
-            // All retryable failures: schedule one SyncRetry, publish Unavailable.
-            // QBIT-5 (PreferencesFailed / ListenPortSetFailed) and QBIT-13
-            // (PrivacySettingsDisableFailed) share this arm because the action is identical.
+            // QBIT-5 / QBIT-13: PreferencesFailed and
+            // PrivacySettingsDisableFailed retry via SyncRetry with no
+            // attempt counter (qBit just needs time to come back).
             QbitEvent::PreferencesFailed { reason }
-            | QbitEvent::ListenPortSetFailed { reason, .. }
             | QbitEvent::PrivacySettingsDisableFailed { reason } => Outcome {
                 actions: vec![QbitAction::ScheduleTimer {
                     timer: QbitTimer::SyncRetry,
@@ -670,8 +725,43 @@ impl Machine for QbitMachine {
                 }],
                 publish: vec![QbitPublish::Unavailable { reason }],
             },
+            // §36 step 3: ListenPortSetFailed has its own arm so we can
+            // track consecutive attempts and surface a persistent-failure
+            // signal at the configured threshold.  Below the threshold:
+            // retry silently like the other QBIT-5 arms.  At the
+            // threshold: publish ListenPortPersistentFailure (domain
+            // fires a Warning alert), clear the cookie (forces fresh
+            // Login on the next refresh), and reset the counter.
+            QbitEvent::ListenPortSetFailed { port, reason } => {
+                self.sync_attempts = self.sync_attempts.saturating_add(1);
+                let max = self.config.max_sync_attempts;
+                if max > 0 && self.sync_attempts >= max {
+                    let attempts = self.sync_attempts;
+                    self.sync_attempts = 0;
+                    self.cookie = None;
+                    Outcome {
+                        actions: vec![QbitAction::ScheduleTimer {
+                            timer: QbitTimer::AuthRetry,
+                            after: self.config.auth_retry,
+                        }],
+                        publish: vec![
+                            QbitPublish::Unavailable { reason },
+                            QbitPublish::ListenPortPersistentFailure { port, attempts },
+                        ],
+                    }
+                } else {
+                    Outcome {
+                        actions: vec![QbitAction::ScheduleTimer {
+                            timer: QbitTimer::SyncRetry,
+                            after: self.config.sync_retry,
+                        }],
+                        publish: vec![QbitPublish::Unavailable { reason }],
+                    }
+                }
+            }
             QbitEvent::ListenPortSet { port } => {
                 self.listen_port = Some(port);
+                self.sync_attempts = 0;
                 // Route through the desired-port filter so QBIT-4 holds for any
                 // event, not just well-formed shell events. (Story 18.)
                 Outcome {
@@ -851,6 +941,7 @@ mod tests {
                 torrent_refresh: Duration::from_secs(30),
                 hnr_seed_time: HNR_SEED_TIME,
                 unsatisfied_quota_limit: 0,
+                max_sync_attempts: 3,
             },
             Instant::now(),
         )
@@ -1951,6 +2042,7 @@ mod tests {
                 torrent_refresh: Duration::from_secs(30),
                 hnr_seed_time: HNR_SEED_TIME,
                 unsatisfied_quota_limit: limit,
+                max_sync_attempts: 3,
             },
             Instant::now(),
         )
@@ -2243,6 +2335,7 @@ mod prop_tests {
                             torrent_refresh: Duration::from_secs(30),
                             hnr_seed_time: Duration::from_secs(72 * 3600),
                             unsatisfied_quota_limit,
+                            max_sync_attempts: 3,
                         },
                         Instant::now(),
                     );
@@ -2263,6 +2356,7 @@ mod prop_tests {
             Just(QbitEvent::Init),
             any_auth_cookie().prop_map(|cookie| QbitEvent::AuthSucceeded { cookie }),
             any::<String>().prop_map(|reason| QbitEvent::AuthFailed { reason }),
+            any::<String>().prop_map(|reason| QbitEvent::AuthRejected { reason }),
             (
                 proptest::option::of(any_vpn_port()),
                 any::<bool>(),

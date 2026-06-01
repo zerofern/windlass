@@ -220,6 +220,9 @@ pub(super) async fn init_shell(
             // Set to 0 to disable the gate (e.g. for lower-class accounts where
             // the real limit is unknown; operators should set this explicitly).
             unsatisfied_quota_limit: 100,
+            // §36 step 3: 3 consecutive port-sync failures trip the
+            // persistent-failure publish (Warning alert + cookie clear).
+            max_sync_attempts: 3,
         },
         qbit.clone(),
     )

@@ -60,12 +60,26 @@ impl SystemState {
             | Event::LogsDumped { .. }
             | Event::DockerGluetunHealthy { .. }
             | Event::PortFileReadResult { .. } => Vec::new(),
-            Event::QbitAuthSuccess { cookie, .. } => self.on_qbit_auth_success(cookie),
-            Event::QbitConnectionRefused { .. } => self.on_qbit_connection_refused(),
-            Event::QbitAuthFailed { .. } => self.on_qbit_auth_failed(),
-            Event::QbitApiError { code, .. } => self.on_qbit_api_error(code),
-            Event::QbitPortSyncSuccess { .. } => self.on_qbit_port_sync_success(),
-            Event::QbitPortSyncFailed { code, .. } => self.on_qbit_port_sync_failed(code),
+            // ── §36 step 3: legacy qBit handlers retired ──────────────────────
+            // `service_events.rs` translates these events into
+            // `QbitEvent::AuthSucceeded / AuthFailed / AuthRejected /
+            // ListenPortSet / ListenPortSetFailed / PreferencesRead /
+            // PreferencesFailed` for `QbitMachine`.  Credentials-rejection
+            // Critical alert: domain DOM-30 on `QbitPublish::AuthRejected`.
+            // Port-sync persistent-failure Warning: domain DOM-31 on
+            // `QbitPublish::ListenPortPersistentFailure`.  Activity
+            // entries (`qbit_authenticated`, `port_synced`): domain
+            // DOM-29/DOM-32 rising-edge on Ready / ListenPortReady.
+            // `max_active_torrents` arrives via QbitMachine's own
+            // `ReadPreferences` action and is stored on the machine —
+            // separate from the legacy event and not affected by this
+            // retirement.
+            Event::QbitAuthSuccess { .. }
+            | Event::QbitConnectionRefused { .. }
+            | Event::QbitAuthFailed { .. }
+            | Event::QbitApiError { .. }
+            | Event::QbitPortSyncSuccess { .. }
+            | Event::QbitPortSyncFailed { .. } => Vec::new(),
 
             // ── §36 step 2: legacy MAM handlers retired ───────────────────────
             // `service_events.rs` translates these events into
@@ -91,11 +105,17 @@ impl SystemState {
             Event::QbitTorrentDetailsReceived { torrents, .. } => {
                 self.on_qbit_torrent_details_received(torrents)
             }
-            Event::QbitPreferencesReceived {
-                max_active_torrents,
-                ..
-            } => self.on_qbit_preferences_received(max_active_torrents),
-            Event::QbitPreferencesFailed { .. } => Vec::new(),
+            // §36 step 3: legacy `state.max_active_torrents` updates
+            // retired.  `QbitMachine` reads max_active_torrents from its
+            // own `ReadPreferences` action.  Legacy `compliance.rs::
+            // check_active_limit` will see `state.max_active_torrents = 5`
+            // (SystemState::initial default) until compliance.rs is
+            // retired in §36 step 7; in practice this means legacy
+            // queue orchestration is inert with fewer than 5 active
+            // torrents — the new core's QBIT-14/15/16 path is authoritative.
+            Event::QbitPreferencesReceived { .. } | Event::QbitPreferencesFailed { .. } => {
+                Vec::new()
+            }
             Event::DeleteTorrentRequested { hash, .. } => self.on_delete_torrent_requested(hash),
 
             // ── Manual download ───────────────────────────────────────────────
