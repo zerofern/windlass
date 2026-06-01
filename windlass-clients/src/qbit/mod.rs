@@ -5,7 +5,10 @@ mod types;
 mod write;
 
 pub use client::QbitClient;
-pub use types::{QbitPreferences, QbitTorrentDetails, QbitTorrentState, parse_mam_id};
+pub use types::{
+    QbitAuthResult, QbitPortSyncResult, QbitPreferences, QbitTorrentDetails, QbitTorrentState,
+    parse_mam_id,
+};
 
 #[cfg(test)]
 mod tests;

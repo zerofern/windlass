@@ -26,9 +26,9 @@ fn make_client() -> QbitClient {
 
 async fn authenticated_clean_client() -> (QbitClient, AuthCookie) {
     let client = make_client();
-    let event = client.authenticate().await;
-    let windlass_core::events::Event::QbitAuthSuccess { cookie, .. } = event else {
-        panic!("auth failed");
+    let result = client.authenticate().await;
+    let windlass_clients::qbit::QbitAuthResult::Success(cookie) = result else {
+        panic!("auth failed: {result:?}");
     };
     clear_torrents(&client, &cookie).await;
     (client, cookie)
@@ -46,10 +46,10 @@ async fn clear_torrents(client: &QbitClient, cookie: &AuthCookie) {
 #[ignore = "requires qbit integration stack"]
 async fn authenticate_succeeds() {
     let client = make_client();
-    let event = client.authenticate().await;
+    let result = client.authenticate().await;
     assert!(
-        matches!(event, windlass_core::events::Event::QbitAuthSuccess { .. }),
-        "expected auth success, got {event:?}"
+        matches!(result, windlass_clients::qbit::QbitAuthResult::Success(_)),
+        "expected auth success, got {result:?}"
     );
 }
 

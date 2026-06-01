@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use windlass_clients::mam::{MamClient, MamFetchError};
+use windlass_clients::mam::{MamClient, MamFetchError, MamSeedboxResult};
 use windlass_machine::{Shell, Timed};
 use windlass_mam_core::{MamAction, MamEvent};
 
@@ -50,41 +50,30 @@ impl Shell for MamShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
+                    // §36 step 9a: typed result direct from the client —
+                    // shell maps each variant to the matching MamEvent.
                     let event = match client.update_seedbox().await {
-                        // §32: forward the registered IP/ASN/AS the legacy
-                        // event carries so the MAM core can dedup further
-                        // updates against MAM's view of "what's registered".
-                        windlass_core::events::Event::MamUpdateSuccess {
+                        MamSeedboxResult::Success {
                             registered_ip,
                             registered_asn,
                             registered_as,
-                            ..
                         } => MamEvent::SeedboxUpdated {
                             registered_ip,
                             registered_asn,
                             registered_as,
                         },
-                        windlass_core::events::Event::MamRateLimitViolation { .. } => {
-                            MamEvent::RateLimited {
-                                retry_after: Duration::from_secs(1),
-                            }
-                        }
-                        // §30: ASN mismatch is a distinct compliance signal,
-                        // not a generic SeedboxUpdateFailed.  The MAM core
-                        // tracks it via AsnState and the domain blocks
-                        // admission + raises a Critical alert.
-                        windlass_core::events::Event::MamAsnMismatch { ip, .. } => {
-                            MamEvent::AsnMismatch { ip }
-                        }
-                        // §28: a transport-level failure now arrives as a
-                        // distinct event instead of being silently mapped to
-                        // SeedboxUpdateFailed.
-                        windlass_core::events::Event::MamUnreachable { reason, .. } => {
+                        MamSeedboxResult::RateLimited => MamEvent::RateLimited {
+                            retry_after: Duration::from_secs(1),
+                        },
+                        // §30: ASN mismatch is a distinct compliance signal.
+                        MamSeedboxResult::AsnMismatch { ip } => MamEvent::AsnMismatch { ip },
+                        // §28: transport-level failure routes as Unreachable.
+                        MamSeedboxResult::Unreachable { reason } => {
                             MamEvent::Unreachable { reason }
                         }
-                        other => MamEvent::SeedboxUpdateFailed {
-                            reason: format!("unexpected response: {other:?}"),
-                        },
+                        MamSeedboxResult::Failed { reason } => {
+                            MamEvent::SeedboxUpdateFailed { reason }
+                        }
                     };
                     let _ = tx.send(Timed::now(event));
                 });

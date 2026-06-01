@@ -277,6 +277,18 @@ because every other check is already in the new cores.
    torrent names; `/api/v1/torrents` (Torrent Monitor UI) keeps
    reading the same table.
 
+9a. **windlass-clients typed returns** — DONE (2026-06-01).
+    `QbitClient::authenticate` / `sync_port` return new
+    `QbitAuthResult` / `QbitPortSyncResult` enums in `qbit/types.rs`;
+    `MamClient::update_seedbox` returns new `MamSeedboxResult` enum.
+    `HttpObserver` moved from `windlass-core` to `windlass-types`.
+    Dead methods removed: `QbitClient::list_torrents` (legacy torrent
+    poll) and `MamClient::check_connectability` (legacy heartbeat).
+    `windlass-core` dep dropped from `windlass-clients/Cargo.toml`.
+    qbit_shell + mam_shell updated to consume typed results; 4
+    list_torrents tests + 7 check_connectability tests deleted; 1
+    test renamed to reflect the honest parse-failure behaviour.
+
 8. **Drop the shadow** — DONE (2026-06-01).  The shell event loop no
    longer runs `process_legacy_event` or `dispatch_event`.  The loop
    now reads each event, sends it through `service_cores.observe` (the

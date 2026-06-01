@@ -1,19 +1,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
-use chrono::Utc;
-use serde::Deserialize;
 use tracing::{debug, warn};
 
-use windlass_core::HttpObserver;
-use windlass_core::events::Event;
-use windlass_types::{AuthCookie, HttpExchange, HttpStatusCode, TorrentName, VpnPort};
+use windlass_types::{AuthCookie, HttpExchange, HttpObserver, VpnPort};
 
-use super::types::{QbitPreferences, QbitTorrentDetails, QbitTorrentState};
-
-#[derive(Deserialize)]
-struct TorrentInfo {
-    name: String,
-}
+use super::types::{
+    QbitAuthResult, QbitPortSyncResult, QbitPreferences, QbitTorrentDetails, QbitTorrentState,
+};
 
 /// Wraps a `reqwest::Client` together with the qBittorrent connection details.
 /// All qBittorrent operations are methods so call sites only pass `&self`.
@@ -62,8 +55,10 @@ impl QbitClient {
         });
     }
 
-    /// Authenticates with qBittorrent and returns the SID cookie on success.
-    pub async fn authenticate(&self) -> Event {
+    /// Authenticates with qBittorrent.  §36 step 9a: returns a typed
+    /// `QbitAuthResult` so the shell can map to `QbitEvent::AuthSucceeded /
+    /// AuthFailed / AuthRejected` without depending on legacy core types.
+    pub async fn authenticate(&self) -> QbitAuthResult {
         let url = format!("{}/api/v2/auth/login", self.base_url);
         match self
             .client
@@ -76,10 +71,10 @@ impl QbitClient {
             .await
         {
             Err(e) => {
-                // Connection refused is normal during container startup — report as
-                // ConnectionRefused so the Core can retry silently without alerting.
+                // Connection refused is normal during container startup —
+                // shell retries silently without alerting.
                 debug!("qBit auth request failed (connection): {e}");
-                Event::QbitConnectionRefused { at: Utc::now() }
+                QbitAuthResult::ConnectionRefused
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -90,29 +85,24 @@ impl QbitClient {
                 if status.is_success() && (body.trim() == "Ok." || body.trim().is_empty()) {
                     let Some(cookie) = sid else {
                         warn!("qBit auth: ok status but no SID cookie in response");
-                        return Event::QbitAuthFailed { at: Utc::now() };
+                        return QbitAuthResult::Rejected;
                     };
                     debug!("qBit auth success");
-                    return Event::QbitAuthSuccess {
-                        at: Utc::now(),
-                        cookie: AuthCookie::new(cookie),
-                    };
+                    return QbitAuthResult::Success(AuthCookie::new(cookie));
                 }
                 if body.trim() == "Fails." {
                     warn!("qBit auth: credentials rejected (Fails.)");
-                    return Event::QbitAuthFailed { at: Utc::now() };
+                    return QbitAuthResult::Rejected;
                 }
                 warn!("qBit auth unexpected response: status={status}, body={body:?}");
-                Event::QbitApiError {
-                    at: Utc::now(),
-                    code: HttpStatusCode(status.as_u16()),
-                }
+                QbitAuthResult::ApiError(status.as_u16())
             }
         }
     }
 
     /// Updates qBittorrent's listen port via the preferences API.
-    pub async fn sync_port(&self, cookie: &AuthCookie, port: VpnPort) -> Event {
+    /// §36 step 9a: returns typed `QbitPortSyncResult`.
+    pub async fn sync_port(&self, cookie: &AuthCookie, port: VpnPort) -> QbitPortSyncResult {
         let url = format!("{}/api/v2/app/setPreferences", self.base_url);
         let req_body = format!(r#"{{"listen_port":"{}"}}"#, port.into_inner());
         match self
@@ -128,10 +118,7 @@ impl QbitClient {
         {
             Err(e) => {
                 warn!("qBit port sync request failed: {e}");
-                Event::QbitPortSyncFailed {
-                    at: Utc::now(),
-                    code: HttpStatusCode(0),
-                }
+                QbitPortSyncResult::Failed(0)
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -139,45 +126,12 @@ impl QbitClient {
                 self.emit_http("POST", &url, Some(req_body), status.as_u16(), &body);
                 if status.is_success() {
                     debug!("qBit port sync success");
-                    Event::QbitPortSyncSuccess { at: Utc::now() }
+                    QbitPortSyncResult::Success
                 } else {
                     warn!("qBit port sync failed: status={status}");
-                    Event::QbitPortSyncFailed {
-                        at: Utc::now(),
-                        code: HttpStatusCode(status.as_u16()),
-                    }
+                    QbitPortSyncResult::Failed(status.as_u16())
                 }
             }
-        }
-    }
-
-    /// Fetches the current list of torrent names from qBittorrent.
-    ///
-    /// Returns an empty vec on error rather than propagating — the torrent
-    /// checker treats an empty result as "no new torrents" and reschedules.
-    pub async fn list_torrents(&self, cookie: &AuthCookie) -> Vec<TorrentName> {
-        let url = format!("{}/api/v2/torrents/info", self.base_url);
-        match self
-            .client
-            .get(&url)
-            .header(
-                reqwest::header::COOKIE,
-                format!("SID={}", cookie.expose_secret()),
-            )
-            .send()
-            .await
-        {
-            Err(e) => {
-                warn!("Failed to list torrents: {e}");
-                vec![]
-            }
-            Ok(resp) => match resp.json::<Vec<TorrentInfo>>().await {
-                Ok(torrents) => torrents.into_iter().map(|t| TorrentName(t.name)).collect(),
-                Err(e) => {
-                    warn!("Failed to parse torrent list: {e}");
-                    vec![]
-                }
-            },
         }
     }
 

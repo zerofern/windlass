@@ -4,7 +4,14 @@ use nutype::nutype;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// §36 step 9a: type-erased HTTP-observation callback used to feed the
+/// debug exchange channel.  Moved here from `windlass_core::observation`
+/// so the qBit + MAM clients don't need to depend on the legacy core
+/// crate.
+pub type HttpObserver = Arc<dyn Fn(HttpExchange) + Send + Sync>;
 pub use uom::si::f64::Information;
 
 // ── IPs ──────────────────────────────────────────────────────────────────────

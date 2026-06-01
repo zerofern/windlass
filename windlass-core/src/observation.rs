@@ -1,13 +1,10 @@
-use std::sync::Arc;
-
 use crate::types::SystemState;
 use serde::Serialize;
-use windlass_types::HttpExchange;
 
-/// Type-erased callback for HTTP observation. Injected into clients at
-/// construction; the implementation in `windlass-debug` routes to the debug
-/// exchange channel when debug mode is active.
-pub type HttpObserver = Arc<dyn Fn(HttpExchange) + Send + Sync>;
+/// §36 step 9a: re-export so existing call sites in `windlass-debug` and
+/// the legacy shell wiring keep working; the canonical definition lives
+/// in `windlass-types` so the clients can drop the legacy-core dep.
+pub use windlass_types::HttpObserver;
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", content = "data")]

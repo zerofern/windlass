@@ -1,13 +1,31 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::bail;
-use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use windlass_core::HttpObserver;
-use windlass_core::events::Event;
-use windlass_types::{HttpExchange, MamStatus, VpnIp};
+use windlass_types::{HttpExchange, HttpObserver, VpnIp};
+
+/// §36 step 9a: typed result for `MamClient::update_seedbox`.  Replaces
+/// the legacy `windlass_core::Event::Mam*` shape so the shell can map
+/// to `MamEvent` without depending on legacy core types.
+#[derive(Debug, Clone)]
+pub enum MamSeedboxResult {
+    Success {
+        registered_ip: Option<VpnIp>,
+        registered_asn: Option<u32>,
+        registered_as: Option<String>,
+    },
+    /// MAM rejected the update with an ASN mismatch (§30).
+    AsnMismatch { ip: VpnIp },
+    /// Transport-level failure — DNS / TCP / TLS / timeout.
+    Unreachable { reason: String },
+    /// MAM's documented 1-hour rolling rate limit, or the operator's
+    /// 400ms inter-request guard.
+    RateLimited,
+    /// MAM responded with an error (non-1.0 IP/port, etc.).
+    Failed { reason: String },
+}
 
 #[derive(Deserialize)]
 struct DynamicSeedboxResponse {
@@ -309,27 +327,28 @@ impl MamClient {
     }
 
     /// Registers the current VPN IP with MAM via the dynamic seedbox endpoint.
+    /// §36 step 9a: returns typed `MamSeedboxResult`.
     ///
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
-    pub async fn update_seedbox(&self) -> Event {
+    pub async fn update_seedbox(&self) -> MamSeedboxResult {
         // §32: enforce MAM's documented 1-hour rolling rate limit
         // client-side.  Without this guard our retry/heartbeat paths can
         // hit the dynamic-seedbox endpoint repeatedly during normal
         // operation and accumulate `Last change too recent` rejections.
         if !self.check_seedbox_call_rate_limit() {
             warn!("MAM dynamic-seedbox 1h client-side rate limit triggered");
-            return Event::MamRateLimitViolation { at: Utc::now() };
+            return MamSeedboxResult::RateLimited;
         }
         if !self.check_rate_limit() {
-            return Event::MamRateLimitViolation { at: Utc::now() };
+            return MamSeedboxResult::RateLimited;
         }
         let current = self.session.lock().unwrap().clone();
-        let (event, new_session) = self.do_update_seedbox(&current).await;
+        let (result, new_session) = self.do_update_seedbox(&current).await;
         if let Some(rotated) = new_session {
             *self.session.lock().unwrap() = rotated;
         }
-        event
+        result
     }
 
     /// Fetches the MAM status and returns a typed result carrying connectivity,
@@ -428,25 +447,9 @@ impl MamClient {
         }
     }
 
-    /// Checks whether MAM reports the seedbox as connectable.
-    ///
-    /// # Panics
-    /// Panics if the internal session mutex is poisoned.
-    pub async fn check_connectability(&self) -> Event {
-        if !self.check_rate_limit() {
-            return Event::MamRateLimitViolation { at: Utc::now() };
-        }
-        let current = self.session.lock().unwrap().clone();
-        let (event, new_session) = self.do_check_connectability(&current).await;
-        if let Some(rotated) = new_session {
-            *self.session.lock().unwrap() = rotated;
-        }
-        event
-    }
-
     /// Returns `true` if the request can proceed (≥400ms since last request).
-    /// Returns `false` if the guard triggers — a `MamRateLimitViolation` event
-    /// will be emitted by the caller.
+    /// Returns `false` if the guard triggers — caller surfaces the rate-
+    /// limit hit via the typed result.
     fn check_rate_limit(&self) -> bool {
         let mut last = self.last_request_at.lock().unwrap();
         if let Some(t) = *last
@@ -484,7 +487,7 @@ impl MamClient {
         });
     }
 
-    async fn do_update_seedbox(&self, session: &str) -> (Event, Option<String>) {
+    async fn do_update_seedbox(&self, session: &str) -> (MamSeedboxResult, Option<String>) {
         let result = self
             .client
             .get(&self.seedbox_url)
@@ -496,18 +499,11 @@ impl MamClient {
 
         match result {
             // §28: a transport-level failure means we did not reach MAM at
-            // all.  Previously this returned `MamUpdateSuccess` (an obvious
-            // lie that made the operator look healthy during DNS/TLS outages).
+            // all.
             Err(e) => {
                 let reason = e.to_string();
                 warn!("MAM seedbox update request failed: {reason}");
-                (
-                    Event::MamUnreachable {
-                        at: Utc::now(),
-                        reason,
-                    },
-                    new_session,
-                )
+                (MamSeedboxResult::Unreachable { reason }, new_session)
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -516,12 +512,13 @@ impl MamClient {
                 match serde_json::from_str::<DynamicSeedboxResponse>(&raw) {
                     Err(e) => {
                         warn!("MAM seedbox response parse failed: {e}");
+                        // Parse failure is treated as a generic Failed
+                        // (pre-§36 the legacy event was an unhelpful
+                        // success — the typed path now surfaces it
+                        // honestly).
                         (
-                            Event::MamUpdateSuccess {
-                                at: Utc::now(),
-                                registered_ip: None,
-                                registered_asn: None,
-                                registered_as: None,
+                            MamSeedboxResult::Failed {
+                                reason: format!("parse error: {e}"),
                             },
                             new_session,
                         )
@@ -532,13 +529,12 @@ impl MamClient {
                             body.ip.trim().parse::<std::net::Ipv4Addr>().ok().map(VpnIp);
                         let registered_asn = (body.asn != 0).then_some(body.asn);
                         let registered_as = (!body.as_org.is_empty()).then(|| body.as_org.clone());
-                        // §30: ASN mismatch routed as a distinct compliance
-                        // signal (typed match — was substring-matching).
+                        // §30: ASN mismatch is a distinct compliance signal.
                         if msg == DynamicSeedboxMsg::InvalidSessionAsnMismatch {
                             let ip =
                                 registered_ip.unwrap_or(VpnIp(std::net::Ipv4Addr::UNSPECIFIED));
                             warn!("MAM ASN mismatch: ip={}", ip.0);
-                            return (Event::MamAsnMismatch { at: Utc::now(), ip }, new_session);
+                            return (MamSeedboxResult::AsnMismatch { ip }, new_session);
                         }
                         if body.success {
                             info!(
@@ -553,89 +549,12 @@ impl MamClient {
                         }
                         // §32: regardless of `Success`, MAM returns the IP
                         // it currently has registered — carry it through so
-                        // the MAM core can dedup against it.  Failures still
-                        // surface as `MamUpdateSuccess` here for now (matches
-                        // pre-§32 behaviour); future work can distinguish.
+                        // the MAM core can dedup against it.
                         (
-                            Event::MamUpdateSuccess {
-                                at: Utc::now(),
+                            MamSeedboxResult::Success {
                                 registered_ip,
                                 registered_asn,
                                 registered_as,
-                            },
-                            new_session,
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    async fn do_check_connectability(&self, session: &str) -> (Event, Option<String>) {
-        let result = self
-            .client
-            .get(&self.load_url)
-            .header(reqwest::header::COOKIE, format!("mam_id={session}"))
-            .send()
-            .await;
-
-        let new_session = result.as_ref().ok().and_then(extract_mam_cookie);
-
-        match result {
-            Err(e) => {
-                warn!("MAM connectivity check request failed: {e}");
-                (
-                    Event::MamStatusObserved {
-                        at: Utc::now(),
-                        status: MamStatus::Unreachable,
-                    },
-                    new_session,
-                )
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    warn!("MAM connectivity check HTTP {}", status);
-                    self.emit_http(&self.load_url, status.as_u16(), "");
-                    return (
-                        Event::MamStatusObserved {
-                            at: Utc::now(),
-                            status: MamStatus::Unreachable,
-                        },
-                        new_session,
-                    );
-                }
-                let raw = resp.text().await.unwrap_or_default();
-                self.emit_http(&self.load_url, status.as_u16(), &raw);
-                match serde_json::from_str::<JsonLoadResponse>(&raw) {
-                    Ok(body) => {
-                        let connectable = body
-                            .connectable
-                            .as_deref()
-                            .is_some_and(|s| s.eq_ignore_ascii_case("yes"));
-                        debug!("MAM connectable={connectable}");
-                        if let Some(ref unsat) = body.unsat {
-                            debug!("MAM unsat: {}/{}", unsat.count, unsat.limit);
-                        }
-                        let mam_status = if connectable {
-                            MamStatus::Connectable
-                        } else {
-                            MamStatus::NotConnectable
-                        };
-                        (
-                            Event::MamStatusObserved {
-                                at: Utc::now(),
-                                status: mam_status,
-                            },
-                            new_session,
-                        )
-                    }
-                    Err(e) => {
-                        warn!("MAM connectivity parse failed: {e}");
-                        (
-                            Event::MamStatusObserved {
-                                at: Utc::now(),
-                                status: MamStatus::Unreachable,
                             },
                             new_session,
                         )
@@ -756,7 +675,7 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
+        assert!(matches!(event, MamSeedboxResult::Success { .. }));
     }
 
     #[tokio::test]
@@ -782,7 +701,7 @@ mod tests {
         .unwrap();
         let event = mam.update_seedbox().await;
         assert!(
-            matches!(event, Event::MamAsnMismatch { ip, .. } if ip.0.to_string() == "79.127.184.201")
+            matches!(&event, MamSeedboxResult::AsnMismatch { ip } if ip.0.to_string() == "79.127.184.201")
         );
     }
 
@@ -838,152 +757,12 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
+        assert!(matches!(event, MamSeedboxResult::Success { .. }));
     }
 
-    // ── check_connectability ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn check_connectability_returns_true_when_connectable_yes() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "connectable": "yes",
-                "username": "BrightVoyage"
-            })))
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let event = mam.check_connectability().await;
-        assert!(matches!(
-            event,
-            Event::MamStatusObserved {
-                status: MamStatus::Connectable,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn check_connectability_returns_false_when_connectable_no() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "connectable": "no",
-                "username": "BrightVoyage"
-            })))
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let event = mam.check_connectability().await;
-        assert!(matches!(
-            event,
-            Event::MamStatusObserved {
-                status: MamStatus::NotConnectable,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn check_connectability_returns_false_when_field_absent() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "username": "BrightVoyage" })),
-            )
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let event = mam.check_connectability().await;
-        assert!(matches!(
-            event,
-            Event::MamStatusObserved {
-                status: MamStatus::NotConnectable,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn check_connectability_rotates_cookie() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .append_header("Set-Cookie", "mam_id=new_cookie; Path=/; HttpOnly")
-                    .set_body_json(serde_json::json!({ "connectable": "yes" })),
-            )
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "old_cookie".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        mam.check_connectability().await;
-        assert_eq!(mam.session_value(), "new_cookie");
-    }
-
-    #[tokio::test]
-    async fn check_connectability_returns_false_on_http_error_status() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let event = mam.check_connectability().await;
-        assert!(matches!(
-            event,
-            Event::MamStatusObserved {
-                status: MamStatus::Unreachable,
-                ..
-            }
-        ));
-    }
+    // §36 step 9a: `check_connectability` deleted (was dead code); its
+    // tests went with it.  Connectability is owned by `fetch_mam_status`
+    // and surfaced through `MamFetchError`.
 
     // ── check_session ─────────────────────────────────────────────────────────
 
@@ -1079,32 +858,7 @@ mod tests {
         mam.update_seedbox().await;
         // Second call immediately after should be rate-limited.
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamRateLimitViolation { .. }));
-    }
-
-    #[tokio::test]
-    async fn check_connectability_rate_limit_returns_violation() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "connectable": "yes" })),
-            )
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        mam.check_connectability().await;
-        let event = mam.check_connectability().await;
-        assert!(matches!(event, Event::MamRateLimitViolation { .. }));
+        assert!(matches!(event, MamSeedboxResult::RateLimited));
     }
 
     // ── do_update_seedbox error paths ─────────────────────────────────────────
@@ -1124,7 +878,7 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUnreachable { .. }));
+        assert!(matches!(event, MamSeedboxResult::Unreachable { .. }));
     }
 
     #[tokio::test]
@@ -1149,11 +903,14 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
+        assert!(matches!(event, MamSeedboxResult::Success { .. }));
     }
 
     #[tokio::test]
-    async fn update_seedbox_unparseable_body_returns_success() {
+    async fn update_seedbox_unparseable_body_returns_failed() {
+        // §36 step 9a: parse failure is now surfaced honestly as
+        // `MamSeedboxResult::Failed` instead of the pre-§36 lie that
+        // returned `Success` with empty registered fields.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
@@ -1170,87 +927,7 @@ mod tests {
         )
         .unwrap();
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, Event::MamUpdateSuccess { .. }));
-    }
-
-    // ── do_check_connectability error paths ───────────────────────────────────
-
-    #[tokio::test]
-    async fn check_connectability_network_error_returns_unreachable() {
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            "http://127.0.0.1:1".into(),
-            "http://127.0.0.1:1".into(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let event = mam.check_connectability().await;
-        assert!(matches!(
-            event,
-            Event::MamStatusObserved {
-                status: MamStatus::Unreachable,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn check_connectability_unparseable_body_returns_unreachable() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let event = mam.check_connectability().await;
-        assert!(matches!(
-            event,
-            Event::MamStatusObserved {
-                status: MamStatus::Unreachable,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn check_connectability_with_unsat_field_returns_connectable() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "connectable": "yes",
-                "unsat": { "count": 2, "limit": 10 }
-            })))
-            .mount(&server)
-            .await;
-
-        let mam = MamClient::new(
-            None,
-            "my_session".into(),
-            server.uri(),
-            server.uri(),
-            "windlass",
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let event = mam.check_connectability().await;
-        assert!(matches!(
-            event,
-            Event::MamStatusObserved {
-                status: MamStatus::Connectable,
-                ..
-            }
-        ));
+        assert!(matches!(event, MamSeedboxResult::Failed { .. }));
     }
 
     // ── constructor ───────────────────────────────────────────────────────────

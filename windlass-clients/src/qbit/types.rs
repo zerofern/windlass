@@ -1,7 +1,32 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 use serde::Deserialize;
-use windlass_types::{MamTorrentId, TorrentName, VpnPort};
+use windlass_types::{AuthCookie, MamTorrentId, TorrentName, VpnPort};
+
+/// §36 step 9a: typed result for `QbitClient::authenticate`.  Replaces
+/// the legacy `windlass_core::Event::QbitAuthSuccess / QbitAuthFailed /
+/// QbitConnectionRefused / QbitApiError` return shape so the shell can
+/// own the protocol mapping without depending on legacy core types.
+#[derive(Debug, Clone)]
+pub enum QbitAuthResult {
+    Success(AuthCookie),
+    /// Credentials rejected — the operator must fix `QBITTORRENT_USER`
+    /// / `QBITTORRENT_PASS`.
+    Rejected,
+    /// Connection refused (qBit container starting up).  Silent retry.
+    ConnectionRefused,
+    /// Unexpected HTTP status from the auth endpoint.
+    ApiError(u16),
+}
+
+/// §36 step 9a: typed result for `QbitClient::sync_port`.  Replaces the
+/// legacy `windlass_core::Event::QbitPortSync{Success,Failed}` return.
+#[derive(Debug, Clone, Copy)]
+pub enum QbitPortSyncResult {
+    Success,
+    /// Failed with HTTP status code (or `0` for network errors).
+    Failed(u16),
+}
 
 /// Full torrent record as returned by `/api/v2/torrents/info`.
 #[derive(Debug, Clone)]

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use windlass_clients::qbit::{QbitClient, QbitTorrentState};
+use windlass_clients::qbit::{QbitAuthResult, QbitClient, QbitPortSyncResult, QbitTorrentState};
 use windlass_machine::{Shell, Timed};
 use windlass_qbit_core::{QbitAction, QbitEvent};
 use windlass_types::{TorrentRecord, TorrentState};
@@ -29,27 +29,21 @@ impl Shell for QbitShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    // §36 step 3: credentials rejection (`QbitAuthFailed`)
-                    // is a configuration error and routes to `AuthRejected`
+                    // §36 step 3 / §36 step 9a: credentials rejection
+                    // (`QbitAuthResult::Rejected`) routes to AuthRejected
                     // so domain can fire a Critical alert.  Transient
-                    // failures (connection refused, API errors, unexpected
-                    // responses) route to `AuthFailed` for silent retry.
+                    // failures (connection refused, API errors) route to
+                    // AuthFailed for silent retry.
                     let event = match client.authenticate().await {
-                        windlass_core::events::Event::QbitAuthSuccess { cookie, .. } => {
-                            QbitEvent::AuthSucceeded { cookie }
-                        }
-                        windlass_core::events::Event::QbitAuthFailed { .. } => {
-                            QbitEvent::AuthRejected {
-                                reason: "qBittorrent rejected credentials".to_string(),
-                            }
-                        }
-                        windlass_core::events::Event::QbitConnectionRefused { .. } => {
-                            QbitEvent::AuthFailed {
-                                reason: "connection refused".to_string(),
-                            }
-                        }
-                        other => QbitEvent::AuthFailed {
-                            reason: format!("unexpected response: {other:?}"),
+                        QbitAuthResult::Success(cookie) => QbitEvent::AuthSucceeded { cookie },
+                        QbitAuthResult::Rejected => QbitEvent::AuthRejected {
+                            reason: "qBittorrent rejected credentials".to_string(),
+                        },
+                        QbitAuthResult::ConnectionRefused => QbitEvent::AuthFailed {
+                            reason: "connection refused".to_string(),
+                        },
+                        QbitAuthResult::ApiError(code) => QbitEvent::AuthFailed {
+                            reason: format!("qBittorrent API error (status {code})"),
                         },
                     };
                     let _ = tx.send(Timed::now(event));
@@ -93,18 +87,10 @@ impl Shell for QbitShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let event = match client.sync_port(&cookie, port).await {
-                        windlass_core::events::Event::QbitPortSyncSuccess { .. } => {
-                            QbitEvent::ListenPortSet { port }
-                        }
-                        windlass_core::events::Event::QbitPortSyncFailed { code, .. } => {
-                            QbitEvent::ListenPortSetFailed {
-                                port,
-                                reason: format!("port sync failed (status {})", code.0),
-                            }
-                        }
-                        other => QbitEvent::ListenPortSetFailed {
+                        QbitPortSyncResult::Success => QbitEvent::ListenPortSet { port },
+                        QbitPortSyncResult::Failed(code) => QbitEvent::ListenPortSetFailed {
                             port,
-                            reason: format!("unexpected response: {other:?}"),
+                            reason: format!("port sync failed (status {code})"),
                         },
                     };
                     let _ = tx.send(Timed::now(event));

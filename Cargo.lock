@@ -3235,7 +3235,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "windlass-core",
  "windlass-debug",
  "windlass-types",
  "wiremock",

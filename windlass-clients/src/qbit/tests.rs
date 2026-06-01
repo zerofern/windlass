@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use super::{QbitClient, QbitTorrentState};
-use windlass_core::events::Event;
-use windlass_types::{AuthCookie, HttpStatusCode, MamTorrentId, TorrentHash, TorrentName, VpnPort};
+use super::{QbitAuthResult, QbitClient, QbitPortSyncResult, QbitTorrentState};
+use windlass_types::{AuthCookie, MamTorrentId, TorrentHash, VpnPort};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -30,8 +29,8 @@ async fn authenticate_success_extracts_sid_cookie() {
     );
     let event = qbit.authenticate().await;
     match &event {
-        Event::QbitAuthSuccess { cookie, .. } => assert_eq!(cookie.expose_secret(), "abc123"),
-        _ => panic!("Expected QbitAuthSuccess(abc123), got {event:?}"),
+        QbitAuthResult::Success(cookie) => assert_eq!(cookie.expose_secret(), "abc123"),
+        _ => panic!("Expected QbitAuthResult::Success(abc123), got {event:?}"),
     }
 }
 
@@ -55,8 +54,8 @@ async fn authenticate_success_accepts_204_with_sid_cookie() {
     );
     let event = qbit.authenticate().await;
     match &event {
-        Event::QbitAuthSuccess { cookie, .. } => assert_eq!(cookie.expose_secret(), "abc123"),
-        _ => panic!("Expected QbitAuthSuccess(abc123), got {event:?}"),
+        QbitAuthResult::Success(cookie) => assert_eq!(cookie.expose_secret(), "abc123"),
+        _ => panic!("Expected QbitAuthResult::Success(abc123), got {event:?}"),
     }
 }
 
@@ -81,8 +80,8 @@ async fn authenticate_success_extracts_qbt_sid_cookie() {
     );
     let event = qbit.authenticate().await;
     match &event {
-        Event::QbitAuthSuccess { cookie, .. } => assert_eq!(cookie.expose_secret(), "abc123"),
-        _ => panic!("Expected QbitAuthSuccess(abc123), got {event:?}"),
+        QbitAuthResult::Success(cookie) => assert_eq!(cookie.expose_secret(), "abc123"),
+        _ => panic!("Expected QbitAuthResult::Success(abc123), got {event:?}"),
     }
 }
 
@@ -103,7 +102,7 @@ async fn authenticate_ok_body_without_sid_cookie_returns_auth_failed() {
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
-    assert!(matches!(event, Event::QbitAuthFailed { .. }));
+    assert!(matches!(event, QbitAuthResult::Rejected));
 }
 
 #[tokio::test]
@@ -123,7 +122,7 @@ async fn authenticate_fails_body_returns_auth_failed() {
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
-    assert!(matches!(event, Event::QbitAuthFailed { .. }));
+    assert!(matches!(event, QbitAuthResult::Rejected));
 }
 
 #[tokio::test]
@@ -137,7 +136,7 @@ async fn authenticate_network_error_returns_connection_refused() {
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
-    assert!(matches!(event, Event::QbitConnectionRefused { .. }));
+    assert!(matches!(event, QbitAuthResult::ConnectionRefused));
 }
 
 // ── sync_port ─────────────────────────────────────────────────────────────────
@@ -161,7 +160,7 @@ async fn sync_port_returns_success_on_200() {
     let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
     let event = qbit.sync_port(&cookie, port).await;
-    assert!(matches!(event, Event::QbitPortSyncSuccess { .. }));
+    assert!(matches!(event, QbitPortSyncResult::Success));
 }
 
 #[tokio::test]
@@ -183,85 +182,14 @@ async fn sync_port_returns_failed_with_status_on_403() {
     let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
     let event = qbit.sync_port(&cookie, port).await;
-    assert!(matches!(
-        event,
-        Event::QbitPortSyncFailed {
-            code: HttpStatusCode(403),
-            ..
-        }
-    ));
+    assert!(matches!(event, QbitPortSyncResult::Failed(403)));
 }
 
-// ── list_torrents ─────────────────────────────────────────────────────────────
+// §36 step 9a: `list_torrents` deleted (was dead code); its tests went
+// with it.  `list_torrent_details` covers the live qBit listing path.
 
-#[tokio::test]
-async fn list_torrents_returns_names_from_json() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v2/torrents/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {"name": "Album A", "hash": "aaa"},
-            {"name": "Album B", "hash": "bbb"}
-        ])))
-        .mount(&server)
-        .await;
-
-    let qbit = QbitClient::new(
-        reqwest::Client::new(),
-        server.uri(),
-        "admin".into(),
-        "password".into(),
-        Arc::new(|_| {}),
-    );
-    let cookie = AuthCookie::new("abc123".to_string());
-    let names = qbit.list_torrents(&cookie).await;
-    assert_eq!(
-        names,
-        vec![TorrentName("Album A".into()), TorrentName("Album B".into())]
-    );
-}
-
-#[tokio::test]
-async fn list_torrents_returns_empty_on_empty_array() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v2/torrents/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-        .mount(&server)
-        .await;
-
-    let qbit = QbitClient::new(
-        reqwest::Client::new(),
-        server.uri(),
-        "admin".into(),
-        "password".into(),
-        Arc::new(|_| {}),
-    );
-    let cookie = AuthCookie::new("abc123".to_string());
-    let names = qbit.list_torrents(&cookie).await;
-    assert!(names.is_empty());
-}
-
-#[tokio::test]
-async fn list_torrents_returns_empty_on_bad_json() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v2/torrents/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-        .mount(&server)
-        .await;
-
-    let qbit = QbitClient::new(
-        reqwest::Client::new(),
-        server.uri(),
-        "admin".into(),
-        "password".into(),
-        Arc::new(|_| {}),
-    );
-    let cookie = AuthCookie::new("abc123".to_string());
-    let names = qbit.list_torrents(&cookie).await;
-    assert!(names.is_empty());
-}
+// §36 step 9a: `list_torrents` was dead code; its 4 tests were deleted
+// with it.  `list_torrent_details` covers the live qBit listing path.
 
 #[tokio::test]
 async fn authenticate_unexpected_response_returns_api_error() {
@@ -281,14 +209,8 @@ async fn authenticate_unexpected_response_returns_api_error() {
     );
     let event = qbit.authenticate().await;
     assert!(
-        matches!(
-            event,
-            Event::QbitApiError {
-                code: HttpStatusCode(503),
-                ..
-            }
-        ),
-        "Expected QbitApiError(503), got {event:?}"
+        matches!(event, QbitAuthResult::ApiError(503)),
+        "Expected QbitAuthResult::ApiError(503), got {event:?}"
     );
 }
 
@@ -305,29 +227,9 @@ async fn sync_port_network_error_returns_failed_with_code_zero() {
     let port = VpnPort::try_new(51820).unwrap();
     let event = qbit.sync_port(&cookie, port).await;
     assert!(
-        matches!(
-            event,
-            Event::QbitPortSyncFailed {
-                code: HttpStatusCode(0),
-                ..
-            }
-        ),
-        "Expected QbitPortSyncFailed(0), got {event:?}"
+        matches!(event, QbitPortSyncResult::Failed(0)),
+        "Expected QbitPortSyncResult::Failed(0), got {event:?}"
     );
-}
-
-#[tokio::test]
-async fn list_torrents_network_error_returns_empty() {
-    let qbit = QbitClient::new(
-        reqwest::Client::new(),
-        "http://127.0.0.1:1".into(),
-        "admin".into(),
-        "password".into(),
-        Arc::new(|_| {}),
-    );
-    let cookie = AuthCookie::new("abc123".to_string());
-    let names = qbit.list_torrents(&cookie).await;
-    assert!(names.is_empty());
 }
 
 // ── list_torrent_details ──────────────────────────────────────────────────────
