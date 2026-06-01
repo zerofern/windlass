@@ -97,6 +97,24 @@ impl Shell for MamShell {
                     let _ = tx.send(Timed::new(scheduled_at, MamEvent::TimerFired(timer)));
                 });
             }
+            // §36 step 5: fetch the `.torrent` bytes for a manual-download
+            // admission.  `mam_client.fetch_torrent` returns `None` on any
+            // network or HTTP error; we don't have a typed error surface
+            // here so the failure reason stays generic.
+            MamAction::FetchTorrentBytes { mam_id } => {
+                let client = self.client.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let event = match client.fetch_torrent(mam_id).await {
+                        Some(bytes) => MamEvent::TorrentBytesFetched { mam_id, bytes },
+                        None => MamEvent::TorrentBytesFetchFailed {
+                            mam_id,
+                            reason: "MAM torrent fetch failed (network or HTTP error)".to_string(),
+                        },
+                    };
+                    let _ = tx.send(Timed::now(event));
+                });
+            }
         }
     }
 }

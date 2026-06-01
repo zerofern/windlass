@@ -3442,6 +3442,8 @@ dependencies = [
  "windlass-db",
  "windlass-db-core",
  "windlass-debug",
+ "windlass-domain-core",
+ "windlass-machine",
  "windlass-types",
 ]
 

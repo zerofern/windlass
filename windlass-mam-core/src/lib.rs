@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
-use windlass_types::{VpnIp, VpnPort};
+use windlass_types::{MamTorrentId, VpnIp, VpnPort};
 
 /// 25 GiB in bytes (binary GiB: 1024³ = 1 073 741 824).
 ///
@@ -63,6 +63,13 @@ pub enum MamCommand {
     /// the last observed value.
     ObservedIpChanged {
         ip: VpnIp,
+    },
+    /// §36 step 5: fetch the raw `.torrent` bytes for a MAM torrent id.
+    /// Domain dispatches this on `WindlassCommand::ManualDownload`; the
+    /// shell calls `mam_client.fetch_torrent(mam_id)` and emits
+    /// `TorrentBytesFetched` / `TorrentBytesFetchFailed`.
+    FetchTorrent {
+        mam_id: MamTorrentId,
     },
 }
 
@@ -130,13 +137,33 @@ pub enum MamEvent {
         retry_after: Duration,
     },
     TimerFired(MamTimer),
+    /// §36 step 5: shell fetched the `.torrent` bytes for `mam_id`.
+    TorrentBytesFetched {
+        mam_id: MamTorrentId,
+        bytes: Vec<u8>,
+    },
+    /// §36 step 5: shell failed to fetch the `.torrent` bytes (network
+    /// error, 4xx, etc.).
+    TorrentBytesFetchFailed {
+        mam_id: MamTorrentId,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MamAction {
     FetchStatus,
     UpdateSeedbox,
-    ScheduleTimer { timer: MamTimer, after: Duration },
+    ScheduleTimer {
+        timer: MamTimer,
+        after: Duration,
+    },
+    /// §36 step 5: ask the shell to fetch the `.torrent` bytes for a
+    /// manual-download admission.  Result arrives as
+    /// `TorrentBytesFetched` / `TorrentBytesFetchFailed`.
+    FetchTorrentBytes {
+        mam_id: MamTorrentId,
+    },
 }
 
 // `MamPublish` cannot derive `Eq` because `UploadHealthDegraded` carries `f64`
@@ -204,6 +231,18 @@ pub enum MamPublish {
         consecutive_failures: u32,
         last_reason: String,
     },
+    /// §36 step 5: `.torrent` bytes for `mam_id` are available.  Domain
+    /// forwards as `QbitCommand::AddTorrent { mam_id, bytes }`.
+    TorrentBytesReady {
+        mam_id: MamTorrentId,
+        bytes: Vec<u8>,
+    },
+    /// §36 step 5: the shell failed to fetch the `.torrent` bytes.
+    /// Domain fires a Warning "Download failed" alert.
+    TorrentBytesFetchFailed {
+        mam_id: MamTorrentId,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +256,8 @@ pub enum MamTopic {
     KeepAlive,
     /// MAM ASN-compliance signals (§30).
     Compliance,
+    /// §36 step 5: manual-download torrent-bytes fetch results.
+    TorrentFetch,
 }
 
 impl HasTopic<MamTopic> for MamPublish {
@@ -234,6 +275,9 @@ impl HasTopic<MamTopic> for MamPublish {
             }
             Self::KeepAliveDegraded { .. } => MamTopic::KeepAlive,
             Self::AsnMismatch { .. } | Self::AsnAccepted => MamTopic::Compliance,
+            Self::TorrentBytesReady { .. } | Self::TorrentBytesFetchFailed { .. } => {
+                MamTopic::TorrentFetch
+            }
         }
     }
 }
@@ -698,6 +742,16 @@ impl Machine for MamMachine {
                 }],
                 publish: vec![MamPublish::RateLimited { retry_after }],
             },
+            // §36 step 5: forward the fetched bytes to subscribers (domain
+            // routes them to QbitCommand::AddTorrent).
+            MamEvent::TorrentBytesFetched { mam_id, bytes } => Outcome {
+                actions: Vec::new(),
+                publish: vec![MamPublish::TorrentBytesReady { mam_id, bytes }],
+            },
+            MamEvent::TorrentBytesFetchFailed { mam_id, reason } => Outcome {
+                actions: Vec::new(),
+                publish: vec![MamPublish::TorrentBytesFetchFailed { mam_id, reason }],
+            },
         }
     }
 
@@ -744,6 +798,13 @@ impl Machine for MamMachine {
                     });
                 }
                 actions
+            }
+            // §36 step 5: route the manual-download fetch request to the
+            // shell.  The machine does not change state — the result will
+            // arrive as a `TorrentBytesFetched` / `TorrentBytesFetchFailed`
+            // event and publish accordingly.
+            MamCommand::FetchTorrent { mam_id } => {
+                vec![MamAction::FetchTorrentBytes { mam_id }]
             }
         };
         Self::outcome(actions, MamResponse::Accepted)

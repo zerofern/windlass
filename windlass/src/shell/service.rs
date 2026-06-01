@@ -353,6 +353,7 @@ mod tests {
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
+                    initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,
             )
@@ -613,6 +614,7 @@ mod tests {
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
+                    initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,
             )
@@ -674,6 +676,7 @@ mod tests {
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
+                    initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,
             )

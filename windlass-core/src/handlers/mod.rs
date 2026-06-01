@@ -1,5 +1,4 @@
 mod compliance;
-mod download;
 // §36 step 1: legacy `vpn` handler retired.
 // §36 step 2: legacy `mam` handler retired (2026-05-31).
 // §36 step 3: legacy `qbit` handler retired (2026-06-01).  `QbitMachine`
@@ -10,5 +9,7 @@ mod download;
 // DOM-9 emits the Warning alert + eviction; QbitMachine publishes
 // `NewTorrentsAdded` (DOM-33 Info alert); MamMachine `RateLimited`
 // drives DOM-34 (Critical alert).
-
-pub use download::{on_torrent_add_failed, on_torrent_added_to_qbit};
+// §36 step 5: legacy `download` handler retired (2026-06-01).  Web
+// route sends `WindlassCommand::ManualDownload` directly to the domain;
+// MAM/qBit cores own the fetch + add; domain DOM-35-39 cover the
+// alerts and activity entries.

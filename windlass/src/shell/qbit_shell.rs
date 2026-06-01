@@ -158,21 +158,28 @@ impl Shell for QbitShell {
                     client.force_resume_torrent(&cookie, &hash).await;
                 });
             }
-            // §29 / DOM-17: the domain has authorised this add via the
-            // composite admission predicate.  TODO(librarian A1): fetch the
-            // .torrent bytes from MAM and call qBit's add-torrent API.  For
-            // now this is a no-op stub so the predicate path is exercisable
-            // without the MAM-fetch + qBit-add wiring.
+            // §29 / DOM-17 / §36 step 5: the domain has authorised this
+            // add (composite admission predicate); MAM core has already
+            // fetched the `.torrent` bytes.  Call qBittorrent's add-API
+            // and report the result back via TorrentAdded /
+            // TorrentAddFailed events.
             QbitAction::AddTorrent {
-                cookie: _,
+                cookie,
                 mam_id,
-                dl_url,
+                bytes,
             } => {
-                tracing::info!(
-                    "QbitAction::AddTorrent stub for mam_id={} dl_url={dl_url} \
-                     (librarian A1 will wire the real fetch+add)",
-                    mam_id.into_inner(),
-                );
+                let client = self.client.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let event = match client.add_torrent(&cookie, bytes).await {
+                        Some(hash) => QbitEvent::TorrentAdded { mam_id, hash },
+                        None => QbitEvent::TorrentAddFailed {
+                            mam_id,
+                            reason: "qBittorrent rejected the torrent add request".to_string(),
+                        },
+                    };
+                    let _ = tx.send(Timed::now(event));
+                });
             }
             QbitAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();

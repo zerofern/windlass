@@ -130,16 +130,15 @@ impl SystemState {
             }
             Event::DeleteTorrentRequested { hash, .. } => self.on_delete_torrent_requested(hash),
 
-            // ── Manual download ───────────────────────────────────────────────
-            Event::ManualDownloadRequested { mam_id, .. } => {
-                self.on_manual_download_requested(mam_id)
-            }
-            Event::TorrentAddedToQbit { mam_id, hash, at } => {
-                handlers::on_torrent_added_to_qbit(mam_id, &hash, at)
-            }
-            Event::TorrentAddFailed { mam_id, reason, .. } => {
-                handlers::on_torrent_add_failed(mam_id, &reason)
-            }
+            // ── §36 step 5: legacy manual-download handlers retired ───────────
+            // The web route now sends `WindlassCommand::ManualDownload`
+            // directly to the domain runtime, bypassing the legacy event
+            // channel entirely.  These event variants stay for the debug
+            // history shape but never fire from production code paths
+            // and produce no actions when bridged from tests.
+            Event::ManualDownloadRequested { .. }
+            | Event::TorrentAddedToQbit { .. }
+            | Event::TorrentAddFailed { .. } => Vec::new(),
         };
 
         let actions = retire_service_orchestration(actions);

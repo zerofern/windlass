@@ -23,8 +23,10 @@ pub(crate) async fn test_state() -> AppState {
     pool.migrate().await.unwrap();
     let (event_tx, _rx) = mpsc::channel(1);
     let (obs_tx, _) = broadcast::channel(1);
+    let (domain_command_tx, _domain_cmd_rx) = mpsc::unbounded_channel();
     AppState {
         event_tx,
+        domain_command_tx,
         debug_ctrl: windlass_debug::DebugController::new(),
         observations: obs_tx,
         chaos_url: None,

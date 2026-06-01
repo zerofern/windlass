@@ -124,26 +124,26 @@ pub(super) async fn init_shell(
         obs_tx.clone(),
     );
 
-    let app_state = windlass_web::AppState {
-        event_tx: tx.clone(),
-        debug_ctrl: debug_ctrl.clone(),
-        observations: obs_tx.clone(),
-        chaos_url: std::env::var("CHAOS_URL").ok(),
-        db_pool: db_pool.clone(),
-    };
-    start_http_server(app_state).await?;
+    // §36 step 5: HTTP server start is deferred until after the domain
+    // runtime is spawned so AppState can carry the domain command channel
+    // (for `WindlassCommand::ManualDownload`).
 
     let wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
     let blacklisted = windlass_db::download_queue::get_blacklisted_ids(&db_pool)
         .await
         .unwrap_or_default();
+    // §36 step 5: also feed the blacklist into the new domain core so
+    // manual-download admission can reject previously-dead torrents.
+    let initial_blacklist: std::collections::HashSet<windlass_types::MamTorrentId> =
+        blacklisted.iter().copied().collect();
     let state = SystemState::initial()
         .with_compliance_config(
             config.unsatisfied_quota_limit,
             config.compliance_poll_interval_secs,
         )
         .with_blacklisted_ids(blacklisted);
-    let (db_handles, _db_join) = windlass_machine::spawn::<DbMachine, DbShell>((), db_pool).await;
+    let (db_handles, _db_join) =
+        windlass_machine::spawn::<DbMachine, DbShell>((), db_pool.clone()).await;
     let (db_pub_tx, mut db_pub_rx) = mpsc::channel::<DbPublish>(128);
     db_handles
         .subscribe
@@ -302,6 +302,7 @@ pub(super) async fn init_shell(
         WindlassConfig {
             snapshot_interval: Duration::from_secs(config.compliance_poll_interval_secs),
             gluetun_anchor: docker.gluetun_anchor.clone(),
+            initial_blacklist,
         },
         DomainShellConfig {
             db: db_handles.commands.clone(),
@@ -320,6 +321,19 @@ pub(super) async fn init_shell(
             domain_pub_tx,
         ))
         .expect("domain pub subscription");
+
+    // §36 step 5: now that the domain runtime exists, build AppState and
+    // start the HTTP server.  The web layer carries
+    // `domain_command_tx` for `WindlassCommand::ManualDownload`.
+    let app_state = windlass_web::AppState {
+        event_tx: tx.clone(),
+        domain_command_tx: domain_handles.commands.clone(),
+        debug_ctrl: debug_ctrl.clone(),
+        observations: obs_tx.clone(),
+        chaos_url: std::env::var("CHAOS_URL").ok(),
+        db_pool: db_pool.clone(),
+    };
+    start_http_server(app_state).await?;
 
     // ── Shared forwarded-port state ───────────────────────────────────────────
     // Written by the VPN forwarder task; read synchronously by ServiceCores::observe

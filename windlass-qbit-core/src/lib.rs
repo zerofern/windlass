@@ -56,13 +56,15 @@ pub enum QbitCommand {
     /// completed+high-rating+long-since-listened, unstarted+low-AI-score)
     /// require librarian data outside operator scope and are deferred.
     EvictOneForDiskPressure,
-    /// §29: add a torrent to qBittorrent.  Only emitted by the qBit core
-    /// when the domain's composite admission predicate authorises the add
-    /// (DOM-17).  The qBit core does not re-check the gates — admission is
-    /// owned by the domain.  qBit core simply requires a cookie (QBIT-1).
+    /// §29 / §36 step 5: add a torrent to qBittorrent.  Only emitted by
+    /// the qBit core when the domain's composite admission predicate
+    /// authorises the add (DOM-17).  The qBit core does not re-check the
+    /// gates — admission is owned by the domain.  qBit core simply
+    /// requires a cookie (QBIT-1).  `bytes` is the raw `.torrent` body
+    /// (fetched by MAM core via `FetchTorrent`).
     AddTorrent {
         mam_id: MamTorrentId,
-        dl_url: String,
+        bytes: Vec<u8>,
     },
 }
 
@@ -128,6 +130,19 @@ pub enum QbitEvent {
     PrivacySettingsDisableFailed {
         reason: String,
     },
+    /// §36 step 5: qBittorrent accepted the `AddTorrent` request and
+    /// returned the info-hash.  Domain fires an Info "Download started"
+    /// alert + Activity entry.
+    TorrentAdded {
+        mam_id: MamTorrentId,
+        hash: TorrentHash,
+    },
+    /// §36 step 5: qBittorrent rejected the `AddTorrent` request.
+    /// Domain fires a Warning "Download failed" alert + Activity entry.
+    TorrentAddFailed {
+        mam_id: MamTorrentId,
+        reason: String,
+    },
     TimerFired(QbitTimer),
 }
 
@@ -175,13 +190,14 @@ pub enum QbitAction {
         cookie: AuthCookie,
         hash: TorrentHash,
     },
-    /// §29: add a torrent to qBittorrent.  Only emitted in response to a
-    /// `QbitCommand::AddTorrent` that arrives via the domain's admission
-    /// gate.  Requires a cookie (QBIT-1).
+    /// §29 / §36 step 5: add a torrent to qBittorrent.  Only emitted in
+    /// response to a `QbitCommand::AddTorrent` that arrives via the
+    /// domain's admission gate.  Requires a cookie (QBIT-1).  `bytes` is
+    /// the raw `.torrent` body.
     AddTorrent {
         cookie: AuthCookie,
         mam_id: MamTorrentId,
-        dl_url: String,
+        bytes: Vec<u8>,
     },
     ScheduleTimer {
         timer: QbitTimer,
@@ -273,6 +289,22 @@ pub enum QbitPublish {
     NewTorrentsAdded {
         hashes: Vec<TorrentHash>,
     },
+    /// §36 step 5 (ported from legacy `on_torrent_added_to_qbit`):
+    /// qBittorrent confirmed the manual-download add.  Domain fires an
+    /// Info "Download started" alert and a `torrent_added` activity
+    /// entry keyed by `mam_id`.
+    TorrentAdded {
+        mam_id: MamTorrentId,
+        hash: TorrentHash,
+    },
+    /// §36 step 5 (ported from legacy `on_torrent_add_failed`):
+    /// qBittorrent rejected the manual-download add.  Domain fires a
+    /// Warning "Download failed" alert and a `torrent_add_failed`
+    /// activity entry keyed by `mam_id`.
+    TorrentAddFailed {
+        mam_id: MamTorrentId,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,7 +332,9 @@ impl HasTopic<QbitTopic> for QbitPublish {
             // existing `Torrents` subscription delivers it without a new topic.
             Self::TorrentsUpdated { .. }
             | Self::DeadTorrentRemoved { .. }
-            | Self::NewTorrentsAdded { .. } => QbitTopic::Torrents,
+            | Self::NewTorrentsAdded { .. }
+            | Self::TorrentAdded { .. }
+            | Self::TorrentAddFailed { .. } => QbitTopic::Torrents,
             Self::BannedPrivacySettingsObserved { .. } | Self::PrivacyClean => QbitTopic::Privacy,
             Self::QueueOrchestrated { .. } => QbitTopic::Queue,
             Self::UnsatisfiedQuotaCritical { .. }
@@ -878,6 +912,16 @@ impl Machine for QbitMachine {
                     publish: Vec::new(),
                 }
             }
+            // §36 step 5: forward manual-download add success/failure to
+            // domain.  Domain emits Info/Warning alert + activity entry.
+            QbitEvent::TorrentAdded { mam_id, hash } => Outcome {
+                actions: Vec::new(),
+                publish: vec![QbitPublish::TorrentAdded { mam_id, hash }],
+            },
+            QbitEvent::TorrentAddFailed { mam_id, reason } => Outcome {
+                actions: Vec::new(),
+                publish: vec![QbitPublish::TorrentAddFailed { mam_id, reason }],
+            },
         }
     }
 
@@ -922,15 +966,16 @@ impl Machine for QbitMachine {
             QbitCommand::EvictOneForDiskPressure => {
                 return Self::outcome(self.evict_one_for_disk_pressure(), QbitResponse::Accepted);
             }
-            // §29 / QBIT-1: only emit `AddTorrent` when a cookie is present.
-            // Admission is owned by the domain (DOM-17) — the qBit core does
-            // not re-check the §29 gates here.
-            QbitCommand::AddTorrent { mam_id, dl_url } => {
+            // §29 / QBIT-1 / §36 step 5: only emit `AddTorrent` when a
+            // cookie is present.  Admission is owned by the domain
+            // (DOM-17) — the qBit core does not re-check the §29 gates
+            // here.
+            QbitCommand::AddTorrent { mam_id, bytes } => {
                 self.cookie.clone().map_or_else(Vec::new, |cookie| {
                     vec![QbitAction::AddTorrent {
                         cookie,
                         mam_id,
-                        dl_url,
+                        bytes,
                     }]
                 })
             }

@@ -1,8 +1,8 @@
 use crate::AppState;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
-use chrono::Utc;
 use serde::Deserialize;
-use windlass_core::events::Event;
+use tokio::sync::oneshot;
+use windlass_domain_core::{WindlassCommand, WindlassResponse};
 use windlass_types::MamTorrentId;
 
 #[derive(Deserialize)]
@@ -30,12 +30,18 @@ async fn post_add_download(
         return StatusCode::BAD_REQUEST;
     };
 
-    let event = Event::ManualDownloadRequested {
-        at: Utc::now(),
-        mam_id,
-    };
-    if app.event_tx.send(event).await.is_err() {
-        tracing::warn!("Event channel closed — could not queue ManualDownloadRequested");
+    // §36 step 5: route through the new domain command flow.  Domain
+    // runs the 3-gate manual-download admission (blacklist / quota /
+    // qBit-ready) and dispatches MAM fetch on pass.  The HTTP response
+    // is ACCEPTED — the actual download proceeds asynchronously and
+    // surfaces to the operator as alerts + activity entries.
+    let (reply_tx, _reply_rx) = oneshot::channel::<WindlassResponse>();
+    if app
+        .domain_command_tx
+        .send((WindlassCommand::ManualDownload { mam_id }, reply_tx))
+        .is_err()
+    {
+        tracing::warn!("Domain command channel closed — could not queue ManualDownload");
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     StatusCode::ACCEPTED

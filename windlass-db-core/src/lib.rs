@@ -61,6 +61,9 @@ pub enum ActivitySource {
     Vpn,
     Web,
     System,
+    /// §36 step 5: manual-download activity entries
+    /// (download_blocked / torrent_added / torrent_add_failed).
+    Download,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

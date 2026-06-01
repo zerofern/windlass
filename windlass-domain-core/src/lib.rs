@@ -3,6 +3,8 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
 use windlass_db_core::{
     ActivityRecord, ActivitySource, AlertRecord, DbCommand, DownloadStateChange, DownloadStatus,
 };
@@ -21,6 +23,10 @@ pub struct WindlassConfig {
     /// §38: name of the Gluetun anchor container.  Used to address
     /// `Docker(RestartContainer { name })` during crash recovery.
     pub gluetun_anchor: String,
+    /// §36 step 5: blacklisted MAM torrent ids loaded from the DB at
+    /// boot.  Manual-download admission rejects any candidate whose
+    /// `mam_id` is in this set.  Empty in tests.
+    pub initial_blacklist: HashSet<MamTorrentId>,
 }
 
 // `WindlassEvent` cannot derive `Eq` because `MamPublish::UploadHealthDegraded`
@@ -97,12 +103,20 @@ impl HasTopic<WindlassTopic> for WindlassPublish {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindlassCommand {
     Refresh,
-    /// §29: ask the domain core to admit and start downloading a candidate
-    /// torrent.  Runs the composite fail-closed admission predicate; on
-    /// success emits `Qbit(QbitCommand::AddTorrent)`, on failure emits an
-    /// `Activity` publish listing the failing gates.
+    /// §29: ask the domain core to admit and start downloading a
+    /// librarian-fed candidate.  Runs the composite fail-closed
+    /// admission predicate; on success dispatches `Mam(FetchTorrent)`
+    /// which routes to `Qbit(AddTorrent)` once bytes arrive; on failure
+    /// emits an `Activity` publish listing the failing gates.
     TryAddTorrent {
         candidate: DownloadCandidate,
+    },
+    /// §36 step 5: manual-download flow (web UI).  Web emits this with
+    /// just a `mam_id`.  Domain runs a 3-gate subset of the §29
+    /// admission predicate (blacklist, unsatisfied-quota,
+    /// qBit-ready), then dispatches `Mam(FetchTorrent)` on pass.
+    ManualDownload {
+        mam_id: MamTorrentId,
     },
 }
 
@@ -231,6 +245,13 @@ pub struct WindlassMachine {
     config: WindlassConfig,
     state: SystemStateView,
     admission: AdmissionState,
+    /// §36 step 5: blacklisted MAM torrent ids.  Loaded at boot from the
+    /// DB (`WindlassConfig::initial_blacklist`), extended on every
+    /// `QbitPublish::DeadTorrentRemoved { mam_id: Some(_) }` (the qBit
+    /// core authorised a dead-torrent delete which becomes a blacklist).
+    /// Read by the manual-download admission to fail-closed reject
+    /// previously-dead torrents.
+    blacklisted_mam_ids: HashSet<MamTorrentId>,
 }
 
 impl WindlassMachine {
@@ -242,6 +263,82 @@ impl WindlassMachine {
     #[must_use]
     pub const fn admission(&self) -> &AdmissionState {
         &self.admission
+    }
+
+    /// §36 step 5: returns whether `mam_id` is blacklisted.
+    #[must_use]
+    pub fn is_blacklisted(&self, mam_id: MamTorrentId) -> bool {
+        self.blacklisted_mam_ids.contains(&mam_id)
+    }
+
+    /// §36 step 5: 3-gate manual-download admission, mirrors the legacy
+    /// `on_manual_download_requested`.  Returns the actions/publishes the
+    /// command handler should emit.  On pass, dispatches the MAM fetch;
+    /// on fail, emits a Warning alert and the Activity entry.
+    fn handle_manual_download(
+        &self,
+        mam_id: MamTorrentId,
+    ) -> CommandOutcome<WindlassAction, WindlassPublish, WindlassResponse> {
+        // Blacklist gate — legacy `if self.blacklisted_mam_ids.contains(&mam_id)`.
+        if self.is_blacklisted(mam_id) {
+            return Self::outcome(
+                vec![WindlassAction::Db(DbCommand::RecordActivity(
+                    ActivityRecord {
+                        at: chrono::Utc::now(),
+                        source: ActivitySource::Download,
+                        action: "download_blocked".to_string(),
+                        book_id: None,
+                        detail: Some(format!(
+                            "{{\"mam_id\":{},\"reason\":\"blacklisted\"}}",
+                            mam_id.into_inner()
+                        )),
+                        metadata: serde_json::json!({
+                            "mam_id": mam_id.into_inner(),
+                            "reason": "blacklisted",
+                        }),
+                    },
+                ))],
+                WindlassResponse::Accepted,
+            );
+        }
+        // Unsatisfied-quota gate — legacy reads SystemState.torrents and
+        // counts unsatisfied; new path uses the §25 admission flag the
+        // QbitMachine publishes on every TorrentsListed.
+        if self.admission.unsatisfied_quota_full {
+            return Self::outcome(
+                vec![WindlassAction::SendAlert {
+                    priority: AlertPriority::Warning,
+                    title: "Download blocked — quota full".to_string(),
+                    body: format!(
+                        "MAM #{} not started: unsatisfied-torrent quota is full.",
+                        mam_id.into_inner(),
+                    ),
+                }],
+                WindlassResponse::Accepted,
+            );
+        }
+        // qBit-ready gate — legacy checks `QbitState::Ready { cookie }`.
+        // New path uses the admission gate (port-synced means we have
+        // a cookie and a port).
+        if self.admission.qbit_listen_port.is_none() {
+            return Self::outcome(
+                vec![WindlassAction::SendAlert {
+                    priority: AlertPriority::Warning,
+                    title: "Download blocked — qBit not ready".to_string(),
+                    body: format!(
+                        "MAM #{} not started: qBittorrent is not connected. \
+                         Try again shortly.",
+                        mam_id.into_inner(),
+                    ),
+                }],
+                WindlassResponse::Accepted,
+            );
+        }
+        // All gates pass: dispatch to MAM to fetch the bytes.
+        Self::outcome(
+            vec![WindlassAction::Mam(MamCommand::FetchTorrent { mam_id })],
+            WindlassResponse::Accepted,
+        )
     }
 
     /// §29: composite fail-closed admission predicate.
@@ -339,6 +436,7 @@ impl Machine for WindlassMachine {
     type Response = WindlassResponse;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
+        let blacklisted_mam_ids = config.initial_blacklist.clone();
         Self {
             config,
             state: SystemStateView {
@@ -348,6 +446,7 @@ impl Machine for WindlassMachine {
                 forwarded_port: None,
             },
             admission: AdmissionState::fail_closed(),
+            blacklisted_mam_ids,
         }
     }
 
@@ -624,6 +723,104 @@ impl Machine for WindlassMachine {
             }
             WindlassEvent::Qbit(QbitPublish::TorrentsUpdated { .. })
             | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
+            // §36 step 5 / DOM-35: MAM finished fetching the `.torrent`
+            // bytes for a manual or librarian-driven admission.  Forward
+            // to qBit as `AddTorrent { mam_id, bytes }`.
+            WindlassEvent::Mam(MamPublish::TorrentBytesReady { mam_id, bytes }) => Outcome {
+                actions: vec![WindlassAction::Qbit(QbitCommand::AddTorrent {
+                    mam_id,
+                    bytes,
+                })],
+                publish: Vec::new(),
+            },
+            // §36 step 5 / DOM-37: MAM failed to fetch the bytes.  Emit a
+            // Warning "Download failed" alert + Activity entry.
+            WindlassEvent::Mam(MamPublish::TorrentBytesFetchFailed { mam_id, reason }) => Outcome {
+                actions: vec![
+                    WindlassAction::SendAlert {
+                        priority: AlertPriority::Warning,
+                        title: "Download failed".to_string(),
+                        body: format!(
+                            "Failed to fetch MAM torrent #{}: {reason}",
+                            mam_id.into_inner(),
+                        ),
+                    },
+                    WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                        at: chrono::Utc::now(),
+                        source: ActivitySource::Download,
+                        action: "torrent_add_failed".to_string(),
+                        book_id: None,
+                        detail: Some(format!(
+                            "{{\"mam_id\":{},\"reason\":\"{reason}\"}}",
+                            mam_id.into_inner(),
+                        )),
+                        metadata: serde_json::json!({
+                            "mam_id": mam_id.into_inner(),
+                            "stage": "mam_fetch",
+                            "reason": reason,
+                        }),
+                    })),
+                ],
+                publish: Vec::new(),
+            },
+            // §36 step 5 / DOM-38: qBit accepted the manual-download add.
+            // Emit Info "Download started" + `torrent_added` activity.
+            WindlassEvent::Qbit(QbitPublish::TorrentAdded { mam_id, hash }) => Outcome {
+                actions: vec![
+                    WindlassAction::SendAlert {
+                        priority: AlertPriority::Info,
+                        title: "Download started".to_string(),
+                        body: format!("MAM #{} added to qBittorrent.", mam_id.into_inner(),),
+                    },
+                    WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                        at: chrono::Utc::now(),
+                        source: ActivitySource::Download,
+                        action: "torrent_added".to_string(),
+                        book_id: None,
+                        detail: Some(format!(
+                            "{{\"mam_id\":{},\"hash\":\"{}\"}}",
+                            mam_id.into_inner(),
+                            hash.0,
+                        )),
+                        metadata: serde_json::json!({
+                            "mam_id": mam_id.into_inner(),
+                            "hash": hash.0,
+                        }),
+                    })),
+                ],
+                publish: Vec::new(),
+            },
+            // §36 step 5 / DOM-39: qBit rejected the manual-download add.
+            // Emit Warning "Download failed" + `torrent_add_failed`
+            // activity.
+            WindlassEvent::Qbit(QbitPublish::TorrentAddFailed { mam_id, reason }) => Outcome {
+                actions: vec![
+                    WindlassAction::SendAlert {
+                        priority: AlertPriority::Warning,
+                        title: "Download failed".to_string(),
+                        body: format!(
+                            "Failed to add MAM #{} to qBittorrent: {reason}",
+                            mam_id.into_inner(),
+                        ),
+                    },
+                    WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
+                        at: chrono::Utc::now(),
+                        source: ActivitySource::Download,
+                        action: "torrent_add_failed".to_string(),
+                        book_id: None,
+                        detail: Some(format!(
+                            "{{\"mam_id\":{},\"reason\":\"{reason}\"}}",
+                            mam_id.into_inner(),
+                        )),
+                        metadata: serde_json::json!({
+                            "mam_id": mam_id.into_inner(),
+                            "stage": "qbit_add",
+                            "reason": reason,
+                        }),
+                    })),
+                ],
+                publish: Vec::new(),
+            },
             // §36 step 4 / DOM-33: rising-edge new-torrent notification
             // (ported from legacy `on_new_torrents_observed`).  Hash-only
             // alert because the new path tracks `TorrentRecord` by hash;
@@ -678,6 +875,11 @@ impl Machine for WindlassMachine {
                 Outcome::none()
             }
             WindlassEvent::Qbit(QbitPublish::DeadTorrentRemoved { mam_id, .. }) => {
+                // §36 step 5: also extend the in-memory blacklist so the
+                // manual-download gate rejects future re-adds.
+                if let Some(id) = mam_id {
+                    self.blacklisted_mam_ids.insert(id);
+                }
                 Self::on_dead_torrent_removed(mam_id)
             }
             // DOM-10: BannedPrivacySettingsObserved → one Critical RecordAlert + one Activity.
@@ -843,14 +1045,17 @@ impl Machine for WindlassMachine {
                 ];
                 Self::outcome(actions, WindlassResponse::Accepted)
             }
-            // DOM-17/18/19 (§29): composite fail-closed admission.
+            // DOM-17/18/19 (§29): composite fail-closed admission for
+            // librarian-fed candidates.  On pass, dispatch to MAM to
+            // fetch the `.torrent` bytes; MAM publishes
+            // `TorrentBytesReady` which the domain then forwards as
+            // `QbitCommand::AddTorrent` (§36 step 5 / DOM-35).
             WindlassCommand::TryAddTorrent { candidate } => {
                 let now = chrono::Utc::now();
                 match self.admit(&candidate, now) {
                     Ok(()) => Self::outcome(
-                        vec![WindlassAction::Qbit(QbitCommand::AddTorrent {
+                        vec![WindlassAction::Mam(MamCommand::FetchTorrent {
                             mam_id: candidate.mam_id,
-                            dl_url: candidate.dl_url,
                         })],
                         WindlassResponse::Accepted,
                     ),
@@ -863,6 +1068,13 @@ impl Machine for WindlassMachine {
                     ),
                 }
             }
+            // §36 step 5 / DOM-36: manual-download flow.  Web emits this
+            // with just a `mam_id` (no librarian DownloadCandidate fields
+            // available).  Domain runs a 3-gate subset of the §29
+            // admission — blacklist, unsatisfied-quota, qBit-ready — and
+            // dispatches `MamCommand::FetchTorrent` on pass.  Failures
+            // emit a Warning alert.
+            WindlassCommand::ManualDownload { mam_id } => self.handle_manual_download(mam_id),
         }
     }
 }
@@ -1495,6 +1707,7 @@ mod tests {
             WindlassConfig {
                 snapshot_interval: Duration::from_secs(60),
                 gluetun_anchor: "gluetun".to_string(),
+                initial_blacklist: std::collections::HashSet::new(),
             },
             Instant::now(),
         )
@@ -2412,6 +2625,7 @@ mod prop_tests {
                     WindlassConfig {
                         snapshot_interval: Duration::from_secs(60),
                         gluetun_anchor: "gluetun".to_string(),
+                        initial_blacklist: std::collections::HashSet::new(),
                     },
                     Instant::now(),
                 );

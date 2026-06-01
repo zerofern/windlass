@@ -266,6 +266,28 @@ because every other check is already in the new cores.
    Critical "MAM rate limit" alert.  `Event::Wakeup` is now a no-op
    for every `WakeupId` (each had a self-driving timer in the relevant
    core or no remaining consumer).
+5. **download.rs** — DONE (2026-06-01).  Legacy `handlers/download.rs`
+   deleted; `Event::ManualDownloadRequested / TorrentAddedToQbit /
+   TorrentAddFailed` dispatches now no-op.  Web route now sends
+   `WindlassCommand::ManualDownload { mam_id }` directly to the domain
+   runtime (via a new `AppState::domain_command_tx`).  Domain
+   `handle_manual_download` runs a 3-gate admission subset
+   (blacklist / unsatisfied-quota / qBit-ready) mirroring the legacy
+   `on_manual_download_requested`; on pass, dispatches
+   `MamCommand::FetchTorrent`.  MAM core gains `FetchTorrent` command /
+   `FetchTorrentBytes` action / `TorrentBytesFetched`/`Failed` events /
+   `TorrentBytesReady`/`Failed` publishes; MAM shell wires
+   `mam_client.fetch_torrent`.  qBit core's `AddTorrent` action shape
+   changes from `{ mam_id, dl_url }` to `{ mam_id, bytes }`; qBit shell
+   un-stubs and calls `qbit_client.add_torrent(cookie, bytes)`.  qBit
+   publishes new `TorrentAdded` / `TorrentAddFailed`; domain handlers
+   DOM-35 (MAM bytes → qBit add), DOM-36 (ManualDownload admission),
+   DOM-37 (MAM fetch fail Warning + Activity), DOM-38 (qBit add success
+   Info + Activity), DOM-39 (qBit add fail Warning + Activity).
+   `WindlassMachine` gains `blacklisted_mam_ids: HashSet<MamTorrentId>`
+   loaded at boot from the DB (`WindlassConfig::initial_blacklist`) and
+   extended on every `DeadTorrentRemoved { mam_id: Some(_) }`.
+   `ActivitySource::Download` added.
 2. **mam.rs** — same shape, slightly larger event set.
 3. **qbit.rs** (excluding compliance-related preferences flow) —
    careful with `on_qbit_preferences_received`; the `max_active_torrents`

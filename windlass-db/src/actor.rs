@@ -317,6 +317,7 @@ const fn activity_source_str(source: &ActivitySource) -> &'static str {
         ActivitySource::Vpn => "vpn",
         ActivitySource::Web => "web",
         ActivitySource::System => "system",
+        ActivitySource::Download => "download",
     }
 }
 
