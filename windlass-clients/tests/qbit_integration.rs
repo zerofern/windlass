@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use windlass_clients::qbit::QbitClient;
-use windlass_types::{AuthCookie, MamTorrentId};
+use windlass_types::{AuthCookie, MamTorrentId, QbitPassword};
 
 const QBIT_URL: &str = "http://localhost:18090";
 const TORRENT_FIXTURE: &[u8] = include_bytes!("fixtures/test.torrent");
@@ -19,7 +19,7 @@ fn make_client() -> QbitClient {
         reqwest::Client::new(),
         QBIT_URL.to_owned(),
         "admin".to_owned(),
-        "adminadmin".to_owned(),
+        QbitPassword::new("adminadmin".to_owned()),
         Arc::new(|_| {}),
     )
 }

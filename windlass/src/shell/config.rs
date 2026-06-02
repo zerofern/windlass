@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
-use secrecy::SecretString;
 
-use windlass_types::QbitPassword;
+use windlass_types::{MamSessionId, QbitPassword};
 
 pub struct Config {
     pub qbit_url: String,
     pub qbit_user: String,
     pub qbit_pass: QbitPassword,
-    pub mam_session: String,
+    pub mam_session: MamSessionId,
     /// Gluetun's built-in HTTP proxy, used to route MAM traffic through the VPN.
     /// When `None` (env var absent), the VPN client makes direct connections — useful
     /// in integration tests and local dev where no VPN tunnel is running.
@@ -41,12 +40,10 @@ impl Config {
         Ok(Self {
             qbit_url: var("QBITTORRENT_URL").context("QBITTORRENT_URL missing")?,
             qbit_user: var("QBITTORRENT_USER").context("QBITTORRENT_USER missing")?,
-            qbit_pass: QbitPassword(SecretString::new(
-                var("QBITTORRENT_PASS")
-                    .context("QBITTORRENT_PASS missing")?
-                    .into(),
-            )),
-            mam_session: var("MAM_SESSION").context("MAM_SESSION missing")?,
+            qbit_pass: QbitPassword::new(
+                var("QBITTORRENT_PASS").context("QBITTORRENT_PASS missing")?,
+            ),
+            mam_session: MamSessionId::new(var("MAM_SESSION").context("MAM_SESSION missing")?),
             gluetun_proxy_url: var("GLUETUN_PROXY_URL").ok(),
             mam_seedbox_url: var("MAM_SEEDBOX_URL").unwrap_or_else(|_| {
                 "https://t.myanonamouse.net/json/dynamicSeedbox.php".to_string()
@@ -121,5 +118,21 @@ mod tests {
     fn execute_service_actions_accepts_legacy_env_name() {
         assert!(!execute_service_actions_setting(None, Some("false")));
         assert!(execute_service_actions_setting(None, None));
+    }
+
+    #[test]
+    fn config_secrets_debug_does_not_leak_cleartext() {
+        use windlass_types::{MamSessionId, QbitPassword};
+        let pass = QbitPassword::new("super-secret-pw".to_string());
+        let session = MamSessionId::new("super-secret-session".to_string());
+        let dbg = format!("{pass:?} {session:?}");
+        assert!(
+            !dbg.contains("super-secret-pw"),
+            "QbitPassword leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("super-secret-session"),
+            "MamSessionId leaked: {dbg}"
+        );
     }
 }

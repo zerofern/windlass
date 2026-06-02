@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::bail;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use windlass_types::{HttpExchange, HttpObserver, VpnIp};
+use windlass_types::{HttpExchange, HttpObserver, MamSessionId, VpnIp};
 
 /// §36 step 9a: typed result for `MamClient::update_seedbox`.  Replaces
 /// the legacy `windlass_core::Event::Mam*` shape so the shell can map
@@ -201,10 +202,15 @@ struct UnsatSummary {
 /// Wraps a VPN-routed `reqwest::Client` together with the MAM connection
 /// details and a rotating session cookie. All MAM operations are methods
 /// so call sites only pass `&self`.
+///
+/// The MAM session cookie is held as a [`SecretString`] so accidental
+/// `Debug` formatting or future `Serialize` derives cannot leak it. The
+/// raw value is only read via [`secrecy::ExposeSecret`] at the HTTP
+/// boundary where the `Cookie: mam_id=…` header is constructed.
 #[derive(Clone)]
 pub struct MamClient {
     client: reqwest::Client,
-    session: Arc<Mutex<String>>,
+    session: Arc<Mutex<SecretString>>,
     check_session_url: String,
     seedbox_url: String,
     load_url: String,
@@ -226,7 +232,7 @@ impl MamClient {
     /// Returns an error if the reqwest client cannot be built (e.g. invalid proxy URL).
     pub fn new(
         proxy_url: Option<&str>,
-        session: String,
+        session: MamSessionId,
         seedbox_url: String,
         load_url: String,
         user_agent: &str,
@@ -243,7 +249,9 @@ impl MamClient {
         let client = builder.build()?;
         Ok(Self {
             client,
-            session: Arc::new(Mutex::new(session)),
+            session: Arc::new(Mutex::new(SecretString::from(
+                session.expose_secret().to_owned(),
+            ))),
             check_session_url: "https://www.myanonamouse.net/json/checkCookie.php".into(),
             seedbox_url,
             // §32: switch to `?clientStats=` so MAM actually returns the
@@ -269,7 +277,7 @@ impl MamClient {
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn check_session(&self) -> anyhow::Result<()> {
-        let current = self.session.lock().unwrap().clone();
+        let current = self.current_session();
         let resp = self
             .client
             .get(&self.check_session_url)
@@ -280,10 +288,22 @@ impl MamClient {
             bail!("MAM session check failed: HTTP {}", resp.status());
         }
         if let Some(rotated) = extract_mam_cookie(&resp) {
-            *self.session.lock().unwrap() = rotated;
+            self.store_session(rotated);
         }
         info!("MAM session valid");
         Ok(())
+    }
+
+    /// Reads the current MAM session cookie as an owned cleartext string.
+    /// Restricted to in-crate callers that build HTTP requests.
+    fn current_session(&self) -> String {
+        self.session.lock().unwrap().expose_secret().to_owned()
+    }
+
+    /// Replaces the stored session with a rotated value from a MAM
+    /// `Set-Cookie` header.  Restricted to in-crate callers.
+    fn store_session(&self, rotated: String) {
+        *self.session.lock().unwrap() = SecretString::from(rotated);
     }
 
     /// §32: returns MAM's view of our current IP/ASN via `/json/jsonIp.php`.
@@ -343,10 +363,10 @@ impl MamClient {
         if !self.check_rate_limit() {
             return MamSeedboxResult::RateLimited;
         }
-        let current = self.session.lock().unwrap().clone();
+        let current = self.current_session();
         let (result, new_session) = self.do_update_seedbox(&current).await;
         if let Some(rotated) = new_session {
-            *self.session.lock().unwrap() = rotated;
+            self.store_session(rotated);
         }
         result
     }
@@ -371,10 +391,10 @@ impl MamClient {
         if !self.check_rate_limit() {
             return Err(MamFetchError::LocalRateLimit);
         }
-        let current = self.session.lock().unwrap().clone();
+        let current = self.current_session();
         let (result, new_session) = self.do_fetch_mam_status(&current).await;
         if let Some(rotated) = new_session {
-            *self.session.lock().unwrap() = rotated;
+            self.store_session(rotated);
         }
         result
     }
@@ -569,7 +589,7 @@ impl MamClient {
     /// Panics if the internal session mutex is poisoned.
     #[must_use]
     pub fn session_value(&self) -> String {
-        self.session.lock().unwrap().clone()
+        self.current_session()
     }
 
     #[cfg(test)]
@@ -587,7 +607,7 @@ impl MamClient {
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn fetch_torrent(&self, mam_id: windlass_types::MamTorrentId) -> Option<Vec<u8>> {
-        let current = self.session.lock().unwrap().clone();
+        let current = self.current_session();
         let url = format!(
             "{}/tor/download.php?tid={}",
             self.torrent_base_url,
@@ -651,6 +671,60 @@ mod tests {
     use wiremock::matchers::{header_exists, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // ── §37a secret-redaction acceptance ──────────────────────────────────────
+
+    #[test]
+    fn mam_session_id_debug_does_not_leak_cleartext() {
+        let cleartext = "totally-private-session";
+        let id = MamSessionId::new(cleartext.into());
+        let dbg = format!("{id:?}");
+        assert!(!dbg.contains(cleartext), "MamSessionId leaked: {dbg}");
+    }
+
+    #[test]
+    fn mam_session_id_tracing_capture_does_not_leak() {
+        use std::io::Write;
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct MemWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for MemWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for MemWriter {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = MemWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+
+        let session = MamSessionId::new("trace-canary-session".into());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(?session, "captured");
+        });
+
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logged.contains("trace-canary-session"),
+            "tracing leaked MAM session cleartext: {logged}"
+        );
+    }
+
     // ── update_seedbox ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -667,7 +741,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -692,7 +766,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -723,7 +797,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "old_cookie".into(),
+            MamSessionId::new("old_cookie".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -749,7 +823,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -776,7 +850,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -797,7 +871,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -821,7 +895,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "old_session".into(),
+            MamSessionId::new("old_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -847,7 +921,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -870,7 +944,7 @@ mod tests {
         // and TLS failures as healthy operator state).
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             "http://127.0.0.1:1".into(),
             "http://127.0.0.1:1".into(),
             "windlass",
@@ -895,7 +969,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -919,7 +993,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -937,7 +1011,7 @@ mod tests {
         // A local socks5 proxy address — client builds without error.
         let result = MamClient::new(
             Some("socks5://127.0.0.1:1080"),
-            "session".into(),
+            MamSessionId::new("session".into()),
             "http://example.com".into(),
             "http://example.com".into(),
             "windlass",
@@ -963,7 +1037,7 @@ mod tests {
         let base = server.uri();
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             base.clone(),
             base.clone(),
             "windlass",
@@ -990,7 +1064,7 @@ mod tests {
         let base = server.uri();
         let mam = MamClient::new(
             None,
-            "my_session".into(),
+            MamSessionId::new("my_session".into()),
             base.clone(),
             base.clone(),
             "windlass",

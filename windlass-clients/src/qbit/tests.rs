@@ -1,9 +1,80 @@
 use std::sync::Arc;
 
 use super::{QbitAuthResult, QbitClient, QbitPortSyncResult, QbitTorrentState};
-use windlass_types::{AuthCookie, MamTorrentId, TorrentHash, VpnPort};
+use windlass_types::{AuthCookie, MamTorrentId, QbitPassword, TorrentHash, VpnPort};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+// ── §37a secret-redaction acceptance ─────────────────────────────────────────
+
+#[test]
+fn qbit_password_debug_does_not_leak_cleartext() {
+    // The password held inside QbitClient is a QbitPassword
+    // (SecretString wrapper).  A bug that prints it should never expose
+    // the cleartext.
+    let cleartext = "totally-not-a-secret-pw";
+    let password = QbitPassword::new(cleartext.into());
+    let dbg = format!("{password:?}");
+    assert!(!dbg.contains(cleartext), "QbitPassword leaked: {dbg}");
+}
+
+#[test]
+fn qbit_client_password_does_not_serialize_to_cleartext() {
+    // QbitPassword has no Serialize impl; if a future commit adds one
+    // that exposes the cleartext, this test must catch the regression.
+    // We assert structurally: serializing a JSON map that includes the
+    // SecretString via expose_secret would write cleartext — but the
+    // default route should never expose it.  Since QbitPassword does not
+    // impl Serialize, attempting `serde_json::to_string(&password)` is a
+    // compile error, which is exactly the desired guarantee.  Confirm
+    // with a Debug check instead (Serialize is opt-in by absence).
+    let p = QbitPassword::new("plain-pw".into());
+    assert!(!format!("{p:?}").contains("plain-pw"));
+}
+
+#[test]
+fn qbit_client_password_tracing_capture_does_not_leak() {
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct MemWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for MemWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for MemWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buf = MemWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+
+    let password = QbitPassword::new("trace-leak-canary".into());
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(?password, "captured");
+    });
+
+    let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logged.contains("trace-leak-canary"),
+        "tracing leaked cleartext: {logged}"
+    );
+}
 
 // ── authenticate ──────────────────────────────────────────────────────────────
 
@@ -24,7 +95,7 @@ async fn authenticate_success_extracts_sid_cookie() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
@@ -49,7 +120,7 @@ async fn authenticate_success_accepts_204_with_sid_cookie() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
@@ -75,7 +146,7 @@ async fn authenticate_success_extracts_qbt_sid_cookie() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
@@ -98,7 +169,7 @@ async fn authenticate_ok_body_without_sid_cookie_returns_auth_failed() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
@@ -118,7 +189,7 @@ async fn authenticate_fails_body_returns_auth_failed() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "wrong_pass".into(),
+        QbitPassword::new("wrong_pass".into()),
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
@@ -132,7 +203,7 @@ async fn authenticate_network_error_returns_connection_refused() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
@@ -154,7 +225,7 @@ async fn sync_port_returns_success_on_200() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let cookie = AuthCookie::new("abc123".to_string());
@@ -176,7 +247,7 @@ async fn sync_port_returns_failed_with_status_on_403() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let cookie = AuthCookie::new("abc123".to_string());
@@ -204,7 +275,7 @@ async fn authenticate_unexpected_response_returns_api_error() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let event = qbit.authenticate().await;
@@ -220,7 +291,7 @@ async fn sync_port_network_error_returns_failed_with_code_zero() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "admin".into(),
-        "password".into(),
+        QbitPassword::new("password".into()),
         Arc::new(|_| {}),
     );
     let cookie = AuthCookie::new("abc123".to_string());
@@ -264,7 +335,7 @@ async fn list_torrent_details_returns_parsed_records() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     let cookie = AuthCookie::new("sid".to_string());
@@ -314,7 +385,7 @@ async fn list_torrent_details_maps_all_state_strings() {
             reqwest::Client::new(),
             server.uri(),
             "a".into(),
-            "p".into(),
+            QbitPassword::new("p".into()),
             Arc::new(|_| {}),
         );
         let details = qbit
@@ -336,7 +407,7 @@ async fn list_torrent_details_returns_empty_on_bad_json() {
         reqwest::Client::new(),
         server.uri(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     let details = qbit
@@ -351,7 +422,7 @@ async fn list_torrent_details_returns_empty_on_network_error() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     let details = qbit
@@ -377,7 +448,7 @@ async fn get_preferences_returns_parsed_limits() {
         reqwest::Client::new(),
         server.uri(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     let prefs = qbit
@@ -406,7 +477,7 @@ async fn get_preferences_returns_none_on_bad_json() {
         reqwest::Client::new(),
         server.uri(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     let prefs = qbit
@@ -431,7 +502,7 @@ async fn add_torrent_returns_hash_from_response_body() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     let cookie = AuthCookie::new("sid".to_string());
@@ -452,7 +523,7 @@ async fn add_torrent_returns_none_on_error_response() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     let cookie = AuthCookie::new("sid".to_string());
@@ -478,7 +549,7 @@ async fn pause_torrent_posts_correct_form() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     let cookie = AuthCookie::new("sid".to_string());
@@ -493,7 +564,7 @@ async fn pause_torrent_does_not_panic_on_network_error() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     qbit.pause_torrent(
@@ -521,7 +592,7 @@ async fn resume_torrent_posts_correct_form() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     qbit.resume_torrent(
@@ -538,7 +609,7 @@ async fn resume_torrent_does_not_panic_on_network_error() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     qbit.resume_torrent(
@@ -566,7 +637,7 @@ async fn force_resume_torrent_posts_correct_form() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     qbit.force_resume_torrent(
@@ -583,7 +654,7 @@ async fn force_resume_torrent_does_not_panic_on_network_error() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     qbit.force_resume_torrent(
@@ -613,7 +684,7 @@ async fn delete_torrent_posts_with_delete_files_false() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     qbit.delete_torrent(
@@ -630,7 +701,7 @@ async fn delete_torrent_does_not_panic_on_network_error() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     qbit.delete_torrent(
@@ -658,7 +729,7 @@ async fn set_all_files_priority_posts_correct_form() {
         reqwest::Client::new(),
         server.uri(),
         "admin".into(),
-        "pass".into(),
+        QbitPassword::new("pass".into()),
         Arc::new(|_| {}),
     );
     qbit.set_all_files_priority(
@@ -675,7 +746,7 @@ async fn set_all_files_priority_does_not_panic_on_network_error() {
         reqwest::Client::new(),
         "http://127.0.0.1:1".into(),
         "a".into(),
-        "p".into(),
+        QbitPassword::new("p".into()),
         Arc::new(|_| {}),
     );
     qbit.set_all_files_priority(

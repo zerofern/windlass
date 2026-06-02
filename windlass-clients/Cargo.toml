@@ -8,6 +8,7 @@ windlass-types = { workspace = true }
 windlass-debug = { workspace = true }
 chrono         = { workspace = true }
 reqwest        = { workspace = true }
+secrecy        = { workspace = true }
 tokio          = { workspace = true }
 tracing        = { workspace = true }
 serde          = { workspace = true }
@@ -15,5 +16,6 @@ serde_json     = { workspace = true }
 anyhow         = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }
 tokio    = { workspace = true }

@@ -3231,10 +3231,12 @@ dependencies = [
  "anyhow",
  "chrono",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "windlass-debug",
  "windlass-types",
  "wiremock",
@@ -3405,6 +3407,8 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
  "uom",
 ]
 

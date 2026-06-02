@@ -2,7 +2,7 @@
 
 use tracing::{debug, warn};
 
-use windlass_types::{AuthCookie, HttpExchange, HttpObserver, VpnPort};
+use windlass_types::{AuthCookie, HttpExchange, HttpObserver, QbitPassword, VpnPort};
 
 use super::types::{
     QbitAuthResult, QbitPortSyncResult, QbitPreferences, QbitTorrentDetails, QbitTorrentState,
@@ -10,12 +10,16 @@ use super::types::{
 
 /// Wraps a `reqwest::Client` together with the qBittorrent connection details.
 /// All qBittorrent operations are methods so call sites only pass `&self`.
+///
+/// The password is held as a [`QbitPassword`] so the type's `Debug` impl
+/// emits `[REDACTED]` and the cleartext only reaches the auth POST via an
+/// explicit `expose_secret()` call.
 #[derive(Clone)]
 pub struct QbitClient {
     pub(super) client: reqwest::Client,
     pub(super) base_url: String,
     user: String,
-    pass: String,
+    pass: QbitPassword,
     pub(super) on_http: HttpObserver,
 }
 
@@ -25,7 +29,7 @@ impl QbitClient {
         client: reqwest::Client,
         base_url: String,
         user: String,
-        pass: String,
+        pass: QbitPassword,
         on_http: HttpObserver,
     ) -> Self {
         Self {
@@ -65,7 +69,7 @@ impl QbitClient {
             .post(&url)
             .form(&[
                 ("username", self.user.as_str()),
-                ("password", self.pass.as_str()),
+                ("password", self.pass.expose_secret()),
             ])
             .send()
             .await

@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use secrecy::ExposeSecret;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -104,7 +103,7 @@ pub(super) async fn init_shell(
         direct,
         config.qbit_url.clone(),
         config.qbit_user.clone(),
-        config.qbit_pass.0.expose_secret().to_owned(),
+        config.qbit_pass.clone(),
         on_http.clone(),
     );
     let mam = mam::MamClient::new(

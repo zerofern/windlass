@@ -110,8 +110,44 @@ pub struct ContainerName(pub String);
 
 // ── Secrets ──────────────────────────────────────────────────────────────────
 
-pub struct MamSessionId(pub SecretString);
-pub struct QbitPassword(pub SecretString);
+/// Operator's MAM session cookie (`mam_id` value).
+///
+/// Wraps `SecretString` so `Debug` formats as `[REDACTED]` and the type
+/// carries no default `Serialize` impl (cleartext never reaches a generic
+/// JSON encoder). Call `expose_secret()` at the HTTP boundary where the
+/// raw value is actually needed.
+#[derive(Debug, Clone)]
+pub struct MamSessionId(SecretString);
+
+impl MamSessionId {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(SecretString::from(value))
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+/// qBittorrent admin password. Same redaction discipline as
+/// [`MamSessionId`]: `Debug` emits `[REDACTED]`, no default `Serialize`
+/// impl, cleartext only available via `expose_secret()`.
+#[derive(Debug, Clone)]
+pub struct QbitPassword(SecretString);
+
+impl QbitPassword {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(SecretString::from(value))
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
 
 // ── Retry / recovery counts ───────────────────────────────────────────────────
 
@@ -350,6 +386,103 @@ mod tests {
     fn auth_cookie_deserializes_from_string() {
         let c: AuthCookie = serde_json::from_str(r#""some-value""#).unwrap();
         assert_eq!(c.expose_secret(), "some-value");
+    }
+
+    #[test]
+    fn auth_cookie_debug_does_not_leak_cleartext() {
+        let c = AuthCookie::new("super-sekrit".to_string());
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("super-sekrit"),
+            "Debug leaked cleartext: {dbg}"
+        );
+    }
+
+    #[test]
+    fn mam_session_id_debug_does_not_leak_cleartext() {
+        let id = MamSessionId::new("very-secret-session".to_string());
+        let dbg = format!("{id:?}");
+        assert!(
+            !dbg.contains("very-secret-session"),
+            "Debug leaked cleartext: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "expected REDACTED marker: {dbg}");
+    }
+
+    #[test]
+    fn qbit_password_debug_does_not_leak_cleartext() {
+        let p = QbitPassword::new("hunter2".to_string());
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains("hunter2"), "Debug leaked cleartext: {dbg}");
+        assert!(dbg.contains("REDACTED"), "expected REDACTED marker: {dbg}");
+    }
+
+    #[test]
+    fn mam_session_id_exposes_cleartext_only_via_expose_secret() {
+        let id = MamSessionId::new("session-xyz".to_string());
+        assert_eq!(id.expose_secret(), "session-xyz");
+    }
+
+    #[test]
+    fn qbit_password_exposes_cleartext_only_via_expose_secret() {
+        let p = QbitPassword::new("pw-xyz".to_string());
+        assert_eq!(p.expose_secret(), "pw-xyz");
+    }
+
+    #[test]
+    fn tracing_capture_of_secrets_does_not_leak_cleartext() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct MemWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for MemWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for MemWriter {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = MemWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+
+        let cookie = AuthCookie::new("auth-cleartext-xyz".to_string());
+        let session = MamSessionId::new("mam-cleartext-xyz".to_string());
+        let password = QbitPassword::new("pw-cleartext-xyz".to_string());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(?cookie, ?session, ?password, "captured");
+        });
+
+        let bytes = buf.0.lock().unwrap().clone();
+        let logged = String::from_utf8(bytes).unwrap();
+        assert!(
+            !logged.contains("auth-cleartext-xyz"),
+            "AuthCookie cleartext leaked: {logged}"
+        );
+        assert!(
+            !logged.contains("mam-cleartext-xyz"),
+            "MamSessionId cleartext leaked: {logged}"
+        );
+        assert!(
+            !logged.contains("pw-cleartext-xyz"),
+            "QbitPassword cleartext leaked: {logged}"
+        );
     }
 
     #[test]
