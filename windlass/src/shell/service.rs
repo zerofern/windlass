@@ -373,6 +373,8 @@ mod tests {
 
         let (domain_handles, _domain_join) =
             windlass_machine::spawn::<WindlassMachine, crate::shell::domain_shell::DomainShell>(
+                windlass_machine::CoreId::Domain,
+                windlass_machine::NullRuntimeTap::arc(),
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
@@ -646,6 +648,8 @@ mod tests {
 
         let (domain_handles, _domain_join) =
             windlass_machine::spawn::<WindlassMachine, crate::shell::domain_shell::DomainShell>(
+                windlass_machine::CoreId::Domain,
+                windlass_machine::NullRuntimeTap::arc(),
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
@@ -712,6 +716,8 @@ mod tests {
 
         let (domain_handles, _domain_join) =
             windlass_machine::spawn::<WindlassMachine, crate::shell::domain_shell::DomainShell>(
+                windlass_machine::CoreId::Domain,
+                windlass_machine::NullRuntimeTap::arc(),
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),

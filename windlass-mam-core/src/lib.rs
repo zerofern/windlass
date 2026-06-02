@@ -536,11 +536,11 @@ impl Machine for MamMachine {
         match event.inner {
             MamEvent::Init => Outcome {
                 actions: vec![MamAction::FetchStatus],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             MamEvent::TimerFired(MamTimer::StatusRetry | MamTimer::RateLimitExpired) => Outcome {
                 actions: self.refresh_or_update_seedbox(),
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §27: the keep-alive timer always re-schedules itself before
             // emitting the FetchStatus action, so a dropped result or shell
@@ -553,7 +553,7 @@ impl Machine for MamMachine {
                         after: self.config.keep_alive_interval,
                     },
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §31 / MAM-17: stale-registration refresh.  Mousehole's
             // `STALE_RESPONSE_SECONDS` analog — force a `UpdateSeedbox`
@@ -568,7 +568,7 @@ impl Machine for MamMachine {
                         after: self.config.stale_registration_interval,
                     },
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             MamEvent::AuthSucceeded => {
                 self.authenticated = true;
@@ -584,13 +584,13 @@ impl Machine for MamMachine {
                 }
                 Outcome {
                     actions,
-                    publish: vec![MamPublish::Ready],
+                    publishes: vec![MamPublish::Ready],
                 }
             }
             MamEvent::AuthFailed { reason }
             | MamEvent::StatusFailed { reason }
             | MamEvent::SeedboxUpdateFailed { reason } => {
-                let mut publish = vec![MamPublish::Unavailable {
+                let mut publishes = vec![MamPublish::Unavailable {
                     reason: reason.clone(),
                 }];
                 // §27 / MAM-10: increment the consecutive-failure count, and
@@ -598,7 +598,7 @@ impl Machine for MamMachine {
                 // when the count crosses the configured threshold.
                 let crossed = self.bump_keep_alive_failures();
                 if crossed {
-                    publish.push(MamPublish::KeepAliveDegraded {
+                    publishes.push(MamPublish::KeepAliveDegraded {
                         consecutive_failures: self.consecutive_status_failures,
                         last_reason: reason,
                     });
@@ -608,7 +608,7 @@ impl Machine for MamMachine {
                         timer: MamTimer::StatusRetry,
                         after: self.config.status_retry,
                     }],
-                    publish,
+                    publishes,
                 }
             }
             // §28 / MAM-11: a transport-level failure publishes
@@ -619,12 +619,12 @@ impl Machine for MamMachine {
             // side").  Same StatusRetry + keep-alive-counter handling as the
             // other retryable failures.
             MamEvent::Unreachable { reason } => {
-                let mut publish = vec![MamPublish::Unreachable {
+                let mut publishes = vec![MamPublish::Unreachable {
                     reason: reason.clone(),
                 }];
                 let crossed = self.bump_keep_alive_failures();
                 if crossed {
-                    publish.push(MamPublish::KeepAliveDegraded {
+                    publishes.push(MamPublish::KeepAliveDegraded {
                         consecutive_failures: self.consecutive_status_failures,
                         last_reason: reason,
                     });
@@ -634,7 +634,7 @@ impl Machine for MamMachine {
                         timer: MamTimer::StatusRetry,
                         after: self.config.status_retry,
                     }],
-                    publish,
+                    publishes,
                 }
             }
             MamEvent::StatusFetched {
@@ -650,7 +650,7 @@ impl Machine for MamMachine {
                 // failure count.  After a future failure burst, the rising
                 // edge over the threshold republishes KeepAliveDegraded.
                 self.consecutive_status_failures = 0;
-                let mut publish = vec![if connectable {
+                let mut publishes = vec![if connectable {
                     MamPublish::Connectable { seedbox_port }
                 } else {
                     MamPublish::NotConnectable {
@@ -658,7 +658,7 @@ impl Machine for MamMachine {
                     }
                 }];
                 if connectable {
-                    publish.extend(self.seedbox_publish(seedbox_port));
+                    publishes.extend(self.seedbox_publish(seedbox_port));
                 }
                 // §26: publish UploadHealthDegraded when the strictest
                 // (non-freeleech) gate would block.  §29: publish
@@ -666,14 +666,14 @@ impl Machine for MamMachine {
                 // the domain admission state has a rising-edge positive
                 // signal.  Either branch is exhaustive — exactly one fires.
                 if self.upload_health_ok(false) {
-                    publish.push(MamPublish::UploadHealthOk {
+                    publishes.push(MamPublish::UploadHealthOk {
                         ratio,
                         upload_credit_bytes,
                     });
                 } else {
                     let ratio_ok = ratio >= self.config.min_global_ratio;
                     let buffer_ok = upload_credit_bytes >= self.config.min_upload_buffer_bytes;
-                    publish.push(MamPublish::UploadHealthDegraded {
+                    publishes.push(MamPublish::UploadHealthDegraded {
                         ratio,
                         upload_credit_bytes,
                         ratio_ok,
@@ -682,7 +682,7 @@ impl Machine for MamMachine {
                 }
                 Outcome {
                     actions: self.converge_seedbox(),
-                    publish,
+                    publishes,
                 }
             }
             MamEvent::SeedboxUpdated {
@@ -708,7 +708,7 @@ impl Machine for MamMachine {
                 if registered_as.is_some() {
                     self.registered_as = registered_as;
                 }
-                let mut publish: Vec<MamPublish> = port
+                let mut publishes: Vec<MamPublish> = port
                     .map(|p| MamPublish::SeedboxPortReady { port: p })
                     .into_iter()
                     .collect();
@@ -716,11 +716,11 @@ impl Machine for MamMachine {
                 // publish when transitioning from Unknown or Mismatched.
                 if self.asn_state != AsnState::Accepted {
                     self.asn_state = AsnState::Accepted;
-                    publish.push(MamPublish::AsnAccepted);
+                    publishes.push(MamPublish::AsnAccepted);
                 }
                 Outcome {
                     actions: Vec::new(),
-                    publish,
+                    publishes,
                 }
             }
             // §30 / MAM-14: rising-edge ASN-mismatch.  Publishes
@@ -730,14 +730,14 @@ impl Machine for MamMachine {
             // bumps the §27 keep-alive failure counter — a persistent ASN
             // mismatch shows up as a degraded heartbeat too.
             MamEvent::AsnMismatch { ip } => {
-                let mut publish = Vec::new();
+                let mut publishes = Vec::new();
                 if self.asn_state != AsnState::Mismatched {
                     self.asn_state = AsnState::Mismatched;
-                    publish.push(MamPublish::AsnMismatch { ip });
+                    publishes.push(MamPublish::AsnMismatch { ip });
                 }
                 let crossed = self.bump_keep_alive_failures();
                 if crossed {
-                    publish.push(MamPublish::KeepAliveDegraded {
+                    publishes.push(MamPublish::KeepAliveDegraded {
                         consecutive_failures: self.consecutive_status_failures,
                         last_reason: format!("ASN mismatch for {}", ip.0),
                     });
@@ -747,7 +747,7 @@ impl Machine for MamMachine {
                         timer: MamTimer::StatusRetry,
                         after: self.config.status_retry,
                     }],
-                    publish,
+                    publishes,
                 }
             }
             MamEvent::RateLimited { retry_after } => Outcome {
@@ -755,17 +755,17 @@ impl Machine for MamMachine {
                     timer: MamTimer::RateLimitExpired,
                     after: retry_after,
                 }],
-                publish: vec![MamPublish::RateLimited { retry_after }],
+                publishes: vec![MamPublish::RateLimited { retry_after }],
             },
             // §36 step 5: forward the fetched bytes to subscribers (domain
             // routes them to QbitCommand::AddTorrent).
             MamEvent::TorrentBytesFetched { mam_id, bytes } => Outcome {
                 actions: Vec::new(),
-                publish: vec![MamPublish::TorrentBytesReady { mam_id, bytes }],
+                publishes: vec![MamPublish::TorrentBytesReady { mam_id, bytes }],
             },
             MamEvent::TorrentBytesFetchFailed { mam_id, reason } => Outcome {
                 actions: Vec::new(),
-                publish: vec![MamPublish::TorrentBytesFetchFailed { mam_id, reason }],
+                publishes: vec![MamPublish::TorrentBytesFetchFailed { mam_id, reason }],
             },
         }
     }
@@ -892,7 +892,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(out.publish, vec![MamPublish::Ready]);
+        assert_eq!(out.publishes, vec![MamPublish::Ready]);
         assert!(machine.keep_alive_scheduled());
     }
 
@@ -919,7 +919,7 @@ mod tests {
                 after: retry_after,
             }]
         );
-        assert_eq!(out.publish, vec![MamPublish::RateLimited { retry_after }]);
+        assert_eq!(out.publishes, vec![MamPublish::RateLimited { retry_after }]);
     }
 
     #[test]
@@ -942,7 +942,7 @@ mod tests {
         // §30: the first SeedboxUpdated also publishes AsnAccepted (rising
         // edge from Unknown).
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![
                 MamPublish::SeedboxPortReady { port },
                 MamPublish::AsnAccepted,
@@ -973,7 +973,7 @@ mod tests {
 
         assert_eq!(out.actions, vec![MamAction::UpdateSeedbox]);
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![
                 MamPublish::Connectable {
                     seedbox_port: Some(observed),
@@ -1009,7 +1009,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            failed.publish,
+            failed.publishes,
             vec![MamPublish::Unavailable {
                 reason: "rate limited".to_string(),
             }]
@@ -1037,7 +1037,7 @@ mod tests {
         let out = machine.handle_command(Instant::now(), MamCommand::EnsureSeedboxPort { port });
 
         assert!(out.actions.is_empty());
-        assert_eq!(out.publish, vec![MamPublish::SeedboxPortReady { port }]);
+        assert_eq!(out.publishes, vec![MamPublish::SeedboxPortReady { port }]);
     }
 
     // ── upload_health_ok predicate tests (§26) ────────────────────────────────
@@ -1106,7 +1106,7 @@ mod tests {
             },
         );
         let degraded = out
-            .publish
+            .publishes
             .iter()
             .find(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }));
         assert!(
@@ -1137,7 +1137,7 @@ mod tests {
             },
         );
         let degraded = out
-            .publish
+            .publishes
             .iter()
             .find(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }));
         assert!(
@@ -1168,7 +1168,7 @@ mod tests {
             },
         );
         let degraded_count = out
-            .publish
+            .publishes
             .iter()
             .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
             .count();
@@ -1191,7 +1191,7 @@ mod tests {
             },
         );
         let degraded_count = out
-            .publish
+            .publishes
             .iter()
             .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
             .count();
@@ -1204,7 +1204,7 @@ mod tests {
             buffer_ok,
             ..
         }) = out
-            .publish
+            .publishes
             .iter()
             .find(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
         {
@@ -1233,7 +1233,7 @@ mod tests {
                 },
             ]
         );
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
     }
 
     #[test]
@@ -1305,7 +1305,7 @@ mod tests {
         );
 
         let degraded_count = |out: &Outcome<MamAction, MamPublish>| {
-            out.publish
+            out.publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
                 .count()
@@ -1328,7 +1328,7 @@ mod tests {
             consecutive_failures,
             last_reason,
         }) = third
-            .publish
+            .publishes
             .iter()
             .find(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
         {
@@ -1383,7 +1383,7 @@ mod tests {
             },
         );
         let degraded_count = third
-            .publish
+            .publishes
             .iter()
             .filter(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
             .count();
@@ -1416,7 +1416,7 @@ mod tests {
         );
 
         let degraded = third
-            .publish
+            .publishes
             .iter()
             .find(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }));
         assert!(
@@ -1454,7 +1454,7 @@ mod tests {
                 },
             );
             assert!(
-                !out.publish
+                !out.publishes
                     .iter()
                     .any(|p| matches!(p, MamPublish::KeepAliveDegraded { .. })),
                 "threshold=0 must never publish KeepAliveDegraded"
@@ -1630,7 +1630,7 @@ mod prop_tests {
             event in any_mam_event(),
         ) {
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
-            for publish in &out.publish {
+            for publish in &out.publishes {
                 if let MamPublish::SeedboxPortReady { port } = publish {
                     prop_assert!(
                         machine.desired_seedbox_port.is_none()
@@ -1665,7 +1665,7 @@ mod prop_tests {
                 );
                 prop_assert!(is_status_retry);
                 let unavailable_count = out
-                    .publish
+                    .publishes
                     .iter()
                     .filter(|p| matches!(p, MamPublish::Unavailable { .. }))
                     .count();
@@ -1684,13 +1684,13 @@ mod prop_tests {
             );
             prop_assert!(is_status_retry);
             let unreachable_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::Unreachable { .. }))
                 .count();
             prop_assert_eq!(unreachable_count, 1);
             let unavailable_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::Unavailable { .. }))
                 .count();
@@ -1726,7 +1726,7 @@ mod prop_tests {
             // After handle, self.ratio and self.upload_credit_bytes are updated.
             let expected_health_ok = machine.upload_health_ok(false);
             let degraded_publishes: Vec<_> = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
                 .collect();
@@ -1789,12 +1789,12 @@ mod prop_tests {
             );
             let expected_ok = machine.upload_health_ok(false);
             let ok_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::UploadHealthOk { .. }))
                 .count();
             let degraded_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::UploadHealthDegraded { .. }))
                 .count();
@@ -1863,7 +1863,7 @@ mod prop_tests {
                 .count();
             prop_assert_eq!(fetch_count, 1, "must emit exactly one FetchStatus");
             prop_assert_eq!(reschedule_count, 1, "must re-arm KeepAlive exactly once");
-            prop_assert!(out.publish.is_empty(),
+            prop_assert!(out.publishes.is_empty(),
                 "KeepAlive timer is side-effect-free on publishes");
         }
 
@@ -1892,7 +1892,7 @@ mod prop_tests {
             prop_assert!(after == before.saturating_add(1));
 
             let degraded_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::KeepAliveDegraded { .. }))
                 .count();
@@ -1903,7 +1903,7 @@ mod prop_tests {
                     "rising edge must publish exactly one KeepAliveDegraded");
                 if let Some(MamPublish::KeepAliveDegraded {
                     consecutive_failures, last_reason,
-                }) = out.publish.iter().find(|p| matches!(p, MamPublish::KeepAliveDegraded { .. })) {
+                }) = out.publishes.iter().find(|p| matches!(p, MamPublish::KeepAliveDegraded { .. })) {
                     prop_assert_eq!(*consecutive_failures, after);
                     prop_assert_eq!(last_reason, &reason);
                 }
@@ -1927,19 +1927,19 @@ mod prop_tests {
                 Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::Unreachable { reason: reason.clone() }),
             );
             let unreachable_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::Unreachable { .. }))
                 .count();
             let notconnectable_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::NotConnectable { .. }))
                 .count();
             prop_assert_eq!(unreachable_count, 1);
             prop_assert_eq!(notconnectable_count, 0);
             if let Some(MamPublish::Unreachable { reason: r }) = out
-                .publish
+                .publishes
                 .iter()
                 .find(|p| matches!(p, MamPublish::Unreachable { .. }))
             {
@@ -1968,12 +1968,12 @@ mod prop_tests {
                 }),
             );
             let notconnectable_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::NotConnectable { .. }))
                 .count();
             let unreachable_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::Unreachable { .. }))
                 .count();
@@ -1999,7 +1999,7 @@ mod prop_tests {
             );
             prop_assert_eq!(machine.asn_state(), AsnState::Mismatched);
             let mismatch_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::AsnMismatch { .. }))
                 .count();
@@ -2032,7 +2032,7 @@ mod prop_tests {
             );
             prop_assert_eq!(machine.asn_state(), AsnState::Accepted);
             let accepted_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, MamPublish::AsnAccepted))
                 .count();

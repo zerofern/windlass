@@ -481,7 +481,7 @@ impl Machine for WindlassMachine {
                         after: self.config.snapshot_interval,
                     },
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             WindlassEvent::Vpn(VpnPublish::Connected) => {
                 self.state.vpn = ServiceStatus::Ready;
@@ -512,7 +512,7 @@ impl Machine for WindlassMachine {
                             body: "💀 Gluetun crashed.  Dumping logs, stopping dependents, and restarting.".to_string(),
                         },
                     ],
-                    publish: Vec::new(),
+                    publishes: Vec::new(),
                 }
             }
             // §38 / DOM-28: rising-edge VPN recovery starts dependents
@@ -522,7 +522,7 @@ impl Machine for WindlassMachine {
                 use windlass_docker_core::DockerCommand;
                 Outcome {
                     actions: vec![WindlassAction::Docker(DockerCommand::StartDependents)],
-                    publish: Vec::new(),
+                    publishes: Vec::new(),
                 }
             }
             WindlassEvent::Vpn(VpnPublish::PortReady { port }) => {
@@ -533,7 +533,7 @@ impl Machine for WindlassMachine {
                         WindlassAction::Mam(MamCommand::EnsureSeedboxPort { port }),
                         self.snapshot_action(),
                     ],
-                    publish: vec![WindlassPublish::SystemState(self.state.clone())],
+                    publishes: vec![WindlassPublish::SystemState(self.state.clone())],
                 }
             }
             WindlassEvent::Vpn(VpnPublish::PortUnavailable) => {
@@ -545,7 +545,7 @@ impl Machine for WindlassMachine {
             // the last observed IP) and arm the stale-registration timer.
             WindlassEvent::Vpn(VpnPublish::PublicIpObserved { ip }) => Outcome {
                 actions: vec![WindlassAction::Mam(MamCommand::ObservedIpChanged { ip })],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §31: VPN disconnected or Gluetun deleted the IP file.  Clear
             // the §29 admission gate to its unknown default — autograb is
@@ -619,7 +619,7 @@ impl Machine for WindlassMachine {
                 if name == self.config.gluetun_anchor {
                     Outcome {
                         actions: vec![WindlassAction::Vpn(VpnCommand::ContainerHealthy)],
-                        publish: Vec::new(),
+                        publishes: Vec::new(),
                     }
                 } else {
                     Outcome::none()
@@ -629,7 +629,7 @@ impl Machine for WindlassMachine {
                 if name == self.config.gluetun_anchor {
                     Outcome {
                         actions: vec![WindlassAction::Vpn(VpnCommand::ContainerUnhealthy)],
-                        publish: Vec::new(),
+                        publishes: Vec::new(),
                     }
                 } else {
                     Outcome::none()
@@ -683,7 +683,7 @@ impl Machine for WindlassMachine {
                          Check QBITTORRENT_USER / QBITTORRENT_PASS.",
                     ),
                 }],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §36 step 3 / DOM-31: persistent port-sync failure Warning
             // (ported from legacy `on_qbit_port_sync_failed` retry-limit
@@ -700,7 +700,7 @@ impl Machine for WindlassMachine {
                             port.into_inner(),
                         ),
                     }],
-                    publish: Vec::new(),
+                    publishes: Vec::new(),
                 }
             }
             // §29 / §36 step 3 / DOM-32: ListenPortReady drives the qBit-
@@ -724,7 +724,7 @@ impl Machine for WindlassMachine {
                                 metadata: serde_json::json!({"port": port.into_inner()}),
                             },
                         ))],
-                        publish: Vec::new(),
+                        publishes: Vec::new(),
                     }
                 }
             }
@@ -746,7 +746,7 @@ impl Machine for WindlassMachine {
                     .into_iter()
                     .map(|r| WindlassAction::Db(DbCommand::UpsertTorrent(to_db_record(&r))))
                     .collect(),
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §36 step 7 / DOM-41: Critical "HnR at risk" alert (ported
             // from legacy `check_hnr_at_risk`).  Fires per at-risk
@@ -770,7 +770,7 @@ impl Machine for WindlassMachine {
                             name.0,
                         ),
                     }],
-                    publish: Vec::new(),
+                    publishes: Vec::new(),
                 }
             }
             // §36 step 7 / DOM-42: Warning "HnR lock — cannot delete"
@@ -796,7 +796,7 @@ impl Machine for WindlassMachine {
                             name.0,
                         ),
                     }],
-                    publish: Vec::new(),
+                    publishes: Vec::new(),
                 }
             }
             // §36 step 5 / DOM-35: MAM finished fetching the `.torrent`
@@ -807,7 +807,7 @@ impl Machine for WindlassMachine {
                     mam_id,
                     bytes,
                 })],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §36 step 5 / DOM-37: MAM failed to fetch the bytes.  Emit a
             // Warning "Download failed" alert + Activity entry.
@@ -837,7 +837,7 @@ impl Machine for WindlassMachine {
                         }),
                     })),
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §36 step 5 / DOM-38: qBit accepted the manual-download add.
             // Emit Info "Download started" + `torrent_added` activity.
@@ -864,7 +864,7 @@ impl Machine for WindlassMachine {
                         }),
                     })),
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §36 step 5 / DOM-39: qBit rejected the manual-download add.
             // Emit Warning "Download failed" + `torrent_add_failed`
@@ -895,7 +895,7 @@ impl Machine for WindlassMachine {
                         }),
                     })),
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §36 step 4 / DOM-33: rising-edge new-torrent notification
             // (ported from legacy `on_new_torrents_observed`).  Hash-only
@@ -922,7 +922,7 @@ impl Machine for WindlassMachine {
                         title: "New torrents".to_string(),
                         body,
                     }],
-                    publish: Vec::new(),
+                    publishes: Vec::new(),
                 }
             }
             // DOM-11: QueueOrchestrated → one RecordActivity + one Activity publish.
@@ -975,7 +975,7 @@ impl Machine for WindlassMachine {
                     title: "MAM seedbox updated".to_string(),
                     body: format!("MAM seedbox registered with port {}.", port.into_inner()),
                 }],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §29: MAM auth-success marks the MAM-healthy admission gate true.
             WindlassEvent::Mam(MamPublish::Ready) => {
@@ -1081,7 +1081,7 @@ impl Machine for WindlassMachine {
                             body: format!("💾 Low disk space: {gib:.1} GB remaining."),
                         },
                     ],
-                    publish: vec![WindlassPublish::Activity {
+                    publishes: vec![WindlassPublish::Activity {
                         message: format!(
                             "Disk pressure: {free_bytes} bytes free — eviction triggered"
                         ),
@@ -1090,7 +1090,7 @@ impl Machine for WindlassMachine {
             }
             WindlassEvent::DbFailed { operation, message } => Outcome {
                 actions: Vec::new(),
-                publish: vec![WindlassPublish::Activity {
+                publishes: vec![WindlassPublish::Activity {
                     message: format!("DB {operation} failed: {message}"),
                 }],
             },
@@ -1102,7 +1102,7 @@ impl Machine for WindlassMachine {
                         after: self.config.snapshot_interval,
                     },
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
         }
     }
@@ -1262,7 +1262,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1281,7 +1281,7 @@ impl WindlassMachine {
                     status: DownloadStatus::Blacklisted,
                 },
             ))],
-            publish: vec![WindlassPublish::Activity {
+            publishes: vec![WindlassPublish::Activity {
                 message: format!(
                     "Dead torrent blacklisted in DB (MAM ID {})",
                     id.into_inner()
@@ -1312,7 +1312,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 },
             ))],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1344,7 +1344,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1376,7 +1376,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1423,7 +1423,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1480,7 +1480,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1519,7 +1519,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1562,7 +1562,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1584,7 +1584,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 },
             ))],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1621,7 +1621,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1660,7 +1660,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1697,7 +1697,7 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
@@ -1729,7 +1729,7 @@ impl WindlassMachine {
                 })),
                 self.snapshot_action(),
             ],
-            publish: vec![
+            publishes: vec![
                 WindlassPublish::SystemState(self.state.clone()),
                 WindlassPublish::Activity { message },
             ],
@@ -1773,14 +1773,14 @@ impl WindlassMachine {
                     metadata: serde_json::Value::Null,
                 })),
             ],
-            publish: vec![WindlassPublish::Activity { message }],
+            publishes: vec![WindlassPublish::Activity { message }],
         }
     }
 
     fn publish_state(&self) -> Outcome<WindlassAction, WindlassPublish> {
         Outcome {
             actions: vec![self.snapshot_action()],
-            publish: vec![WindlassPublish::SystemState(self.state.clone())],
+            publishes: vec![WindlassPublish::SystemState(self.state.clone())],
         }
     }
 
@@ -1790,7 +1790,7 @@ impl WindlassMachine {
     ) -> Outcome<WindlassAction, WindlassPublish> {
         Outcome {
             actions: vec![self.snapshot_action()],
-            publish: vec![
+            publishes: vec![
                 WindlassPublish::SystemState(self.state.clone()),
                 WindlassPublish::Activity { message },
             ],
@@ -1875,7 +1875,7 @@ mod tests {
                 .contains(&WindlassAction::Mam(MamCommand::EnsureSeedboxPort { port }))
         );
         assert!(matches!(
-            out.publish.as_slice(),
+            out.publishes.as_slice(),
             [WindlassPublish::SystemState(_)]
         ));
     }
@@ -1894,7 +1894,7 @@ mod tests {
         assert_eq!(machine.state().vpn, ServiceStatus::Degraded);
         assert_eq!(machine.state().forwarded_port, None);
         assert!(matches!(
-            out.publish.as_slice(),
+            out.publishes.as_slice(),
             [WindlassPublish::SystemState(_)]
         ));
     }
@@ -1913,7 +1913,7 @@ mod tests {
             out.actions.as_slice(),
             [WindlassAction::SendAlert { title, .. }] if title == "MAM seedbox updated"
         ));
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
     }
 
     // ── Dead-torrent blacklist tests (DOM-8 / story 20) ───────────────────────
@@ -1946,12 +1946,12 @@ mod tests {
         );
         assert_eq!(out.actions.len(), 1, "exactly one action expected");
         assert_eq!(
-            out.publish.len(),
+            out.publishes.len(),
             1,
             "exactly one publish expected (Activity)"
         );
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -1974,7 +1974,7 @@ mod tests {
             "no action must be emitted when mam_id is None"
         );
         assert!(
-            out.publish.is_empty(),
+            out.publishes.is_empty(),
             "no publish must be emitted when mam_id is None"
         );
     }
@@ -2017,12 +2017,12 @@ mod tests {
             "BelowFloor must emit Warning alert"
         );
         assert_eq!(
-            out.publish.len(),
+            out.publishes.len(),
             1,
             "exactly one publish expected (Activity)"
         );
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -2041,7 +2041,10 @@ mod tests {
         );
 
         assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
-        assert!(out.publish.is_empty(), "AboveFloor must emit no publishes");
+        assert!(
+            out.publishes.is_empty(),
+            "AboveFloor must emit no publishes"
+        );
     }
 
     // ── Privacy auto-revert routing unit tests (DOM-10 / story 23) ───────────
@@ -2087,9 +2090,9 @@ mod tests {
         );
 
         // Exactly one Activity publish
-        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert_eq!(out.publishes.len(), 1, "exactly one publish expected");
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -2166,9 +2169,9 @@ mod tests {
         );
 
         // Exactly one Activity publish
-        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert_eq!(out.publishes.len(), 1, "exactly one publish expected");
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -2213,9 +2216,9 @@ mod tests {
             "second action must be RecordActivity"
         );
         // Exactly one Activity publish
-        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert_eq!(out.publishes.len(), 1, "exactly one publish expected");
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -2287,9 +2290,9 @@ mod tests {
             "second action must be RecordActivity"
         );
         // Exactly one Activity publish
-        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert_eq!(out.publishes.len(), 1, "exactly one publish expected");
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -2366,9 +2369,9 @@ mod tests {
             "second action must be RecordActivity"
         );
         // Exactly one Activity publish
-        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert_eq!(out.publishes.len(), 1, "exactly one publish expected");
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -2442,9 +2445,9 @@ mod tests {
             ),
             "second action must be RecordActivity"
         );
-        assert_eq!(out.publish.len(), 1, "exactly one publish expected");
+        assert_eq!(out.publishes.len(), 1, "exactly one publish expected");
         assert!(
-            matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+            matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
             "publish must be an Activity"
         );
     }
@@ -2526,7 +2529,7 @@ mod tests {
         assert_eq!(activity_db_count, 1, "must emit one RecordActivity");
 
         let activity_publish_count = out
-            .publish
+            .publishes
             .iter()
             .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
             .count();
@@ -2589,7 +2592,7 @@ mod tests {
         );
 
         let activity_count = out
-            .publish
+            .publishes
             .iter()
             .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
             .count();
@@ -2641,7 +2644,7 @@ mod tests {
         assert_eq!(activity_db_count, 1, "must emit one RecordActivity");
 
         let activity_publish_count = out
-            .publish
+            .publishes
             .iter()
             .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
             .count();
@@ -2662,7 +2665,7 @@ mod tests {
         let out = handle(&mut machine, WindlassEvent::Mam(MamPublish::AsnAccepted));
 
         assert!(out.actions.is_empty(), "AsnAccepted emits no actions");
-        assert!(out.publish.is_empty(), "AsnAccepted emits no publishes");
+        assert!(out.publishes.is_empty(), "AsnAccepted emits no publishes");
         assert_eq!(machine.admission().vpn_ip_compliant, Some(true));
     }
 
@@ -3112,9 +3115,9 @@ mod prop_tests {
                 )),
                 "BelowFloor must emit Warning alert"
             );
-            prop_assert_eq!(out.publish.len(), 1);
+            prop_assert_eq!(out.publishes.len(), 1);
             prop_assert!(
-                matches!(&out.publish[0], WindlassPublish::Activity { .. }),
+                matches!(&out.publishes[0], WindlassPublish::Activity { .. }),
                 "BelowFloor must emit exactly one Activity publish"
             );
         }
@@ -3130,7 +3133,7 @@ mod prop_tests {
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Disk(DiskPublish::AboveFloor { free_bytes })),
             );
             prop_assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
-            prop_assert!(out.publish.is_empty(), "AboveFloor must emit no publishes");
+            prop_assert!(out.publishes.is_empty(), "AboveFloor must emit no publishes");
         }
 
         // DOM-10 [safety] (privacy alert routing — §23):
@@ -3177,7 +3180,7 @@ mod prop_tests {
             );
 
             let activity_publish_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                 .count();
@@ -3223,7 +3226,7 @@ mod prop_tests {
                 "UnsatisfiedQuotaCritical must emit exactly one RecordAlert(Critical)"
             );
 
-            let activity_count = out.publish.iter()
+            let activity_count = out.publishes.iter()
                 .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                 .count();
             prop_assert_eq!(
@@ -3268,7 +3271,7 @@ mod prop_tests {
                 "UnsatisfiedQuotaApproaching must emit exactly one RecordAlert(Warning)"
             );
 
-            let activity_count = out.publish.iter()
+            let activity_count = out.publishes.iter()
                 .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                 .count();
             prop_assert_eq!(
@@ -3317,7 +3320,7 @@ mod prop_tests {
                 "UploadHealthDegraded must emit exactly one RecordAlert(Warning)"
             );
 
-            let activity_count = out.publish.iter()
+            let activity_count = out.publishes.iter()
                 .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                 .count();
             prop_assert_eq!(
@@ -3362,7 +3365,7 @@ mod prop_tests {
                 "KeepAliveDegraded must emit exactly one RecordAlert(Warning)"
             );
 
-            let activity_count = out.publish.iter()
+            let activity_count = out.publishes.iter()
                 .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                 .count();
             prop_assert_eq!(
@@ -3402,7 +3405,7 @@ mod prop_tests {
                 "NotConnectable must emit exactly one RecordAlert(Warning)"
             );
 
-            let activity_count = out.publish.iter()
+            let activity_count = out.publishes.iter()
                 .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                 .count();
             prop_assert_eq!(
@@ -3437,7 +3440,7 @@ mod prop_tests {
                 "Unreachable must emit zero RecordAlert"
             );
 
-            let activity_count = out.publish.iter()
+            let activity_count = out.publishes.iter()
                 .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                 .count();
             prop_assert_eq!(
@@ -3495,7 +3498,7 @@ mod prop_tests {
                 WindlassCommand::TryAddTorrent { candidate },
             );
             if will_block {
-                let activity_count = out.publish.iter()
+                let activity_count = out.publishes.iter()
                     .filter(|p| matches!(p, WindlassPublish::Activity { .. }))
                     .count();
                 prop_assert_eq!(activity_count, 1,
@@ -3543,7 +3546,7 @@ mod prop_tests {
             prop_assert_eq!(activity_db_count, 1,
                 "DOM-20: must emit one RecordActivity");
 
-            let activity_count = out.publish.iter().filter(|p| matches!(
+            let activity_count = out.publishes.iter().filter(|p| matches!(
                 p, WindlassPublish::Activity { .. }
             )).count();
             prop_assert_eq!(activity_count, 1,
@@ -3584,7 +3587,7 @@ mod prop_tests {
             )).count();
             prop_assert_eq!(critical_count, 1);
 
-            let activity_count = out.publish.iter().filter(|p| matches!(
+            let activity_count = out.publishes.iter().filter(|p| matches!(
                 p, WindlassPublish::Activity { .. }
             )).count();
             prop_assert_eq!(activity_count, 1);
@@ -3658,7 +3661,7 @@ mod prop_tests {
             )).count();
             prop_assert_eq!(critical_count, 1);
 
-            let activity_count = out.publish.iter().filter(|p| matches!(
+            let activity_count = out.publishes.iter().filter(|p| matches!(
                 p, WindlassPublish::Activity { .. }
             )).count();
             prop_assert_eq!(activity_count, 1);

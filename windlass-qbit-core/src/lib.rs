@@ -723,7 +723,7 @@ impl Machine for QbitMachine {
         match event.inner {
             QbitEvent::Init | QbitEvent::TimerFired(QbitTimer::AuthRetry) => Outcome {
                 actions: vec![QbitAction::Login],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             QbitEvent::AuthSucceeded { cookie } => {
                 self.cookie = Some(cookie.clone());
@@ -749,7 +749,7 @@ impl Machine for QbitMachine {
                 }
                 Outcome {
                     actions,
-                    publish: vec![QbitPublish::Ready],
+                    publishes: vec![QbitPublish::Ready],
                 }
             }
             QbitEvent::AuthFailed { reason } => Outcome {
@@ -757,7 +757,7 @@ impl Machine for QbitMachine {
                     timer: QbitTimer::AuthRetry,
                     after: self.config.auth_retry,
                 }],
-                publish: vec![QbitPublish::Unavailable { reason }],
+                publishes: vec![QbitPublish::Unavailable { reason }],
             },
             // §36 step 3: credentials-rejected variant.  Same retry as
             // `AuthFailed` (qBit may come back if the operator fixes the
@@ -768,7 +768,7 @@ impl Machine for QbitMachine {
                     timer: QbitTimer::AuthRetry,
                     after: self.config.auth_retry,
                 }],
-                publish: vec![
+                publishes: vec![
                     QbitPublish::Unavailable {
                         reason: reason.clone(),
                     },
@@ -787,7 +787,7 @@ impl Machine for QbitMachine {
                 self.max_active_torrents = max_active_torrents;
 
                 let mut actions = self.converge_listen_port();
-                let mut publish = self.listen_port_publish(listen_port);
+                let mut publishes = self.listen_port_publish(listen_port);
 
                 // QBIT-12: if any banned privacy setting is enabled, disable
                 // them and publish the observation.  The disable action is only
@@ -798,12 +798,12 @@ impl Machine for QbitMachine {
                     if let Some(cookie) = self.cookie.clone() {
                         actions.push(QbitAction::DisableBannedPrivacySettings { cookie });
                     }
-                    publish.push(QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd });
+                    publishes.push(QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd });
                 } else {
-                    publish.push(QbitPublish::PrivacyClean);
+                    publishes.push(QbitPublish::PrivacyClean);
                 }
 
-                Outcome { actions, publish }
+                Outcome { actions, publishes }
             }
             // QBIT-5 / QBIT-13: PreferencesFailed and
             // PrivacySettingsDisableFailed retry via SyncRetry with no
@@ -814,7 +814,7 @@ impl Machine for QbitMachine {
                     timer: QbitTimer::SyncRetry,
                     after: self.config.sync_retry,
                 }],
-                publish: vec![QbitPublish::Unavailable { reason }],
+                publishes: vec![QbitPublish::Unavailable { reason }],
             },
             // §36 step 3: ListenPortSetFailed has its own arm so we can
             // track consecutive attempts and surface a persistent-failure
@@ -835,7 +835,7 @@ impl Machine for QbitMachine {
                             timer: QbitTimer::AuthRetry,
                             after: self.config.auth_retry,
                         }],
-                        publish: vec![
+                        publishes: vec![
                             QbitPublish::Unavailable { reason },
                             QbitPublish::ListenPortPersistentFailure { port, attempts },
                         ],
@@ -846,7 +846,7 @@ impl Machine for QbitMachine {
                             timer: QbitTimer::SyncRetry,
                             after: self.config.sync_retry,
                         }],
-                        publish: vec![QbitPublish::Unavailable { reason }],
+                        publishes: vec![QbitPublish::Unavailable { reason }],
                     }
                 }
             }
@@ -857,7 +857,7 @@ impl Machine for QbitMachine {
                 // event, not just well-formed shell events. (Story 18.)
                 Outcome {
                     actions: Vec::new(),
-                    publish: self.listen_port_publish(Some(port)),
+                    publishes: self.listen_port_publish(Some(port)),
                 }
             }
             QbitEvent::TorrentsListed { torrents } => {
@@ -887,7 +887,7 @@ impl Machine for QbitMachine {
                 // the publish carries the canonical state stored in the
                 // machine, not the input vec.
                 let records: Vec<TorrentRecord> = self.torrents.values().cloned().collect();
-                let mut publish = vec![
+                let mut publishes = vec![
                     QbitPublish::TorrentsUpdated { hashes },
                     QbitPublish::TorrentRecords { records },
                 ];
@@ -905,7 +905,7 @@ impl Machine for QbitMachine {
                             TorrentState::StalledUploading | TorrentState::Error,
                         )
                     {
-                        publish.push(QbitPublish::HnRAtRisk {
+                        publishes.push(QbitPublish::HnRAtRisk {
                             hash: t.hash.clone(),
                             name: t.name.clone(),
                             seed_time: t.seed_time,
@@ -918,7 +918,7 @@ impl Machine for QbitMachine {
                 // from legacy `on_new_torrents_observed`).  Domain fires
                 // an Info alert.
                 if !newly_seen.is_empty() {
-                    publish.push(QbitPublish::NewTorrentsAdded {
+                    publishes.push(QbitPublish::NewTorrentsAdded {
                         hashes: newly_seen.clone(),
                     });
                 }
@@ -943,7 +943,7 @@ impl Machine for QbitMachine {
                     let delete_actions = self.authorize_delete(&hash);
                     if !delete_actions.is_empty() {
                         actions.extend(delete_actions);
-                        publish.push(QbitPublish::DeadTorrentRemoved { hash, mam_id });
+                        publishes.push(QbitPublish::DeadTorrentRemoved { hash, mam_id });
                     }
                 }
 
@@ -954,21 +954,21 @@ impl Machine for QbitMachine {
                 // (checked inside orchestrate_queue).
                 let (orch_actions, orch_publish) = self.orchestrate_queue();
                 actions.extend(orch_actions);
-                publish.extend(orch_publish);
+                publishes.extend(orch_publish);
 
                 // Quota evaluation step (§25 / QBIT-17/18): after the map is
                 // replaced, evaluate the unsatisfied count against the configured
                 // class limit.  Emits at most one quota publish per listing.
-                publish.extend(self.quota_publish());
+                publishes.extend(self.quota_publish());
 
-                Outcome { actions, publish }
+                Outcome { actions, publishes }
             }
             // QBIT-12: success is a no-op — next PreferencesRead will confirm
             // the settings are now false.
             QbitEvent::PrivacySettingsDisabled => Outcome::none(),
             QbitEvent::TimerFired(QbitTimer::SyncRetry) => Outcome {
                 actions: self.retry_listen_port_or_read_preferences(),
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             QbitEvent::TimerFired(QbitTimer::TorrentRefresh) => {
                 let mut actions = self.cookie.clone().map_or_else(Vec::new, |cookie| {
@@ -987,18 +987,18 @@ impl Machine for QbitMachine {
                 });
                 Outcome {
                     actions,
-                    publish: Vec::new(),
+                    publishes: Vec::new(),
                 }
             }
             // §36 step 5: forward manual-download add success/failure to
             // domain.  Domain emits Info/Warning alert + activity entry.
             QbitEvent::TorrentAdded { mam_id, hash } => Outcome {
                 actions: Vec::new(),
-                publish: vec![QbitPublish::TorrentAdded { mam_id, hash }],
+                publishes: vec![QbitPublish::TorrentAdded { mam_id, hash }],
             },
             QbitEvent::TorrentAddFailed { mam_id, reason } => Outcome {
                 actions: Vec::new(),
-                publish: vec![QbitPublish::TorrentAddFailed { mam_id, reason }],
+                publishes: vec![QbitPublish::TorrentAddFailed { mam_id, reason }],
             },
         }
     }
@@ -1050,13 +1050,13 @@ impl Machine for QbitMachine {
                     && t.downloaded_bytes > 0
                     && t.seed_time < self.config.hnr_seed_time
                 {
-                    let publish = vec![QbitPublish::DeleteBlockedHnRLock {
+                    let publishes = vec![QbitPublish::DeleteBlockedHnRLock {
                         hash: hash.clone(),
                         name: t.name.clone(),
                         seed_time: t.seed_time,
                         required: self.config.hnr_seed_time,
                     }];
-                    return Self::outcome_with_publish(actions, publish, QbitResponse::Accepted);
+                    return Self::outcome_with_publish(actions, publishes, QbitResponse::Accepted);
                 }
                 return Self::outcome(actions, QbitResponse::Accepted);
             }
@@ -1178,7 +1178,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(out.publish, vec![QbitPublish::Ready]);
+        assert_eq!(out.publishes, vec![QbitPublish::Ready]);
     }
 
     #[test]
@@ -1215,7 +1215,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(out.publish, vec![QbitPublish::Ready]);
+        assert_eq!(out.publishes, vec![QbitPublish::Ready]);
     }
 
     #[test]
@@ -1275,7 +1275,7 @@ mod tests {
         );
         // §29: PreferencesRead with all three privacy settings off now
         // emits a positive PrivacyClean publish.
-        assert_eq!(out.publish, vec![QbitPublish::PrivacyClean]);
+        assert_eq!(out.publishes, vec![QbitPublish::PrivacyClean]);
     }
 
     #[test]
@@ -1307,7 +1307,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            failed.publish,
+            failed.publishes,
             vec![QbitPublish::Unavailable {
                 reason: "forbidden".to_string(),
             }]
@@ -1330,7 +1330,7 @@ mod tests {
         let out = machine.handle_command(Instant::now(), QbitCommand::EnsureListenPort { port });
 
         assert!(out.actions.is_empty());
-        assert_eq!(out.publish, vec![QbitPublish::ListenPortReady { port }]);
+        assert_eq!(out.publishes, vec![QbitPublish::ListenPortReady { port }]);
     }
 
     #[test]
@@ -1341,7 +1341,7 @@ mod tests {
         let out = handle(&mut machine, QbitEvent::ListenPortSet { port });
 
         assert_eq!(machine.listen_port(), Some(port));
-        assert_eq!(out.publish, vec![QbitPublish::ListenPortReady { port }]);
+        assert_eq!(out.publishes, vec![QbitPublish::ListenPortReady { port }]);
     }
 
     #[test]
@@ -1367,7 +1367,7 @@ mod tests {
             "listen_port must still be recorded"
         );
         assert!(
-            out.publish.is_empty(),
+            out.publishes.is_empty(),
             "must not publish ListenPortReady when port != desired_listen_port"
         );
     }
@@ -1604,7 +1604,7 @@ mod tests {
             "DeleteTorrent must be emitted for a dead zero-byte torrent"
         );
         assert!(
-            out.publish
+            out.publishes
                 .contains(&QbitPublish::DeadTorrentRemoved { hash, mam_id: None }),
             "DeadTorrentRemoved must be published when delete is authorised"
         );
@@ -1636,7 +1636,7 @@ mod tests {
             "an active Downloading torrent must NOT trigger auto-delete"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::DeadTorrentRemoved { .. })),
             "DeadTorrentRemoved must NOT be published for an active torrent"
@@ -1670,7 +1670,7 @@ mod tests {
             "a non-zero-byte stalled torrent must NOT be auto-deleted"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::DeadTorrentRemoved { .. })),
             "DeadTorrentRemoved must NOT be published for a non-zero-byte torrent"
@@ -1696,7 +1696,7 @@ mod tests {
             "no delete must be emitted without a cookie"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::DeadTorrentRemoved { .. })),
             "no DeadTorrentRemoved must be published without a cookie"
@@ -1801,7 +1801,7 @@ mod tests {
             "DeleteTorrent must also be emitted for a newly-seen dead torrent"
         );
         assert!(
-            out.publish
+            out.publishes
                 .contains(&QbitPublish::DeadTorrentRemoved { hash, mam_id: None }),
             "DeadTorrentRemoved must be published"
         );
@@ -1897,7 +1897,7 @@ mod tests {
             "DisableBannedPrivacySettings must be emitted for dht=true when authenticated"
         );
         assert!(
-            out.publish
+            out.publishes
                 .contains(&QbitPublish::BannedPrivacySettingsObserved {
                     dht: true,
                     pex: false,
@@ -1928,7 +1928,7 @@ mod tests {
             "no DisableBannedPrivacySettings when all settings are clean"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. })),
             "no BannedPrivacySettingsObserved when all settings are clean"
@@ -1958,7 +1958,7 @@ mod tests {
             "no DisableBannedPrivacySettings without a cookie (QBIT-1)"
         );
         assert!(
-            out.publish
+            out.publishes
                 .contains(&QbitPublish::BannedPrivacySettingsObserved {
                     dht: true,
                     pex: false,
@@ -1987,7 +1987,7 @@ mod tests {
             "PrivacySettingsDisableFailed must schedule exactly one SyncRetry"
         );
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![QbitPublish::Unavailable {
                 reason: "forbidden".to_string(),
             }],
@@ -2005,7 +2005,7 @@ mod tests {
             "PrivacySettingsDisabled must emit no actions"
         );
         assert!(
-            out.publish.is_empty(),
+            out.publishes.is_empty(),
             "PrivacySettingsDisabled must emit no publishes"
         );
     }
@@ -2188,7 +2188,7 @@ mod tests {
             "ForceResumeTorrent must target the parked unsatisfied torrent"
         );
         assert!(
-            out.publish.contains(&QbitPublish::QueueOrchestrated {
+            out.publishes.contains(&QbitPublish::QueueOrchestrated {
                 paused: sat,
                 force_resumed: unsat,
             }),
@@ -2228,7 +2228,7 @@ mod tests {
             "no ForceResumeTorrent without a cookie"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::QueueOrchestrated { .. })),
             "no QueueOrchestrated published without a cookie"
@@ -2291,13 +2291,13 @@ mod tests {
             },
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })),
             "quota disabled must never publish UnsatisfiedQuotaCritical"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
             "quota disabled must never publish UnsatisfiedQuotaApproaching"
@@ -2314,7 +2314,7 @@ mod tests {
             .collect();
         let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
         assert!(
-            out.publish.iter().any(|p| matches!(
+            out.publishes.iter().any(|p| matches!(
                 p,
                 QbitPublish::UnsatisfiedQuotaCritical {
                     unsatisfied,
@@ -2324,7 +2324,7 @@ mod tests {
             "must publish UnsatisfiedQuotaCritical when unsatisfied == limit"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
             "must not also publish UnsatisfiedQuotaApproaching"
@@ -2341,7 +2341,7 @@ mod tests {
             .collect();
         let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
         assert!(
-            out.publish.iter().any(|p| matches!(
+            out.publishes.iter().any(|p| matches!(
                 p,
                 QbitPublish::UnsatisfiedQuotaApproaching {
                     unsatisfied,
@@ -2351,7 +2351,7 @@ mod tests {
             "must publish UnsatisfiedQuotaApproaching when unsatisfied == limit - 1"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })),
             "must not publish UnsatisfiedQuotaCritical when below limit"
@@ -2368,7 +2368,7 @@ mod tests {
             .collect();
         let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
         assert!(
-            out.publish
+            out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
             "must publish UnsatisfiedQuotaApproaching when unsatisfied == limit - 5"
@@ -2385,13 +2385,13 @@ mod tests {
             .collect();
         let out = handle(&mut m, QbitEvent::TorrentsListed { torrents });
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })),
             "must not publish critical below warning threshold"
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })),
             "must not publish approaching when 6 below limit"
@@ -2681,7 +2681,7 @@ mod prop_tests {
             event in any_qbit_event(),
         ) {
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
-            for publish in &out.publish {
+            for publish in &out.publishes {
                 if let QbitPublish::ListenPortReady { port } = publish {
                     prop_assert!(
                         machine.desired_listen_port.is_none()
@@ -2923,7 +2923,7 @@ mod prop_tests {
             // BannedPrivacySettingsObserved must always be published when any setting is banned,
             // regardless of cookie (the qBit core publishes the observation independently of
             // whether it can act on it — the domain needs to alert regardless).
-            let observed_count = out.publish.iter().filter(|p| {
+            let observed_count = out.publishes.iter().filter(|p| {
                 matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. })
             }).count();
             prop_assert_eq!(
@@ -2954,7 +2954,7 @@ mod prop_tests {
                 "no DisableBannedPrivacySettings when all settings are clean"
             );
             prop_assert!(
-                !out.publish.iter().any(|p| matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. })),
+                !out.publishes.iter().any(|p| matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. })),
                 "no BannedPrivacySettingsObserved publish when all settings are clean"
             );
         }
@@ -2980,7 +2980,7 @@ mod prop_tests {
                 "PrivacySettingsDisableFailed must schedule exactly one SyncRetry"
             );
 
-            let unavailable_count = out.publish.iter().filter(|p| {
+            let unavailable_count = out.publishes.iter().filter(|p| {
                 matches!(p, QbitPublish::Unavailable { .. })
             }).count();
             prop_assert_eq!(
@@ -3004,7 +3004,7 @@ mod prop_tests {
                 Timed::external(Instant::now(), ExternalCause::Unknown, QbitEvent::PrivacySettingsDisabled),
             );
             prop_assert!(out.actions.is_empty(), "PrivacySettingsDisabled must emit no actions");
-            prop_assert!(out.publish.is_empty(), "PrivacySettingsDisabled must emit no publishes");
+            prop_assert!(out.publishes.is_empty(), "PrivacySettingsDisabled must emit no publishes");
         }
 
         // QBIT-14 [safety] (queue orchestration: never pause unsatisfied — §24):
@@ -3107,7 +3107,7 @@ mod prop_tests {
             let event = QbitEvent::TorrentsListed { torrents };
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
-            for publish in &out.publish {
+            for publish in &out.publishes {
                 if let QbitPublish::QueueOrchestrated { .. } = publish {
                     prop_assert!(
                         had_cookie,
@@ -3144,7 +3144,7 @@ mod prop_tests {
             let event = QbitEvent::TorrentsListed { torrents };
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
-            let critical_count = out.publish.iter().filter(|p| {
+            let critical_count = out.publishes.iter().filter(|p| {
                 matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })
             }).count();
 
@@ -3179,7 +3179,7 @@ mod prop_tests {
             let event = QbitEvent::TorrentsListed { torrents };
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
-            let approaching_count = out.publish.iter().filter(|p| {
+            let approaching_count = out.publishes.iter().filter(|p| {
                 matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })
             }).count();
 
@@ -3217,7 +3217,7 @@ mod prop_tests {
             let event = QbitEvent::TorrentsListed { torrents };
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
-            let ok_count = out.publish.iter().filter(|p| {
+            let ok_count = out.publishes.iter().filter(|p| {
                 matches!(p, QbitPublish::UnsatisfiedQuotaOk { .. })
             }).count();
 
@@ -3253,10 +3253,10 @@ mod prop_tests {
             };
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
-            let clean_count = out.publish.iter()
+            let clean_count = out.publishes.iter()
                 .filter(|p| matches!(p, QbitPublish::PrivacyClean))
                 .count();
-            let banned_count = out.publish.iter()
+            let banned_count = out.publishes.iter()
                 .filter(|p| matches!(p, QbitPublish::BannedPrivacySettingsObserved { .. }))
                 .count();
 

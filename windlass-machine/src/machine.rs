@@ -100,11 +100,36 @@ impl<E> Timed<E> {
     }
 }
 
+/// An action paired with a runtime-minted id.
+///
+/// IDs are assigned by the runtime (not by `Machine::handle`) so the
+/// machine stays a pure function — see EC-7 in
+/// `docs/observability-redesign.md`. The shell receives `payload`;
+/// the `id` rides through `CausalTx` so HTTP exchanges can be
+/// threaded back to the originating action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionEnvelope<A> {
+    pub id: Uuid,
+    pub payload: A,
+}
+
+/// A publish paired with a runtime-minted id.
+///
+/// The publish_id flows through `TopicFanout` so subscriber bridges
+/// can construct downstream events with
+/// `Timed::from_publish(now, envelope.id, e)` — preserving the
+/// cross-core causal chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishEnvelope<P> {
+    pub id: Uuid,
+    pub payload: P,
+}
+
 /// The side-effect requests and publish messages produced by one event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome<A, P> {
     pub actions: Vec<A>,
-    pub publish: Vec<P>,
+    pub publishes: Vec<P>,
 }
 
 impl<A, P> Outcome<A, P> {
@@ -112,7 +137,7 @@ impl<A, P> Outcome<A, P> {
     pub const fn none() -> Self {
         Self {
             actions: Vec::new(),
-            publish: Vec::new(),
+            publishes: Vec::new(),
         }
     }
 }
@@ -121,7 +146,7 @@ impl<A, P> Outcome<A, P> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutcome<A, P, R> {
     pub actions: Vec<A>,
-    pub publish: Vec<P>,
+    pub publishes: Vec<P>,
     pub response: R,
 }
 
@@ -178,19 +203,19 @@ pub trait Machine: Sized {
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         CommandOutcome {
             actions,
-            publish: Vec::new(),
+            publishes: Vec::new(),
             response,
         }
     }
 
     fn outcome_with_publish(
         actions: Vec<Self::Action>,
-        publish: Vec<Self::Publish>,
+        publishes: Vec<Self::Publish>,
         response: Self::Response,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         CommandOutcome {
             actions,
-            publish,
+            publishes,
             response,
         }
     }

@@ -152,13 +152,13 @@ impl Machine for DiskMachine {
         match event.inner {
             DiskEvent::Init => Outcome {
                 actions: Vec::new(),
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             DiskEvent::DiskSpaceObserved { free_bytes } => {
                 self.free_bytes = Some(free_bytes);
                 Outcome {
                     actions: Vec::new(),
-                    publish: vec![self.pressure_publish(free_bytes)],
+                    publishes: vec![self.pressure_publish(free_bytes)],
                 }
             }
         }
@@ -200,7 +200,7 @@ mod tests {
                 DiskEvent::DiskSpaceObserved { free_bytes },
             ),
         )
-        .publish
+        .publishes
     }
 
     // ── DISK-1 unit tests ────────────────────────────────────────────────────
@@ -208,9 +208,9 @@ mod tests {
     #[test]
     fn below_floor_publishes_below_floor() {
         let mut m = machine(1_000_000);
-        let publish = observe(&mut m, 999_999);
+        let publishes = observe(&mut m, 999_999);
         assert_eq!(
-            publish,
+            publishes,
             vec![DiskPublish::BelowFloor {
                 free_bytes: 999_999
             }]
@@ -221,9 +221,9 @@ mod tests {
     fn at_floor_publishes_above_floor() {
         // `free == floor` is NOT below floor — DISK-1 threshold edge.
         let mut m = machine(1_000_000);
-        let publish = observe(&mut m, 1_000_000);
+        let publishes = observe(&mut m, 1_000_000);
         assert_eq!(
-            publish,
+            publishes,
             vec![DiskPublish::AboveFloor {
                 free_bytes: 1_000_000
             }]
@@ -233,9 +233,9 @@ mod tests {
     #[test]
     fn above_floor_publishes_above_floor() {
         let mut m = machine(1_000_000);
-        let publish = observe(&mut m, 2_000_000);
+        let publishes = observe(&mut m, 2_000_000);
         assert_eq!(
-            publish,
+            publishes,
             vec![DiskPublish::AboveFloor {
                 free_bytes: 2_000_000
             }]
@@ -249,7 +249,7 @@ mod tests {
             Instant::now(),
             Timed::external(Instant::now(), ExternalCause::Unknown, DiskEvent::Init),
         );
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
         assert!(out.actions.is_empty());
     }
 
@@ -319,8 +319,8 @@ mod prop_tests {
                 Timed::external(Instant::now(), ExternalCause::Unknown, DiskEvent::DiskSpaceObserved { free_bytes }),
             );
             // Exactly one publish must be emitted.
-            prop_assert_eq!(out.publish.len(), 1);
-            match out.publish[0] {
+            prop_assert_eq!(out.publishes.len(), 1);
+            match out.publishes[0] {
                 DiskPublish::BelowFloor { free_bytes: fb } => {
                     prop_assert_eq!(fb, free_bytes);
                     prop_assert!(

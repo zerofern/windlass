@@ -224,7 +224,7 @@ impl Machine for DbMachine {
         _now: Instant,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
-        let publish = match event.inner {
+        let publishes = match event.inner {
             DbEvent::Failed(failure) => DbPublish::Failed(failure),
             DbEvent::ActivityRecorded { .. } => DbPublish::Succeeded {
                 operation: "RecordActivity".to_string(),
@@ -247,7 +247,7 @@ impl Machine for DbMachine {
         };
         Outcome {
             actions: Vec::new(),
-            publish: vec![publish],
+            publishes: vec![publishes],
         }
     }
 
@@ -411,8 +411,8 @@ mod prop_tests {
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             prop_assert!(out.actions.is_empty());
-            prop_assert_eq!(out.publish.len(), 1);
-            match &out.publish[0] {
+            prop_assert_eq!(out.publishes.len(), 1);
+            match &out.publishes[0] {
                 DbPublish::Failed(_) => prop_assert!(is_failure),
                 DbPublish::Succeeded { .. } => prop_assert!(!is_failure),
             }
@@ -425,7 +425,7 @@ mod prop_tests {
 
             let out = machine.handle_command(Instant::now(), command.clone());
 
-            prop_assert!(out.publish.is_empty());
+            prop_assert!(out.publishes.is_empty());
             prop_assert_eq!(out.response, DbResponse::Accepted);
             prop_assert_eq!(out.actions, vec![DbAction::Execute(command)]);
         }

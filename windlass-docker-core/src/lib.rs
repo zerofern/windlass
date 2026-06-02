@@ -354,7 +354,7 @@ impl DockerMachine {
             (vec![DockerAction::RestartContainer { name }], Vec::new())
         } else {
             let mut actions = Vec::new();
-            let publish = vec![DockerPublish::RestartStorm { window_count, max }];
+            let publishes = vec![DockerPublish::RestartStorm { window_count, max }];
             if !self.crash_dump_emitted_for_current_incident {
                 self.crash_dump_emitted_for_current_incident = true;
                 actions.push(DockerAction::DumpLogs {
@@ -364,7 +364,7 @@ impl DockerMachine {
                     actions.push(DockerAction::DumpLogs { name: dep_name });
                 }
             }
-            (actions, publish)
+            (actions, publishes)
         }
     }
 }
@@ -413,7 +413,7 @@ impl Machine for DockerMachine {
                         name: self.config.gluetun_anchor.clone(),
                     },
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             DockerEvent::LogsDumped { .. } | DockerEvent::LogsDumpFailed { .. } => Outcome::none(),
             DockerEvent::DependentsDiscovered { names } => {
@@ -424,7 +424,7 @@ impl Machine for DockerMachine {
                 let entry = self.containers.entry(name.clone()).or_default();
                 let was_healthy = entry.health == ContainerHealth::Healthy;
                 entry.health = ContainerHealth::Healthy;
-                let mut publish = Vec::new();
+                let mut publishes = Vec::new();
                 let mut actions = Vec::new();
                 if name == self.config.gluetun_anchor {
                     let was_anchor_healthy = self.anchor_healthy_since.is_some();
@@ -440,18 +440,18 @@ impl Machine for DockerMachine {
                             dep.network_trusted = false;
                             actions.push(DockerAction::InspectContainer { name: dep_name });
                         }
-                        publish.push(DockerPublish::ContainerHealthy { name });
+                        publishes.push(DockerPublish::ContainerHealthy { name });
                     }
                 } else if !was_healthy {
-                    publish.push(DockerPublish::ContainerHealthy { name });
+                    publishes.push(DockerPublish::ContainerHealthy { name });
                 }
-                Outcome { actions, publish }
+                Outcome { actions, publishes }
             }
             DockerEvent::ContainerUnhealthy { name } => {
                 let entry = self.containers.entry(name.clone()).or_default();
                 let was_unhealthy = entry.health == ContainerHealth::Unhealthy;
                 entry.health = ContainerHealth::Unhealthy;
-                let mut publish = Vec::new();
+                let mut publishes = Vec::new();
                 let mut actions = Vec::new();
                 if name == self.config.gluetun_anchor {
                     let was_anchor_healthy = self.anchor_healthy_since.is_some();
@@ -465,11 +465,11 @@ impl Machine for DockerMachine {
                         for dep in self.containers.values_mut() {
                             dep.network_trusted = false;
                         }
-                        publish.push(DockerPublish::ContainerCrashed { name });
+                        publishes.push(DockerPublish::ContainerCrashed { name });
                     }
                 } else {
                     if !was_unhealthy {
-                        publish.push(DockerPublish::ContainerCrashed { name: name.clone() });
+                        publishes.push(DockerPublish::ContainerCrashed { name: name.clone() });
                     }
                     // §38 PR 5 / DOCKER-5: autoheal subsume.  When
                     // enabled, every unhealthy event for a known
@@ -477,23 +477,23 @@ impl Machine for DockerMachine {
                     if self.config.autoheal_dependents && self.dependents.contains(&name) {
                         let (restart_actions, restart_publish) = self.try_restart(name);
                         actions.extend(restart_actions);
-                        publish.extend(restart_publish);
+                        publishes.extend(restart_publish);
                     }
                 }
-                Outcome { actions, publish }
+                Outcome { actions, publishes }
             }
             DockerEvent::ContainerStopped { name } => {
                 let entry = self.containers.entry(name.clone()).or_default();
                 entry.network_trusted = false;
                 Outcome {
                     actions: Vec::new(),
-                    publish: vec![DockerPublish::Stopped { name }],
+                    publishes: vec![DockerPublish::Stopped { name }],
                 }
             }
             DockerEvent::ContainerStarted { name, started_at } => {
                 let entry = self.containers.entry(name.clone()).or_default();
                 entry.started_at = Some(started_at);
-                let mut publish = vec![DockerPublish::Started {
+                let mut publishes = vec![DockerPublish::Started {
                     name: name.clone(),
                     started_at,
                 }];
@@ -509,21 +509,21 @@ impl Machine for DockerMachine {
                         let was_untrusted = !entry.network_trusted;
                         entry.network_trusted = true;
                         if was_untrusted {
-                            publish.push(DockerPublish::DependentNetworkTrusted { name });
+                            publishes.push(DockerPublish::DependentNetworkTrusted { name });
                         }
                     } else {
                         entry.network_trusted = false;
-                        publish.push(DockerPublish::DependentNetworkUntrusted {
+                        publishes.push(DockerPublish::DependentNetworkUntrusted {
                             name: name.clone(),
                             dependent_started_at: started_at,
                             gluetun_healthy_since: healthy_since,
                         });
                         let (restart_actions, restart_publish) = self.try_restart(name);
                         actions.extend(restart_actions);
-                        publish.extend(restart_publish);
+                        publishes.extend(restart_publish);
                     }
                 }
-                Outcome { actions, publish }
+                Outcome { actions, publishes }
             }
         }
     }
@@ -654,7 +654,7 @@ mod tests {
                 },
             ]
         );
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
         assert!(m.dependents().is_empty());
     }
 
@@ -801,7 +801,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![DockerPublish::ContainerHealthy {
                 name: "gluetun".to_string()
             }]
@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(m.anchor_healthy_since(), healthy_since_first);
         assert_eq!(m.incident_id(), 1);
         assert!(out.actions.is_empty());
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
     }
 
     #[test]
@@ -851,7 +851,7 @@ mod tests {
         );
         assert!(m.anchor_healthy_since().is_none());
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![DockerPublish::ContainerCrashed {
                 name: "gluetun".to_string()
             }]
@@ -874,7 +874,7 @@ mod tests {
         );
         assert!(out.actions.is_empty());
         assert!(
-            out.publish
+            out.publishes
                 .contains(&DockerPublish::DependentNetworkTrusted {
                     name: "qbittorrent".to_string()
                 })
@@ -898,7 +898,7 @@ mod tests {
             name: "qbittorrent".to_string()
         }));
         assert!(
-            out.publish
+            out.publishes
                 .contains(&DockerPublish::DependentNetworkUntrusted {
                     name: "qbittorrent".to_string(),
                     dependent_started_at: started_at(900),
@@ -922,7 +922,7 @@ mod tests {
             },
         );
         assert!(
-            !out.publish
+            !out.publishes
                 .iter()
                 .any(|p| matches!(p, DockerPublish::DependentNetworkUntrusted { .. }))
         );
@@ -951,7 +951,7 @@ mod tests {
                 .all(|a| !matches!(a, DockerAction::RestartContainer { .. }))
         );
         assert!(
-            out.publish
+            out.publishes
                 .iter()
                 .all(|p| !matches!(p, DockerPublish::DependentNetworkUntrusted { .. }))
         );
@@ -1000,7 +1000,7 @@ mod tests {
                 .any(|a| matches!(a, DockerAction::RestartContainer { .. })),
             "4th attempt must not emit RestartContainer"
         );
-        assert!(out.publish.iter().any(|p| matches!(
+        assert!(out.publishes.iter().any(|p| matches!(
             p,
             DockerPublish::RestartStorm {
                 window_count: 3,
@@ -1107,7 +1107,7 @@ mod tests {
                 .any(|a| matches!(a, DockerAction::RestartContainer { .. })),
             "autoheal off: no RestartContainer"
         );
-        assert!(out.publish.contains(&DockerPublish::ContainerCrashed {
+        assert!(out.publishes.contains(&DockerPublish::ContainerCrashed {
             name: "qbittorrent".to_string()
         }));
     }
@@ -1232,7 +1232,7 @@ mod tests {
             "3rd restart suppressed by shared budget"
         );
         assert!(
-            out3.publish
+            out3.publishes
                 .iter()
                 .any(|p| matches!(p, DockerPublish::RestartStorm { .. }))
         );
@@ -1251,7 +1251,7 @@ mod tests {
         );
         assert!(out.actions.is_empty());
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![DockerPublish::ContainerHealthy {
                 name: "qbittorrent".to_string()
             }]
@@ -1349,7 +1349,7 @@ mod prop_tests {
                 Timed::external(Instant::now(), ExternalCause::Unknown, DockerEvent::ContainerUnhealthy { name: name.clone() }),
             );
             let crashed_count = out
-                .publish
+                .publishes
                 .iter()
                 .filter(|p| matches!(p, crate::DockerPublish::ContainerCrashed { .. }))
                 .count();

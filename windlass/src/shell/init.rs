@@ -146,8 +146,13 @@ pub(super) async fn init_shell(
             config.compliance_poll_interval_secs,
         )
         .with_blacklisted_ids(blacklisted);
-    let (db_handles, _db_join) =
-        windlass_machine::spawn::<DbMachine, DbShell>((), db_pool.clone()).await;
+    let (db_handles, _db_join) = windlass_machine::spawn::<DbMachine, DbShell>(
+        windlass_machine::CoreId::Db,
+        windlass_machine::NullRuntimeTap::arc(),
+        (),
+        db_pool.clone(),
+    )
+    .await;
     let (db_pub_tx, mut db_pub_rx) = mpsc::channel::<DbPublish>(128);
     db_handles
         .subscribe
@@ -158,6 +163,8 @@ pub(super) async fn init_shell(
     // namespace and restart-storm circuit-breaker now live here.  PR 4
     // (crash-recovery orchestration) will route publishes to the domain.
     let (docker_handles, _docker_join) = windlass_machine::spawn::<DockerMachine, DockerShell>(
+        windlass_machine::CoreId::Docker,
+        windlass_machine::NullRuntimeTap::arc(),
         DockerConfig {
             gluetun_anchor: docker.gluetun_anchor.clone(),
             // §35: restart circuit-breaker — 3 restarts per 10-minute
@@ -193,6 +200,8 @@ pub(super) async fn init_shell(
     // `DiskPublish::BelowFloor` to fire the Warning alert and trigger
     // disk-pressure eviction.
     let (disk_handles, _disk_join) = windlass_machine::spawn::<DiskMachine, DiskShell>(
+        windlass_machine::CoreId::Disk,
+        windlass_machine::NullRuntimeTap::arc(),
         // 50 GiB hard floor — mirrors the legacy threshold so the alert
         // and eviction trigger at the same point.
         DiskConfig {
@@ -208,6 +217,8 @@ pub(super) async fn init_shell(
         .expect("disk pub subscription");
 
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
+        windlass_machine::CoreId::Vpn,
+        windlass_machine::NullRuntimeTap::arc(),
         VpnConfig {
             health_poll_interval: Duration::from_secs(30),
             unhealthy_poll_interval: Duration::from_secs(5),
@@ -270,6 +281,8 @@ pub(super) async fn init_shell(
     }
 
     let (qbit_handles, _qbit_join) = windlass_machine::spawn::<QbitMachine, QbitShell>(
+        windlass_machine::CoreId::Qbit,
+        windlass_machine::NullRuntimeTap::arc(),
         QbitConfig {
             auth_retry: Duration::from_secs(5),
             sync_retry: Duration::from_secs(2),
@@ -303,6 +316,8 @@ pub(super) async fn init_shell(
         .expect("qbit pub subscription");
 
     let (mam_handles, _mam_join) = windlass_machine::spawn::<MamMachine, MamShell>(
+        windlass_machine::CoreId::Mam,
+        windlass_machine::NullRuntimeTap::arc(),
         MamConfig {
             status_retry: Duration::from_secs(30),
             // §26 upload-health gate defaults (binary GiB; see MamConfig docs).
@@ -336,6 +351,8 @@ pub(super) async fn init_shell(
         .expect("mam pub subscription");
 
     let (domain_handles, _domain_join) = windlass_machine::spawn::<WindlassMachine, DomainShell>(
+        windlass_machine::CoreId::Domain,
+        windlass_machine::NullRuntimeTap::arc(),
         WindlassConfig {
             snapshot_interval: Duration::from_secs(config.compliance_poll_interval_secs),
             gluetun_anchor: docker.gluetun_anchor.clone(),

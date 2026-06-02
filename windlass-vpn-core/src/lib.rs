@@ -328,16 +328,16 @@ impl Machine for VpnMachine {
         match event.inner {
             VpnEvent::Init => Outcome {
                 actions: vec![VpnAction::StartMonitoring, VpnAction::InspectContainer],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             VpnEvent::ContainerHealthy => {
                 let was_unhealthy = !self.connected;
                 self.connected = true;
-                let mut publish = vec![VpnPublish::Connected];
+                let mut publishes = vec![VpnPublish::Connected];
                 if was_unhealthy {
                     // §38: rising-edge recovery signal so domain can drive
                     // the post-crash StartDependents fan-out exactly once.
-                    publish.push(VpnPublish::Recovered);
+                    publishes.push(VpnPublish::Recovered);
                 }
                 Outcome {
                     actions: vec![
@@ -347,25 +347,25 @@ impl Machine for VpnMachine {
                             after: self.config.health_poll_interval,
                         },
                     ],
-                    publish,
+                    publishes,
                 }
             }
             VpnEvent::ContainerUnhealthy => {
                 let was_connected = self.connected;
                 self.connected = false;
                 self.port = None;
-                let mut publish = vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable];
+                let mut publishes = vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable];
                 if was_connected {
                     // §38: rising-edge crash signal so domain can drive
                     // log dump + StopDependents + RestartGluetun + Critical
                     // alert exactly once per crash.
-                    publish.push(VpnPublish::Crashed);
+                    publishes.push(VpnPublish::Crashed);
                 }
                 // §31: clear observed_ip on disconnect; surface the
                 // unavailable signal so the domain can clear the §29 gate.
                 if self.observed_ip.is_some() {
                     self.observed_ip = None;
-                    publish.push(VpnPublish::PublicIpUnavailable);
+                    publishes.push(VpnPublish::PublicIpUnavailable);
                 }
                 self.last_verified_ip = None;
                 self.verification_failures = 0;
@@ -376,14 +376,14 @@ impl Machine for VpnMachine {
                         timer: VpnTimer::HealthPoll,
                         after: self.config.unhealthy_poll_interval,
                     }],
-                    publish,
+                    publishes,
                 }
             }
             VpnEvent::PortFileChanged { port } => {
                 self.port = Some(port);
                 Outcome {
                     actions: Vec::new(),
-                    publish: vec![VpnPublish::PortReady { port }],
+                    publishes: vec![VpnPublish::PortReady { port }],
                 }
             }
             VpnEvent::StateRead { connected, port } => {
@@ -395,22 +395,22 @@ impl Machine for VpnMachine {
                     });
                     Outcome {
                         actions: Vec::new(),
-                        publish: vec![VpnPublish::Connected, port_publish],
+                        publishes: vec![VpnPublish::Connected, port_publish],
                     }
                 } else {
                     // A disconnected VPN never holds a forwarded port, regardless
                     // of what the shell reports. Mirror ContainerUnhealthy (VPN-1).
                     self.port = None;
-                    let mut publish = vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable];
+                    let mut publishes = vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable];
                     if self.observed_ip.is_some() {
                         self.observed_ip = None;
-                        publish.push(VpnPublish::PublicIpUnavailable);
+                        publishes.push(VpnPublish::PublicIpUnavailable);
                     }
                     self.last_verified_ip = None;
                     self.verification_failures = 0;
                     Outcome {
                         actions: Vec::new(),
-                        publish,
+                        publishes,
                     }
                 }
             }
@@ -419,15 +419,15 @@ impl Machine for VpnMachine {
                     timer: VpnTimer::PortReadRetry,
                     after: self.config.port_read_retry_interval,
                 }],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             VpnEvent::TimerFired(VpnTimer::HealthPoll) => Outcome {
                 actions: vec![VpnAction::InspectContainer],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             VpnEvent::TimerFired(VpnTimer::PortReadRetry) => Outcome {
                 actions: vec![VpnAction::ReadPortFiles],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
             // §31 / VPN-8: rising-edge IP-from-file signal.  When the file
             // value changes, publish `PublicIpObserved` and trigger an
@@ -452,7 +452,7 @@ impl Machine for VpnMachine {
                 }
                 Outcome {
                     actions,
-                    publish: vec![VpnPublish::PublicIpObserved { ip }],
+                    publishes: vec![VpnPublish::PublicIpObserved { ip }],
                 }
             }
             // §31: Gluetun deleted the IP file.  Clear observed_ip and the
@@ -469,7 +469,7 @@ impl Machine for VpnMachine {
                 self.mam_verification_failures = 0;
                 Outcome {
                     actions: Vec::new(),
-                    publish: vec![VpnPublish::PublicIpUnavailable],
+                    publishes: vec![VpnPublish::PublicIpUnavailable],
                 }
             }
             // §31 / VPN-9: ifconfig.co verification succeeded.  Reset the
@@ -478,11 +478,11 @@ impl Machine for VpnMachine {
             VpnEvent::PublicIpVerified { info } => {
                 self.verification_failures = 0;
                 self.last_verified_ip = Some(info.ip);
-                let mut publish = Vec::new();
+                let mut publishes = Vec::new();
                 if let Some(file_ip) = self.observed_ip
                     && file_ip != info.ip
                 {
-                    publish.push(VpnPublish::PublicIpMismatch {
+                    publishes.push(VpnPublish::PublicIpMismatch {
                         file_ip,
                         verified_ip: info.ip,
                         source: VerificationSource::IfConfigCo,
@@ -490,7 +490,7 @@ impl Machine for VpnMachine {
                 }
                 Outcome {
                     actions: Vec::new(),
-                    publish,
+                    publishes,
                 }
             }
             // §33 / VPN-11: MAM `/json/jsonIp.php` verification succeeded.
@@ -500,11 +500,11 @@ impl Machine for VpnMachine {
             VpnEvent::MamIpVerified { info } => {
                 self.mam_verification_failures = 0;
                 self.last_mam_verified_ip = Some(info.ip);
-                let mut publish = Vec::new();
+                let mut publishes = Vec::new();
                 if let Some(file_ip) = self.observed_ip
                     && file_ip != info.ip
                 {
-                    publish.push(VpnPublish::PublicIpMismatch {
+                    publishes.push(VpnPublish::PublicIpMismatch {
                         file_ip,
                         verified_ip: info.ip,
                         source: VerificationSource::MamJsonIp,
@@ -512,7 +512,7 @@ impl Machine for VpnMachine {
                 }
                 Outcome {
                     actions: Vec::new(),
-                    publish,
+                    publishes,
                 }
             }
             // §31 / VPN-10: rising-edge degraded publish on persistent
@@ -521,16 +521,16 @@ impl Machine for VpnMachine {
                 let threshold = self.config.public_ip_verify_failure_threshold;
                 let before = self.verification_failures;
                 self.verification_failures = before.saturating_add(1);
-                let mut publish = Vec::new();
+                let mut publishes = Vec::new();
                 if threshold > 0 && before < threshold && self.verification_failures >= threshold {
-                    publish.push(VpnPublish::PublicIpVerificationDegraded {
+                    publishes.push(VpnPublish::PublicIpVerificationDegraded {
                         consecutive_failures: self.verification_failures,
                         last_reason: reason,
                     });
                 }
                 Outcome {
                     actions: Vec::new(),
-                    publish,
+                    publishes,
                 }
             }
             // §33 / VPN-12: same rising-edge pattern for the MAM source.
@@ -541,19 +541,19 @@ impl Machine for VpnMachine {
                 let threshold = self.config.public_ip_verify_failure_threshold;
                 let before = self.mam_verification_failures;
                 self.mam_verification_failures = before.saturating_add(1);
-                let mut publish = Vec::new();
+                let mut publishes = Vec::new();
                 if threshold > 0
                     && before < threshold
                     && self.mam_verification_failures >= threshold
                 {
-                    publish.push(VpnPublish::MamIpVerificationDegraded {
+                    publishes.push(VpnPublish::MamIpVerificationDegraded {
                         consecutive_failures: self.mam_verification_failures,
                         last_reason: reason,
                     });
                 }
                 Outcome {
                     actions: Vec::new(),
-                    publish,
+                    publishes,
                 }
             }
             // §31 + §33: self-perpetuating verification heartbeat.  Fires
@@ -568,7 +568,7 @@ impl Machine for VpnMachine {
                         after: self.config.public_ip_verify_interval,
                     },
                 ],
-                publish: Vec::new(),
+                publishes: Vec::new(),
             },
         }
     }
@@ -591,7 +591,7 @@ impl Machine for VpnMachine {
                     now,
                     Timed::external(now, ExternalCause::Unknown, VpnEvent::ContainerHealthy),
                 );
-                Self::outcome_with_publish(out.actions, out.publish, VpnResponse::Accepted)
+                Self::outcome_with_publish(out.actions, out.publishes, VpnResponse::Accepted)
             }
             VpnCommand::ContainerUnhealthy => {
                 // TODO(§37d): see ContainerHealthy above.
@@ -599,7 +599,7 @@ impl Machine for VpnMachine {
                     now,
                     Timed::external(now, ExternalCause::Unknown, VpnEvent::ContainerUnhealthy),
                 );
-                Self::outcome_with_publish(out.actions, out.publish, VpnResponse::Accepted)
+                Self::outcome_with_publish(out.actions, out.publishes, VpnResponse::Accepted)
             }
             VpnCommand::StartMonitoring => Self::outcome(
                 vec![VpnAction::StartMonitoring, VpnAction::InspectContainer],
@@ -658,7 +658,7 @@ mod tests {
             out.actions,
             vec![VpnAction::StartMonitoring, VpnAction::InspectContainer]
         );
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
     }
 
     #[test]
@@ -693,7 +693,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![VpnPublish::Connected, VpnPublish::Recovered]
         );
     }
@@ -704,8 +704,8 @@ mod tests {
         let mut machine = machine();
         handle(&mut machine, VpnEvent::ContainerHealthy);
         let out = handle(&mut machine, VpnEvent::ContainerHealthy);
-        assert!(!out.publish.contains(&VpnPublish::Recovered));
-        assert!(out.publish.contains(&VpnPublish::Connected));
+        assert!(!out.publishes.contains(&VpnPublish::Recovered));
+        assert!(out.publishes.contains(&VpnPublish::Connected));
     }
 
     #[test]
@@ -726,7 +726,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
         );
     }
@@ -737,10 +737,10 @@ mod tests {
         let mut machine = machine();
         handle(&mut machine, VpnEvent::ContainerHealthy);
         let out = handle(&mut machine, VpnEvent::ContainerUnhealthy);
-        assert!(out.publish.contains(&VpnPublish::Crashed));
+        assert!(out.publishes.contains(&VpnPublish::Crashed));
         // Re-observing unhealthy is a no-op for Crashed.
         let out2 = handle(&mut machine, VpnEvent::ContainerUnhealthy);
-        assert!(!out2.publish.contains(&VpnPublish::Crashed));
+        assert!(!out2.publishes.contains(&VpnPublish::Crashed));
     }
 
     #[test]
@@ -751,7 +751,7 @@ mod tests {
         let out = handle(&mut machine, VpnEvent::PortFileChanged { port });
 
         assert_eq!(machine.port(), Some(port));
-        assert_eq!(out.publish, vec![VpnPublish::PortReady { port }]);
+        assert_eq!(out.publishes, vec![VpnPublish::PortReady { port }]);
     }
 
     #[test]
@@ -772,7 +772,7 @@ mod tests {
                 after: Duration::from_millis(500),
             }]
         );
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
     }
 
     #[test]
@@ -782,7 +782,7 @@ mod tests {
         let out = handle(&mut machine, VpnEvent::TimerFired(VpnTimer::PortReadRetry));
 
         assert_eq!(out.actions, vec![VpnAction::ReadPortFiles]);
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
     }
 
     #[test]
@@ -792,7 +792,7 @@ mod tests {
         let out = handle(&mut machine, VpnEvent::TimerFired(VpnTimer::HealthPoll));
 
         assert_eq!(out.actions, vec![VpnAction::InspectContainer]);
-        assert!(out.publish.is_empty());
+        assert!(out.publishes.is_empty());
     }
 
     // StateRead four-shape tests (story 18 / VPN-4).
@@ -813,7 +813,7 @@ mod tests {
         assert!(machine.is_connected());
         assert_eq!(machine.port(), Some(port));
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![VpnPublish::Connected, VpnPublish::PortReady { port }]
         );
         assert!(out.actions.is_empty());
@@ -834,7 +834,7 @@ mod tests {
         assert!(machine.is_connected());
         assert_eq!(machine.port(), None);
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![VpnPublish::Connected, VpnPublish::PortUnavailable]
         );
         assert!(out.actions.is_empty());
@@ -855,7 +855,7 @@ mod tests {
         assert!(!machine.is_connected());
         assert_eq!(machine.port(), None);
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
         );
         assert!(out.actions.is_empty());
@@ -898,7 +898,7 @@ mod tests {
             "port must be cleared when disconnected"
         );
         assert_eq!(
-            out.publish,
+            out.publishes,
             vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
         );
         assert!(out.actions.is_empty());
@@ -1025,7 +1025,7 @@ mod prop_tests {
             event in any_vpn_event(),
         ) {
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
-            for publish in &out.publish {
+            for publish in &out.publishes {
                 if let VpnPublish::PortReady { port } = publish {
                     prop_assert_eq!(machine.port(), Some(*port));
                 }
@@ -1047,7 +1047,7 @@ mod prop_tests {
                 VpnEvent::PublicIpFromFile { ip },
             ));
             prop_assert_eq!(machine.observed_ip(), Some(ip));
-            let observed_count = out.publish.iter()
+            let observed_count = out.publishes.iter()
                 .filter(|p| matches!(p, VpnPublish::PublicIpObserved { .. }))
                 .count();
             if pre == Some(ip) {
@@ -1069,7 +1069,7 @@ mod prop_tests {
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpVerified { info: info.clone() },
             ));
-            let mismatch_count = out.publish.iter()
+            let mismatch_count = out.publishes.iter()
                 .filter(|p| matches!(p, VpnPublish::PublicIpMismatch { .. }))
                 .count();
             let should_mismatch = pre_observed.is_some()
@@ -1096,7 +1096,7 @@ mod prop_tests {
             let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpVerifyFailed { reason },
             ));
-            let degraded_count = out.publish.iter()
+            let degraded_count = out.publishes.iter()
                 .filter(|p| matches!(p, VpnPublish::PublicIpVerificationDegraded { .. }))
                 .count();
             let crossed = threshold > 0

@@ -1,11 +1,18 @@
+use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
-use crate::machine::{Machine, Timed};
+use crate::machine::{ActionEnvelope, Machine, PublishEnvelope, Timed};
 use crate::pubsub::{SubscriberReg, TopicFanout};
 use crate::shell::Shell;
+use crate::tap::{
+    CommandResponseStatus, CoreId, EventGateView, OutcomeGateView, RuntimeTap, StepKind,
+    StepRecordView,
+};
 
 /// A command paired with the channel its typed response is returned on.
 pub type Command<M> = (
@@ -26,17 +33,19 @@ pub struct ServiceHandles<M: Machine> {
 /// Generic event loop that drives one sans-I/O [`Machine`] paired with its
 /// imperative [`Shell`].
 ///
-/// The runtime owns the machine, shell, event and command channels, and the
-/// publish fanout. It calls [`Machine::handle`] for timed events and
-/// [`Machine::handle_command`] for commands, dispatches the returned actions
-/// through the shell, and routes published facts to subscribers.
+/// The runtime owns the machine, shell, event and command channels, the
+/// publish fanout, and an `Arc<dyn RuntimeTap>` for observability gating
+/// and recording. See `docs/observability-redesign.md` for the loop
+/// shape and engineering contracts.
 pub struct ServiceRuntime<M: Machine, S> {
+    core_id: CoreId,
     machine: M,
     shell: S,
     event_tx: mpsc::UnboundedSender<Timed<M::Event>>,
     event_rx: mpsc::UnboundedReceiver<Timed<M::Event>>,
     command_rx: mpsc::UnboundedReceiver<Command<M>>,
     fanout: TopicFanout<M::Topic, M::Publish>,
+    tap: Arc<dyn RuntimeTap>,
 }
 
 impl<M, S> ServiceRuntime<M, S>
@@ -44,29 +53,167 @@ where
     M: Machine,
     S: Shell<Event = M::Event, Action = M::Action>,
 {
-    fn apply(&mut self, actions: Vec<M::Action>, publish: Vec<M::Publish>) {
-        for action in actions {
-            self.shell.dispatch(action, &self.event_tx);
+    /// Apply one outcome: dispatch each action envelope through the
+    /// shell, fan each publish envelope out through `TopicFanout`.
+    ///
+    /// Action IDs ride along through `CausalTx` in §37e (HTTP tap).
+    /// Publish IDs ride along through `TopicFanout` once it switches
+    /// to envelope-aware sends (planned follow-up to §37d under C2).
+    fn apply(
+        &mut self,
+        actions: Vec<ActionEnvelope<M::Action>>,
+        publishes: Vec<PublishEnvelope<M::Publish>>,
+    ) {
+        for env in actions {
+            self.shell.dispatch(env.payload, &self.event_tx);
         }
-        for msg in publish {
-            self.fanout.send(&msg);
+        for env in publishes {
+            self.fanout.send(&env.payload);
         }
     }
 
     /// Runs until both the event and command channels are closed.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
         loop {
             tokio::select! {
                 event = self.event_rx.recv() => {
-                    let Some(event) = event else { break };
-                    let outcome = self.machine.handle(Instant::now(), event);
-                    self.apply(outcome.actions, outcome.publish);
+                    let Some(timed) = event else { break };
+                    let event_cause = timed.cause.clone();
+                    // §37f will introduce a Serialize bound on M::Event
+                    // and replace this placeholder with the real
+                    // serialized payload + extracted variant name.
+                    let event_json = serde_json::Value::Null;
+
+                    self.tap.gate_event(self.core_id, &EventGateView {
+                        variant: "?",
+                        cause: &event_cause,
+                        event: &event_json,
+                    }).await;
+
+                    let t0 = Instant::now();
+                    let outcome = self.machine.handle(t0, timed);
+                    let duration = t0.elapsed();
+
+                    let step_id = Uuid::new_v4();
+                    let actions: Vec<ActionEnvelope<M::Action>> = outcome
+                        .actions
+                        .into_iter()
+                        .map(|payload| ActionEnvelope { id: Uuid::new_v4(), payload })
+                        .collect();
+                    let publishes: Vec<PublishEnvelope<M::Publish>> = outcome
+                        .publishes
+                        .into_iter()
+                        .map(|payload| PublishEnvelope { id: Uuid::new_v4(), payload })
+                        .collect();
+                    let action_ids: Vec<Uuid> = actions.iter().map(|e| e.id).collect();
+                    let publish_ids: Vec<Uuid> = publishes.iter().map(|e| e.id).collect();
+                    // §37f populates the variant-name slices once
+                    // M::Action / M::Publish gain a name accessor.
+                    let action_variants: Vec<&str> = action_ids.iter().map(|_| "?").collect();
+                    let publish_variants: Vec<&str> = publish_ids.iter().map(|_| "?").collect();
+
+                    self.tap.gate_outcome(self.core_id, &OutcomeGateView {
+                        source_event_variant: "?",
+                        action_variants: &action_variants,
+                        action_ids: &action_ids,
+                        publish_variants: &publish_variants,
+                        publish_ids: &publish_ids,
+                    }).await;
+
+                    self.tap.reserve_step_ids(
+                        self.core_id,
+                        step_id,
+                        &action_ids,
+                        &publish_ids,
+                    );
+
+                    self.apply(actions, publishes);
+
+                    let snapshot = self.machine.state_snapshot();
+                    let state_json = serde_json::to_value(snapshot)
+                        .unwrap_or(serde_json::Value::Null);
+                    self.tap.observed_step(self.core_id, &StepRecordView {
+                        step_id,
+                        core: self.core_id,
+                        recorded_at: Utc::now(),
+                        duration,
+                        kind: StepKind::Event,
+                        event_variant: "?",
+                        event: &event_json,
+                        event_cause: &event_cause,
+                        state_after: &state_json,
+                        action_ids: &action_ids,
+                        action_variants: &action_variants,
+                        publish_ids: &publish_ids,
+                        publish_variants: &publish_variants,
+                    });
                 }
                 command = self.command_rx.recv() => {
                     let Some((cmd, reply)) = command else { break };
-                    let outcome = self.machine.handle_command(Instant::now(), cmd);
-                    self.apply(outcome.actions, outcome.publish);
-                    let _ = reply.send(outcome.response);
+                    // Command bodies are opaque to the gate views in
+                    // §37d; the kind tag is enough to distinguish them
+                    // in the step record stream.
+                    let t0 = Instant::now();
+                    let outcome = self.machine.handle_command(t0, cmd);
+                    let duration = t0.elapsed();
+
+                    let step_id = Uuid::new_v4();
+                    let actions: Vec<ActionEnvelope<M::Action>> = outcome
+                        .actions
+                        .into_iter()
+                        .map(|payload| ActionEnvelope { id: Uuid::new_v4(), payload })
+                        .collect();
+                    let publishes: Vec<PublishEnvelope<M::Publish>> = outcome
+                        .publishes
+                        .into_iter()
+                        .map(|payload| PublishEnvelope { id: Uuid::new_v4(), payload })
+                        .collect();
+                    let action_ids: Vec<Uuid> = actions.iter().map(|e| e.id).collect();
+                    let publish_ids: Vec<Uuid> = publishes.iter().map(|e| e.id).collect();
+                    let action_variants: Vec<&str> = action_ids.iter().map(|_| "?").collect();
+                    let publish_variants: Vec<&str> = publish_ids.iter().map(|_| "?").collect();
+
+                    self.tap.reserve_step_ids(
+                        self.core_id,
+                        step_id,
+                        &action_ids,
+                        &publish_ids,
+                    );
+
+                    self.apply(actions, publishes);
+
+                    let response_status = if reply.send(outcome.response).is_ok() {
+                        CommandResponseStatus::Sent
+                    } else {
+                        CommandResponseStatus::ReceiverDropped
+                    };
+
+                    let snapshot = self.machine.state_snapshot();
+                    let state_json = serde_json::to_value(snapshot)
+                        .unwrap_or(serde_json::Value::Null);
+                    // Commands don't carry an upstream Timed::cause; use
+                    // External(ManualCommand) as a stand-in until §37f
+                    // distinguishes "domain command" causes from
+                    // "operator command" causes.
+                    let cause = crate::machine::EventCause::External(
+                        crate::machine::ExternalCause::ManualCommand,
+                    );
+                    self.tap.observed_step(self.core_id, &StepRecordView {
+                        step_id,
+                        core: self.core_id,
+                        recorded_at: Utc::now(),
+                        duration,
+                        kind: StepKind::Command { response: response_status },
+                        event_variant: "?",
+                        event: &serde_json::Value::Null,
+                        event_cause: &cause,
+                        state_after: &state_json,
+                        action_ids: &action_ids,
+                        action_variants: &action_variants,
+                        publish_ids: &publish_ids,
+                        publish_variants: &publish_variants,
+                    });
                 }
             }
         }
@@ -75,7 +222,14 @@ where
 
 /// Builds a machine and shell, spawns the runtime loop, and returns the handles
 /// used to drive it plus the task's `JoinHandle`.
+///
+/// `tap` is the observability hook; pass [`crate::tap::NullRuntimeTap`]
+/// when observability is not needed, or an
+/// `Arc<windlass_observability::ObservabilityController>` to attach
+/// the live backend.
 pub async fn spawn<M, S>(
+    core_id: CoreId,
+    tap: Arc<dyn RuntimeTap>,
     machine_config: M::Config,
     shell_config: S::Config,
 ) -> (ServiceHandles<M>, JoinHandle<()>)
@@ -94,12 +248,14 @@ where
     let shell = S::new(shell_config, event_tx.clone()).await;
 
     let runtime = ServiceRuntime {
+        core_id,
         machine,
         shell,
         event_tx: event_tx.clone(),
         event_rx,
         command_rx,
         fanout,
+        tap,
     };
     let join = tokio::spawn(runtime.run());
 
@@ -124,6 +280,7 @@ mod tests {
     use crate::machine::{CommandOutcome, ExternalCause, Machine, Outcome, Timed};
     use crate::pubsub::HasTopic;
     use crate::shell::Shell;
+    use crate::tap::{CoreId, NullRuntimeTap};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Event {
@@ -180,7 +337,7 @@ mod tests {
             match event.inner {
                 Event::Ping => Outcome {
                     actions: vec![Action::Pong],
-                    publish: vec![Publish::Beep],
+                    publishes: vec![Publish::Beep],
                 },
             }
         }
@@ -229,7 +386,9 @@ mod tests {
     #[tokio::test]
     async fn event_produces_action_and_publish() {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-        let (handles, _join) = spawn::<FakeMachine, FakeShell>((), action_tx).await;
+        let (handles, _join) =
+            spawn::<FakeMachine, FakeShell>(CoreId::Vpn, NullRuntimeTap::arc(), (), action_tx)
+                .await;
 
         let (beep_tx, mut beep_rx) = mpsc::channel(1);
         handles
@@ -253,7 +412,9 @@ mod tests {
     #[tokio::test]
     async fn command_returns_typed_response_and_dispatches_actions() {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-        let (handles, _join) = spawn::<FakeMachine, FakeShell>((), action_tx).await;
+        let (handles, _join) =
+            spawn::<FakeMachine, FakeShell>(CoreId::Vpn, NullRuntimeTap::arc(), (), action_tx)
+                .await;
 
         let (reply_tx, reply_rx) = oneshot::channel();
         handles
@@ -280,7 +441,9 @@ mod tests {
     #[tokio::test]
     async fn loop_exits_when_channels_close() {
         let (action_tx, _action_rx) = mpsc::unbounded_channel();
-        let (handles, join) = spawn::<FakeMachine, FakeShell>((), action_tx).await;
+        let (handles, join) =
+            spawn::<FakeMachine, FakeShell>(CoreId::Vpn, NullRuntimeTap::arc(), (), action_tx)
+                .await;
 
         drop(handles);
 

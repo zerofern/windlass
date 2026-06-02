@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "windlass-machine",
+    "windlass-observability",
     "windlass-mam-core",
     "windlass-types",
     "windlass-core",
@@ -55,6 +56,8 @@ windlass-docker-core = { path = "windlass-docker-core" }
 windlass-domain-core = { path = "windlass-domain-core" }
 windlass-mam-core = { path = "windlass-mam-core" }
 windlass-machine = { path = "windlass-machine" }
+windlass-observability = { path = "windlass-observability" }
+async-trait      = "0.1"
 windlass-qbit-core = { path = "windlass-qbit-core" }
 windlass-types   = { path = "windlass-types" }
 windlass-vpn-core = { path = "windlass-vpn-core" }
