@@ -15,7 +15,7 @@ pub mod ring;
 pub mod sse;
 pub mod stored;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -69,9 +69,24 @@ pub struct ObservabilityController {
     publish_index: Mutex<HashMap<Uuid, (CoreId, Uuid)>>,
     /// Per-core + cross-core loss counters.
     loss: Mutex<LossCounters>,
+    /// Variant-keyed breakpoint registry — see §37g.  Reads happen on
+    /// every gate call so the structure is held behind `ArcSwap` for
+    /// lock-free fast-path access.
+    breakpoints: ArcSwap<BreakpointSet>,
     /// SSE broadcast.  Subscribers receive every record / status /
     /// eviction / loss update.
     sse_tx: broadcast::Sender<SseMessage>,
+}
+
+/// Inner storage for the variant-keyed breakpoint registry.  One flat
+/// set per category; the controller routes each entry to the
+/// appropriate gate.
+#[derive(Default, Clone)]
+struct BreakpointSet {
+    event_variants: HashSet<String>,
+    action_variants: HashSet<String>,
+    publish_variants: HashSet<String>,
+    http_url_patterns: HashSet<String>,
 }
 
 struct CoreState {
@@ -111,6 +126,7 @@ impl ObservabilityController {
             action_index: Mutex::new(HashMap::new()),
             publish_index: Mutex::new(HashMap::new()),
             loss: Mutex::new(LossCounters::default()),
+            breakpoints: ArcSwap::from_pointee(BreakpointSet::default()),
             sse_tx,
         })
     }
@@ -201,6 +217,128 @@ impl ObservabilityController {
     /// payload and operator UI badges.
     pub async fn loss_snapshot(&self) -> LossCounters {
         self.loss.lock().await.clone()
+    }
+
+    // ── Breakpoint registry (§37g) ────────────────────────────────────────────
+
+    /// Add an event-variant breakpoint.  When an event of this variant
+    /// arrives at `gate_event`, the owning core's pause flag is
+    /// flipped and the runtime parks before `machine.handle` runs.
+    pub fn add_event_breakpoint(&self, variant: impl Into<String>) {
+        let v = variant.into();
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.event_variants.insert(v.clone());
+            new
+        });
+    }
+
+    pub fn remove_event_breakpoint(&self, variant: &str) {
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.event_variants.remove(variant);
+            new
+        });
+    }
+
+    /// Add an action-variant breakpoint.  Enforced at `gate_outcome`:
+    /// when an outcome contains any action of this variant, the owning
+    /// core parks before `apply` runs.
+    pub fn add_action_breakpoint(&self, variant: impl Into<String>) {
+        let v = variant.into();
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.action_variants.insert(v.clone());
+            new
+        });
+    }
+
+    pub fn remove_action_breakpoint(&self, variant: &str) {
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.action_variants.remove(variant);
+            new
+        });
+    }
+
+    /// Add a publish-variant breakpoint.  Enforced at `gate_outcome`.
+    pub fn add_publish_breakpoint(&self, variant: impl Into<String>) {
+        let v = variant.into();
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.publish_variants.insert(v.clone());
+            new
+        });
+    }
+
+    pub fn remove_publish_breakpoint(&self, variant: &str) {
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.publish_variants.remove(variant);
+            new
+        });
+    }
+
+    /// Add an HTTP-URL substring pattern.  Any request whose URL
+    /// contains `pattern` parks at `gate_request`.  v1 uses simple
+    /// substring matching; regex/glob can come later if needed.
+    pub fn add_http_breakpoint(&self, pattern: impl Into<String>) {
+        let v = pattern.into();
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.http_url_patterns.insert(v.clone());
+            new
+        });
+    }
+
+    pub fn remove_http_breakpoint(&self, pattern: &str) {
+        self.breakpoints.rcu(|set| {
+            let mut new = (**set).clone();
+            new.http_url_patterns.remove(pattern);
+            new
+        });
+    }
+
+    /// All currently active breakpoints as a flat list for the Hello
+    /// snapshot and the `/api/v1/observability/breakpoints` GET.
+    #[must_use]
+    pub fn active_breakpoints(&self) -> Vec<Breakpoint> {
+        let set = self.breakpoints.load();
+        let mut out = Vec::new();
+        for v in &set.event_variants {
+            out.push(Breakpoint::EventVariant { variant: v.clone() });
+        }
+        for v in &set.action_variants {
+            out.push(Breakpoint::ActionVariant { variant: v.clone() });
+        }
+        for v in &set.publish_variants {
+            out.push(Breakpoint::PublishVariant { variant: v.clone() });
+        }
+        for p in &set.http_url_patterns {
+            out.push(Breakpoint::HttpUrlPattern { pattern: p.clone() });
+        }
+        out
+    }
+
+    fn event_variant_breakpointed(&self, variant: &str) -> bool {
+        self.breakpoints.load().event_variants.contains(variant)
+    }
+
+    fn outcome_breakpointed(&self, action_variants: &[&str], publish_variants: &[&str]) -> bool {
+        let set = self.breakpoints.load();
+        action_variants
+            .iter()
+            .any(|v| set.action_variants.contains(*v))
+            || publish_variants
+                .iter()
+                .any(|v| set.publish_variants.contains(*v))
+    }
+
+    fn http_url_breakpointed(&self, url: &str) -> bool {
+        let set = self.breakpoints.load();
+        set.http_url_patterns
+            .iter()
+            .any(|p| url.contains(p.as_str()))
     }
 
     // ── Internal: ring + index maintenance ────────────────────────────────────
@@ -301,7 +439,7 @@ impl ObservabilityController {
             http,
             logs: Vec::new(), // §37 follow-up: hook DebugLogLayer → StoredLogLine
             loss,
-            active_breakpoints: Vec::new(), // §37g
+            active_breakpoints: self.active_breakpoints(),
         }
     }
 }
@@ -311,6 +449,12 @@ impl ObservabilityController {
 #[async_trait]
 impl RuntimeTap for ObservabilityController {
     async fn gate_event(&self, core: CoreId, view: &EventGateView<'_>) {
+        // §37g: an event-variant breakpoint flips this core's pause
+        // flag so the rest of this method parks as if the operator
+        // had clicked Pause manually.
+        if self.event_variant_breakpointed(view.variant) {
+            self.pause(core);
+        }
         let c = self.core(core);
         if !c.paused.load(Ordering::SeqCst) {
             return;
@@ -335,6 +479,12 @@ impl RuntimeTap for ObservabilityController {
     }
 
     async fn gate_outcome(&self, core: CoreId, view: &OutcomeGateView<'_>) {
+        // §37g: outcome (action/publish) variant breakpoints — when
+        // any matches, flip this core's pause flag so the outcome
+        // gate parks before apply runs.
+        if self.outcome_breakpointed(view.action_variants, view.publish_variants) {
+            self.pause(core);
+        }
         let c = self.core(core);
         if !c.paused.load(Ordering::SeqCst) {
             return;
@@ -460,6 +610,11 @@ impl ObservabilityController {
 #[async_trait]
 impl HttpTap for ObservabilityController {
     async fn gate_request(&self, core: CoreId, view: &HttpRequestView<'_>) {
+        // §37g: HTTP-URL pattern breakpoints — flip the per-core
+        // pause flag when the URL matches any active pattern.
+        if self.http_url_breakpointed(view.url) {
+            self.pause(core);
+        }
         let c = self.core(core);
         if !c.paused.load(Ordering::SeqCst) {
             return;
@@ -655,5 +810,86 @@ mod tests {
         assert!(h.steps.is_empty());
         assert!(h.http.is_empty());
         assert!(h.loss.is_empty());
+        assert!(h.active_breakpoints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_variant_breakpoint_parks_gate_event() {
+        let ctrl = ObservabilityController::new();
+        ctrl.add_event_breakpoint("StatusFetched");
+        assert!(!ctrl.is_paused(CoreId::Mam));
+
+        let cause = EventCause::External(ExternalCause::Init);
+        let v = serde_json::Value::Null;
+
+        // First an unmatched variant — returns immediately, no pause.
+        ctrl.gate_event(
+            CoreId::Mam,
+            &EventGateView {
+                variant: "Init",
+                cause: &cause,
+                event: &v,
+            },
+        )
+        .await;
+        assert!(!ctrl.is_paused(CoreId::Mam));
+
+        // The breakpointed variant flips the flag and parks.
+        let ctrl2 = ctrl.clone();
+        let handle = tokio::spawn(async move {
+            ctrl2
+                .gate_event(
+                    CoreId::Mam,
+                    &EventGateView {
+                        variant: "StatusFetched",
+                        cause: &cause,
+                        event: &v,
+                    },
+                )
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!handle.is_finished(), "gate_event should have parked");
+        assert!(ctrl.is_paused(CoreId::Mam));
+        ctrl.step(CoreId::Mam);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_url_pattern_breakpoint_parks_gate_request() {
+        use windlass_types::{HttpRequestView, HttpTap};
+        let ctrl = ObservabilityController::new();
+        ctrl.add_http_breakpoint("/jsonLoad.php");
+
+        let ctrl2 = ctrl.clone();
+        let parked = tokio::spawn(async move {
+            ctrl2
+                .gate_request(
+                    CoreId::Mam,
+                    &HttpRequestView {
+                        method: "GET",
+                        url: "https://www.myanonamouse.net/json/jsonLoad.php",
+                        body: None,
+                    },
+                )
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!parked.is_finished(), "URL-matched request should park");
+        ctrl.step(CoreId::Mam);
+        parked.await.unwrap();
+    }
+
+    #[test]
+    fn active_breakpoints_returns_all_categories() {
+        let ctrl = ObservabilityController::new();
+        ctrl.add_event_breakpoint("E");
+        ctrl.add_action_breakpoint("A");
+        ctrl.add_publish_breakpoint("P");
+        ctrl.add_http_breakpoint("/path");
+        let all = ctrl.active_breakpoints();
+        assert_eq!(all.len(), 4);
+        ctrl.remove_event_breakpoint("E");
+        assert_eq!(ctrl.active_breakpoints().len(), 3);
     }
 }
