@@ -22,6 +22,7 @@ arc-swap         = { workspace = true }
 windlass-types   = { workspace = true }
 windlass-core    = { workspace = true }
 windlass-debug   = { workspace = true }
+windlass-observability = { workspace = true }
 windlass-local   = { workspace = true }
 windlass-clients = { workspace = true }
 windlass-web     = { workspace = true }

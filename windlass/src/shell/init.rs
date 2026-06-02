@@ -94,12 +94,30 @@ pub(super) async fn init_shell(
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    // §37e: HTTP clients now take an `Arc<dyn HttpTap>`.  Live wiring
-    // to `ObservabilityController` lands in §37h with the frontend;
-    // until then every client gets a `NullHttpTap` and the legacy
-    // `on_http` callback is dropped on the floor.
+    // §37h: construct the live ObservabilityController and apply
+    // PAUSE_ON_START.  Threaded into every ServiceRuntime::spawn so
+    // gates and tap calls flow through it, and into AppState so the
+    // /api/v1/observability routes can drive it from the web side.
+    let observability = windlass_observability::ObservabilityController::new();
+    let pause_on_start_raw = std::env::var("PAUSE_ON_START").ok();
+    let pre_paused = windlass_observability::parse_pause_on_start(pause_on_start_raw.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for core in &pre_paused {
+        observability.pause(*core);
+    }
+    if !pre_paused.is_empty() {
+        info!(
+            "PAUSE_ON_START: pre-pausing cores: {}",
+            pre_paused
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let runtime_tap: std::sync::Arc<dyn windlass_machine::RuntimeTap> = observability.clone();
+    let http_tap: std::sync::Arc<dyn windlass_types::HttpTap> = observability.clone();
     let _ = on_http; // legacy HttpObserver — no longer threaded into clients
-    let http_tap = windlass_types::NullHttpTap::arc();
 
     let qbit = qbit::QbitClient::new(
         direct,
@@ -149,7 +167,7 @@ pub(super) async fn init_shell(
         .with_blacklisted_ids(blacklisted);
     let (db_handles, _db_join) = windlass_machine::spawn::<DbMachine, DbShell>(
         windlass_machine::CoreId::Db,
-        windlass_machine::NullRuntimeTap::arc(),
+        runtime_tap.clone(),
         (),
         db_pool.clone(),
     )
@@ -165,7 +183,7 @@ pub(super) async fn init_shell(
     // (crash-recovery orchestration) will route publishes to the domain.
     let (docker_handles, _docker_join) = windlass_machine::spawn::<DockerMachine, DockerShell>(
         windlass_machine::CoreId::Docker,
-        windlass_machine::NullRuntimeTap::arc(),
+        runtime_tap.clone(),
         DockerConfig {
             gluetun_anchor: docker.gluetun_anchor.clone(),
             // §35: restart circuit-breaker — 3 restarts per 10-minute
@@ -202,7 +220,7 @@ pub(super) async fn init_shell(
     // disk-pressure eviction.
     let (disk_handles, _disk_join) = windlass_machine::spawn::<DiskMachine, DiskShell>(
         windlass_machine::CoreId::Disk,
-        windlass_machine::NullRuntimeTap::arc(),
+        runtime_tap.clone(),
         // 50 GiB hard floor — mirrors the legacy threshold so the alert
         // and eviction trigger at the same point.
         DiskConfig {
@@ -219,7 +237,7 @@ pub(super) async fn init_shell(
 
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         windlass_machine::CoreId::Vpn,
-        windlass_machine::NullRuntimeTap::arc(),
+        runtime_tap.clone(),
         VpnConfig {
             health_poll_interval: Duration::from_secs(30),
             unhealthy_poll_interval: Duration::from_secs(5),
@@ -283,7 +301,7 @@ pub(super) async fn init_shell(
 
     let (qbit_handles, _qbit_join) = windlass_machine::spawn::<QbitMachine, QbitShell>(
         windlass_machine::CoreId::Qbit,
-        windlass_machine::NullRuntimeTap::arc(),
+        runtime_tap.clone(),
         QbitConfig {
             auth_retry: Duration::from_secs(5),
             sync_retry: Duration::from_secs(2),
@@ -318,7 +336,7 @@ pub(super) async fn init_shell(
 
     let (mam_handles, _mam_join) = windlass_machine::spawn::<MamMachine, MamShell>(
         windlass_machine::CoreId::Mam,
-        windlass_machine::NullRuntimeTap::arc(),
+        runtime_tap.clone(),
         MamConfig {
             status_retry: Duration::from_secs(30),
             // §26 upload-health gate defaults (binary GiB; see MamConfig docs).
@@ -353,7 +371,7 @@ pub(super) async fn init_shell(
 
     let (domain_handles, _domain_join) = windlass_machine::spawn::<WindlassMachine, DomainShell>(
         windlass_machine::CoreId::Domain,
-        windlass_machine::NullRuntimeTap::arc(),
+        runtime_tap.clone(),
         WindlassConfig {
             snapshot_interval: Duration::from_secs(config.compliance_poll_interval_secs),
             gluetun_anchor: docker.gluetun_anchor.clone(),
@@ -384,6 +402,7 @@ pub(super) async fn init_shell(
         event_tx: tx.clone(),
         domain_command_tx: domain_handles.commands.clone(),
         debug_ctrl: debug_ctrl.clone(),
+        observability: observability.clone(),
         observations: obs_tx.clone(),
         chaos_url: std::env::var("CHAOS_URL").ok(),
         db_pool: db_pool.clone(),

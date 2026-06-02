@@ -3229,6 +3229,7 @@ dependencies = [
  "windlass-local",
  "windlass-machine",
  "windlass-mam-core",
+ "windlass-observability",
  "windlass-qbit-core",
  "windlass-types",
  "windlass-vpn-core",
@@ -3486,6 +3487,7 @@ dependencies = [
  "windlass-debug",
  "windlass-domain-core",
  "windlass-machine",
+ "windlass-observability",
  "windlass-types",
 ]
 

@@ -6,6 +6,7 @@ mod alerts;
 mod download;
 mod download_queue;
 mod health;
+mod observability;
 mod stream;
 mod torrents;
 
@@ -19,5 +20,6 @@ pub fn router(state: AppState) -> Router {
         .merge(activity_log::router(state.clone()))
         .merge(health::router(state.clone()))
         .merge(stream::router(state.clone()))
-        .merge(torrents::router(state))
+        .merge(torrents::router(state.clone()))
+        .merge(observability::router(state))
 }
