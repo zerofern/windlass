@@ -7,10 +7,72 @@ use windlass_core::events::Event;
 use windlass_core::types::SystemState;
 use windlass_types::HttpExchange;
 
-use crate::stream::{action_variant, event_variant};
 use crate::types::{
     ActionEntry, ActiveEvent, DebugCommand, LogEntry, RunningAction, StoredEvent, TraceEntry,
 };
+
+/// Static variant name for a legacy `Event`.  Moved here from the
+/// deleted `stream` module during the §37d closeout.
+const fn event_variant(event: &Event) -> &'static str {
+    match event {
+        Event::Init { .. } => "Init",
+        Event::DockerGluetunDied { .. } => "DockerGluetunDied",
+        Event::DockerGluetunHealthy { .. } => "DockerGluetunHealthy",
+        Event::PortFileReadResult { .. } => "PortFileReadResult",
+        Event::QbitAuthSuccess { .. } => "QbitAuthSuccess",
+        Event::QbitAuthFailed { .. } => "QbitAuthFailed",
+        Event::QbitConnectionRefused { .. } => "QbitConnectionRefused",
+        Event::QbitApiError { .. } => "QbitApiError",
+        Event::QbitPortSyncSuccess { .. } => "QbitPortSyncSuccess",
+        Event::QbitPortSyncFailed { .. } => "QbitPortSyncFailed",
+        Event::MamUpdateSuccess { .. } => "MamUpdateSuccess",
+        Event::MamAsnMismatch { .. } => "MamAsnMismatch",
+        Event::MamUnreachable { .. } => "MamUnreachable",
+        Event::MamStatusObserved { .. } => "MamStatusObserved",
+        Event::DiskSpaceObserved { .. } => "DiskSpaceObserved",
+        Event::NewTorrentsObserved { .. } => "NewTorrentsObserved",
+        Event::LogsDumped { .. } => "LogsDumped",
+        Event::Wakeup { .. } => "Wakeup",
+        Event::MamRateLimitViolation { .. } => "MamRateLimitViolation",
+        Event::QbitTorrentDetailsReceived { .. } => "QbitTorrentDetailsReceived",
+        Event::QbitPreferencesReceived { .. } => "QbitPreferencesReceived",
+        Event::QbitPreferencesFailed { .. } => "QbitPreferencesFailed",
+        Event::DeleteTorrentRequested { .. } => "DeleteTorrentRequested",
+        Event::ManualDownloadRequested { .. } => "ManualDownloadRequested",
+        Event::TorrentAddedToQbit { .. } => "TorrentAddedToQbit",
+        Event::TorrentAddFailed { .. } => "TorrentAddFailed",
+    }
+}
+
+/// Static variant name for a legacy `Action`.  Moved here from the
+/// deleted `stream` module during the §37d closeout.
+const fn action_variant(action: &Action) -> &'static str {
+    match action {
+        Action::ScheduleWakeup(_, _) => "ScheduleWakeup",
+        Action::ReadPortFiles => "ReadPortFiles",
+        Action::FetchAndDumpAllLogs => "FetchAndDumpAllLogs",
+        Action::StopDependentContainers => "StopDependentContainers",
+        Action::StartDependentContainers => "StartDependentContainers",
+        Action::RestartGluetun => "RestartGluetun",
+        Action::AuthenticateQbit => "AuthenticateQbit",
+        Action::SyncQbitPort(_, _) => "SyncQbitPort",
+        Action::UpdateMam(_) => "UpdateMam",
+        Action::CheckMamConnectability => "CheckMamConnectability",
+        Action::CheckDiskSpace => "CheckDiskSpace",
+        Action::CheckNewTorrents(_) => "CheckNewTorrents",
+        Action::SendAlert { .. } => "SendAlert",
+        Action::FetchTorrentDetails(_) => "FetchTorrentDetails",
+        Action::FetchQbitPreferences(_) => "FetchQbitPreferences",
+        Action::PauseTorrent(_, _) => "PauseTorrent",
+        Action::ForceResumeTorrent(_, _) => "ForceResumeTorrent",
+        Action::DeleteTorrent(_, _) => "DeleteTorrent",
+        Action::SetAllFilesPriority(_, _) => "SetAllFilesPriority",
+        Action::UpsertTorrentRecords(_) => "UpsertTorrentRecords",
+        Action::BlacklistMamId(_) => "BlacklistMamId",
+        Action::WriteActivity { .. } => "WriteActivity",
+        Action::FetchAndAddTorrent { .. } => "FetchAndAddTorrent",
+    }
+}
 
 const TRACE_CAP: usize = 200;
 const LOG_CAP: usize = 500;

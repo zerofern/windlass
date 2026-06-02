@@ -1,17 +1,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 pub mod causal_tx;
-mod dispatcher;
 pub mod history;
 pub mod log_layer;
-pub(crate) mod stream;
 pub mod types;
 
 pub use causal_tx::CausalTx;
-pub use dispatcher::DebugDispatcher;
 pub use history::DebugHistory;
 pub use log_layer::DebugLogLayer;
-pub use stream::DebuggableEventStream;
 pub use types::{
     ActionEntry, ActiveEvent, DebugCommand, LogEntry, RunningAction, StoredEvent, TraceEntry,
 };
@@ -25,11 +21,8 @@ use serde::Serialize;
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use uuid::Uuid;
 use windlass_core::HttpObserver;
-use windlass_core::events::Event;
 use windlass_core::types::SystemState;
 use windlass_types::HttpExchange;
-
-pub(crate) use stream::QueueSink;
 
 // ── PausedOn ──────────────────────────────────────────────────────────────────
 
@@ -105,28 +98,24 @@ impl DebugState {
 /// `cmd_tx`; the main loop drains `cmd_rx` between events.
 #[derive(Clone, Debug)]
 pub struct DebugController {
-    /// Manually enabled/disabled from the UI or by the MAM rate-limit guardrail.
-    /// When enabled, each event/action waits for an explicit step permit.
+    /// Vestigial from the legacy debug-mode toggle; kept so existing
+    /// callers compile but never flips to true.  Removed entirely with
+    /// the §37j rename pass.
     debug_mode: Arc<AtomicBool>,
     event_breakpoints: Arc<ArcSwap<HashSet<String>>>,
     action_breakpoints: Arc<ArcSwap<HashSet<String>>>,
-    /// One permit = one event or action may proceed.
-    /// Released by `POST /debug/step`; consumed by `acquire_step`.
+    /// One permit = one event or action may proceed.  Now unused after
+    /// §37d closeout; retained so `DebugDispatcher`-shaped tests still
+    /// link.
     step: Arc<Semaphore>,
-    /// When set, the next `acquire_step` caller skips its item instead of executing it.
+    /// When set, the next `acquire_step` caller skips its item.
     skip: Arc<AtomicBool>,
     /// What the system is currently paused on; `None` when running freely.
     paused_on: Arc<ArcSwap<Option<PausedOn>>>,
-    // ── Queue routing ─────────────────────────────────────────────────────────
-    /// Controls where the intake task routes incoming events.
-    /// Swapped atomically on enable/disable debug.
-    pub(crate) queue_sink: Arc<ArcSwap<QueueSink>>,
-    /// Sender for the non-debug (mpsc) path — restored on `disable_debug()`.
-    internal_tx: mpsc::Sender<Event>,
-    /// Sender for the debug (`VecDeque`) path — activated on `enable_debug()`.
-    stored_tx: mpsc::Sender<StoredEvent>,
     // ── Shared handles for history / snapshot ─────────────────────────────────
-    /// Latest published snapshot of `DebugState`. Read by GET /api/v1/debug.
+    /// Latest published snapshot of `DebugState`.  The SSE stream and
+    /// health endpoint still read this until §37h wires the new
+    /// observability page.
     pub snapshot: Arc<ArcSwap<DebugState>>,
     /// HTTP handlers send queue-manipulation commands here; main loop drains `cmd_rx`.
     pub cmd_tx: mpsc::Sender<DebugCommand>,
@@ -141,10 +130,6 @@ pub struct DebugController {
 /// The receiver halves of the history channels, owned exclusively by the main
 /// event loop. Returned alongside `DebugController` from `new_with_owned`.
 pub struct DebugOwnedPart {
-    /// Receives events from the intake task in non-debug mode.
-    pub internal_rx: mpsc::Receiver<Event>,
-    /// Receives `StoredEvent`s from the intake task in debug mode.
-    pub queue_rx: mpsc::Receiver<StoredEvent>,
     pub cmd_rx: mpsc::Receiver<DebugCommand>,
     pub log_rx: mpsc::Receiver<LogEntry>,
     /// Receives `(action_id, HttpExchange)` pairs from `make_http_observer`
@@ -157,15 +142,10 @@ impl DebugController {
     /// event loop must own. Pass the returned `DebugOwnedPart` to `shell::run`.
     #[must_use]
     pub fn new_with_owned() -> (Self, DebugOwnedPart) {
-        let (internal_tx, internal_rx) = mpsc::channel::<Event>(128);
-        let (stored_tx, queue_rx) = mpsc::channel::<StoredEvent>(128);
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (log_tx, log_rx) = mpsc::channel(1024);
         let (exchange_tx, exchange_rx) = mpsc::channel(1024);
         let (notify_tx, _) = broadcast::channel(256);
-
-        // Start in non-debug mode: intake task routes to internal_tx.
-        let queue_sink = Arc::new(ArcSwap::from_pointee(QueueSink::Mpsc(internal_tx.clone())));
 
         let ctrl = Self {
             debug_mode: Arc::new(AtomicBool::new(false)),
@@ -174,9 +154,6 @@ impl DebugController {
             step: Arc::new(Semaphore::new(0)),
             skip: Arc::new(AtomicBool::new(false)),
             paused_on: Arc::new(ArcSwap::from_pointee(None)),
-            queue_sink,
-            internal_tx,
-            stored_tx,
             snapshot: Arc::new(ArcSwap::from_pointee(DebugState::initial())),
             cmd_tx,
             log_tx,
@@ -184,8 +161,6 @@ impl DebugController {
             notify_tx,
         };
         let owned = DebugOwnedPart {
-            internal_rx,
-            queue_rx,
             cmd_rx,
             log_rx,
             exchange_rx,
@@ -202,11 +177,11 @@ impl DebugController {
 
     // ── Debug mode ────────────────────────────────────────────────────────────
 
+    /// Vestigial post-§37d.  The legacy queue-routing path is gone;
+    /// nothing actually pauses now.  Kept so existing callers compile
+    /// until §37j retires `windlass-debug`.
     pub fn enable_debug(&self) {
         self.debug_mode.store(true, Ordering::SeqCst);
-        // Swap intake routing to the VecDeque path.
-        self.queue_sink
-            .store(Arc::new(QueueSink::Queue(self.stored_tx.clone())));
         let current = self.snapshot.load_full();
         let seq = current.seq + 1;
         let enabled_state = Arc::new(DebugState {
@@ -222,18 +197,11 @@ impl DebugController {
         self.debug_mode.store(false, Ordering::SeqCst);
         self.skip.store(false, Ordering::SeqCst);
         self.paused_on.store(Arc::new(None));
-        // Release up to MAX_PERMITS so any waiter is unblocked. We use
-        // MAX_PERMITS - available_permits() to avoid exceeding the tokio limit.
         let available = self.step.available_permits();
         let to_add = Semaphore::MAX_PERMITS.saturating_sub(available);
         if to_add > 0 {
             self.step.add_permits(to_add);
         }
-        // Restore intake routing to the direct mpsc path.
-        self.queue_sink
-            .store(Arc::new(QueueSink::Mpsc(self.internal_tx.clone())));
-        // Push a final snapshot with debug_mode=false so SSE clients update.
-        // publish() is a no-op when debug mode is off, so we do it directly here.
         let current = self.snapshot.load_full();
         let seq = current.seq + 1;
         let final_state = Arc::new(DebugState {

@@ -10,9 +10,7 @@ use tracing::{info, warn};
 use windlass_clients::{mam, qbit};
 use windlass_core::{events::Event, types::SystemState};
 use windlass_db::DbPool;
-use windlass_debug::{
-    DebugCommand, DebugController, DebugHistory, DebuggableEventStream, LogEntry, StoredEvent,
-};
+use windlass_debug::{DebugCommand, DebugController, DebugHistory, LogEntry};
 use windlass_local::{docker, vpn_files};
 use windlass_types::{VpnPort, WakeupId};
 
@@ -39,7 +37,7 @@ use super::vpn_shell::{VpnShell, VpnShellConfig};
 
 /// All runtime state extracted from `init_shell` so `run` stays concise.
 pub(super) struct ShellRuntime {
-    pub(super) debug_stream: DebuggableEventStream,
+    pub(super) event_rx: mpsc::Receiver<Event>,
     pub(super) docker: docker::DockerClient,
     pub(super) dependents: Vec<String>,
     pub(super) qbit: qbit::QbitClient,
@@ -54,10 +52,7 @@ pub(super) struct ShellRuntime {
     pub(super) history: DebugHistory,
     pub(super) cmd_rx: mpsc::Receiver<DebugCommand>,
     pub(super) log_rx: mpsc::Receiver<LogEntry>,
-    pub(super) queue_rx: mpsc::Receiver<StoredEvent>,
     pub(super) exchange_rx: mpsc::Receiver<(uuid::Uuid, windlass_types::HttpExchange)>,
-    pub(super) causal_debug_tx: mpsc::Sender<(Event, uuid::Uuid)>,
-    pub(super) causal_rx: mpsc::Receiver<(Event, uuid::Uuid)>,
     pub(super) service_cores: ServiceCores,
     pub(super) execute_service_actions: bool,
 }
@@ -121,12 +116,11 @@ pub(super) async fn init_shell(
 
     let (obs_tx, _) = broadcast::channel::<windlass_core::Observation>(256);
 
-    let debug_stream = DebuggableEventStream::new(
-        rx,
-        debug_owned.internal_rx,
-        debug_ctrl.clone(),
-        obs_tx.clone(),
-    );
+    // §37d closeout: the legacy DebuggableEventStream / dequeue_debug
+    // pause path is gone.  The main loop reads `rx` directly; the new
+    // observability system gates per-core inside ServiceRuntime, not
+    // at the central legacy-event intake.
+    let event_rx = rx;
 
     // §36 step 5: HTTP server start is deferred until after the domain
     // runtime is spawned so AppState can carry the domain command channel
@@ -576,17 +570,14 @@ pub(super) async fn init_shell(
     let history = DebugHistory::new(SystemState::initial());
     let cmd_rx = debug_owned.cmd_rx;
     let log_rx = debug_owned.log_rx;
-    let queue_rx = debug_owned.queue_rx;
     let exchange_rx = debug_owned.exchange_rx;
-
-    // Causation channel: action handlers send (event, action_id) here in debug mode.
-    let (causal_debug_tx, causal_rx) = mpsc::channel::<(Event, uuid::Uuid)>(128);
 
     if let Err(e) = mam.check_session().await {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
     }
 
-    // Send Init into the channel so it flows through DebuggableEventStream.
+    // Send Init into the central event channel.  The main loop in
+    // shell/mod.rs reads from `event_rx` directly post-§37d closeout.
     tx.send(Event::Init {
         at: chrono::Utc::now(),
         is_gluetun_healthy: boot.is_gluetun_healthy,
@@ -596,7 +587,7 @@ pub(super) async fn init_shell(
     .expect("event channel open at startup");
 
     Ok(ShellRuntime {
-        debug_stream,
+        event_rx,
         docker,
         dependents: boot.dependents,
         qbit,
@@ -611,10 +602,7 @@ pub(super) async fn init_shell(
         history,
         cmd_rx,
         log_rx,
-        queue_rx,
         exchange_rx,
-        causal_debug_tx,
-        causal_rx,
         service_cores,
         execute_service_actions,
     })

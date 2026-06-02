@@ -3,7 +3,6 @@ use axum::Router;
 
 mod activity_log;
 mod alerts;
-mod debug;
 mod download;
 mod download_queue;
 mod health;
@@ -20,6 +19,5 @@ pub fn router(state: AppState) -> Router {
         .merge(activity_log::router(state.clone()))
         .merge(health::router(state.clone()))
         .merge(stream::router(state.clone()))
-        .merge(torrents::router(state.clone()))
-        .merge(debug::router(state))
+        .merge(torrents::router(state))
 }

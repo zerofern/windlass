@@ -55,81 +55,9 @@ export interface HttpExchange {
 
 export type Observation =
   | { type: "StateSnapshot"; data: SystemState }
-  | { type: "DebugModeChanged"; data: boolean }
-  // Legacy variants — no longer sent by the backend but kept so Dashboard/Chaos compile
+  // Legacy variants — kept so Dashboard/Chaos compile.  §37h's new
+  // observability page consumes a new SSE shape and drops Observation.
   | { type: "EventArrived"; data: unknown }
   | { type: "EventReceived"; data: unknown }
   | { type: "ActionDispatched"; data: unknown }
   | { type: "HttpExchange"; data: HttpExchange }
-
-// ── Debug ─────────────────────────────────────────────────────────────────
-
-export type PausedOn =
-  | { kind: "Event"; variant: string }
-  | { kind: "Action"; variant: string; index: number; of: number }
-
-export interface StoredEvent {
-  id: string
-  at: string
-  arrived_at: string
-  variant: string
-  payload: unknown
-  caused_by_action: string | null
-}
-
-export interface ActionEntry {
-  id: string
-  variant: string
-  payload: unknown
-  parent_event_id: string
-  started_at: string
-  completed_at: string | null
-  caused_event_id: string | null
-  http_exchanges: HttpExchange[]
-}
-
-export interface ActiveEvent {
-  stored: StoredEvent
-  state_before: SystemState
-  started_at: string
-  actions: ActionEntry[]
-  /** Actions waiting to be dispatched — populated before dispatch begins. */
-  pending_actions: unknown[]
-}
-
-export interface RunningAction {
-  id: string
-  variant: string
-  payload: unknown
-  parent_event_id: string
-  started_at: string
-}
-
-export interface TraceEntry {
-  event: StoredEvent
-  state_before: SystemState
-  state_after: SystemState
-  actions: ActionEntry[]
-  completed_at: string
-}
-
-export interface LogEntry {
-  at: string
-  level: string
-  target: string
-  message: string
-}
-
-export interface DebugState {
-  seq: number
-  debug_mode: boolean
-  paused_on: PausedOn | null
-  event_breakpoints: string[]
-  action_breakpoints: string[]
-  event_queue: StoredEvent[]
-  current_event: ActiveEvent | null
-  running_actions: RunningAction[]
-  trace: TraceEntry[]
-  logs: LogEntry[]
-  latest_state: SystemState
-}
