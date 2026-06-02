@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use windlass_local::vpn_files;
-use windlass_machine::{Shell, Timed};
+use windlass_machine::{ExternalCause, Shell, Timed};
 use windlass_types::VpnIp;
 use windlass_vpn_core::{VerifiedIpInfo, VpnAction, VpnEvent};
 
@@ -110,17 +110,29 @@ impl Shell for VpnShell {
                     .unwrap_or_else(|e| Err(e.to_string()));
                     match result {
                         Ok((ip, port)) => {
-                            let _ = tx.send(Timed::now(VpnEvent::PortFileChanged { port }));
+                            let _ = tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                VpnEvent::PortFileChanged { port },
+                            ));
                             // §31: emit the file IP too so the core can dedup
                             // and trigger verification.
-                            let _ = tx.send(Timed::now(VpnEvent::PublicIpFromFile { ip }));
+                            let _ = tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                VpnEvent::PublicIpFromFile { ip },
+                            ));
                         }
                         Err(reason) => {
                             // §31: a read failure is currently surfaced as
                             // `StateReadFailed`. Distinguishing "file
                             // missing" (PublicIpFileUnavailable) from a
                             // genuine I/O error is a follow-up.
-                            let _ = tx.send(Timed::now(VpnEvent::StateReadFailed { reason }));
+                            let _ = tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                VpnEvent::StateReadFailed { reason },
+                            ));
                         }
                     }
                 });
@@ -132,7 +144,11 @@ impl Shell for VpnShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let event = verify_public_ip(&http, &url).await;
-                    let _ = tx.send(Timed::now(event));
+                    let _ = tx.send(Timed::external(
+                        std::time::Instant::now(),
+                        ExternalCause::Unknown,
+                        event,
+                    ));
                 });
             }
             // §33: MAM /json/jsonIp.php verification through the same
@@ -144,7 +160,11 @@ impl Shell for VpnShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let event = verify_mam_ip(&http, &url).await;
-                    let _ = tx.send(Timed::now(event));
+                    let _ = tx.send(Timed::external(
+                        std::time::Instant::now(),
+                        ExternalCause::Unknown,
+                        event,
+                    ));
                 });
             }
             VpnAction::ScheduleTimer { timer, after } => {
@@ -152,7 +172,11 @@ impl Shell for VpnShell {
                 tokio::spawn(async move {
                     let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::new(scheduled_at, VpnEvent::TimerFired(timer)));
+                    let _ = tx.send(Timed::external(
+                        scheduled_at,
+                        ExternalCause::Timer { name: timer.name() },
+                        VpnEvent::TimerFired(timer),
+                    ));
                 });
             }
         }

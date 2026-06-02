@@ -22,7 +22,7 @@ use windlass_docker_core::{DockerConfig, DockerMachine};
 use windlass_domain_core::{
     WindlassConfig, WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic,
 };
-use windlass_machine::Timed;
+use windlass_machine::{ExternalCause, Timed};
 use windlass_mam_core::{MamConfig, MamMachine, MamPublish, MamTopic};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
@@ -246,15 +246,21 @@ pub(super) async fn init_shell(
             while let Some(result) = file_result_rx.recv().await {
                 match result {
                     Ok((ip, port)) => {
-                        let _ = vpn_event_tx.send(Timed::now(
+                        let _ = vpn_event_tx.send(Timed::external(
+                            std::time::Instant::now(),
+                            ExternalCause::Unknown,
                             windlass_vpn_core::VpnEvent::PortFileChanged { port },
                         ));
-                        let _ = vpn_event_tx.send(Timed::now(
+                        let _ = vpn_event_tx.send(Timed::external(
+                            std::time::Instant::now(),
+                            ExternalCause::Unknown,
                             windlass_vpn_core::VpnEvent::PublicIpFromFile { ip },
                         ));
                     }
                     Err(reason) => {
-                        let _ = vpn_event_tx.send(Timed::now(
+                        let _ = vpn_event_tx.send(Timed::external(
+                            std::time::Instant::now(),
+                            ExternalCause::Unknown,
                             windlass_vpn_core::VpnEvent::StateReadFailed { reason },
                         ));
                     }
@@ -399,7 +405,11 @@ pub(super) async fn init_shell(
                     | VpnPublish::PublicIpVerificationDegraded { .. }
                     | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
-                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
+                let _ = domain_ev_tx.send(Timed::external(
+                    std::time::Instant::now(),
+                    ExternalCause::Unknown,
+                    WindlassEvent::Vpn(publish),
+                ));
             }
         });
     }
@@ -413,7 +423,11 @@ pub(super) async fn init_shell(
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
             while let Some(publish) = docker_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Docker(publish)));
+                let _ = domain_ev_tx.send(Timed::external(
+                    std::time::Instant::now(),
+                    ExternalCause::Unknown,
+                    WindlassEvent::Docker(publish),
+                ));
             }
         });
     }
@@ -425,7 +439,11 @@ pub(super) async fn init_shell(
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
             while let Some(publish) = qbit_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Qbit(publish)));
+                let _ = domain_ev_tx.send(Timed::external(
+                    std::time::Instant::now(),
+                    ExternalCause::Unknown,
+                    WindlassEvent::Qbit(publish),
+                ));
             }
         });
     }
@@ -437,7 +455,11 @@ pub(super) async fn init_shell(
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
             while let Some(publish) = mam_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Mam(publish)));
+                let _ = domain_ev_tx.send(Timed::external(
+                    std::time::Instant::now(),
+                    ExternalCause::Unknown,
+                    WindlassEvent::Mam(publish),
+                ));
             }
         });
     }
@@ -450,7 +472,11 @@ pub(super) async fn init_shell(
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
             while let Some(publish) = disk_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Disk(publish)));
+                let _ = domain_ev_tx.send(Timed::external(
+                    std::time::Instant::now(),
+                    ExternalCause::Unknown,
+                    WindlassEvent::Disk(publish),
+                ));
             }
         });
     }
@@ -479,7 +505,11 @@ pub(super) async fn init_shell(
                                 operation: failure.operation,
                                 message: failure.message,
                             };
-                            let _ = domain_ev_tx.send(Timed::now(event));
+                            let _ = domain_ev_tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                event,
+                            ));
                         }
                     }
                 }

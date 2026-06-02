@@ -75,6 +75,19 @@ pub enum QbitTimer {
     TorrentRefresh,
 }
 
+impl QbitTimer {
+    /// Static name used as the `ExternalCause::Timer { name }` tag when
+    /// the shell forwards a fired timer back into the runtime.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::AuthRetry => "QbitTimer::AuthRetry",
+            Self::SyncRetry => "QbitTimer::SyncRetry",
+            Self::TorrentRefresh => "QbitTimer::TorrentRefresh",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QbitEvent {
     Init,
@@ -1076,7 +1089,7 @@ impl Machine for QbitMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::{Machine, Outcome, Timed};
+    use windlass_machine::{ExternalCause, Machine, Outcome, Timed};
     use windlass_types::{AuthCookie, TorrentHash, TorrentRecord, TorrentState, VpnPort};
 
     use crate::{
@@ -1112,7 +1125,10 @@ mod tests {
     }
 
     fn handle(machine: &mut QbitMachine, event: QbitEvent) -> Outcome<QbitAction, QbitPublish> {
-        machine.handle(Instant::now(), Timed::now(event))
+        machine.handle(
+            Instant::now(),
+            Timed::external(Instant::now(), ExternalCause::Unknown, event),
+        )
     }
 
     #[test]
@@ -1436,9 +1452,13 @@ mod tests {
         let cookie = AuthCookie::new("sid".to_string());
         let _ = m.handle(
             Instant::now(),
-            Timed::now(QbitEvent::AuthSucceeded {
-                cookie: cookie.clone(),
-            }),
+            Timed::external(
+                Instant::now(),
+                ExternalCause::Unknown,
+                QbitEvent::AuthSucceeded {
+                    cookie: cookie.clone(),
+                },
+            ),
         );
         (m, cookie)
     }
@@ -1446,7 +1466,11 @@ mod tests {
     fn load_torrent(m: &mut QbitMachine, r: TorrentRecord) {
         let _ = m.handle(
             Instant::now(),
-            Timed::now(QbitEvent::TorrentsListed { torrents: vec![r] }),
+            Timed::external(
+                Instant::now(),
+                ExternalCause::Unknown,
+                QbitEvent::TorrentsListed { torrents: vec![r] },
+            ),
         );
     }
 
@@ -2246,7 +2270,11 @@ mod tests {
             .collect();
         let _ = m.handle(
             Instant::now(),
-            Timed::now(QbitEvent::TorrentsListed { torrents }),
+            Timed::external(
+                Instant::now(),
+                ExternalCause::Unknown,
+                QbitEvent::TorrentsListed { torrents },
+            ),
         );
     }
 
@@ -2376,14 +2404,18 @@ mod tests {
         // 2 unsatisfied (downloaded > 0, seed < 72h), 1 satisfied (seed >= 72h), 1 zero-byte
         let _ = m.handle(
             Instant::now(),
-            Timed::now(QbitEvent::TorrentsListed {
-                torrents: vec![
-                    unsatisfied_record(&TorrentHash("a".repeat(40))),
-                    unsatisfied_record(&TorrentHash("b".repeat(40))),
-                    record(&TorrentHash("c".repeat(40)), 1, 72 * 3600), // satisfied
-                    record(&TorrentHash("d".repeat(40)), 0, 0),         // zero-byte
-                ],
-            }),
+            Timed::external(
+                Instant::now(),
+                ExternalCause::Unknown,
+                QbitEvent::TorrentsListed {
+                    torrents: vec![
+                        unsatisfied_record(&TorrentHash("a".repeat(40))),
+                        unsatisfied_record(&TorrentHash("b".repeat(40))),
+                        record(&TorrentHash("c".repeat(40)), 1, 72 * 3600), // satisfied
+                        record(&TorrentHash("d".repeat(40)), 0, 0),         // zero-byte
+                    ],
+                },
+            ),
         );
         assert_eq!(m.unsatisfied_count(), 2);
     }
@@ -2416,7 +2448,7 @@ mod prop_tests {
     use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
     use windlass_types::{
         AuthCookie, MamTorrentId, TorrentHash, TorrentRecord, TorrentState, VpnPort,
     };
@@ -2601,7 +2633,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic).
         #[test]
         fn handle_never_panics(mut machine in any_qbit_machine(), event in any_qbit_event()) {
-            let _ = machine.handle(Instant::now(), Timed::now(event));
+            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // GLOBAL-1 (no panic) for commands.
@@ -2617,7 +2649,7 @@ mod prop_tests {
             mut machine in any_qbit_machine(),
             event in any_qbit_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for action in &out.actions {
                 if carries_cookie(action) {
                     prop_assert!(machine.is_authenticated());
@@ -2648,7 +2680,7 @@ mod prop_tests {
             mut machine in any_qbit_machine(),
             event in any_qbit_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for publish in &out.publish {
                 if let QbitPublish::ListenPortReady { port } = publish {
                     prop_assert!(
@@ -2675,7 +2707,7 @@ mod prop_tests {
                 })
                 .map(|(h, _)| h.clone())
                 .collect();
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for action in &out.actions {
                 if let QbitAction::DeleteTorrent { hash, .. } = action {
                     prop_assert!(
@@ -2726,7 +2758,7 @@ mod prop_tests {
                 .collect();
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             for action in &out.actions {
                 if let QbitAction::DeleteTorrent { hash, .. } = action {
@@ -2760,7 +2792,7 @@ mod prop_tests {
                 machine.torrents.keys().cloned().collect();
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             for action in &out.actions {
                 if let QbitAction::SetAllFilesPriority { hash, .. } = action {
@@ -2785,7 +2817,7 @@ mod prop_tests {
             // Force unauthenticated.
             machine.cookie = None;
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for action in &out.actions {
                 prop_assert!(
                     !matches!(action, QbitAction::SetAllFilesPriority { .. }),
@@ -2867,7 +2899,7 @@ mod prop_tests {
                 lsd,
                 max_active_torrents: u32::MAX,
             };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             let disable_count = out.actions.iter().filter(|a| {
                 matches!(a, QbitAction::DisableBannedPrivacySettings { .. })
@@ -2915,7 +2947,7 @@ mod prop_tests {
                 lsd: false,
                 max_active_torrents: u32::MAX,
             };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             prop_assert!(
                 !out.actions.iter().any(|a| matches!(a, QbitAction::DisableBannedPrivacySettings { .. })),
@@ -2937,7 +2969,7 @@ mod prop_tests {
             reason in any::<String>(),
         ) {
             let event = QbitEvent::PrivacySettingsDisableFailed { reason };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             let sync_retry_count = out.actions.iter().filter(|a| {
                 matches!(a, QbitAction::ScheduleTimer { timer: QbitTimer::SyncRetry, .. })
@@ -2969,7 +3001,7 @@ mod prop_tests {
         fn privacy_settings_disabled_is_noop(mut machine in any_qbit_machine()) {
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(QbitEvent::PrivacySettingsDisabled),
+                Timed::external(Instant::now(), ExternalCause::Unknown, QbitEvent::PrivacySettingsDisabled),
             );
             prop_assert!(out.actions.is_empty(), "PrivacySettingsDisabled must emit no actions");
             prop_assert!(out.publish.is_empty(), "PrivacySettingsDisabled must emit no publishes");
@@ -2993,7 +3025,7 @@ mod prop_tests {
             let hnr_seed_time = machine.config.hnr_seed_time;
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             for action in &out.actions {
                 if let QbitAction::PauseTorrent { hash, .. } = action {
@@ -3025,7 +3057,7 @@ mod prop_tests {
             let hnr_seed_time = machine.config.hnr_seed_time;
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             for action in &out.actions {
                 if let QbitAction::ForceResumeTorrent { hash, .. } = action {
@@ -3073,7 +3105,7 @@ mod prop_tests {
             .unwrap_or(u32::MAX);
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             for publish in &out.publish {
                 if let QbitPublish::QueueOrchestrated { .. } = publish {
@@ -3110,7 +3142,7 @@ mod prop_tests {
             ).unwrap_or(u32::MAX);
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             let critical_count = out.publish.iter().filter(|p| {
                 matches!(p, QbitPublish::UnsatisfiedQuotaCritical { .. })
@@ -3145,7 +3177,7 @@ mod prop_tests {
             ).unwrap_or(u32::MAX);
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             let approaching_count = out.publish.iter().filter(|p| {
                 matches!(p, QbitPublish::UnsatisfiedQuotaApproaching { .. })
@@ -3183,7 +3215,7 @@ mod prop_tests {
             ).unwrap_or(u32::MAX);
 
             let event = QbitEvent::TorrentsListed { torrents };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             let ok_count = out.publish.iter().filter(|p| {
                 matches!(p, QbitPublish::UnsatisfiedQuotaOk { .. })
@@ -3219,7 +3251,7 @@ mod prop_tests {
                 lsd,
                 max_active_torrents,
             };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             let clean_count = out.publish.iter()
                 .filter(|p| matches!(p, QbitPublish::PrivacyClean))

@@ -183,7 +183,7 @@ impl Machine for DiskMachine {
 mod tests {
     use std::time::Instant;
 
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
 
     use crate::{DiskConfig, DiskEvent, DiskMachine, DiskPublish};
 
@@ -194,7 +194,11 @@ mod tests {
     fn observe(m: &mut DiskMachine, free_bytes: u64) -> Vec<DiskPublish> {
         m.handle(
             Instant::now(),
-            Timed::now(DiskEvent::DiskSpaceObserved { free_bytes }),
+            Timed::external(
+                Instant::now(),
+                ExternalCause::Unknown,
+                DiskEvent::DiskSpaceObserved { free_bytes },
+            ),
         )
         .publish
     }
@@ -241,7 +245,10 @@ mod tests {
     #[test]
     fn init_produces_no_publish() {
         let mut m = machine(1_000_000);
-        let out = m.handle(Instant::now(), Timed::now(DiskEvent::Init));
+        let out = m.handle(
+            Instant::now(),
+            Timed::external(Instant::now(), ExternalCause::Unknown, DiskEvent::Init),
+        );
         assert!(out.publish.is_empty());
         assert!(out.actions.is_empty());
     }
@@ -271,7 +278,7 @@ mod prop_tests {
     use std::time::Instant;
 
     use proptest::prelude::*;
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
 
     use crate::{DiskConfig, DiskEvent, DiskMachine, DiskPublish};
 
@@ -296,7 +303,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic).
         #[test]
         fn handle_never_panics(mut machine in any_disk_machine(), event in any_disk_event()) {
-            let _ = machine.handle(Instant::now(), Timed::now(event));
+            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // DISK-1 [safety] (Guarantee A): BelowFloor is published iff
@@ -309,7 +316,7 @@ mod prop_tests {
         ) {
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(DiskEvent::DiskSpaceObserved { free_bytes }),
+                Timed::external(Instant::now(), ExternalCause::Unknown, DiskEvent::DiskSpaceObserved { free_bytes }),
             );
             // Exactly one publish must be emitted.
             prop_assert_eq!(out.publish.len(), 1);
@@ -339,7 +346,7 @@ mod prop_tests {
             mut machine in any_disk_machine(),
             event in any_disk_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             prop_assert!(out.actions.is_empty());
         }
     }

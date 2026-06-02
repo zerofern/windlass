@@ -1,37 +1,100 @@
+use std::path::PathBuf;
 use std::time::Instant;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use uuid::Uuid;
 
 use crate::pubsub::HasTopic;
 
-/// An event paired with the logical time it occurred.
+/// Why an event arrived — the upstream side effect that produced it.
 ///
-/// For timers, `at` should be the scheduled fire time, not the wall-clock time
-/// when an async runtime woke up. Machines can then compare it against a fresh
-/// `Instant::now()` to reason about scheduler slack and event-queue lag.
+/// The observability layer uses this to render the bidirectional causal
+/// graph: an event's cause points back at the action or publish that
+/// produced it; clicking that node jumps to the originating step in
+/// whichever core emitted it. See `docs/observability-redesign.md`
+/// "Architecture / `Timed<E>` causal extension".
+///
+/// This is the runtime-side enum. The wire-side counterpart
+/// (`StoredEventCause`) lands in §37f with the rest of the SSE shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EventCause {
+    /// Event is the result of an action this or another core dispatched.
+    Action(Uuid),
+    /// Event is the result of a publish from another core.
+    Publish(Uuid),
+    /// Event originates outside the action/publish graph.
+    External(ExternalCause),
+}
+
+/// What kind of external source produced an event.
+///
+/// Runtime-side only — uses zero-copy variants where it can
+/// (`&'static str` for timer / Docker-event names). The wire-side
+/// `StoredExternalCause` (everything as `String`) lands in §37f.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExternalCause {
+    /// A timer fired. `name` identifies the timer (e.g. `"VpnHealthPoll"`).
+    Timer { name: &'static str },
+    /// A file-watcher event arrived.
+    FileWatcher { path: PathBuf },
+    /// A Docker engine event arrived. `kind` is the event class
+    /// (e.g. `"container.start"`, `"container.health_status"`).
+    DockerEvent { kind: &'static str },
+    /// An operator-initiated command (web UI button, CLI invocation).
+    ManualCommand,
+    /// System boot — the first event each core emits during init.
+    Init,
+    /// The cause is not yet wired up. Used as a placeholder during the
+    /// §37 migration; every `Unknown` site should be replaced before
+    /// observability ships.
+    Unknown,
+}
+
+/// An event paired with the logical time it occurred and the upstream
+/// cause that produced it.
+///
+/// For timers, `at` should be the scheduled fire time, not the wall-clock
+/// time when an async runtime woke up. Machines can then compare it
+/// against a fresh `Instant::now()` to reason about scheduler slack and
+/// event-queue lag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timed<E> {
     pub at: Instant,
+    pub cause: EventCause,
     pub inner: E,
 }
 
 impl<E> Timed<E> {
-    /// Pairs `inner` with an explicit logical time.
+    /// Event arrived as the result of action `action_id` completing.
+    /// Used by shells at I/O completion sites.
     #[must_use]
-    pub const fn new(at: Instant, inner: E) -> Self {
-        Self { at, inner }
+    pub const fn from_action(at: Instant, action_id: Uuid, inner: E) -> Self {
+        Self {
+            at,
+            cause: EventCause::Action(action_id),
+            inner,
+        }
     }
 
-    /// Pairs `inner` with the current wall-clock instant.
-    ///
-    /// Use this for I/O completion events, where "when it happened" is the
-    /// moment the external result was observed. Timers should prefer
-    /// [`Timed::new`] with the scheduled fire time.
+    /// Event arrived because a subscribed publish `publish_id` fired in
+    /// another core. Used by cross-core subscriber bridges.
     #[must_use]
-    pub fn now(inner: E) -> Self {
+    pub const fn from_publish(at: Instant, publish_id: Uuid, inner: E) -> Self {
         Self {
-            at: Instant::now(),
+            at,
+            cause: EventCause::Publish(publish_id),
+            inner,
+        }
+    }
+
+    /// Event originates outside the action/publish graph — timer fire,
+    /// file watcher, Docker watcher, manual command, init, etc.
+    #[must_use]
+    pub const fn external(at: Instant, cause: ExternalCause, inner: E) -> Self {
+        Self {
+            at,
+            cause: EventCause::External(cause),
             inner,
         }
     }
@@ -130,5 +193,53 @@ pub trait Machine: Sized {
             publish,
             response,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_action_sets_action_cause() {
+        let id = Uuid::new_v4();
+        let t = Timed::from_action(Instant::now(), id, 42_u32);
+        assert_eq!(t.cause, EventCause::Action(id));
+        assert_eq!(t.inner, 42);
+    }
+
+    #[test]
+    fn from_publish_sets_publish_cause() {
+        let id = Uuid::new_v4();
+        let t = Timed::from_publish(Instant::now(), id, "hello");
+        assert_eq!(t.cause, EventCause::Publish(id));
+        assert_eq!(t.inner, "hello");
+    }
+
+    #[test]
+    fn external_wraps_inner_cause() {
+        let t = Timed::external(
+            Instant::now(),
+            ExternalCause::Timer { name: "TestTimer" },
+            (),
+        );
+        assert_eq!(
+            t.cause,
+            EventCause::External(ExternalCause::Timer { name: "TestTimer" })
+        );
+    }
+
+    #[test]
+    fn distinct_action_ids_compare_unequal() {
+        let a = EventCause::Action(Uuid::new_v4());
+        let b = EventCause::Action(Uuid::new_v4());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn external_unknown_round_trips() {
+        let c = EventCause::External(ExternalCause::Unknown);
+        assert_eq!(c, EventCause::External(ExternalCause::Unknown));
+        assert_ne!(c, EventCause::External(ExternalCause::Init));
     }
 }

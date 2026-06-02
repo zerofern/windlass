@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use windlass_clients::mam::{MamClient, MamFetchError, MamSeedboxResult};
-use windlass_machine::{Shell, Timed};
+use windlass_machine::{ExternalCause, Shell, Timed};
 use windlass_mam_core::{MamAction, MamEvent};
 
 pub struct MamShell {
@@ -43,7 +43,11 @@ impl Shell for MamShell {
                             MamEvent::StatusFailed { reason }
                         }
                     };
-                    let _ = tx.send(Timed::now(event));
+                    let _ = tx.send(Timed::external(
+                        std::time::Instant::now(),
+                        ExternalCause::Unknown,
+                        event,
+                    ));
                 });
             }
             MamAction::UpdateSeedbox => {
@@ -75,7 +79,11 @@ impl Shell for MamShell {
                             MamEvent::SeedboxUpdateFailed { reason }
                         }
                     };
-                    let _ = tx.send(Timed::now(event));
+                    let _ = tx.send(Timed::external(
+                        std::time::Instant::now(),
+                        ExternalCause::Unknown,
+                        event,
+                    ));
                 });
             }
             MamAction::ScheduleTimer { timer, after } => {
@@ -83,7 +91,11 @@ impl Shell for MamShell {
                 tokio::spawn(async move {
                     let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::new(scheduled_at, MamEvent::TimerFired(timer)));
+                    let _ = tx.send(Timed::external(
+                        scheduled_at,
+                        ExternalCause::Timer { name: timer.name() },
+                        MamEvent::TimerFired(timer),
+                    ));
                 });
             }
             // §36 step 5: fetch the `.torrent` bytes for a manual-download
@@ -101,7 +113,11 @@ impl Shell for MamShell {
                             reason: "MAM torrent fetch failed (network or HTTP error)".to_string(),
                         },
                     };
-                    let _ = tx.send(Timed::now(event));
+                    let _ = tx.send(Timed::external(
+                        std::time::Instant::now(),
+                        ExternalCause::Unknown,
+                        event,
+                    ));
                 });
             }
         }

@@ -8,7 +8,7 @@ use serde_json::json;
 use windlass_db_core::{AlertRecord, DbCommand, DbMachine, DbResponse, SystemSnapshotRecord};
 use windlass_docker_core::{DockerMachine, DockerResponse};
 use windlass_domain_core::{WindlassAction, WindlassEvent};
-use windlass_machine::{Command, Shell, Timed};
+use windlass_machine::{Command, ExternalCause, Shell, Timed};
 use windlass_mam_core::{MamMachine, MamResponse};
 use windlass_qbit_core::{QbitMachine, QbitResponse};
 use windlass_vpn_core::{VpnMachine, VpnResponse};
@@ -121,6 +121,10 @@ fn schedule_domain_timer(
     tokio::spawn(async move {
         let scheduled_at = Instant::now() + after;
         tokio::time::sleep(after).await;
-        let _ = tx.send(Timed::new(scheduled_at, WindlassEvent::TimerFired(timer)));
+        let _ = tx.send(Timed::external(
+            scheduled_at,
+            ExternalCause::Timer { name: timer.name() },
+            WindlassEvent::TimerFired(timer),
+        ));
     });
 }

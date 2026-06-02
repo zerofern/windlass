@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
+use windlass_machine::{CommandOutcome, ExternalCause, HasTopic, Machine, Outcome, Timed};
 use windlass_types::{VpnIp, VpnPort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,19 @@ pub enum VpnTimer {
     PortReadRetry,
     /// §31: self-perpetuating ifconfig.co verification cadence (default 6h).
     PublicIpVerify,
+}
+
+impl VpnTimer {
+    /// Static name used as the `ExternalCause::Timer { name }` tag when
+    /// the shell forwards a fired timer back into the runtime.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::HealthPoll => "VpnTimer::HealthPoll",
+            Self::PortReadRetry => "VpnTimer::PortReadRetry",
+            Self::PublicIpVerify => "VpnTimer::PublicIpVerify",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,11 +584,21 @@ impl Machine for VpnMachine {
         // etc.) as the legacy poll-driven events.
         match cmd {
             VpnCommand::ContainerHealthy => {
-                let out = self.handle(now, Timed::new(now, VpnEvent::ContainerHealthy));
+                // TODO(§37d): the cause here is the inbound command, which is
+                // itself caused by an upstream Docker publish. Once envelopes
+                // flow through TopicFanout, thread the publish_id through.
+                let out = self.handle(
+                    now,
+                    Timed::external(now, ExternalCause::Unknown, VpnEvent::ContainerHealthy),
+                );
                 Self::outcome_with_publish(out.actions, out.publish, VpnResponse::Accepted)
             }
             VpnCommand::ContainerUnhealthy => {
-                let out = self.handle(now, Timed::new(now, VpnEvent::ContainerUnhealthy));
+                // TODO(§37d): see ContainerHealthy above.
+                let out = self.handle(
+                    now,
+                    Timed::external(now, ExternalCause::Unknown, VpnEvent::ContainerUnhealthy),
+                );
                 Self::outcome_with_publish(out.actions, out.publish, VpnResponse::Accepted)
             }
             VpnCommand::StartMonitoring => Self::outcome(
@@ -600,7 +623,7 @@ impl Machine for VpnMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::{Machine, Outcome, Timed};
+    use windlass_machine::{ExternalCause, Machine, Outcome, Timed};
     use windlass_types::VpnPort;
 
     use crate::{VpnAction, VpnCommand, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
@@ -619,7 +642,10 @@ mod tests {
     }
 
     fn handle(machine: &mut VpnMachine, event: VpnEvent) -> Outcome<VpnAction, VpnPublish> {
-        machine.handle(Instant::now(), Timed::now(event))
+        machine.handle(
+            Instant::now(),
+            Timed::external(Instant::now(), ExternalCause::Unknown, event),
+        )
     }
 
     #[test]
@@ -884,7 +910,7 @@ mod prop_tests {
     use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
     use windlass_types::{VpnIp, VpnPort};
 
     use crate::{VerifiedIpInfo, VpnAction, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
@@ -988,7 +1014,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic): handle tolerates any (state, event).
         #[test]
         fn handle_never_panics(mut machine in any_vpn_machine(), event in any_vpn_event()) {
-            let _ = machine.handle(Instant::now(), Timed::now(event));
+            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // VPN-2 (Guarantee C): every published `PortReady` carries the port the
@@ -998,7 +1024,7 @@ mod prop_tests {
             mut machine in any_vpn_machine(),
             event in any_vpn_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for publish in &out.publish {
                 if let VpnPublish::PortReady { port } = publish {
                     prop_assert_eq!(machine.port(), Some(*port));
@@ -1017,7 +1043,7 @@ mod prop_tests {
             ip in any_vpn_ip(),
         ) {
             let pre = machine.observed_ip();
-            let out = machine.handle(Instant::now(), Timed::now(
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpFromFile { ip },
             ));
             prop_assert_eq!(machine.observed_ip(), Some(ip));
@@ -1040,7 +1066,7 @@ mod prop_tests {
             info in any_verified_ip_info(),
         ) {
             let pre_observed = machine.observed_ip();
-            let out = machine.handle(Instant::now(), Timed::now(
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpVerified { info: info.clone() },
             ));
             let mismatch_count = out.publish.iter()
@@ -1067,7 +1093,7 @@ mod prop_tests {
         ) {
             let threshold = machine.config.public_ip_verify_failure_threshold;
             let pre = machine.verification_failures;
-            let out = machine.handle(Instant::now(), Timed::now(
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpVerifyFailed { reason },
             ));
             let degraded_count = out.publish.iter()
@@ -1089,7 +1115,7 @@ mod prop_tests {
         fn public_ip_verify_timer_always_reschedules(
             mut machine in any_vpn_machine(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::TimerFired(VpnTimer::PublicIpVerify),
             ));
             let verify_count = out.actions.iter()

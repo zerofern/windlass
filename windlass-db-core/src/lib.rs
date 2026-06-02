@@ -305,7 +305,7 @@ mod prop_tests {
     use chrono::Utc;
     use proptest::prelude::*;
     use serde_json::json;
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
     use windlass_types::{AlertPriority, MamTorrentId, TorrentHash};
 
     use crate::{
@@ -408,7 +408,7 @@ mod prop_tests {
             let mut machine = DbMachine::new((), Instant::now());
             let is_failure = matches!(event, DbEvent::Failed(_));
 
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             prop_assert!(out.actions.is_empty());
             prop_assert_eq!(out.publish.len(), 1);

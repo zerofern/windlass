@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use windlass_docker_core::{DockerAction, DockerEvent};
 use windlass_local::docker::DockerClient;
-use windlass_machine::{Shell, Timed};
+use windlass_machine::{ExternalCause, Shell, Timed};
 
 pub struct DockerShellConfig {
     pub docker: DockerClient,
@@ -86,10 +86,14 @@ impl Shell for DockerShell {
                     // VpnShell `is_gluetun_healthy()` poll.
                     let (started_at, healthy) = inspect_state(&docker, &name).await;
                     if let Some(started_at) = started_at {
-                        let _ = tx.send(Timed::now(DockerEvent::ContainerStarted {
-                            name: name.clone(),
-                            started_at,
-                        }));
+                        let _ = tx.send(Timed::external(
+                            std::time::Instant::now(),
+                            ExternalCause::Unknown,
+                            DockerEvent::ContainerStarted {
+                                name: name.clone(),
+                                started_at,
+                            },
+                        ));
                     }
                     if let Some(healthy) = healthy {
                         let event = if healthy {
@@ -97,7 +101,11 @@ impl Shell for DockerShell {
                         } else {
                             DockerEvent::ContainerUnhealthy { name }
                         };
-                        let _ = tx.send(Timed::now(event));
+                        let _ = tx.send(Timed::external(
+                            std::time::Instant::now(),
+                            ExternalCause::Unknown,
+                            event,
+                        ));
                     }
                 });
             }
@@ -108,11 +116,18 @@ impl Shell for DockerShell {
                 tokio::spawn(async move {
                     match dump_one(&docker, &dump_dir, &name).await {
                         Ok(path) => {
-                            let _ = tx.send(Timed::now(DockerEvent::LogsDumped { name, path }));
+                            let _ = tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                DockerEvent::LogsDumped { name, path },
+                            ));
                         }
                         Err(reason) => {
-                            let _ =
-                                tx.send(Timed::now(DockerEvent::LogsDumpFailed { name, reason }));
+                            let _ = tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                DockerEvent::LogsDumpFailed { name, reason },
+                            ));
                         }
                     }
                 });
@@ -122,7 +137,11 @@ impl Shell for DockerShell {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     let names = docker.discover_dependents().await;
-                    let _ = tx.send(Timed::now(DockerEvent::DependentsDiscovered { names }));
+                    let _ = tx.send(Timed::external(
+                        std::time::Instant::now(),
+                        ExternalCause::Unknown,
+                        DockerEvent::DependentsDiscovered { names },
+                    ));
                 });
             }
         }
@@ -175,7 +194,13 @@ fn spawn_event_watcher(docker: Docker, event_tx: UnboundedSender<Timed<DockerEve
                     None
                 };
                 if let Some(event) = event
-                    && event_tx.send(Timed::now(event)).is_err()
+                    && event_tx
+                        .send(Timed::external(
+                            std::time::Instant::now(),
+                            ExternalCause::Unknown,
+                            event,
+                        ))
+                        .is_err()
                 {
                     return;
                 }

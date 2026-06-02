@@ -55,6 +55,17 @@ pub enum WindlassTimer {
     Snapshot,
 }
 
+impl WindlassTimer {
+    /// Static name used as the `ExternalCause::Timer { name }` tag when
+    /// the shell forwards a fired timer back into the runtime.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Snapshot => "WindlassTimer::Snapshot",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindlassAction {
     Vpn(VpnCommand),
@@ -1791,7 +1802,7 @@ impl WindlassMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::{Machine, Outcome, Timed};
+    use windlass_machine::{ExternalCause, Machine, Outcome, Timed};
     use windlass_mam_core::MamCommand;
     use windlass_mam_core::MamPublish;
     use windlass_qbit_core::QbitCommand;
@@ -1818,7 +1829,10 @@ mod tests {
         machine: &mut WindlassMachine,
         event: WindlassEvent,
     ) -> Outcome<WindlassAction, WindlassPublish> {
-        machine.handle(Instant::now(), Timed::now(event))
+        machine.handle(
+            Instant::now(),
+            Timed::external(Instant::now(), ExternalCause::Unknown, event),
+        )
     }
 
     #[test]
@@ -2746,7 +2760,7 @@ mod prop_tests {
     use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
     use windlass_mam_core::{MamCommand, MamPublish};
     use windlass_qbit_core::{QbitCommand, QbitPublish};
     use windlass_types::{TorrentHash, VpnPort};
@@ -3032,7 +3046,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic).
         #[test]
         fn handle_never_panics(mut machine in any_windlass_machine(), event in any_windlass_event()) {
-            let _ = machine.handle(Instant::now(), Timed::now(event));
+            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // DOM-1 (Guarantee C, marquee): the domain never commands qBit or MAM to
@@ -3042,7 +3056,7 @@ mod prop_tests {
             mut machine in any_windlass_machine(),
             event in any_windlass_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for action in &out.actions {
                 if let WindlassAction::Qbit(QbitCommand::EnsureListenPort { port })
                     | WindlassAction::Mam(MamCommand::EnsureSeedboxPort { port }) = action
@@ -3062,7 +3076,7 @@ mod prop_tests {
                 Just(VpnPublish::PortUnavailable),
             ],
         ) {
-            machine.handle(Instant::now(), Timed::now(WindlassEvent::Vpn(lost)));
+            machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(lost)));
             prop_assert!(machine.state().forwarded_port.is_none());
         }
 
@@ -3079,7 +3093,7 @@ mod prop_tests {
             use windlass_types::AlertPriority;
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes })),
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes })),
             );
             // §36 step 4: BelowFloor now emits 2 actions (evict + Warning
             // alert) and 1 Activity publish.
@@ -3113,7 +3127,7 @@ mod prop_tests {
             use windlass_disk_core::DiskPublish;
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Disk(DiskPublish::AboveFloor { free_bytes })),
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Disk(DiskPublish::AboveFloor { free_bytes })),
             );
             prop_assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
             prop_assert!(out.publish.is_empty(), "AboveFloor must emit no publishes");
@@ -3142,7 +3156,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Qbit(
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Qbit(
                     QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd },
                 )),
             );
@@ -3189,7 +3203,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Qbit(
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Qbit(
                     QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit },
                 )),
             );
@@ -3234,7 +3248,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Qbit(
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Qbit(
                     QbitPublish::UnsatisfiedQuotaApproaching { unsatisfied, limit },
                 )),
             );
@@ -3280,7 +3294,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
                     ratio,
                     upload_credit_bytes,
                     ratio_ok,
@@ -3327,7 +3341,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
                     consecutive_failures,
                     last_reason,
                 })),
@@ -3370,7 +3384,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Mam(MamPublish::NotConnectable { reason })),
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::NotConnectable { reason })),
             );
 
             let warning_alert_count = out.actions.iter().filter(|a| {
@@ -3411,7 +3425,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Mam(MamPublish::Unreachable { reason })),
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::Unreachable { reason })),
             );
 
             let alert_count = out.actions.iter().filter(|a| {
@@ -3510,7 +3524,7 @@ mod prop_tests {
             let ip = VpnIp(std::net::Ipv4Addr::from(ip_bytes));
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Mam(MamPublish::AsnMismatch { ip })),
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::AsnMismatch { ip })),
             );
 
             let critical_count = out.actions.iter().filter(|a| matches!(
@@ -3554,7 +3568,7 @@ mod prop_tests {
             let verified_ip = VpnIp(std::net::Ipv4Addr::from(verified_ip_bytes));
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
                     file_ip,
                     verified_ip,
                     source: windlass_vpn_core::VerificationSource::IfConfigCo,
@@ -3594,7 +3608,7 @@ mod prop_tests {
             let pre_compliant = machine.admission().vpn_ip_compliant;
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Vpn(VpnPublish::PublicIpVerificationDegraded {
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::PublicIpVerificationDegraded {
                     consecutive_failures,
                     last_reason,
                 })),
@@ -3628,7 +3642,7 @@ mod prop_tests {
             let verified_ip = VpnIp(std::net::Ipv4Addr::from(verified_ip_bytes));
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
                     file_ip,
                     verified_ip,
                     source: windlass_vpn_core::VerificationSource::MamJsonIp,
@@ -3667,7 +3681,7 @@ mod prop_tests {
             let pre_compliant = machine.admission().vpn_ip_compliant;
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(WindlassEvent::Vpn(VpnPublish::MamIpVerificationDegraded {
+                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::MamIpVerificationDegraded {
                     consecutive_failures,
                     last_reason,
                 })),
@@ -3699,7 +3713,7 @@ mod prop_tests {
 
             let healthy = chrono::Utc::now() - chrono::Duration::seconds(healthy_offset);
             let started = chrono::Utc::now() - chrono::Duration::seconds(dep_offset + healthy_offset);
-            let out = machine.handle(Instant::now(), Timed::now(
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 WindlassEvent::Docker(windlass_docker_core::DockerPublish::DependentNetworkUntrusted {
                     name,
                     dependent_started_at: started,
@@ -3728,7 +3742,7 @@ mod prop_tests {
             use windlass_db_core::{AlertRecord, DbCommand};
             use windlass_types::AlertPriority;
 
-            let out = machine.handle(Instant::now(), Timed::now(
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 WindlassEvent::Docker(windlass_docker_core::DockerPublish::RestartStorm { window_count, max }),
             ));
             let critical = out.actions.iter().filter(|a| matches!(

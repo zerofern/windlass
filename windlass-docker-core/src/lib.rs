@@ -598,7 +598,7 @@ impl Machine for DockerMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
 
     use crate::{
         DockerAction, DockerCommand, DockerConfig, DockerEvent, DockerMachine, DockerResponse,
@@ -611,9 +611,13 @@ mod tests {
     fn discover(m: &mut DockerMachine, names: &[&str]) {
         m.handle(
             Instant::now(),
-            Timed::now(DockerEvent::DependentsDiscovered {
-                names: names.iter().map(|n| (*n).to_string()).collect(),
-            }),
+            Timed::external(
+                Instant::now(),
+                ExternalCause::Unknown,
+                DockerEvent::DependentsDiscovered {
+                    names: names.iter().map(|n| (*n).to_string()).collect(),
+                },
+            ),
         );
     }
 
@@ -637,7 +641,10 @@ mod tests {
         // anchor InspectContainer so VPN core gets a boot-time health
         // signal without polling Docker itself.
         let mut m = machine();
-        let out = m.handle(Instant::now(), Timed::now(DockerEvent::Init));
+        let out = m.handle(
+            Instant::now(),
+            Timed::external(Instant::now(), ExternalCause::Unknown, DockerEvent::Init),
+        );
         assert_eq!(
             out.actions,
             vec![
@@ -763,7 +770,10 @@ mod tests {
         m: &mut DockerMachine,
         event: DockerEvent,
     ) -> crate::Outcome<DockerAction, DockerPublish> {
-        m.handle(Instant::now(), Timed::now(event))
+        m.handle(
+            Instant::now(),
+            Timed::external(Instant::now(), ExternalCause::Unknown, event),
+        )
     }
 
     #[test]
@@ -1260,7 +1270,7 @@ mod prop_tests {
 
     use chrono::Utc;
     use proptest::prelude::*;
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
 
     use crate::{DockerCommand, DockerConfig, DockerEvent, DockerMachine};
 
@@ -1269,7 +1279,11 @@ mod prop_tests {
             let mut m = DockerMachine::new(DockerConfig::default(), Instant::now());
             m.handle(
                 Instant::now(),
-                Timed::now(DockerEvent::DependentsDiscovered { names }),
+                Timed::external(
+                    Instant::now(),
+                    ExternalCause::Unknown,
+                    DockerEvent::DependentsDiscovered { names },
+                ),
             );
             m
         })
@@ -1310,7 +1324,7 @@ mod prop_tests {
         // GLOBAL-1: handle never panics.
         #[test]
         fn handle_never_panics(mut machine in any_machine(), event in any_event()) {
-            let _ = machine.handle(Instant::now(), Timed::now(event));
+            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // GLOBAL-1: handle_command never panics.
@@ -1332,7 +1346,7 @@ mod prop_tests {
                 .map_or(crate::ContainerHealth::Unknown, |s| s.health);
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(DockerEvent::ContainerUnhealthy { name: name.clone() }),
+                Timed::external(Instant::now(), ExternalCause::Unknown, DockerEvent::ContainerUnhealthy { name: name.clone() }),
             );
             let crashed_count = out
                 .publish
@@ -1367,7 +1381,7 @@ mod prop_tests {
                 .unwrap_or_else(chrono::Utc::now);
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(DockerEvent::ContainerStarted {
+                Timed::external(Instant::now(), ExternalCause::Unknown, DockerEvent::ContainerStarted {
                     name,
                     started_at,
                 }),

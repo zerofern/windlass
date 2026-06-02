@@ -2,7 +2,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use windlass_db::DbPool;
 use windlass_db::actor::PostgresDbActor;
 use windlass_db_core::{DbAction, DbEvent};
-use windlass_machine::{Shell, Timed};
+use windlass_machine::{ExternalCause, Shell, Timed};
 
 pub struct DbShell {
     actor: PostgresDbActor,
@@ -26,7 +26,11 @@ impl Shell for DbShell {
                 let event_tx = event_tx.clone();
                 tokio::spawn(async move {
                     let result = actor.handle(command).await;
-                    let _ = event_tx.send(Timed::now(result));
+                    let _ = event_tx.send(Timed::external(
+                        std::time::Instant::now(),
+                        ExternalCause::Unknown,
+                        result,
+                    ));
                 });
             }
         }

@@ -6,7 +6,7 @@ use windlass_core::events::Event;
 use windlass_db_core::DbMachine;
 use windlass_disk_core::DiskMachine;
 use windlass_domain_core::WindlassMachine;
-use windlass_machine::{Command, ServiceHandles, Timed};
+use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
 use windlass_mam_core::MamMachine;
 use windlass_qbit_core::QbitMachine;
 use windlass_types::VpnPort;
@@ -80,21 +80,40 @@ impl ServiceCores {
 
     fn send_service_event(&self, event: ServiceEvent) {
         let now = Instant::now();
+        // TODO(§37d): legacy-event bridge — these forwards inherit the
+        // cause of the original `Event` (which is currently untyped).
+        // Once envelopes flow through the bridge protocol, thread the
+        // upstream cause through instead of Unknown.
         match event {
             ServiceEvent::Domain(event) => {
-                let _ = self.domain.events.send(Timed::new(now, event));
+                let _ =
+                    self.domain
+                        .events
+                        .send(Timed::external(now, ExternalCause::Unknown, event));
             }
             ServiceEvent::Vpn(event) => {
-                let _ = self.vpn.events.send(Timed::new(now, event));
+                let _ = self
+                    .vpn
+                    .events
+                    .send(Timed::external(now, ExternalCause::Unknown, event));
             }
             ServiceEvent::Qbit(event) => {
-                let _ = self.qbit.events.send(Timed::new(now, event));
+                let _ = self
+                    .qbit
+                    .events
+                    .send(Timed::external(now, ExternalCause::Unknown, event));
             }
             ServiceEvent::Mam(event) => {
-                let _ = self.mam.events.send(Timed::new(now, event));
+                let _ = self
+                    .mam
+                    .events
+                    .send(Timed::external(now, ExternalCause::Unknown, event));
             }
             ServiceEvent::Disk(event) => {
-                let _ = self.disk.events.send(Timed::new(now, event));
+                let _ = self
+                    .disk
+                    .events
+                    .send(Timed::external(now, ExternalCause::Unknown, event));
             }
         }
     }
@@ -109,7 +128,7 @@ mod tests {
     use windlass_db_core::{DbEvent, DbMachine, DbPublish};
     use windlass_disk_core::DiskMachine;
     use windlass_domain_core::{WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic};
-    use windlass_machine::{Command, ServiceHandles, Timed};
+    use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
     use windlass_mam_core::{MamEvent, MamMachine};
     use windlass_qbit_core::{QbitEvent, QbitMachine, QbitPublish};
     use windlass_vpn_core::{VpnEvent, VpnMachine, VpnPublish};
@@ -289,7 +308,11 @@ mod tests {
                     | VpnPublish::PublicIpVerificationDegraded { .. }
                     | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
-                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
+                let _ = domain_ev_tx.send(Timed::external(
+                    std::time::Instant::now(),
+                    ExternalCause::Unknown,
+                    WindlassEvent::Vpn(publish),
+                ));
             }
         });
 
@@ -388,7 +411,11 @@ mod tests {
                     | VpnPublish::PublicIpVerificationDegraded { .. }
                     | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
-                let _ = domain_ev_tx.send(Timed::now(WindlassEvent::Vpn(publish)));
+                let _ = domain_ev_tx.send(Timed::external(
+                    std::time::Instant::now(),
+                    ExternalCause::Unknown,
+                    WindlassEvent::Vpn(publish),
+                ));
             }
         });
 
@@ -455,7 +482,11 @@ mod tests {
                                 operation: failure.operation,
                                 message: failure.message,
                             };
-                            let _ = domain_ev_tx.send(Timed::now(event));
+                            let _ = domain_ev_tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                event,
+                            ));
                         }
                     }
                 }
@@ -507,7 +538,11 @@ mod tests {
                                 operation: failure.operation,
                                 message: failure.message,
                             };
-                            let _ = domain_ev_tx.send(Timed::now(event));
+                            let _ = domain_ev_tx.send(Timed::external(
+                                std::time::Instant::now(),
+                                ExternalCause::Unknown,
+                                event,
+                            ));
                         }
                     }
                 }
@@ -630,9 +665,13 @@ mod tests {
         // Inject a QbitPublish::Unavailable event.
         domain_handles
             .events
-            .send(Timed::now(WindlassEvent::Qbit(QbitPublish::Unavailable {
-                reason: "qBittorrent rejected credentials".to_string(),
-            })))
+            .send(Timed::external(
+                std::time::Instant::now(),
+                ExternalCause::Unknown,
+                WindlassEvent::Qbit(QbitPublish::Unavailable {
+                    reason: "qBittorrent rejected credentials".to_string(),
+                }),
+            ))
             .unwrap();
 
         // Wait for the Activity publish.
@@ -690,10 +729,14 @@ mod tests {
 
         domain_handles
             .events
-            .send(Timed::now(WindlassEvent::DbFailed {
-                operation: "SaveSystemSnapshot".to_string(),
-                message: "database unavailable".to_string(),
-            }))
+            .send(Timed::external(
+                std::time::Instant::now(),
+                ExternalCause::Unknown,
+                WindlassEvent::DbFailed {
+                    operation: "SaveSystemSnapshot".to_string(),
+                    message: "database unavailable".to_string(),
+                },
+            ))
             .unwrap();
 
         let publish = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())

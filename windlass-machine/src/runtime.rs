@@ -121,7 +121,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::spawn;
-    use crate::machine::{CommandOutcome, Machine, Outcome, Timed};
+    use crate::machine::{CommandOutcome, ExternalCause, Machine, Outcome, Timed};
     use crate::pubsub::HasTopic;
     use crate::shell::Shell;
 
@@ -239,7 +239,11 @@ mod tests {
 
         handles
             .events
-            .send(Timed::now(Event::Ping))
+            .send(Timed::external(
+                Instant::now(),
+                ExternalCause::Unknown,
+                Event::Ping,
+            ))
             .expect("event channel should be open");
 
         assert_eq!(action_rx.recv().await, Some(Action::Pong));

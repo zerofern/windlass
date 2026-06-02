@@ -84,6 +84,20 @@ pub enum MamTimer {
     StaleRegistrationRefresh,
 }
 
+impl MamTimer {
+    /// Static name used as the `ExternalCause::Timer { name }` tag when
+    /// the shell forwards a fired timer back into the runtime.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::StatusRetry => "MamTimer::StatusRetry",
+            Self::RateLimitExpired => "MamTimer::RateLimitExpired",
+            Self::KeepAlive => "MamTimer::KeepAlive",
+            Self::StaleRegistrationRefresh => "MamTimer::StaleRegistrationRefresh",
+        }
+    }
+}
+
 // `MamEvent` cannot derive `Eq` because `StatusFetched` carries `ratio: f64`,
 // and `f64` only implements `PartialEq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -820,7 +834,7 @@ impl Machine for MamMachine {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windlass_machine::{Machine, Outcome, Timed};
+    use windlass_machine::{ExternalCause, Machine, Outcome, Timed};
     use windlass_types::VpnPort;
 
     use crate::{MamAction, MamCommand, MamConfig, MamEvent, MamMachine, MamPublish, MamTimer};
@@ -840,7 +854,10 @@ mod tests {
     }
 
     fn handle(machine: &mut MamMachine, event: MamEvent) -> Outcome<MamAction, MamPublish> {
-        machine.handle(Instant::now(), Timed::now(event))
+        machine.handle(
+            Instant::now(),
+            Timed::external(Instant::now(), ExternalCause::Unknown, event),
+        )
     }
 
     #[test]
@@ -1451,7 +1468,7 @@ mod prop_tests {
     use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
-    use windlass_machine::{Machine, Timed};
+    use windlass_machine::{ExternalCause, Machine, Timed};
     use windlass_types::{VpnIp, VpnPort};
 
     use crate::{
@@ -1602,7 +1619,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic).
         #[test]
         fn handle_never_panics(mut machine in any_mam_machine(), event in any_mam_event()) {
-            let _ = machine.handle(Instant::now(), Timed::now(event));
+            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // MAM-1 (Guarantee C): every published SeedboxPortReady carries a port
@@ -1612,7 +1629,7 @@ mod prop_tests {
             mut machine in any_mam_machine(),
             event in any_mam_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for publish in &out.publish {
                 if let MamPublish::SeedboxPortReady { port } = publish {
                     prop_assert!(
@@ -1640,7 +1657,7 @@ mod prop_tests {
                 MamEvent::StatusFailed { reason: reason.clone() },
                 MamEvent::SeedboxUpdateFailed { reason: reason.clone() },
             ] {
-                let out = machine.handle(Instant::now(), Timed::now(event));
+                let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
                 prop_assert_eq!(out.actions.len(), 1);
                 let is_status_retry = matches!(
                     out.actions[0],
@@ -1658,7 +1675,7 @@ mod prop_tests {
             // but still schedules exactly one StatusRetry.
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::Unreachable { reason }),
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::Unreachable { reason }),
             );
             prop_assert_eq!(out.actions.len(), 1);
             let is_status_retry = matches!(
@@ -1698,7 +1715,7 @@ mod prop_tests {
         ) {
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::StatusFetched {
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::StatusFetched {
                     connectable,
                     seedbox_port,
                     ratio,
@@ -1763,7 +1780,7 @@ mod prop_tests {
         ) {
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::StatusFetched {
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::StatusFetched {
                     connectable,
                     seedbox_port,
                     ratio,
@@ -1801,7 +1818,7 @@ mod prop_tests {
         #[test]
         fn keep_alive_chain_starts_at_most_once(mut machine in any_mam_machine()) {
             let was_scheduled = machine.keep_alive_scheduled();
-            let out = machine.handle(Instant::now(), Timed::now(MamEvent::AuthSucceeded));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::AuthSucceeded));
             let scheduled = out
                 .actions
                 .iter()
@@ -1829,7 +1846,7 @@ mod prop_tests {
         fn keep_alive_timer_always_reschedules(mut machine in any_mam_machine()) {
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::TimerFired(MamTimer::KeepAlive)),
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::TimerFired(MamTimer::KeepAlive)),
             );
             let fetch_count = out
                 .actions
@@ -1868,7 +1885,7 @@ mod prop_tests {
                 1 => MamEvent::StatusFailed { reason: reason.clone() },
                 _ => MamEvent::SeedboxUpdateFailed { reason: reason.clone() },
             };
-            let out = machine.handle(Instant::now(), Timed::now(event));
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             let after = machine.consecutive_status_failures();
             // The counter advances by exactly 1 unless saturated at u32::MAX.
@@ -1907,7 +1924,7 @@ mod prop_tests {
         ) {
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::Unreachable { reason: reason.clone() }),
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::Unreachable { reason: reason.clone() }),
             );
             let unreachable_count = out
                 .publish
@@ -1943,7 +1960,7 @@ mod prop_tests {
         ) {
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::StatusFetched {
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::StatusFetched {
                     connectable: false,
                     seedbox_port,
                     ratio,
@@ -1978,7 +1995,7 @@ mod prop_tests {
             let ip = VpnIp(std::net::Ipv4Addr::from(ip_bytes));
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::AsnMismatch { ip }),
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::AsnMismatch { ip }),
             );
             prop_assert_eq!(machine.asn_state(), AsnState::Mismatched);
             let mismatch_count = out
@@ -2007,7 +2024,7 @@ mod prop_tests {
             let pre = machine.asn_state();
             let out = machine.handle(
                 Instant::now(),
-                Timed::now(MamEvent::SeedboxUpdated {
+                Timed::external(Instant::now(), ExternalCause::Unknown, MamEvent::SeedboxUpdated {
                     registered_ip: None,
                     registered_asn: None,
                     registered_as: None,
@@ -2112,7 +2129,7 @@ mod prop_tests {
             let pre_registered_ip = machine.registered_ip;
             let pre_registered_asn = machine.registered_asn;
             let pre_registered_as = machine.registered_as.clone();
-            machine.handle(Instant::now(), Timed::now(
+            machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 MamEvent::SeedboxUpdated {
                     registered_ip: new_ip,
                     registered_asn: new_asn,
@@ -2134,7 +2151,7 @@ mod prop_tests {
         fn stale_refresh_timer_always_reschedules(
             mut machine in any_mam_machine(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::now(
+            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 MamEvent::TimerFired(MamTimer::StaleRegistrationRefresh),
             ));
             let update_count = out.actions.iter()
