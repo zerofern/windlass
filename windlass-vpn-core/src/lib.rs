@@ -226,7 +226,7 @@ pub enum VpnResponse {
     Accepted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VpnMachine {
     config: VpnConfig,
     connected: bool,
@@ -287,6 +287,7 @@ impl Machine for VpnMachine {
     type Topic = VpnTopic;
     type Command = VpnCommand;
     type Response = VpnResponse;
+    type StateSnapshot = Self;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
         Self {
@@ -589,6 +590,10 @@ impl Machine for VpnMachine {
             }
         }
     }
+
+    fn state_snapshot(&self) -> Self::StateSnapshot {
+        self.clone()
+    }
 }
 
 #[cfg(test)]
@@ -828,6 +833,21 @@ mod tests {
             vec![VpnPublish::Disconnected, VpnPublish::PortUnavailable]
         );
         assert!(out.actions.is_empty());
+    }
+
+    #[test]
+    fn state_snapshot_reflects_post_event_state() {
+        // §37b: snapshot is an owned, serializable view of the machine
+        // state. After ContainerHealthy the connected flag is set, and
+        // the JSON serialization must reflect that.
+        let mut machine = machine();
+        let _ = handle(&mut machine, VpnEvent::ContainerHealthy);
+        let value =
+            serde_json::to_value(machine.state_snapshot()).expect("snapshot should serialize");
+        assert_eq!(value["connected"], true);
+        // Spot-check a second field so the snapshot isn't collapsed to
+        // a single value by accident.
+        assert!(value.get("verification_failures").is_some());
     }
 
     #[test]

@@ -211,6 +211,9 @@ impl Machine for DbMachine {
     type Topic = DbTopic;
     type Command = DbCommand;
     type Response = DbResponse;
+    // The DB machine is stateless: actions are passed verbatim to the
+    // shell and the machine carries no fields. The snapshot is `()`.
+    type StateSnapshot = ();
 
     fn new(_config: (), _now: Instant) -> Self {
         Self
@@ -255,13 +258,27 @@ impl Machine for DbMachine {
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         Self::outcome(vec![DbAction::Execute(cmd)], DbResponse::Accepted)
     }
+
+    fn state_snapshot(&self) -> Self::StateSnapshot {}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityRecord, ActivitySource, DbCommand};
+    use super::{ActivityRecord, ActivitySource, DbCommand, DbMachine};
     use chrono::Utc;
     use serde_json::json;
+    use std::time::Instant;
+    use windlass_machine::Machine;
+
+    #[test]
+    fn db_machine_state_snapshot_is_unit() {
+        // §37b: DbMachine is stateless — the snapshot is `()` and
+        // serializes to JSON `null`.
+        let machine = DbMachine::new((), Instant::now());
+        let value =
+            serde_json::to_value(machine.state_snapshot()).expect("snapshot should serialize");
+        assert!(value.is_null());
+    }
 
     #[test]
     fn db_command_serializes_with_record_payload() {

@@ -75,6 +75,14 @@ pub trait Machine: Sized {
     type Command: DeserializeOwned + Send + 'static;
     type Response: Serialize + Send + 'static;
 
+    /// An owned, serializable snapshot of the machine's internal state.
+    ///
+    /// `Send + 'static` is required because the observability controller
+    /// hands the snapshot to a serialization worker on a separate task;
+    /// see §37 / `docs/observability-redesign.md` "Architecture / `Machine`
+    /// trait extension".
+    type StateSnapshot: Serialize + Send + 'static;
+
     fn new(config: Self::Config, now: Instant) -> Self;
 
     /// Handles one observed event.
@@ -93,6 +101,13 @@ pub trait Machine: Sized {
         now: Instant,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response>;
+
+    /// Returns an owned snapshot of the machine's current state.
+    ///
+    /// Called by the observability controller after every `handle` /
+    /// `handle_command` invocation; the serialized snapshot is attached
+    /// to the resulting `StepRecord`.
+    fn state_snapshot(&self) -> Self::StateSnapshot;
 
     fn outcome(
         actions: Vec<Self::Action>,

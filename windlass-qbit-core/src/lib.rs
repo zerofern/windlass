@@ -384,7 +384,7 @@ pub enum QbitResponse {
 
 /// Last-observed state of the three privacy settings banned by MAM Rule 6.1.
 /// Grouped to avoid triggering `clippy::struct_excessive_bools` on `QbitMachine`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 struct PrivacySettings {
     dht: bool,
     pex: bool,
@@ -398,7 +398,7 @@ impl PrivacySettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QbitMachine {
     config: QbitConfig,
     cookie: Option<AuthCookie>,
@@ -681,6 +681,7 @@ impl Machine for QbitMachine {
     type Topic = QbitTopic;
     type Command = QbitCommand;
     type Response = QbitResponse;
+    type StateSnapshot = Self;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
         Self {
@@ -1065,6 +1066,10 @@ impl Machine for QbitMachine {
         };
         Self::outcome(actions, QbitResponse::Accepted)
     }
+
+    fn state_snapshot(&self) -> Self::StateSnapshot {
+        self.clone()
+    }
 }
 
 #[cfg(test)]
@@ -1117,6 +1122,21 @@ mod tests {
         let out = handle(&mut machine, QbitEvent::Init);
 
         assert_eq!(out.actions, vec![QbitAction::Login]);
+    }
+
+    #[test]
+    fn state_snapshot_reflects_authentication() {
+        // §37b: after AuthSucceeded the cookie is set; the JSON snapshot
+        // must reflect the new state. AuthCookie serializes as
+        // "[redacted]" by design (windlass-types).
+        let mut machine = machine();
+        let cookie = AuthCookie::new("sid".to_string());
+        let _ = handle(&mut machine, QbitEvent::AuthSucceeded { cookie });
+        let value =
+            serde_json::to_value(machine.state_snapshot()).expect("snapshot should serialize");
+        assert_eq!(value["cookie"], "[redacted]");
+        assert!(value.get("config").is_some());
+        assert!(value.get("torrents").is_some());
     }
 
     #[test]

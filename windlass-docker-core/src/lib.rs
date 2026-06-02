@@ -228,7 +228,7 @@ pub enum DockerResponse {
 }
 
 /// Per-container known state.  Populated from Docker daemon events.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContainerState {
     /// Last observed health from the Docker daemon.
     pub health: ContainerHealth,
@@ -252,7 +252,7 @@ impl Default for ContainerState {
 }
 
 /// Health classification tracked per container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ContainerHealth {
     Unknown,
     Healthy,
@@ -260,7 +260,7 @@ pub enum ContainerHealth {
 }
 
 /// Container-lifecycle sans-I/O machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DockerMachine {
     config: DockerConfig,
     /// Per-container state keyed by container name.  Populated from
@@ -377,6 +377,7 @@ impl Machine for DockerMachine {
     type Topic = DockerTopic;
     type Command = DockerCommand;
     type Response = DockerResponse;
+    type StateSnapshot = Self;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
         Self {
@@ -587,6 +588,10 @@ impl Machine for DockerMachine {
             ),
         }
     }
+
+    fn state_snapshot(&self) -> Self::StateSnapshot {
+        self.clone()
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +615,20 @@ mod tests {
                 names: names.iter().map(|n| (*n).to_string()).collect(),
             }),
         );
+    }
+
+    #[test]
+    fn state_snapshot_reflects_discovered_dependents() {
+        // §37b: DependentsDiscovered populates the dependent registry,
+        // which must appear in the JSON snapshot.
+        let mut m = machine();
+        discover(&mut m, &["qbittorrent", "mlm"]);
+        let value = serde_json::to_value(m.state_snapshot()).expect("snapshot should serialize");
+        assert_eq!(
+            value["dependents"],
+            serde_json::json!(["qbittorrent", "mlm"])
+        );
+        assert_eq!(value["config"]["gluetun_anchor"], "gluetun");
     }
 
     #[test]

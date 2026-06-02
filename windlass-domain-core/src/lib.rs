@@ -240,7 +240,7 @@ impl AdmissionState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WindlassMachine {
     config: WindlassConfig,
     state: SystemStateView,
@@ -434,6 +434,7 @@ impl Machine for WindlassMachine {
     type Topic = WindlassTopic;
     type Command = WindlassCommand;
     type Response = WindlassResponse;
+    type StateSnapshot = Self;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
         let blacklisted_mam_ids = config.initial_blacklist.clone();
@@ -1141,6 +1142,10 @@ impl Machine for WindlassMachine {
             WindlassCommand::ManualDownload { mam_id } => self.handle_manual_download(mam_id),
         }
     }
+
+    fn state_snapshot(&self) -> Self::StateSnapshot {
+        self.clone()
+    }
 }
 
 /// §36 step 6: translate a `windlass_types::TorrentRecord` (qBit feed
@@ -1814,6 +1819,24 @@ mod tests {
         event: WindlassEvent,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         machine.handle(Instant::now(), Timed::now(event))
+    }
+
+    #[test]
+    fn state_snapshot_reflects_post_event_state() {
+        // §37b: after VpnPublish::PortReady the domain state's
+        // forwarded_port is set, and the JSON snapshot exposes it
+        // alongside the per-service status fields.
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+        let _ = handle(
+            &mut machine,
+            WindlassEvent::Vpn(VpnPublish::PortReady { port }),
+        );
+        let value =
+            serde_json::to_value(machine.state_snapshot()).expect("snapshot should serialize");
+        assert_eq!(value["state"]["forwarded_port"], 51_820);
+        assert!(value.get("admission").is_some());
+        assert!(value.get("config").is_some());
     }
 
     #[test]

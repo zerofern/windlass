@@ -153,6 +153,7 @@ mod tests {
 
     // A machine that turns every Ping event into a Pong action plus a Beep
     // publish, and answers Ask commands with a counter that increments per call.
+    #[derive(Clone, Serialize)]
     struct FakeMachine {
         asks: u32,
     }
@@ -165,6 +166,7 @@ mod tests {
         type Topic = Topic;
         type Command = (); // "Ask"
         type Response = u32;
+        type StateSnapshot = Self;
 
         fn new(_config: Self::Config, _now: Instant) -> Self {
             Self { asks: 0 }
@@ -190,6 +192,10 @@ mod tests {
         ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
             self.asks += 1;
             Self::outcome(vec![Action::Pong], self.asks)
+        }
+
+        fn state_snapshot(&self) -> Self::StateSnapshot {
+            self.clone()
         }
     }
 
@@ -253,6 +259,18 @@ mod tests {
 
         assert_eq!(reply_rx.await, Ok(1));
         assert_eq!(action_rx.recv().await, Some(Action::Pong));
+    }
+
+    #[test]
+    fn fake_machine_state_snapshot_serializes() {
+        // §37b: every Machine impl exposes an owned, serializable state
+        // snapshot. The FakeMachine's snapshot is itself; after one Ask
+        // command the asks counter is visible in the JSON.
+        let mut machine = FakeMachine::new((), Instant::now());
+        let _ = machine.handle_command(Instant::now(), ());
+        let value = serde_json::to_value(machine.state_snapshot())
+            .expect("state snapshot should serialize");
+        assert_eq!(value["asks"], 1);
     }
 
     #[tokio::test]

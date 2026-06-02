@@ -3304,6 +3304,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
+ "serde_json",
  "windlass-machine",
 ]
 
@@ -3314,6 +3315,7 @@ dependencies = [
  "chrono",
  "proptest",
  "serde",
+ "serde_json",
  "windlass-machine",
 ]
 
@@ -3357,6 +3359,7 @@ name = "windlass-machine"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -3367,6 +3370,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
+ "serde_json",
  "windlass-machine",
  "windlass-types",
 ]
@@ -3378,6 +3382,7 @@ dependencies = [
  "chrono",
  "proptest",
  "serde",
+ "serde_json",
  "windlass-machine",
  "windlass-types",
 ]
@@ -3419,6 +3424,7 @@ dependencies = [
  "chrono",
  "proptest",
  "serde",
+ "serde_json",
  "windlass-machine",
  "windlass-types",
 ]

@@ -301,7 +301,7 @@ pub enum AsnState {
 
 // `MamMachine` cannot derive `Eq` because `MamConfig.min_global_ratio` and the
 // `ratio` field are `f64`, which only implements `PartialEq`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MamMachine {
     config: MamConfig,
     authenticated: bool,
@@ -488,6 +488,7 @@ impl Machine for MamMachine {
     type Topic = MamTopic;
     type Command = MamCommand;
     type Response = MamResponse;
+    type StateSnapshot = Self;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
         Self {
@@ -809,6 +810,10 @@ impl Machine for MamMachine {
         };
         Self::outcome(actions, MamResponse::Accepted)
     }
+
+    fn state_snapshot(&self) -> Self::StateSnapshot {
+        self.clone()
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +841,19 @@ mod tests {
 
     fn handle(machine: &mut MamMachine, event: MamEvent) -> Outcome<MamAction, MamPublish> {
         machine.handle(Instant::now(), Timed::now(event))
+    }
+
+    #[test]
+    fn state_snapshot_reflects_authentication() {
+        // §37b: AuthSucceeded flips `authenticated`, and the snapshot
+        // serializes it. AsnState defaults to Unknown until §30 wires
+        // a real signal, so we also confirm the field is present.
+        let mut machine = machine();
+        let _ = handle(&mut machine, MamEvent::AuthSucceeded);
+        let value =
+            serde_json::to_value(machine.state_snapshot()).expect("snapshot should serialize");
+        assert_eq!(value["authenticated"], true);
+        assert_eq!(value["asn_state"], "Unknown");
     }
 
     #[test]

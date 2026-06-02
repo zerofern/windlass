@@ -102,7 +102,7 @@ pub enum DiskResponse {
 ///
 /// Tracks the last observed free-space value and publishes `BelowFloor` /
 /// `AboveFloor` on every observation according to DISK-1.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiskMachine {
     config: DiskConfig,
     /// Last known free-space reading, or `None` before the first observation.
@@ -135,6 +135,7 @@ impl Machine for DiskMachine {
     type Topic = DiskTopic;
     type Command = DiskCommand;
     type Response = DiskResponse;
+    type StateSnapshot = Self;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
         Self {
@@ -171,6 +172,10 @@ impl Machine for DiskMachine {
         match cmd {
             DiskCommand::RefreshDisk => Self::outcome(Vec::new(), DiskResponse::Accepted),
         }
+    }
+
+    fn state_snapshot(&self) -> Self::StateSnapshot {
+        self.clone()
     }
 }
 
@@ -247,6 +252,17 @@ mod tests {
         assert_eq!(m.free_bytes(), None);
         let _ = observe(&mut m, 500_000);
         assert_eq!(m.free_bytes(), Some(500_000));
+    }
+
+    #[test]
+    fn state_snapshot_reflects_last_observation() {
+        // §37b: after a fresh observation the snapshot's free_bytes
+        // matches what we just fed in.
+        let mut m = machine(1_000_000);
+        let _ = observe(&mut m, 750_000);
+        let value = serde_json::to_value(m.state_snapshot()).expect("snapshot should serialize");
+        assert_eq!(value["free_bytes"], 750_000);
+        assert_eq!(value["config"]["hard_floor_bytes"], 1_000_000);
     }
 }
 
