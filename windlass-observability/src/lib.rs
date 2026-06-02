@@ -11,9 +11,12 @@
 //! HTTP exchange ring, the backward-causal indices, and the SSE
 //! broadcast channel.
 
+pub mod pause_on_start;
 pub mod ring;
 pub mod sse;
 pub mod stored;
+
+pub use pause_on_start::{PauseOnStartError, parse_pause_on_start};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
