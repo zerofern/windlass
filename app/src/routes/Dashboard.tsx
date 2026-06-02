@@ -32,7 +32,7 @@ function obsBadgeLabel(obs: Observation): string {
   if (obs.type === 'ActionDispatched') return 'action'
   if (obs.type === 'HttpExchange') return 'http'
   if (obs.type === 'StateSnapshot') return 'state'
-  return obs.type.toLowerCase()
+  return 'unknown'
 }
 
 export function Dashboard() {

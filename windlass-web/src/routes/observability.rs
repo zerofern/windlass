@@ -15,7 +15,7 @@ use axum::response::{
     Sse,
     sse::{Event as SseEvent, KeepAlive},
 };
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
@@ -312,5 +312,4 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         assert!(observability.active_breakpoints().is_empty());
     }
-
 }

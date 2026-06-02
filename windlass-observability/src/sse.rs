@@ -15,8 +15,12 @@ use windlass_machine::{CoreId, CoreStatus};
 use crate::stored::{StoredHttpExchange, StoredStepRecord};
 
 /// SSE wire envelope.  See `docs/observability-37pre-checklist.md` §B9.
+///
+/// Uses `tag = "kind", content = "data"` (externally-tagged content)
+/// so the inner `StoredStepRecord.kind` field doesn't collide with the
+/// envelope's discriminator at the same JSON level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum SseMessage {
     Hello(HelloSnapshot),
     Step(StoredStepRecord),

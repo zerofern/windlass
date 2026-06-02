@@ -8,7 +8,7 @@ export function ObservationsProvider({ children }: { children: React.ReactNode }
   const [state, setState] = useState<SystemState | null>(null)
   const [log, setLog] = useState<Observation[]>([])
   const [connected, setConnected] = useState(false)
-  const [debugMode, setDebugMode] = useState(false)
+  const [debugMode] = useState(false) // legacy field — observability page uses its own SSE
   const clearLog = useCallback(() => setLog([]), [])
 
   useEffect(() => {
@@ -18,9 +18,6 @@ export function ObservationsProvider({ children }: { children: React.ReactNode }
       const obs = JSON.parse(e.data as string) as Observation
       if (obs.type === 'StateSnapshot') {
         setState(obs.data)
-      } else if (obs.type === 'DebugModeChanged') {
-        setDebugMode(obs.data)
-        return // don't add debug mode changes to the log
       }
       setLog(prev => [...prev.slice(-(MAX_LOG - 1)), obs])
     })

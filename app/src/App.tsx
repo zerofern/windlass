@@ -1,5 +1,6 @@
 import { Routes, Route, NavLink } from 'react-router-dom'
 import { Dashboard } from '@/routes/Dashboard'
+import { Observability } from '@/routes/Observability'
 import { Chaos } from '@/routes/Chaos'
 import { Download } from '@/routes/Download'
 import { DownloadQueue } from '@/routes/DownloadQueue'
@@ -37,6 +38,7 @@ export default function App() {
             <NavItem to="/torrents" label="Torrent Monitor" />
             <NavItem to="/queue" label="Queue" />
             <NavItem to="/events" label="Events" />
+            <NavItem to="/observability" label="Observability" />
             <NavItem to="/notifications" label="Notifications" />
             {config.chaos_url && <NavItem to="/chaos" label="Chaos" />}
           </nav>
@@ -48,6 +50,7 @@ export default function App() {
             <Route path="/torrents" element={<TorrentMonitor />} />
             <Route path="/queue" element={<DownloadQueue />} />
             <Route path="/events" element={<EventLog />} />
+            <Route path="/observability" element={<Observability />} />
             <Route path="/notifications" element={<Notifications />} />
             {config.chaos_url && (
               <Route path="/chaos" element={<Chaos chaosUrl={config.chaos_url} />} />
