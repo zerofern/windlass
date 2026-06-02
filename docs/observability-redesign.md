@@ -7,6 +7,10 @@ migration, names what is stale or misleading now, and specifies the
 redesign at a level of detail sufficient for implementation stories
 to be cut without further design rounds.
 
+**Locked contracts** (signed off 2026-06-01) live in
+[`observability-37pre-checklist.md`](./observability-37pre-checklist.md).
+Where this doc and the checklist disagree, the checklist wins.
+
 The framing shifts from **debug mode** (a modal toggle wrapped around
 a single event loop) to **observability** (an always-on view of the
 running system, with optional per-core gates for stepping). "Debug"
@@ -221,6 +225,22 @@ pub enum StoredExternalCause {
 This keeps `PathBuf` serialization decisions out of the frontend
 contract.
 
+**Cross-core publish-ID preservation (C2 + B4 in the §37pre
+checklist).** The publishing core's runtime mints a `publish_id`
+once, into a `PublishEnvelope<P>`. `TopicFanout` forwards the
+envelope unchanged to subscribers. Subscriber bridges that
+translate a publish into another core's event **preserve the
+envelope's `publish_id`** when constructing the downstream event:
+
+```rust
+Timed::from_publish(now, envelope.id, derived_event)
+```
+
+No bridge mints a new `publish_id`. Without this rule the causal
+graph could *look* correct (IDs everywhere) while silently
+breaking the cross-core "jump to resulting events" affordance.
+The fanout-bridge harness (D8) asserts this end-to-end.
+
 ### Envelopes — IDs assigned by the runtime, after `handle`
 
 `Machine::handle` stays pure. The runtime envelopes after it
@@ -318,15 +338,16 @@ pub trait RuntimeTap: Send + Sync {
 
     /// Register `action_id → step_id` and `publish_id → step_id`
     /// index entries BEFORE dispatch, so HTTP exchanges captured
-    /// during `apply` already find their parent. Two hashmap
-    /// inserts at most; must not block, must not panic, must not
-    /// fail. (EC-8.)
+    /// during `apply` already find their parent. ID-only — payload
+    /// serialization is intentionally absent so this stays
+    /// trivially non-blocking. Two hashmap inserts at most; must
+    /// not block, must not panic, must not fail. (EC-8.)
     fn reserve_step_ids(
         &self,
         core: CoreId,
         step_id: Uuid,
-        actions: &[ActionEnvelope<impl erased_serde::Serialize>],
-        publishes: &[PublishEnvelope<impl erased_serde::Serialize>],
+        action_ids: &[Uuid],
+        publish_ids: &[Uuid],
     );
 
     /// Fire-and-forget. Must not block, must not panic, must drop
@@ -359,6 +380,12 @@ self.hook.observed_exchange(self.core, &HttpExchangeView { /* … */ });
 
 Reverse-engineering a built `reqwest::Request` is unreliable for
 streaming, multipart, or compressed bodies.
+
+**Hard rule (C8 in the §37pre checklist):** `HttpRequestView` is
+constructed from the same typed data used to build the
+`reqwest::Request`, *before* `reqwest::Request::build()`. The
+observability layer never introspects a built `reqwest::Request`
+body. Enforced by code review, not by trait shape.
 
 ### Borrowed views vs owned stored records
 
@@ -435,10 +462,26 @@ pub struct WireRedacted {
 pub enum BodyCapture {
     Inline(serde_json::Value),
     Text(String),
-    Bytes(usize),  // size only
+    Bytes(usize),  // size only — used unconditionally for BodyKind::Binary
     Truncated { kind: BodyKind, captured: serde_json::Value, original_len: usize },
     None,
 }
+
+pub enum BodyKind { Json, Text, Form, Binary }
+
+pub enum StepKind {
+    Event,                                       // handle(timed_event)
+    Command { response: CommandResponseStatus }, // handle_command(cmd)
+}
+
+pub enum CommandResponseStatus {
+    Sent,             // oneshot::send succeeded
+    ReceiverDropped,  // caller dropped the receiver before we replied
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreId { Vpn, Qbit, Mam, Db, Disk, Docker, Domain }
 ```
 
 `ServerSecretSlot` lives only server-side, inside the ring. The
@@ -491,7 +534,11 @@ Storage:
 Indices:
 - `action_id → (CoreId, step_id)`.
 - `publish_id → (CoreId, step_id)`.
-- `reveal_id → CleartextSlot` (for the secrets endpoint).
+
+No separate `reveal_id` index. The reveal endpoint scans the step
+rings and HTTP ring for the matching `reveal_id`; missing →
+`410 Gone` (B6). Eviction therefore invalidates reveal IDs
+naturally, with no extra map to keep consistent.
 
 Eviction: ring drops oldest; corresponding index entries are removed
 in the same write. Counters: `dropped_steps_total`,
@@ -564,14 +611,16 @@ they hold.
 
 ### EC-3 — Ring eviction cleans indices
 
-When a `StoredStepRecord` leaves a ring (count or byte budget),
-every `action_id` and `publish_id` it owned is removed from the
-controller's indices, every `reveal_id` it owned is invalidated,
-plus the React-side mirror is updated via an explicit
+When a `StoredStepRecord` (or `StoredHttpExchange`) leaves a ring
+(count or byte budget), every `action_id` and `publish_id` it
+owned is removed from the controller's two indices, and the
+React-side mirror is updated via an explicit
 `Evicted { step_ids, action_ids, publish_ids, reveal_ids }` SSE
-message. The UI shows "parent evicted" rather than producing
-dangling jumps; the reveal endpoint returns `410 Gone` for any
-evicted `reveal_id`.
+message. Reveal IDs are listed in `Evicted` for the frontend's
+benefit (it can drop revealed-secret state for those IDs); the
+server has no separate reveal index to clean — its
+scan-based reveal endpoint simply finds nothing once the parent
+record is gone and returns `410 Gone`.
 
 ### EC-4 — Body budgets are enforced at capture
 
@@ -860,7 +909,11 @@ Every story below must keep these passing once they're written in
 1. **Observer equivalence.** For each core, running with
    `NullRuntimeTap + NullHttpTap` vs running with the live taps
    produces the same machine state, the same `Outcome`s, and the
-   same publish order over the same event sequence. (EC-6)
+   **same dispatch order** for actions and publishes, over the
+   same event sequence. Order preservation through `apply` is
+   part of the guarantee (C9). The fanout-bridge harness (D8)
+   additionally asserts publish-ID preservation across the
+   `publish → forward → resulting event` chain. (EC-6)
 2. **Observer cannot block dispatch.** Simulate, in separate
    tests: (a) full step-record ring, (b) closed SSE channel,
    (c) slow JSON serialization worker, (d) tap method panic

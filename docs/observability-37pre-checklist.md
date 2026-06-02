@@ -1,12 +1,13 @@
 # §37pre — Observability Contracts Sign-Off Checklist
 
-This is the work artifact for §37pre. It walks every contract the
-implementation stories need to lock and surfaces the ambiguities the
-redesign doc gestures at without resolving.
+**Status: locked 2026-06-01.** §37a and §37b may start in parallel;
+all other §37 stories proceed in the dependency order named in the
+redesign doc. Implementation stories reference this checklist as the
+spec; they do not re-open the decisions below.
 
-**When this is signed off, §37a and §37b can start in parallel.**
-The implementation stories reference this checklist as the spec —
-they do not re-open the decisions below.
+This was the work artifact for §37pre. It walks every contract the
+implementation stories need to lock and resolves the ambiguities the
+redesign doc gestured at without pinning down.
 
 ## How to read this
 
@@ -68,19 +69,24 @@ Lowercased on the wire to keep SSE payloads stable.
 ### B2 — `StepKind` variants
 
 Referenced in `StepRecordView` and `StoredStepRecord` but never
-defined. Propose:
+defined. **Locked shape:**
 
 ```rust
 pub enum StepKind {
-    Event,                       // handle(timed_event)
-    Command { response_sent: bool },  // handle_command(cmd)
+    Event,                                          // handle(timed_event)
+    Command { response: CommandResponseStatus },    // handle_command(cmd)
+}
+
+pub enum CommandResponseStatus {
+    Sent,             // oneshot::send succeeded
+    ReceiverDropped,  // caller dropped the oneshot::Receiver before we replied
 }
 ```
 
-`Command::response_sent` tells the UI whether the command's typed
-response made it back to the caller (false = receiver dropped). This
-is the only step kind that has a synchronous response, so it gets
-that extra bit.
+A `bool` would tell the UI something went differently without
+telling the operator whether it mattered. The two-variant enum is
+honest: every command has a typed response, and the operator sees
+exactly which case fired.
 
 ### B3 — `BodyKind` variants
 
@@ -144,25 +150,37 @@ When the operator clicks `[Reveal]`, the server resolves the
   looking for the matching `reveal_id`. O(N) but cheaper memory.
 
 The reveal click is a rare operator action. With rings bounded at
-~1000 records total, an O(N) scan is microseconds. **Proposal: B6b
+~1000 records total, an O(N) scan is microseconds. **Locked: B6b
 (scan rings).** Simpler; the saved memory matters more than the
 saved lookup time.
+
+**Scan covers both the step-record rings and the HTTP exchange
+ring.** Missing `reveal_id` → `410 Gone`, never cleartext. There is
+**no separate `reveal_id → CleartextSlot` index** on the controller
+— the redesign doc's earlier mention of one is removed. Eviction
+invalidates reveal IDs naturally because their parent slot is gone.
 
 ### B7 — Internal channel sizes for runtime → controller
 
 EC-1 and EC-5 say `observed_*` writes to a bounded internal channel
-that drops on overflow. Channel sizes weren't named. Propose:
+that drops on overflow. **Locked:**
 
 ```rust
-const RUNTIME_TO_CONTROLLER_BUFFER: usize = 4096;  // events, actions, publishes
-const HTTP_TO_CONTROLLER_BUFFER: usize = 1024;     // HTTP exchanges (slower path)
+const STEP_RECORD_CHANNEL_SIZE: usize = 4096;     // events, actions, publishes
+const HTTP_EXCHANGE_CHANNEL_SIZE: usize = 1024;   // HTTP exchanges
 ```
 
-Both surfaces drop-oldest with the corresponding counter advancing
-on overflow. Tunable from `windlass.toml` (add to schema) or left as
-constants. **Proposal: leave as compile-time constants for v1;
-promote to config the first time we actually hit overflow in
-production.**
+Compile-time constants, **documented in the same source file as the
+observability config defaults** so a maintainer sees them together.
+These are *internal channel capacities*, not ring sizes — ring
+sizes and body caps remain user-tunable in `windlass.toml`; channel
+sizes do not, because changing them rarely solves a real problem.
+
+Drop-oldest on overflow with per-core counters surfaced in the
+`Loss` SSE message (see B9). The rule for promoting to config is:
+**only if the `Loss` counters show real pressure in production.**
+The visible counter exists from day one so we know when that
+moment has come; we don't pre-emptively add a knob.
 
 ### B8 — `PAUSE_ON_START` parsing rules
 
@@ -181,43 +199,52 @@ down parsing details. Propose:
 
 The doc references several SSE message types ("new records,"
 "`CoreStatus` changes," "`Evicted { ids }`") without defining the
-wire envelope. Propose:
+wire envelope. **Locked:**
 
 ```rust
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SseMessage {
-    /// Sent once on connect, before any other messages.
-    Hello {
-        protocol_version: u32,                            // start at 1
-        snapshot: ObservabilitySnapshot,                  // ring contents at connect time
-    },
-    /// New step record committed by `observed_step`.
+    Hello(HelloSnapshot),
     Step(StoredStepRecord),
-    /// New HTTP exchange committed by `observed_exchange`.
     HttpExchange(StoredHttpExchange),
-    /// New log line.
-    Log(StoredLogEntry),
-    /// Per-core status transition.
+    Log(StoredLogLine),
     CoreStatus { core: CoreId, status: CoreStatus },
-    /// IDs that have just left rings (and reveal slots that just expired).
-    Evicted {
-        step_ids: Vec<Uuid>,
-        action_ids: Vec<Uuid>,
-        publish_ids: Vec<Uuid>,
-        reveal_ids: Vec<Uuid>,
-    },
-    /// Loss/truncation counter snapshot. Emitted on change, debounced.
-    Loss {
-        per_core: HashMap<CoreId, CoreCounters>,
-        http: HttpCounters,
-    },
+    Evicted(EvictedIds),
+    Loss(LossCounters),
+}
+
+/// The single snapshot message sent immediately after connect,
+/// before any incremental messages. The frontend boot path is:
+///   empty local store → receive Hello → hydrate → apply deltas.
+pub struct HelloSnapshot {
+    pub protocol_version: u32,            // starts at 1
+    pub cores: Vec<(CoreId, CoreStatus)>,
+    pub steps: Vec<StoredStepRecord>,
+    pub http: Vec<StoredHttpExchange>,
+    pub logs: Vec<StoredLogLine>,
+    pub loss: LossCounters,
+    pub active_breakpoints: Vec<Breakpoint>,
+}
+
+pub struct EvictedIds {
+    pub step_ids: Vec<Uuid>,
+    pub action_ids: Vec<Uuid>,
+    pub publish_ids: Vec<Uuid>,
+    pub reveal_ids: Vec<Uuid>,
+}
+
+pub struct LossCounters {
+    pub per_core: HashMap<CoreId, CoreCounters>,
+    pub http: HttpCounters,
 }
 ```
 
-The `Hello` message lets a freshly connected client receive the
-current ring contents in one shot rather than reconstructing
-history from `Evicted` deltas it never saw.
+`Hello` carries everything a fresh client needs to hydrate:
+ring contents *plus* current core statuses, *plus* loss counters,
+*plus* active breakpoints. Without all of those the page would
+boot inconsistent and have to chase `CoreStatus` / `Loss` deltas
+it never saw. Reconnect logic stays boring.
 
 ---
 
@@ -235,6 +262,41 @@ history from `Evicted` deltas it never saw.
 | C8 | Every HTTP client (`MamClient`, `QbitClient`, etc.): replace `HttpObserver` parameter with `Arc<dyn HttpTap>`; build the `HttpRequestView` from typed inputs *before* `reqwest::Request::build()` | §37e |
 | C9 | `Outcome::publishes` envelope conversion happens in the runtime, not in `apply`'s callers — `apply`'s signature changes to take envelope slices | §37d |
 | C10 | Rename crate `windlass-debug` → `windlass-observability` (mechanical, atomic) | §37j |
+| C11 | `reserve_step_ids` signature is ID-only: `(core, step_id, action_ids: &[Uuid], publish_ids: &[Uuid])`. No payload serialization, reinforcing EC-8. | §37d |
+
+### Cross-core publish-ID preservation rule (qualifies C2)
+
+The publishing core's runtime mints a `publish_id` once, into a
+`PublishEnvelope<P>`. `TopicFanout` forwards the envelope unchanged.
+Subscriber bridges that translate publish → event in another core
+**preserve the envelope's `publish_id`** when constructing the
+downstream `Timed::from_publish(now, publish_id, event)`. No
+bridge mints a new publish_id. This is what makes the causal graph
+real rather than decorative; bridge-side regression here would
+silently break "jump to resulting events."
+
+### HTTP request capture rule (qualifies C8)
+
+**Hard rule:** `HttpRequestView` is constructed from the same
+typed data used to build the `reqwest::Request`, **before**
+`reqwest::Request::build()`. The observability layer never
+introspects a built `reqwest::Request` body — streaming /
+multipart / compressed bodies make post-build inspection
+unreliable. This is enforced by code review, not by trait shape
+(no good way to express it in Rust types).
+
+### Apply ordering rule (qualifies C9)
+
+`apply(&[ActionEnvelope<A>], &[PublishEnvelope<P>])` preserves
+order exactly:
+
+- Action envelopes are dispatched in the same order as
+  `Outcome.actions`.
+- Publish envelopes are fanned out in the same order as
+  `Outcome.publishes`.
+
+Order preservation is part of the observer-equivalence guarantee
+and is asserted by acceptance test #1.
 
 ---
 
@@ -249,6 +311,7 @@ history from `Evicted` deltas it never saw.
 | D5 | An `httpmock` test server that observes whether the second MAM rate-limited request actually arrives, plus a way to release the gate after assertion | #4 (HTTP gate prevents send) |
 | D6 | A small `RingFiller` utility that pushes synthetic step records into a `StepRing` until eviction begins, plus an SSE consumer that records every `Evicted` message | #5 (Ring eviction cleans indices) |
 | D7 | A `Serialize`-asserting wrapper that runs every `windlass-types` configuration / capture struct through `serde_json::to_value` and pattern-matches the result against expected redaction shapes | #6 (Secret behavior) |
+| D8 | A fanout-bridge harness that proves the publish-ID preservation chain: core A emits `PublishEnvelope { id: X, .. }` → `TopicFanout` forwards → bridge subscriber → core B receives `Timed::from_publish(now, X, event)`. Without this the causal-graph UI may have IDs everywhere and still fail the cross-core jump. | #1 (extends Observer equivalence) |
 
 Most of these are small (~50 LOC each). D5's `httpmock` test server
 likely already exists in some form for the existing integration
@@ -256,34 +319,57 @@ tests — confirm and reuse rather than rebuild.
 
 ---
 
-## E. Sign-off
+## E. Sign-off — locked 2026-06-01
 
-§37pre is **complete** when every line below has an explicit "Yes"
-from the user, after which §37a (`secrecy` adoption) and §37b
-(`Machine::state_snapshot`) start in parallel.
+### B-items (genuine decisions) — all locked
 
-### B-items (genuine decisions)
+- [x] **B1** `CoreId` closed enum, lowercase wire tokens, fail-loud
+      on unknown wire value. `Display`, `FromStr`, `Serialize`,
+      `Deserialize`, `serde(rename_all = "lowercase")`.
+- [x] **B2** `StepKind = Event | Command { response: CommandResponseStatus }`;
+      `CommandResponseStatus = Sent | ReceiverDropped`.
+- [x] **B3** `BodyKind = Json | Text | Form | Binary`; binary
+      truncates to length-only (`BodyCapture::Bytes`).
+- [x] **B4** `erased_serde` dropped. Trait inputs use
+      `&serde_json::Value` throughout. `reserve_step_ids` takes
+      `&[Uuid]` only (no payload at all).
+- [x] **B5** Hand-rolled `Serialize` impl on `ServerSecretSlot`
+      emits `WireRedacted`. Reveal endpoint reads `slot.cleartext`
+      via direct field access, never via `Serialize`.
+- [x] **B6** Scan step rings + HTTP ring for `reveal_id`.
+      No separate `reveal_id → CleartextSlot` index on the
+      controller. Missing → `410 Gone`.
+- [x] **B7** Compile-time constants `STEP_RECORD_CHANNEL_SIZE = 4096`
+      and `HTTP_EXCHANGE_CHANNEL_SIZE = 1024`, documented adjacent
+      to the observability config defaults. Overflow visible via
+      `Loss` SSE counters; promote to config only on real
+      production pressure.
+- [x] **B8** `PAUSE_ON_START` parsing: case-insensitive,
+      `true`/`all` mean all cores, lowercase token match against
+      `CoreId`, unknown token → fatal at startup.
+- [x] **B9** SSE envelope locked: `Hello(HelloSnapshot)`, `Step`,
+      `HttpExchange`, `Log`, `CoreStatus`, `Evicted(EvictedIds)`,
+      `Loss(LossCounters)`. `HelloSnapshot` carries ring contents
+      + core statuses + loss counters + active breakpoints.
 
-- [ ] **B1** `CoreId` enum as proposed (`Vpn | Qbit | Mam | Db | Disk | Docker | Domain`, lowercased on wire).
-- [ ] **B2** `StepKind` as proposed (`Event | Command { response_sent: bool }`).
-- [ ] **B3** `BodyKind` as proposed (`Json | Text | Form | Binary`; binary truncates to length-only).
-- [ ] **B4** Drop `erased_serde`; use `&serde_json::Value` for trait inputs.
-- [ ] **B5** Hand-rolled `Serialize` impl on `ServerSecretSlot` emits `WireRedacted`.
-- [ ] **B6** Scan rings for `reveal_id` lookup (no separate index).
-- [ ] **B7** Internal channel sizes as compile-time constants (4096 + 1024); promote to config later if needed.
-- [ ] **B8** `PAUSE_ON_START` parsing as specified (case-insensitive, `all` alias, lowercase token match, unknown → fatal).
-- [ ] **B9** SSE message envelope as proposed (`Hello`/`Step`/`HttpExchange`/`Log`/`CoreStatus`/`Evicted`/`Loss`, tagged `kind`).
+### C-items (migration scope) — all acknowledged
 
-### C-items (migration scope)
+- [x] **C1..C11** acknowledged. C11 is the ID-only
+      `reserve_step_ids` signature (consequence of B4). The
+      cross-core publish-ID preservation rule (qualifying C2),
+      the HTTP request capture pre-build rule (qualifying C8), and
+      the apply-order preservation rule (qualifying C9) are all
+      part of the lock — see narrative below the C table.
 
-- [ ] **C1..C10** all acknowledged. (One toggle — these are the
-      mechanical changes the implementation stories perform.)
+### D-items (test harness) — all acknowledged
 
-### D-items (test harness)
+- [x] **D1..D8** acknowledged. D8 is the fanout-bridge harness for
+      publish-ID preservation, without which the causal graph could
+      look right while silently breaking cross-core jumps.
 
-- [ ] **D1..D7** all acknowledged as in-scope build-work for the
-      implementation stories that own each acceptance test.
+### Hand-off
 
-When all three groups are signed off, this file gets a header line
-`Status: locked YYYY-MM-DD`, the redesign doc gets a one-line
-pointer to it as the canonical contract, and §37a + §37b kick off.
+§37pre is done. The redesign doc cross-references this file as the
+canonical contract. §37a (`secrecy` adoption) and §37b
+(`Machine::state_snapshot`) may begin in parallel. Every other §37
+story proceeds in the dependency order named in the redesign doc.
