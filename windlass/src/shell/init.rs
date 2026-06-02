@@ -94,12 +94,19 @@ pub(super) async fn init_shell(
         .timeout(Duration::from_secs(30))
         .build()?;
 
+    // §37e: HTTP clients now take an `Arc<dyn HttpTap>`.  Live wiring
+    // to `ObservabilityController` lands in §37h with the frontend;
+    // until then every client gets a `NullHttpTap` and the legacy
+    // `on_http` callback is dropped on the floor.
+    let _ = on_http; // legacy HttpObserver — no longer threaded into clients
+    let http_tap = windlass_types::NullHttpTap::arc();
+
     let qbit = qbit::QbitClient::new(
         direct,
         config.qbit_url.clone(),
         config.qbit_user.clone(),
         config.qbit_pass.clone(),
-        on_http.clone(),
+        http_tap.clone(),
     );
     let mam = mam::MamClient::new(
         config.gluetun_proxy_url.as_deref(),
@@ -107,7 +114,7 @@ pub(super) async fn init_shell(
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
         &config.mam_user_agent,
-        on_http,
+        http_tap,
     )?;
 
     let vpn_ip_file = config.vpn_ip_file.clone();

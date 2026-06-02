@@ -20,7 +20,7 @@ fn make_client() -> QbitClient {
         QBIT_URL.to_owned(),
         "admin".to_owned(),
         QbitPassword::new("adminadmin".to_owned()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     )
 }
 

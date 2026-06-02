@@ -1,5 +1,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+use async_trait::async_trait;
 use nutype::nutype;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -8,11 +9,129 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// §36 step 9a: type-erased HTTP-observation callback used to feed the
-/// debug exchange channel.  Moved here from `windlass_core::observation`
-/// so the qBit + MAM clients don't need to depend on the legacy core
-/// crate.
+/// debug exchange channel.  Retained alongside [`HttpTap`] for now;
+/// removed entirely with §37j.
 pub type HttpObserver = Arc<dyn Fn(HttpExchange) + Send + Sync>;
 pub use uom::si::f64::Information;
+
+// ── CoreId ────────────────────────────────────────────────────────────────────
+
+/// Identifies a per-system service runtime.  Lives here so HTTP clients
+/// (which don't depend on `windlass-machine`) can tag their tap calls
+/// with the owning core.  `windlass-machine::tap` re-exports this so
+/// runtime-side code can keep using `windlass_machine::CoreId`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreId {
+    Vpn,
+    Qbit,
+    Mam,
+    Db,
+    Disk,
+    Docker,
+    Domain,
+}
+
+impl CoreId {
+    /// All seven cores in cores-rail display order.
+    #[must_use]
+    pub const fn all() -> [Self; 7] {
+        [
+            Self::Vpn,
+            Self::Qbit,
+            Self::Mam,
+            Self::Db,
+            Self::Disk,
+            Self::Docker,
+            Self::Domain,
+        ]
+    }
+}
+
+impl std::fmt::Display for CoreId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Vpn => "vpn",
+            Self::Qbit => "qbit",
+            Self::Mam => "mam",
+            Self::Db => "db",
+            Self::Disk => "disk",
+            Self::Docker => "docker",
+            Self::Domain => "domain",
+        };
+        f.write_str(name)
+    }
+}
+
+// ── HttpTap ───────────────────────────────────────────────────────────────────
+
+/// Borrowed view of an HTTP request, handed to [`HttpTap::gate_request`]
+/// just before `client.execute(req)` is called.  Constructed from the
+/// typed inputs the client used to build the request — never from the
+/// built `reqwest::Request` (whose body is not always inspectable).
+/// See `docs/observability-redesign.md` "HTTP request capture rule".
+pub struct HttpRequestView<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub body: Option<&'a serde_json::Value>,
+}
+
+/// Anomalies a client may signal to the tap.  The live tap impl
+/// translates these into per-core pause flips so the *next*
+/// [`HttpTap::gate_request`] call parks the offending request before
+/// it is sent.
+#[derive(Debug, Clone)]
+pub enum HttpAnomaly {
+    /// The client detected a rate-limit violation would occur if it
+    /// proceeded.  Wires the MAM rate-limit guardrail through to a
+    /// per-core pause.
+    RateLimitViolation { reason: String },
+}
+
+/// Observability hook for HTTP clients.  See
+/// `docs/observability-redesign.md` "Architecture / `HttpTap`".
+///
+/// Implementations:
+/// - [`NullHttpTap`]: every method is a no-op.  Use when observability
+///   isn't attached.
+/// - `windlass_observability::ObservabilityController`: the live impl.
+///   `gate_request` parks on the per-core pause flag;
+///   `signal_anomaly` flips the flag so the *current* request parks
+///   when `gate_request` is awaited.
+#[async_trait]
+pub trait HttpTap: Send + Sync {
+    /// Park until released.  Returns immediately when this core's
+    /// pause flag is not set.  Called between building the request
+    /// and `client.execute(req)`.
+    async fn gate_request(&self, core: CoreId, view: &HttpRequestView<'_>);
+
+    /// Fire-and-forget post-response capture.  Must not block.
+    fn observed_exchange(&self, core: CoreId, exchange: &HttpExchange);
+
+    /// Flag an anomaly the client detected.  The live tap impl uses
+    /// this to flip the per-core pause flag *before* the next
+    /// `gate_request` is awaited, so the offending request parks
+    /// rather than being sent.
+    fn signal_anomaly(&self, core: CoreId, anomaly: HttpAnomaly);
+}
+
+/// No-op `HttpTap` used when observability is not attached.
+pub struct NullHttpTap;
+
+#[async_trait]
+impl HttpTap for NullHttpTap {
+    async fn gate_request(&self, _core: CoreId, _view: &HttpRequestView<'_>) {}
+    fn observed_exchange(&self, _core: CoreId, _exchange: &HttpExchange) {}
+    fn signal_anomaly(&self, _core: CoreId, _anomaly: HttpAnomaly) {}
+}
+
+impl NullHttpTap {
+    /// `Arc<dyn HttpTap>` slot for client constructors that take a tap.
+    #[must_use]
+    pub fn arc() -> Arc<dyn HttpTap> {
+        Arc::new(Self)
+    }
+}
 
 // ── IPs ──────────────────────────────────────────────────────────────────────
 

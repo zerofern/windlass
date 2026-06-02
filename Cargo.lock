@@ -3377,6 +3377,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windlass-types",
 ]
 
 [[package]]
@@ -3402,6 +3403,7 @@ dependencies = [
  "tokio",
  "uuid",
  "windlass-machine",
+ "windlass-types",
 ]
 
 [[package]]
@@ -3436,6 +3438,7 @@ dependencies = [
 name = "windlass-types"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "nutype",
  "secrecy",

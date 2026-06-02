@@ -25,6 +25,7 @@ use uuid::Uuid;
 use windlass_machine::{
     CoreId, CoreStatus, EventGateView, OutcomeGateView, RuntimeTap, StepRecordView,
 };
+use windlass_types::{HttpAnomaly, HttpExchange, HttpRequestView, HttpTap};
 
 // ── ObservabilityController ───────────────────────────────────────────────────
 
@@ -173,6 +174,47 @@ impl RuntimeTap for ObservabilityController {
     }
 }
 
+#[async_trait]
+impl HttpTap for ObservabilityController {
+    async fn gate_request(&self, core: CoreId, view: &HttpRequestView<'_>) {
+        let c = self.core(core);
+        if !c.paused.load(Ordering::SeqCst) {
+            return;
+        }
+        c.status.store(Arc::new(CoreStatus::ParkedAtHttp {
+            method: view.method.to_owned(),
+            url: view.url.to_owned(),
+            since: Utc::now(),
+        }));
+        if let Ok(p) = c.step_permits.acquire().await {
+            p.forget();
+        }
+        c.status.store(Arc::new(CoreStatus::Running));
+    }
+
+    fn observed_exchange(&self, _core: CoreId, _exchange: &HttpExchange) {
+        // §37f attaches the cross-core HTTP exchange ring + SSE
+        // broadcast.  §37e ships the call site so clients can be
+        // wired now and §37f only fills in the storage.
+    }
+
+    fn signal_anomaly(&self, core: CoreId, anomaly: HttpAnomaly) {
+        // Translate the anomaly into a per-core pause so the next
+        // `gate_request` call from the same client parks the
+        // offending request before `client.execute(req)` is invoked.
+        //
+        // This is the §37e wiring for the MAM rate-limit guardrail
+        // (P7 in the redesign doc): the bad request never leaves the
+        // host.  The operator sees the parked request on the
+        // ParkedAtHttp status.
+        match anomaly {
+            HttpAnomaly::RateLimitViolation { reason: _ } => {
+                self.pause(core);
+            }
+        }
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -242,5 +284,44 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         ctrl.step(CoreId::Vpn);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signal_rate_limit_violation_flips_pause_flag() {
+        // §37e P7: HTTP tap signal_anomaly translates into a per-core
+        // pause flip, so the next gate_request from the same client
+        // parks the offending request before it is sent.
+        use windlass_types::{HttpAnomaly, HttpRequestView, HttpTap};
+        let ctrl = ObservabilityController::new();
+        assert!(!ctrl.is_paused(CoreId::Mam));
+
+        ctrl.signal_anomaly(
+            CoreId::Mam,
+            HttpAnomaly::RateLimitViolation {
+                reason: "test".into(),
+            },
+        );
+        assert!(ctrl.is_paused(CoreId::Mam));
+        // Other cores untouched.
+        assert!(!ctrl.is_paused(CoreId::Qbit));
+
+        // Confirm gate_request now parks for MAM.
+        let ctrl2 = ctrl.clone();
+        let parked = tokio::spawn(async move {
+            ctrl2
+                .gate_request(
+                    CoreId::Mam,
+                    &HttpRequestView {
+                        method: "GET",
+                        url: "https://example/test",
+                        body: None,
+                    },
+                )
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!parked.is_finished(), "gate_request should have parked");
+        ctrl.step(CoreId::Mam);
+        parked.await.unwrap();
     }
 }

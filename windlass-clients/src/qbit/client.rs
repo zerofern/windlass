@@ -1,8 +1,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+use std::sync::Arc;
+
 use tracing::{debug, warn};
 
-use windlass_types::{AuthCookie, HttpExchange, HttpObserver, QbitPassword, VpnPort};
+use windlass_types::{
+    AuthCookie, CoreId, HttpExchange, HttpRequestView, HttpTap, QbitPassword, VpnPort,
+};
 
 use super::types::{
     QbitAuthResult, QbitPortSyncResult, QbitPreferences, QbitTorrentDetails, QbitTorrentState,
@@ -20,7 +24,7 @@ pub struct QbitClient {
     pub(super) base_url: String,
     user: String,
     pass: QbitPassword,
-    pub(super) on_http: HttpObserver,
+    pub(super) hook: Arc<dyn HttpTap>,
 }
 
 impl QbitClient {
@@ -30,14 +34,14 @@ impl QbitClient {
         base_url: String,
         user: String,
         pass: QbitPassword,
-        on_http: HttpObserver,
+        hook: Arc<dyn HttpTap>,
     ) -> Self {
         Self {
             client,
             base_url,
             user,
             pass,
-            on_http,
+            hook,
         }
     }
 
@@ -49,14 +53,32 @@ impl QbitClient {
         response_status: u16,
         response_body: &str,
     ) {
-        (self.on_http)(HttpExchange {
-            module: "qbit".into(),
-            method: method.into(),
-            url: url.into(),
-            request_body,
-            response_status,
-            response_body: response_body.into(),
-        });
+        self.hook.observed_exchange(
+            CoreId::Qbit,
+            &HttpExchange {
+                module: "qbit".into(),
+                method: method.into(),
+                url: url.into(),
+                request_body,
+                response_status,
+                response_body: response_body.into(),
+            },
+        );
+    }
+
+    /// §37e: per-send-site `gate_request` helper.  Parks on qBit's
+    /// pause flag when set; returns immediately otherwise.
+    pub(crate) async fn gate_request(&self, method: &str, url: &str) {
+        self.hook
+            .gate_request(
+                CoreId::Qbit,
+                &HttpRequestView {
+                    method,
+                    url,
+                    body: None,
+                },
+            )
+            .await;
     }
 
     /// Authenticates with qBittorrent.  §36 step 9a: returns a typed
@@ -64,6 +86,7 @@ impl QbitClient {
     /// AuthFailed / AuthRejected` without depending on legacy core types.
     pub async fn authenticate(&self) -> QbitAuthResult {
         let url = format!("{}/api/v2/auth/login", self.base_url);
+        self.gate_request("POST", &url).await;
         match self
             .client
             .post(&url)
@@ -109,6 +132,7 @@ impl QbitClient {
     pub async fn sync_port(&self, cookie: &AuthCookie, port: VpnPort) -> QbitPortSyncResult {
         let url = format!("{}/api/v2/app/setPreferences", self.base_url);
         let req_body = format!(r#"{{"listen_port":"{}"}}"#, port.into_inner());
+        self.gate_request("POST", &url).await;
         match self
             .client
             .post(&url)
@@ -146,6 +170,7 @@ impl QbitClient {
     pub async fn list_torrent_details(&self, cookie: &AuthCookie) -> Vec<QbitTorrentDetails> {
         use super::types::{TorrentInfoWire, parse_mam_id};
         let url = format!("{}/api/v2/torrents/info", self.base_url);
+        self.gate_request("GET", &url).await;
         match self
             .client
             .get(&url)
@@ -192,6 +217,7 @@ impl QbitClient {
     pub async fn get_preferences(&self, cookie: &AuthCookie) -> Option<QbitPreferences> {
         use super::types::PreferencesWire;
         let url = format!("{}/api/v2/app/preferences", self.base_url);
+        self.gate_request("GET", &url).await;
         match self
             .client
             .get(&url)

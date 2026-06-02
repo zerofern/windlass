@@ -5,7 +5,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use windlass_types::{HttpExchange, HttpObserver, MamSessionId, VpnIp};
+use windlass_types::{
+    CoreId, HttpAnomaly, HttpExchange, HttpRequestView, HttpTap, MamSessionId, VpnIp,
+};
 
 /// §36 step 9a: typed result for `MamClient::update_seedbox`.  Replaces
 /// the legacy `windlass_core::Event::Mam*` shape so the shell can map
@@ -224,7 +226,7 @@ pub struct MamClient {
     /// dynamic-seedbox endpoint.  Enforces MAM's documented 1-hour rolling
     /// limit on top of the existing 400 ms inter-request guard.
     last_seedbox_call_at: Arc<Mutex<Option<std::time::Instant>>>,
-    on_http: HttpObserver,
+    hook: Arc<dyn HttpTap>,
 }
 
 impl MamClient {
@@ -236,7 +238,7 @@ impl MamClient {
         seedbox_url: String,
         load_url: String,
         user_agent: &str,
-        on_http: HttpObserver,
+        hook: Arc<dyn HttpTap>,
     ) -> anyhow::Result<Self> {
         let builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -263,7 +265,7 @@ impl MamClient {
             torrent_base_url: "https://www.myanonamouse.net".into(),
             last_request_at: Arc::new(Mutex::new(None)),
             last_seedbox_call_at: Arc::new(Mutex::new(None)),
-            on_http,
+            hook,
         })
     }
 
@@ -278,6 +280,7 @@ impl MamClient {
     /// Panics if the internal session mutex is poisoned.
     pub async fn check_session(&self) -> anyhow::Result<()> {
         let current = self.current_session();
+        self.gate_request("GET", &self.check_session_url).await;
         let resp = self
             .client
             .get(&self.check_session_url)
@@ -321,6 +324,7 @@ impl MamClient {
         if !self.check_rate_limit() {
             return Err(MamFetchError::LocalRateLimit);
         }
+        self.gate_request("GET", &self.json_ip_url).await;
         let result = self.client.get(&self.json_ip_url).send().await;
         match result {
             Err(e) => Err(MamFetchError::Unreachable(e.to_string())),
@@ -403,6 +407,7 @@ impl MamClient {
         &self,
         session: &str,
     ) -> (Result<MamStatusResult, MamFetchError>, Option<String>) {
+        self.gate_request("GET", &self.load_url).await;
         let result = self
             .client
             .get(&self.load_url)
@@ -470,12 +475,27 @@ impl MamClient {
     /// Returns `true` if the request can proceed (≥400ms since last request).
     /// Returns `false` if the guard triggers — caller surfaces the rate-
     /// limit hit via the typed result.
+    ///
+    /// §37e: when the guard trips, signal the observability tap so the
+    /// live impl can flip MAM's per-core pause flag.  The *next*
+    /// `gate_request` call then parks the offending request before it
+    /// is sent (P7 in the redesign doc — the bad request never leaves
+    /// the host).
     fn check_rate_limit(&self) -> bool {
         let mut last = self.last_request_at.lock().unwrap();
         if let Some(t) = *last
             && t.elapsed() < std::time::Duration::from_millis(400)
         {
             warn!("MAM rate limit guard triggered");
+            self.hook.signal_anomaly(
+                CoreId::Mam,
+                HttpAnomaly::RateLimitViolation {
+                    reason: format!(
+                        "MAM rate limit guard — last request {} ms ago, minimum 400 ms",
+                        t.elapsed().as_millis()
+                    ),
+                },
+            );
             return false;
         }
         *last = Some(std::time::Instant::now());
@@ -497,17 +517,38 @@ impl MamClient {
     }
 
     fn emit_http(&self, url: &str, response_status: u16, response_body: &str) {
-        (self.on_http)(HttpExchange {
-            module: "mam".into(),
-            method: "GET".into(),
-            url: url.into(),
-            request_body: None,
-            response_status,
-            response_body: response_body.into(),
-        });
+        self.hook.observed_exchange(
+            CoreId::Mam,
+            &HttpExchange {
+                module: "mam".into(),
+                method: "GET".into(),
+                url: url.into(),
+                request_body: None,
+                response_status,
+                response_body: response_body.into(),
+            },
+        );
+    }
+
+    /// §37e: convenience for `hook.gate_request` at every MAM HTTP
+    /// send site.  Returns immediately when MAM's per-core pause flag
+    /// is not set; parks otherwise.  Built from the typed inputs the
+    /// client already has — never from a built `reqwest::Request`.
+    async fn gate_request(&self, method: &str, url: &str) {
+        self.hook
+            .gate_request(
+                CoreId::Mam,
+                &HttpRequestView {
+                    method,
+                    url,
+                    body: None,
+                },
+            )
+            .await;
     }
 
     async fn do_update_seedbox(&self, session: &str) -> (MamSeedboxResult, Option<String>) {
+        self.gate_request("GET", &self.seedbox_url).await;
         let result = self
             .client
             .get(&self.seedbox_url)
@@ -613,6 +654,7 @@ impl MamClient {
             self.torrent_base_url,
             mam_id.into_inner()
         );
+        self.gate_request("GET", &url).await;
         let resp = self
             .client
             .get(&url)
@@ -745,7 +787,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -770,7 +812,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -801,7 +843,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         mam.update_seedbox().await;
@@ -827,7 +869,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -854,7 +896,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap()
         .with_check_session_url(server.uri());
@@ -875,7 +917,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap()
         .with_check_session_url(server.uri());
@@ -899,7 +941,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap()
         .with_check_session_url(server.uri());
@@ -925,7 +967,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         // First call consumes the rate limit slot.
@@ -948,7 +990,7 @@ mod tests {
             "http://127.0.0.1:1".into(),
             "http://127.0.0.1:1".into(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -973,7 +1015,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -997,7 +1039,7 @@ mod tests {
             server.uri(),
             server.uri(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
         let event = mam.update_seedbox().await;
@@ -1015,7 +1057,7 @@ mod tests {
             "http://example.com".into(),
             "http://example.com".into(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         );
         assert!(result.is_ok());
     }
@@ -1041,7 +1083,7 @@ mod tests {
             base.clone(),
             base.clone(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap()
         .with_torrent_base_url(base);
@@ -1068,7 +1110,7 @@ mod tests {
             base.clone(),
             base.clone(),
             "windlass",
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         )
         .unwrap()
         .with_torrent_base_url(base);

@@ -96,7 +96,7 @@ async fn authenticate_success_extracts_sid_cookie() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let event = qbit.authenticate().await;
     match &event {
@@ -121,7 +121,7 @@ async fn authenticate_success_accepts_204_with_sid_cookie() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let event = qbit.authenticate().await;
     match &event {
@@ -147,7 +147,7 @@ async fn authenticate_success_extracts_qbt_sid_cookie() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let event = qbit.authenticate().await;
     match &event {
@@ -170,7 +170,7 @@ async fn authenticate_ok_body_without_sid_cookie_returns_auth_failed() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let event = qbit.authenticate().await;
     assert!(matches!(event, QbitAuthResult::Rejected));
@@ -190,7 +190,7 @@ async fn authenticate_fails_body_returns_auth_failed() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("wrong_pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let event = qbit.authenticate().await;
     assert!(matches!(event, QbitAuthResult::Rejected));
@@ -204,7 +204,7 @@ async fn authenticate_network_error_returns_connection_refused() {
         "http://127.0.0.1:1".into(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let event = qbit.authenticate().await;
     assert!(matches!(event, QbitAuthResult::ConnectionRefused));
@@ -226,7 +226,7 @@ async fn sync_port_returns_success_on_200() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
@@ -248,7 +248,7 @@ async fn sync_port_returns_failed_with_status_on_403() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
@@ -276,7 +276,7 @@ async fn authenticate_unexpected_response_returns_api_error() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let event = qbit.authenticate().await;
     assert!(
@@ -292,7 +292,7 @@ async fn sync_port_network_error_returns_failed_with_code_zero() {
         "http://127.0.0.1:1".into(),
         "admin".into(),
         QbitPassword::new("password".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let cookie = AuthCookie::new("abc123".to_string());
     let port = VpnPort::try_new(51820).unwrap();
@@ -336,7 +336,7 @@ async fn list_torrent_details_returns_parsed_records() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let cookie = AuthCookie::new("sid".to_string());
     let details = qbit.list_torrent_details(&cookie).await;
@@ -386,7 +386,7 @@ async fn list_torrent_details_maps_all_state_strings() {
             server.uri(),
             "a".into(),
             QbitPassword::new("p".into()),
-            Arc::new(|_| {}),
+            windlass_types::NullHttpTap::arc(),
         );
         let details = qbit
             .list_torrent_details(&AuthCookie::new("s".to_string()))
@@ -408,7 +408,7 @@ async fn list_torrent_details_returns_empty_on_bad_json() {
         server.uri(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let details = qbit
         .list_torrent_details(&AuthCookie::new("s".to_string()))
@@ -423,7 +423,7 @@ async fn list_torrent_details_returns_empty_on_network_error() {
         "http://127.0.0.1:1".into(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let details = qbit
         .list_torrent_details(&AuthCookie::new("s".to_string()))
@@ -449,7 +449,7 @@ async fn get_preferences_returns_parsed_limits() {
         server.uri(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let prefs = qbit
         .get_preferences(&AuthCookie::new("s".to_string()))
@@ -478,7 +478,7 @@ async fn get_preferences_returns_none_on_bad_json() {
         server.uri(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let prefs = qbit
         .get_preferences(&AuthCookie::new("s".to_string()))
@@ -503,7 +503,7 @@ async fn add_torrent_returns_hash_from_response_body() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let cookie = AuthCookie::new("sid".to_string());
     let result = qbit.add_torrent(&cookie, vec![0u8; 16]).await;
@@ -524,7 +524,7 @@ async fn add_torrent_returns_none_on_error_response() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let cookie = AuthCookie::new("sid".to_string());
     // Mock returns no torrent list fallback since /torrents/info isn't mocked
@@ -550,7 +550,7 @@ async fn pause_torrent_posts_correct_form() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     let cookie = AuthCookie::new("sid".to_string());
     qbit.pause_torrent(&cookie, &TorrentHash("abc123".into()))
@@ -565,7 +565,7 @@ async fn pause_torrent_does_not_panic_on_network_error() {
         "http://127.0.0.1:1".into(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.pause_torrent(
         &AuthCookie::new("s".to_string()),
@@ -593,7 +593,7 @@ async fn resume_torrent_posts_correct_form() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.resume_torrent(
         &AuthCookie::new("sid".to_string()),
@@ -610,7 +610,7 @@ async fn resume_torrent_does_not_panic_on_network_error() {
         "http://127.0.0.1:1".into(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.resume_torrent(
         &AuthCookie::new("s".to_string()),
@@ -638,7 +638,7 @@ async fn force_resume_torrent_posts_correct_form() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.force_resume_torrent(
         &AuthCookie::new("sid".to_string()),
@@ -655,7 +655,7 @@ async fn force_resume_torrent_does_not_panic_on_network_error() {
         "http://127.0.0.1:1".into(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.force_resume_torrent(
         &AuthCookie::new("s".to_string()),
@@ -685,7 +685,7 @@ async fn delete_torrent_posts_with_delete_files_false() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.delete_torrent(
         &AuthCookie::new("sid".to_string()),
@@ -702,7 +702,7 @@ async fn delete_torrent_does_not_panic_on_network_error() {
         "http://127.0.0.1:1".into(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.delete_torrent(
         &AuthCookie::new("s".to_string()),
@@ -730,7 +730,7 @@ async fn set_all_files_priority_posts_correct_form() {
         server.uri(),
         "admin".into(),
         QbitPassword::new("pass".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.set_all_files_priority(
         &AuthCookie::new("sid".to_string()),
@@ -747,7 +747,7 @@ async fn set_all_files_priority_does_not_panic_on_network_error() {
         "http://127.0.0.1:1".into(),
         "a".into(),
         QbitPassword::new("p".into()),
-        Arc::new(|_| {}),
+        windlass_types::NullHttpTap::arc(),
     );
     qbit.set_all_files_priority(
         &AuthCookie::new("s".to_string()),

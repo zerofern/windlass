@@ -13,6 +13,7 @@ impl QbitClient {
     pub async fn set_private_tracker_safe_prefs(&self, cookie: &AuthCookie) -> bool {
         let url = format!("{}/api/v2/app/setPreferences", self.base_url);
         let req_body = r#"{"dht":false,"pex":false,"lsd":false}"#;
+        self.gate_request("POST", &url).await;
         match self
             .client
             .post(&url)
@@ -59,6 +60,7 @@ impl QbitClient {
         torrent_bytes: Vec<u8>,
     ) -> Option<TorrentHash> {
         let url = format!("{}/api/v2/torrents/add", self.base_url);
+        self.gate_request("POST", &url).await;
         let part = reqwest::multipart::Part::bytes(torrent_bytes)
             .file_name("file.torrent")
             .mime_str("application/x-bittorrent")
@@ -104,6 +106,7 @@ impl QbitClient {
     /// Pauses a torrent. Fire-and-forget; logs a warning on failure.
     pub async fn pause_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash) {
         let url = format!("{}/api/v2/torrents/stop", self.base_url);
+        self.gate_request("POST", &url).await;
         if let Err(e) = self
             .client
             .post(&url)
@@ -122,6 +125,7 @@ impl QbitClient {
     /// Resumes a paused torrent. Fire-and-forget; logs a warning on failure.
     pub async fn resume_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash) {
         let url = format!("{}/api/v2/torrents/start", self.base_url);
+        self.gate_request("POST", &url).await;
         if let Err(e) = self
             .client
             .post(&url)
@@ -141,6 +145,7 @@ impl QbitClient {
     /// Fire-and-forget; logs a warning on failure.
     pub async fn force_resume_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash) {
         let url = format!("{}/api/v2/torrents/setForceStart", self.base_url);
+        self.gate_request("POST", &url).await;
         if let Err(e) = self
             .client
             .post(&url)
@@ -160,6 +165,7 @@ impl QbitClient {
     /// Fire-and-forget; logs a warning on failure.
     pub async fn delete_torrent(&self, cookie: &AuthCookie, hash: &TorrentHash) {
         let url = format!("{}/api/v2/torrents/delete", self.base_url);
+        self.gate_request("POST", &url).await;
         if let Err(e) = self
             .client
             .post(&url)
@@ -181,6 +187,7 @@ impl QbitClient {
     /// Fire-and-forget; logs a warning on failure.
     pub async fn set_all_files_priority(&self, cookie: &AuthCookie, hash: &TorrentHash) {
         let url = format!("{}/api/v2/torrents/filePrio", self.base_url);
+        self.gate_request("POST", &url).await;
         if let Err(e) = self
             .client
             .post(&url)

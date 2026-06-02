@@ -22,50 +22,11 @@ use crate::machine::EventCause;
 
 // ── CoreId ────────────────────────────────────────────────────────────────────
 
-/// Identifies a per-system service runtime. Closed enum, lowercased on
-/// the SSE wire so the frontend sees stable identifiers.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CoreId {
-    Vpn,
-    Qbit,
-    Mam,
-    Db,
-    Disk,
-    Docker,
-    Domain,
-}
-
-impl CoreId {
-    /// All seven cores in cores-rail display order.
-    #[must_use]
-    pub const fn all() -> [Self; 7] {
-        [
-            Self::Vpn,
-            Self::Qbit,
-            Self::Mam,
-            Self::Db,
-            Self::Disk,
-            Self::Docker,
-            Self::Domain,
-        ]
-    }
-}
-
-impl std::fmt::Display for CoreId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            Self::Vpn => "vpn",
-            Self::Qbit => "qbit",
-            Self::Mam => "mam",
-            Self::Db => "db",
-            Self::Disk => "disk",
-            Self::Docker => "docker",
-            Self::Domain => "domain",
-        };
-        f.write_str(name)
-    }
-}
+// `CoreId` is defined in `windlass-types` so HTTP clients (which do
+// not depend on this crate) can tag their tap calls with the owning
+// core.  Re-export so existing `windlass_machine::CoreId` paths keep
+// working.
+pub use windlass_types::CoreId;
 
 // ── StepKind ──────────────────────────────────────────────────────────────────
 
