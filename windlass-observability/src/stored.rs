@@ -63,6 +63,89 @@ impl From<&windlass_machine::ExternalCause> for StoredExternalCause {
     }
 }
 
+// ── Secret slots ──────────────────────────────────────────────────────────────
+
+/// Server-side holder for one cleartext secret captured into a stored
+/// record.  Lives only inside the ring; the wire serializer (below)
+/// flips it to [`WireRedacted`] so cleartext never leaves the process
+/// over SSE.  The matching cleartext is exposed only through the
+/// `POST /api/v1/observability/reveal/{reveal_id}` endpoint, which
+/// scans the rings for `reveal_id` and returns `410 Gone` once the
+/// parent record is evicted.
+///
+/// See `docs/observability-redesign.md` "Secrets (Decision 14 detail)".
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ServerSecretSlot {
+    /// The cleartext value.  Never serialized — the hand-rolled
+    /// `Serialize` impl below emits [`WireRedacted`] instead.
+    pub cleartext: String,
+    /// Unguessable single-field handle the UI passes back to the
+    /// reveal endpoint.
+    pub reveal_id: Uuid,
+}
+
+impl ServerSecretSlot {
+    /// Wrap `cleartext` in a new slot with a fresh `reveal_id`.
+    #[must_use]
+    pub fn new(cleartext: impl Into<String>) -> Self {
+        Self {
+            cleartext: cleartext.into(),
+            reveal_id: Uuid::new_v4(),
+        }
+    }
+}
+
+/// Hand-rolled serializer: `ServerSecretSlot` always serializes as
+/// `WireRedacted { redacted: true, reveal_id }`.  Cleartext is
+/// dropped on the floor — there is no opt-in to leak it.  Reveal is
+/// the only path to cleartext on the wire.
+impl Serialize for ServerSecretSlot {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut sm = s.serialize_struct("WireRedacted", 2)?;
+        sm.serialize_field("redacted", &true)?;
+        sm.serialize_field("reveal_id", &self.reveal_id)?;
+        sm.end()
+    }
+}
+
+/// The wire form `ServerSecretSlot` serializes to.  Defined as a
+/// separate type so deserialize paths (tests, transport round-trips)
+/// can target it explicitly; the server never *constructs* one
+/// directly — the `Serialize` impl on [`ServerSecretSlot`] is the
+/// only producer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireRedacted {
+    pub redacted: bool,
+    pub reveal_id: Uuid,
+}
+
+/// A header value (or other captured field) that is either plaintext
+/// passed through unchanged, or a secret slot that serializes to
+/// `WireRedacted`.  Stored alongside the rest of the record; the
+/// serializer chooses the right wire form automatically.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MaybeSecret {
+    Plain(String),
+    Secret(ServerSecretSlot),
+}
+
+impl MaybeSecret {
+    /// Build a plain `MaybeSecret` from any string-like value.
+    #[must_use]
+    pub fn plain(v: impl Into<String>) -> Self {
+        Self::Plain(v.into())
+    }
+
+    /// Build a secret `MaybeSecret` from cleartext.  Mints a fresh
+    /// `reveal_id`.
+    #[must_use]
+    pub fn secret(cleartext: impl Into<String>) -> Self {
+        Self::Secret(ServerSecretSlot::new(cleartext))
+    }
+}
+
 // ── Body capture ──────────────────────────────────────────────────────────────
 
 /// What kind of body the capture is for.  Set from `Content-Type`
@@ -244,5 +327,46 @@ impl StoredStepRecord {
         // saturating cast — durations under u64::MAX millis (≈ 584M
         // years) round-trip exactly.
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::{MaybeSecret, ServerSecretSlot};
+
+    #[test]
+    fn server_secret_slot_serializes_to_wire_redacted() {
+        let slot = ServerSecretSlot::new("super-secret-cookie-value");
+        let json = serde_json::to_value(&slot).unwrap();
+        assert_eq!(json["redacted"], serde_json::Value::Bool(true));
+        assert!(json.get("reveal_id").is_some());
+        assert!(json.get("cleartext").is_none(), "cleartext must not leak");
+        let serialized = serde_json::to_string(&slot).unwrap();
+        assert!(
+            !serialized.contains("super-secret-cookie-value"),
+            "cleartext leaked in serialized form: {serialized}"
+        );
+    }
+
+    #[test]
+    fn maybe_secret_plain_passes_through() {
+        let plain = MaybeSecret::plain("application/json");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(json, serde_json::Value::String("application/json".into()));
+    }
+
+    #[test]
+    fn maybe_secret_secret_redacts() {
+        let s = MaybeSecret::secret("bearer-token-abc");
+        let serialized = serde_json::to_string(&s).unwrap();
+        assert!(serialized.contains("\"redacted\":true"));
+        assert!(!serialized.contains("bearer-token-abc"));
+    }
+
+    #[test]
+    fn reveal_ids_are_unique_per_slot() {
+        let a = ServerSecretSlot::new("v");
+        let b = ServerSecretSlot::new("v");
+        assert_ne!(a.reveal_id, b.reveal_id, "each slot mints a fresh id");
     }
 }

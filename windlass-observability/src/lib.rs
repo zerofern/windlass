@@ -43,8 +43,8 @@ pub use sse::{
     StoredLogLine,
 };
 pub use stored::{
-    BodyCapture, BodyKind, StoredAction, StoredEventCause, StoredExternalCause, StoredHttpExchange,
-    StoredPublish, StoredStepRecord,
+    BodyCapture, BodyKind, MaybeSecret, ServerSecretSlot, StoredAction, StoredEventCause,
+    StoredExternalCause, StoredHttpExchange, StoredPublish, StoredStepRecord, WireRedacted,
 };
 
 /// SSE protocol version emitted in `HelloSnapshot.protocol_version`.
