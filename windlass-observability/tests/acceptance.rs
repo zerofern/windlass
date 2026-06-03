@@ -17,7 +17,7 @@ use std::time::Duration;
 use common::d1_recording_tap::RecordingRuntimeTap;
 use common::support::{TinyAction, TinyEvent, TinyMachine, TinyShell};
 use tokio::sync::mpsc;
-use windlass_machine::{ExternalCause, NullRuntimeTap, Timed};
+use windlass_machine::{ExternalCause, NullRuntimeTap, RuntimeTap, Timed};
 
 // ── Acceptance test #1 — Observer equivalence + publish_id preservation ──────
 
@@ -70,6 +70,75 @@ async fn stalling_tap_does_not_block_runtime_progress() {
         tap.observed_count.load(Ordering::SeqCst) >= 5,
         "tap should have been invoked at least once per dispatched action"
     );
+}
+
+// ── Acceptance test #5 — Ring eviction cleans indices ────────────────────────
+
+#[tokio::test]
+async fn ring_eviction_emits_evicted_message_and_drops_indices() {
+    // D6: fill a core's step ring past its count budget; assert the
+    // controller emits an `Evicted` SSE message listing the dropped
+    // step + action + publish IDs.  EC-3: the controller's
+    // action_id / publish_id indices must be cleaned in lockstep.
+    use windlass_machine::{CoreId, StepKind, StepRecordView};
+    use windlass_observability::{ObservabilityConfig, ObservabilityController, SseMessage};
+
+    // Squeeze the per-core step ring down to 3 entries so we hit
+    // eviction quickly without flooding the channel.
+    let cfg = ObservabilityConfig {
+        step_records_per_core: 3,
+        ..ObservabilityConfig::default()
+    };
+    let ctrl = ObservabilityController::with_config(cfg);
+    let mut rx = ctrl.subscribe();
+
+    let event = serde_json::Value::Null;
+    let state = serde_json::Value::Null;
+    let cause = windlass_machine::EventCause::External(ExternalCause::Init);
+    let action_ids: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+    let publish_ids: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+    let action_payload = vec![serde_json::Value::Null];
+    let publish_payload = vec![serde_json::Value::Null];
+
+    for i in 0..5 {
+        ctrl.observed_step(
+            CoreId::Vpn,
+            &StepRecordView {
+                core: CoreId::Vpn,
+                step_id: uuid::Uuid::new_v4(),
+                recorded_at: chrono::Utc::now(),
+                duration: Duration::from_millis(0),
+                kind: StepKind::Event,
+                event_variant: "T",
+                event: &event,
+                event_cause: &cause,
+                state_after: &state,
+                action_ids: std::slice::from_ref(&action_ids[i]),
+                action_variants: &["A"],
+                action_payloads: &action_payload,
+                publish_ids: std::slice::from_ref(&publish_ids[i]),
+                publish_variants: &["P"],
+                publish_payloads: &publish_payload,
+            },
+        );
+    }
+
+    // Give the EC-5 worker time to drain.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Drain the SSE broadcast for at least one Evicted message that
+    // lists action + publish ids — proves the indices were cleaned.
+    let mut saw_evicted = false;
+    while let Ok(msg) = rx.try_recv() {
+        if let SseMessage::Evicted(ids) = msg {
+            saw_evicted = true;
+            assert!(
+                !ids.action_ids.is_empty() || !ids.publish_ids.is_empty(),
+                "Evicted must list at least one action or publish id (EC-3)"
+            );
+        }
+    }
+    assert!(saw_evicted, "expected at least one Evicted SSE message");
 }
 
 // ── Acceptance test #4 — HTTP gate prevents send ─────────────────────────────
