@@ -72,6 +72,63 @@ async fn stalling_tap_does_not_block_runtime_progress() {
     );
 }
 
+// ── Acceptance test #4 — HTTP gate prevents send ─────────────────────────────
+
+#[tokio::test]
+async fn signal_rate_limit_anomaly_parks_next_request() {
+    // D5: A real httpmock server is overkill for this property — what
+    // matters is that `signal_anomaly(RateLimitViolation)` flips the
+    // per-core pause so the *next* `gate_request` for that core parks.
+    // The controller's HttpTap impl is the unit under test.  P7
+    // wiring: anomaly → pause → next gate_request parks until release.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windlass_machine::CoreId;
+    use windlass_observability::ObservabilityController;
+    use windlass_types::{HttpAnomaly, HttpRequestView, HttpTap};
+
+    let ctrl = ObservabilityController::new();
+
+    // Anomaly fires → pause flips for the affected core only.
+    ctrl.signal_anomaly(
+        CoreId::Mam,
+        HttpAnomaly::RateLimitViolation {
+            reason: "test".to_string(),
+        },
+    );
+    assert!(ctrl.is_paused(CoreId::Mam));
+    assert!(!ctrl.is_paused(CoreId::Qbit));
+
+    // The next gate_request parks.  We launch it on a task and
+    // confirm it does not complete within a short window.
+    let returned = Arc::new(AtomicBool::new(false));
+    let returned_clone = Arc::clone(&returned);
+    let ctrl_clone = ctrl.clone();
+    let handle = tokio::spawn(async move {
+        ctrl_clone
+            .gate_request(
+                CoreId::Mam,
+                &HttpRequestView {
+                    method: "POST",
+                    url: "https://mam.example/api",
+                    body: None,
+                },
+            )
+            .await;
+        returned_clone.store(true, Ordering::SeqCst);
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !returned.load(Ordering::SeqCst),
+        "gate_request must park while the core is paused"
+    );
+
+    // Release: stepping advances the parked gate.
+    ctrl.step(CoreId::Mam);
+    handle.await.expect("parked gate eventually completes");
+    assert!(returned.load(Ordering::SeqCst));
+}
+
 // ── Acceptance test #3 — Per-core pause isolation ────────────────────────────
 
 #[tokio::test]
