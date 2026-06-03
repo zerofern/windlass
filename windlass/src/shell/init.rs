@@ -133,7 +133,8 @@ pub(super) async fn init_shell(
         db_pool.clone(),
     )
     .await;
-    let (db_pub_tx, mut db_pub_rx) = mpsc::channel::<DbPublish>(128);
+    let (db_pub_tx, mut db_pub_rx) =
+        mpsc::channel::<windlass_machine::PublishEnvelope<DbPublish>>(128);
     db_handles
         .subscribe
         .send((vec![DbTopic::Failures, DbTopic::Results], db_pub_tx))
@@ -161,8 +162,9 @@ pub(super) async fn init_shell(
         },
     )
     .await;
-    let (docker_pub_tx, mut docker_pub_rx) =
-        mpsc::channel::<windlass_docker_core::DockerPublish>(128);
+    let (docker_pub_tx, mut docker_pub_rx) = mpsc::channel::<
+        windlass_machine::PublishEnvelope<windlass_docker_core::DockerPublish>,
+    >(128);
     docker_handles
         .subscribe
         .send((
@@ -190,7 +192,8 @@ pub(super) async fn init_shell(
         (),
     )
     .await;
-    let (disk_pub_tx, mut disk_pub_rx) = mpsc::channel::<DiskPublish>(128);
+    let (disk_pub_tx, mut disk_pub_rx) =
+        mpsc::channel::<windlass_machine::PublishEnvelope<DiskPublish>>(128);
     disk_handles
         .subscribe
         .send((vec![DiskTopic::Pressure], disk_pub_tx))
@@ -218,7 +221,8 @@ pub(super) async fn init_shell(
         },
     )
     .await;
-    let (vpn_pub_tx, mut vpn_pub_rx) = mpsc::channel::<VpnPublish>(128);
+    let (vpn_pub_tx, mut vpn_pub_rx) =
+        mpsc::channel::<windlass_machine::PublishEnvelope<VpnPublish>>(128);
     vpn_handles
         .subscribe
         .send((
@@ -279,7 +283,8 @@ pub(super) async fn init_shell(
         qbit.clone(),
     )
     .await;
-    let (qbit_pub_tx, mut qbit_pub_rx) = mpsc::channel::<QbitPublish>(128);
+    let (qbit_pub_tx, mut qbit_pub_rx) =
+        mpsc::channel::<windlass_machine::PublishEnvelope<QbitPublish>>(128);
     qbit_handles
         .subscribe
         .send((
@@ -314,7 +319,8 @@ pub(super) async fn init_shell(
         mam.clone(),
     )
     .await;
-    let (mam_pub_tx, mut mam_pub_rx) = mpsc::channel::<MamPublish>(128);
+    let (mam_pub_tx, mut mam_pub_rx) =
+        mpsc::channel::<windlass_machine::PublishEnvelope<MamPublish>>(128);
     mam_handles
         .subscribe
         .send((
@@ -347,7 +353,8 @@ pub(super) async fn init_shell(
         },
     )
     .await;
-    let (domain_pub_tx, mut domain_pub_rx) = mpsc::channel::<WindlassPublish>(128);
+    let (domain_pub_tx, mut domain_pub_rx) =
+        mpsc::channel::<windlass_machine::PublishEnvelope<WindlassPublish>>(128);
     domain_handles
         .subscribe
         .send((
@@ -379,7 +386,11 @@ pub(super) async fn init_shell(
         let domain_ev_tx = domain_handles.events.clone();
         let fp_arc = Arc::clone(&forwarded_port);
         tokio::spawn(async move {
-            while let Some(publish) = vpn_pub_rx.recv().await {
+            while let Some(envelope) = vpn_pub_rx.recv().await {
+                let windlass_machine::PublishEnvelope {
+                    id: publish_id,
+                    payload: publish,
+                } = envelope;
                 match &publish {
                     VpnPublish::PortReady { port } => {
                         if let Ok(mut g) = fp_arc.lock() {
@@ -400,9 +411,9 @@ pub(super) async fn init_shell(
                     | VpnPublish::PublicIpVerificationDegraded { .. }
                     | VpnPublish::MamIpVerificationDegraded { .. } => {}
                 }
-                let _ = domain_ev_tx.send(Timed::external(
+                let _ = domain_ev_tx.send(Timed::from_publish(
                     std::time::Instant::now(),
-                    ExternalCause::Unknown,
+                    publish_id,
                     WindlassEvent::Vpn(publish),
                 ));
             }
@@ -417,10 +428,14 @@ pub(super) async fn init_shell(
     {
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
-            while let Some(publish) = docker_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::external(
+            while let Some(envelope) = docker_pub_rx.recv().await {
+                let windlass_machine::PublishEnvelope {
+                    id: publish_id,
+                    payload: publish,
+                } = envelope;
+                let _ = domain_ev_tx.send(Timed::from_publish(
                     std::time::Instant::now(),
-                    ExternalCause::Unknown,
+                    publish_id,
                     WindlassEvent::Docker(publish),
                 ));
             }
@@ -433,10 +448,14 @@ pub(super) async fn init_shell(
     {
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
-            while let Some(publish) = qbit_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::external(
+            while let Some(envelope) = qbit_pub_rx.recv().await {
+                let windlass_machine::PublishEnvelope {
+                    id: publish_id,
+                    payload: publish,
+                } = envelope;
+                let _ = domain_ev_tx.send(Timed::from_publish(
                     std::time::Instant::now(),
-                    ExternalCause::Unknown,
+                    publish_id,
                     WindlassEvent::Qbit(publish),
                 ));
             }
@@ -449,10 +468,14 @@ pub(super) async fn init_shell(
     {
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
-            while let Some(publish) = mam_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::external(
+            while let Some(envelope) = mam_pub_rx.recv().await {
+                let windlass_machine::PublishEnvelope {
+                    id: publish_id,
+                    payload: publish,
+                } = envelope;
+                let _ = domain_ev_tx.send(Timed::from_publish(
                     std::time::Instant::now(),
-                    ExternalCause::Unknown,
+                    publish_id,
                     WindlassEvent::Mam(publish),
                 ));
             }
@@ -466,10 +489,14 @@ pub(super) async fn init_shell(
     {
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
-            while let Some(publish) = disk_pub_rx.recv().await {
-                let _ = domain_ev_tx.send(Timed::external(
+            while let Some(envelope) = disk_pub_rx.recv().await {
+                let windlass_machine::PublishEnvelope {
+                    id: publish_id,
+                    payload: publish,
+                } = envelope;
+                let _ = domain_ev_tx.send(Timed::from_publish(
                     std::time::Instant::now(),
-                    ExternalCause::Unknown,
+                    publish_id,
                     WindlassEvent::Disk(publish),
                 ));
             }
@@ -485,7 +512,11 @@ pub(super) async fn init_shell(
     {
         let domain_ev_tx = domain_handles.events.clone();
         tokio::spawn(async move {
-            while let Some(publish) = db_pub_rx.recv().await {
+            while let Some(envelope) = db_pub_rx.recv().await {
+                let windlass_machine::PublishEnvelope {
+                    id: publish_id,
+                    payload: publish,
+                } = envelope;
                 match publish {
                     DbPublish::Succeeded { .. } => {}
                     DbPublish::Failed(failure) => {
@@ -500,9 +531,9 @@ pub(super) async fn init_shell(
                                 operation: failure.operation,
                                 message: failure.message,
                             };
-                            let _ = domain_ev_tx.send(Timed::external(
+                            let _ = domain_ev_tx.send(Timed::from_publish(
                                 std::time::Instant::now(),
-                                ExternalCause::Unknown,
+                                publish_id,
                                 event,
                             ));
                         }
@@ -519,7 +550,10 @@ pub(super) async fn init_shell(
     {
         let db_cmd_tx = db_handles.commands.clone();
         tokio::spawn(async move {
-            while let Some(publish) = domain_pub_rx.recv().await {
+            while let Some(envelope) = domain_pub_rx.recv().await {
+                let windlass_machine::PublishEnvelope {
+                    payload: publish, ..
+                } = envelope;
                 match publish {
                     WindlassPublish::SystemState(_) => {}
                     WindlassPublish::Activity { message } => {

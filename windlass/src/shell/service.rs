@@ -645,7 +645,8 @@ mod tests {
             .await;
 
         // Subscribe to Activity publishes.
-        let (activity_tx, mut activity_rx) = mpsc::channel::<WindlassPublish>(8);
+        let (activity_tx, mut activity_rx) =
+            mpsc::channel::<windlass_machine::PublishEnvelope<WindlassPublish>>(8);
         domain_handles
             .subscribe
             .send((vec![WindlassTopic::Activity], activity_tx))
@@ -664,12 +665,12 @@ mod tests {
             .unwrap();
 
         // Wait for the Activity publish.
-        let publish = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
             .await
             .expect("timeout waiting for activity publish")
             .expect("channel closed");
 
-        match publish {
+        match envelope.payload {
             WindlassPublish::Activity { message } => {
                 assert_eq!(message, "qBittorrent rejected credentials");
             }
@@ -712,7 +713,8 @@ mod tests {
             )
             .await;
 
-        let (activity_tx, mut activity_rx) = mpsc::channel::<WindlassPublish>(8);
+        let (activity_tx, mut activity_rx) =
+            mpsc::channel::<windlass_machine::PublishEnvelope<WindlassPublish>>(8);
         domain_handles
             .subscribe
             .send((vec![WindlassTopic::Activity], activity_tx))
@@ -730,12 +732,12 @@ mod tests {
             ))
             .unwrap();
 
-        let publish = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
             .await
             .expect("timeout waiting for activity")
             .expect("channel closed");
 
-        match publish {
+        match envelope.payload {
             WindlassPublish::Activity { message } => {
                 assert!(
                     message.contains("SaveSystemSnapshot"),

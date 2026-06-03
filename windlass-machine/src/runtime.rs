@@ -75,7 +75,7 @@ where
             });
         }
         for env in publishes {
-            self.fanout.send(&env.payload);
+            self.fanout.send(&env);
         }
     }
 
@@ -454,7 +454,8 @@ mod tests {
             .expect("event channel should be open");
 
         assert_eq!(action_rx.recv().await, Some(Action::Pong));
-        assert_eq!(beep_rx.recv().await, Some(Publish::Beep));
+        let envelope = beep_rx.recv().await.expect("beep envelope arrived");
+        assert_eq!(envelope.payload, Publish::Beep);
     }
 
     #[tokio::test]
