@@ -3219,7 +3219,6 @@ dependencies = [
  "uom",
  "uuid",
  "windlass-clients",
- "windlass-core",
  "windlass-db",
  "windlass-db-core",
  "windlass-disk-core",
@@ -3250,19 +3249,6 @@ dependencies = [
  "tracing-subscriber",
  "windlass-types",
  "wiremock",
-]
-
-[[package]]
-name = "windlass-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "proptest",
- "serde",
- "serde_json",
- "tracing",
- "uom",
- "windlass-types",
 ]
 
 [[package]]
@@ -3465,7 +3451,6 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
- "windlass-core",
  "windlass-db",
  "windlass-db-core",
  "windlass-domain-core",

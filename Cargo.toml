@@ -5,7 +5,6 @@ members = [
     "windlass-observability",
     "windlass-mam-core",
     "windlass-types",
-    "windlass-core",
     "windlass-disk-core",
     "windlass-docker-core",
     "windlass-domain-core",
@@ -59,7 +58,6 @@ async-trait      = "0.1"
 windlass-qbit-core = { path = "windlass-qbit-core" }
 windlass-types   = { path = "windlass-types" }
 windlass-vpn-core = { path = "windlass-vpn-core" }
-windlass-core    = { path = "windlass-core" }
 windlass-local   = { path = "windlass-local" }
 windlass-clients = { path = "windlass-clients" }
 windlass-web     = { path = "windlass-web" }

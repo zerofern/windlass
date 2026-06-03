@@ -29,10 +29,8 @@ pub(crate) async fn test_state_with_observability(
     let database_url = format!("{admin_url}{separator}options=-csearch_path%3D{schema}");
     let pool = windlass_db::DbPool::connect(&database_url).await.unwrap();
     pool.migrate().await.unwrap();
-    let (event_tx, _rx) = mpsc::channel(1);
     let (domain_command_tx, _domain_cmd_rx) = mpsc::unbounded_channel();
     AppState {
-        event_tx,
         domain_command_tx,
         observability,
         chaos_url: None,

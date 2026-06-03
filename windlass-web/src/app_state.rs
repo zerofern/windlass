@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use windlass_core::events::Event;
 use windlass_domain_core::WindlassMachine;
 use windlass_machine::Command;
 use windlass_observability::ObservabilityController;
@@ -9,10 +8,8 @@ use windlass_observability::ObservabilityController;
 /// Shared state threaded through every axum handler via [`axum::extract::State`].
 #[derive(Clone)]
 pub struct AppState {
-    /// Channel for injecting events into the core event loop.
-    pub event_tx: mpsc::Sender<Event>,
-    /// §36 step 5: channel for dispatching commands to the domain
-    /// runtime (e.g. `WindlassCommand::ManualDownload`).
+    /// Channel for dispatching commands to the domain runtime
+    /// (e.g. `WindlassCommand::ManualDownload`).
     pub domain_command_tx: mpsc::UnboundedSender<Command<WindlassMachine>>,
     /// The live observability backend.  Routes call into this for the
     /// SSE stream, pause/resume/step, and breakpoint management.

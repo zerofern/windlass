@@ -2,27 +2,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
-use windlass_core::events::Event;
 use windlass_db_core::DbMachine;
 use windlass_disk_core::DiskMachine;
 use windlass_domain_core::WindlassMachine;
+use windlass_local::vpn_files::PortFileResult;
 use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
-use windlass_mam_core::MamMachine;
-use windlass_qbit_core::QbitMachine;
+use windlass_mam_core::{MamEvent, MamMachine};
+use windlass_qbit_core::{QbitEvent, QbitMachine};
 use windlass_types::VpnPort;
-use windlass_vpn_core::VpnMachine;
+use windlass_vpn_core::{VpnEvent, VpnMachine};
 
-use super::service_events::{ServiceEvent, legacy_to_service_events};
+use windlass_domain_core::WindlassEvent;
 
-/// Runs the new sans-I/O service cores beside the legacy core.
-///
-/// This is a migration bridge: it lets the runtime feed real events into the
-/// service/domain boundaries while legacy-only orchestration remains available
-/// as a rollback path.
-///
-/// Publish routing from service runtimes to the domain runtime is handled by
-/// dedicated async forwarder tasks spawned in `init_shell`; this struct no longer
-/// holds publish receivers.
+/// Holds the per-core `ServiceHandles` returned by every
+/// `ServiceRuntime::spawn`.  `init_shell` constructs this once and
+/// uses it to dispatch the boot Init events directly to each core's
+/// typed event channel (the legacy `Event::Init` bridge is gone
+/// post-§37j).
 pub(super) struct ServiceCores {
     domain: ServiceHandles<WindlassMachine>,
     db: ServiceHandles<DbMachine>,
@@ -32,9 +28,6 @@ pub(super) struct ServiceCores {
     disk: ServiceHandles<DiskMachine>,
     /// Cached forwarded port, shared with the VPN forwarder task.
     /// Updated by the VPN forwarder on PortReady/PortUnavailable/Disconnected.
-    /// Read synchronously by `observe` via the legacy event bridge so that
-    /// legacy shell results (e.g. `QbitPortSyncSuccess`) can be translated
-    /// correctly while legacy orchestration is still running.
     forwarded_port: Arc<Mutex<Option<VpnPort>>>,
 }
 
@@ -71,50 +64,42 @@ impl ServiceCores {
         Arc::clone(&self.forwarded_port)
     }
 
-    pub fn observe(&self, event: &Event) {
-        let forwarded_port = self.forwarded_port.lock().map_or(None, |g| *g);
-        for event in legacy_to_service_events(event, forwarded_port) {
-            self.send_service_event(event);
-        }
-    }
-
-    fn send_service_event(&self, event: ServiceEvent) {
+    /// Dispatch the per-core boot Init events.  Called once from
+    /// `init_shell` after every runtime is spawned and every
+    /// forwarder task is running, so the first events each core sees
+    /// have causes tagged `ExternalCause::Init`.
+    pub fn dispatch_init(&self, is_gluetun_healthy: bool, port_files: &PortFileResult) {
         let now = Instant::now();
-        // TODO(§37d): legacy-event bridge — these forwards inherit the
-        // cause of the original `Event` (which is currently untyped).
-        // Once envelopes flow through the bridge protocol, thread the
-        // upstream cause through instead of Unknown.
-        match event {
-            ServiceEvent::Domain(event) => {
-                let _ =
-                    self.domain
-                        .events
-                        .send(Timed::external(now, ExternalCause::Unknown, event));
-            }
-            ServiceEvent::Vpn(event) => {
-                let _ = self
-                    .vpn
-                    .events
-                    .send(Timed::external(now, ExternalCause::Unknown, event));
-            }
-            ServiceEvent::Qbit(event) => {
-                let _ = self
-                    .qbit
-                    .events
-                    .send(Timed::external(now, ExternalCause::Unknown, event));
-            }
-            ServiceEvent::Mam(event) => {
-                let _ = self
-                    .mam
-                    .events
-                    .send(Timed::external(now, ExternalCause::Unknown, event));
-            }
-            ServiceEvent::Disk(event) => {
-                let _ = self
-                    .disk
-                    .events
-                    .send(Timed::external(now, ExternalCause::Unknown, event));
-            }
+        let _ = self.domain.events.send(Timed::external(
+            now,
+            ExternalCause::Init,
+            WindlassEvent::Init,
+        ));
+        let _ = self
+            .vpn
+            .events
+            .send(Timed::external(now, ExternalCause::Init, VpnEvent::Init));
+        let _ = self
+            .qbit
+            .events
+            .send(Timed::external(now, ExternalCause::Init, QbitEvent::Init));
+        let _ = self
+            .mam
+            .events
+            .send(Timed::external(now, ExternalCause::Init, MamEvent::Init));
+        if is_gluetun_healthy {
+            let _ = self.vpn.events.send(Timed::external(
+                now,
+                ExternalCause::Init,
+                VpnEvent::ContainerHealthy,
+            ));
+        }
+        if let Ok((_, port)) = port_files {
+            let _ = self.vpn.events.send(Timed::external(
+                now,
+                ExternalCause::Init,
+                VpnEvent::PortFileChanged { port: *port },
+            ));
         }
     }
 }

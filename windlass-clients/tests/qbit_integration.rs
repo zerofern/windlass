@@ -6,8 +6,6 @@
 //! ```
 //! Run with: `cargo test --test qbit_integration -- --ignored`
 
-use std::sync::Arc;
-
 use windlass_clients::qbit::QbitClient;
 use windlass_types::{AuthCookie, MamTorrentId, QbitPassword};
 

@@ -3,12 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use windlass_clients::{mam, qbit};
-use windlass_core::{events::Event, types::SystemState};
 use windlass_db::DbPool;
 use windlass_local::{docker, vpn_files};
 use windlass_types::{VpnPort, WakeupId};
@@ -34,19 +33,19 @@ use super::qbit_shell::QbitShell;
 use super::service::ServiceCores;
 use super::vpn_shell::{VpnShell, VpnShellConfig};
 
-/// All runtime state extracted from `init_shell` so `run` stays concise.
+/// Owns everything constructed by `init_shell` that needs to outlive
+/// the function call.  `shell::run` keeps the bundle alive for the
+/// lifetime of the process so background tasks can keep using the
+/// clones they captured at spawn time.
 pub(super) struct ShellRuntime {
-    pub(super) event_rx: mpsc::Receiver<Event>,
     pub(super) docker: docker::DockerClient,
     pub(super) dependents: Vec<String>,
     pub(super) qbit: qbit::QbitClient,
     pub(super) mam: mam::MamClient,
-    pub(super) tx: mpsc::Sender<Event>,
     pub(super) vpn_ip_file: String,
     pub(super) vpn_port_file: String,
     pub(super) data_path: String,
     pub(super) wakeups: HashMap<WakeupId, JoinHandle<()>>,
-    pub(super) state: SystemState,
     pub(super) service_cores: ServiceCores,
     pub(super) execute_service_actions: bool,
 }
@@ -63,8 +62,6 @@ pub(super) async fn init_shell(
     observability: std::sync::Arc<windlass_observability::ObservabilityController>,
 ) -> Result<ShellRuntime> {
     let config = Config::from_env()?;
-
-    let (tx, rx) = mpsc::channel::<Event>(128);
 
     let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone()).await?;
 
@@ -117,10 +114,6 @@ pub(super) async fn init_shell(
     let vpn_port_file = config.vpn_port_file.clone();
     let data_path = config.data_path.clone();
 
-    // §37d closeout / §37j: the legacy debug intake/dispatch path is
-    // gone.  The main loop reads the central event channel directly.
-    let event_rx = rx;
-
     // §36 step 5: HTTP server start is deferred until after the domain
     // runtime is spawned so AppState can carry the domain command channel
     // (for `WindlassCommand::ManualDownload`).
@@ -129,16 +122,10 @@ pub(super) async fn init_shell(
     let blacklisted = windlass_db::download_queue::get_blacklisted_ids(&db_pool)
         .await
         .unwrap_or_default();
-    // §36 step 5: also feed the blacklist into the new domain core so
+    // §36 step 5: feed the blacklist into the new domain core so
     // manual-download admission can reject previously-dead torrents.
     let initial_blacklist: std::collections::HashSet<windlass_types::MamTorrentId> =
         blacklisted.iter().copied().collect();
-    let state = SystemState::initial()
-        .with_compliance_config(
-            config.unsatisfied_quota_limit,
-            config.compliance_poll_interval_secs,
-        )
-        .with_blacklisted_ids(blacklisted);
     let (db_handles, _db_join) = windlass_machine::spawn::<DbMachine, DbShell>(
         windlass_machine::CoreId::Db,
         runtime_tap.clone(),
@@ -373,7 +360,6 @@ pub(super) async fn init_shell(
     // start the HTTP server.  The web layer carries
     // `domain_command_tx` for `WindlassCommand::ManualDownload`.
     let app_state = windlass_web::AppState {
-        event_tx: tx.clone(),
         domain_command_tx: domain_handles.commands.clone(),
         observability: observability.clone(),
         chaos_url: std::env::var("CHAOS_URL").ok(),
@@ -570,28 +556,21 @@ pub(super) async fn init_shell(
         warn!("MAM session check failed at startup: {e} — continuing anyway");
     }
 
-    // Send Init into the central event channel.  The main loop in
-    // shell/mod.rs reads from `event_rx` directly post-§37j.
-    tx.send(Event::Init {
-        at: chrono::Utc::now(),
-        is_gluetun_healthy: boot.is_gluetun_healthy,
-        port_files,
-    })
-    .await
-    .expect("event channel open at startup");
+    // §37j: dispatch the boot Init events directly to each per-core
+    // runtime's typed event channel.  Replaces the legacy
+    // `tx.send(Event::Init { ... })` + `service_cores.observe` bridge
+    // that used to translate one untyped Init into four typed ones.
+    service_cores.dispatch_init(boot.is_gluetun_healthy, &port_files);
 
     Ok(ShellRuntime {
-        event_rx,
         docker,
         dependents: boot.dependents,
         qbit,
         mam,
-        tx,
         vpn_ip_file,
         vpn_port_file,
         data_path,
         wakeups,
-        state,
         service_cores,
         execute_service_actions,
     })
