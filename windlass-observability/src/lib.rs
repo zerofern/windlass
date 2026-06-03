@@ -434,6 +434,34 @@ impl ObservabilityController {
     /// + per-core statuses + loss counters.  Sent to a fresh SSE
     /// subscriber so the frontend can hydrate its local store from one
     /// payload (§37pre B9).
+    /// Look up the cleartext for a `reveal_id` by scanning the per-core
+    /// step rings and the cross-core HTTP ring for a matching
+    /// [`ServerSecretSlot`].  Returns `None` once the parent record has
+    /// been evicted (EC-3) — the `/api/v1/observability/reveal/{id}`
+    /// route maps `None` to `410 Gone`.
+    ///
+    /// The scan is `O(records × slots-per-record)` but only fires on
+    /// explicit operator click.  No separate reveal index is kept
+    /// (eviction would have to walk it anyway); ring eviction
+    /// invalidates IDs naturally.
+    pub async fn reveal(&self, reveal_id: Uuid) -> Option<String> {
+        for id in CoreId::all() {
+            let ring = self.core(id).ring.lock().await;
+            for record in ring.iter() {
+                if let Some(value) = find_reveal_in_step(record, reveal_id) {
+                    return Some(value);
+                }
+            }
+        }
+        let http_ring = self.http_ring.lock().await;
+        for exchange in http_ring.iter() {
+            if let Some(value) = find_reveal_in_http(exchange, reveal_id) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
     pub async fn hello(&self) -> HelloSnapshot {
         let mut cores = Vec::with_capacity(CoreId::all().len());
         let mut steps = Vec::new();
@@ -454,6 +482,23 @@ impl ObservabilityController {
             active_breakpoints: self.active_breakpoints(),
         }
     }
+}
+
+// ── Secret reveal helpers ─────────────────────────────────────────────────────
+
+/// Walk a stored step record for a `ServerSecretSlot` whose `reveal_id`
+/// matches.  Currently records hold no typed secret slots — header
+/// capture is wired in a follow-up gap — so this returns `None`.  The
+/// hook lives here so the scan loop in [`ObservabilityController::reveal`]
+/// doesn't need to change when header types start carrying slots.
+fn find_reveal_in_step(_record: &stored::StoredStepRecord, _reveal_id: Uuid) -> Option<String> {
+    None
+}
+
+/// Walk a stored HTTP exchange for a matching `ServerSecretSlot`.  See
+/// [`find_reveal_in_step`] for the eventual wiring.
+fn find_reveal_in_http(_exchange: &stored::StoredHttpExchange, _reveal_id: Uuid) -> Option<String> {
+    None
 }
 
 // ── RuntimeTap impl ───────────────────────────────────────────────────────────
@@ -910,5 +955,14 @@ mod tests {
         assert_eq!(all.len(), 4);
         ctrl.remove_event_breakpoint("E");
         assert_eq!(ctrl.active_breakpoints().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reveal_unknown_id_returns_none() {
+        let ctrl = ObservabilityController::new();
+        // No records have been captured; any reveal id is "evicted or
+        // unknown" and the controller must report `None` so the HTTP
+        // route returns `410 Gone` (EC-3 + B6).
+        assert!(ctrl.reveal(Uuid::new_v4()).await.is_none());
     }
 }

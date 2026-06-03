@@ -19,6 +19,7 @@ use axum::routing::{get, post};
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
+use uuid::Uuid;
 use windlass_machine::CoreId;
 use windlass_observability::{Breakpoint, SseMessage};
 
@@ -37,6 +38,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route(
             "/api/v1/observability/breakpoints/{kind}/{value}",
             post(add_breakpoint).delete(remove_breakpoint),
+        )
+        .route(
+            "/api/v1/observability/reveal/{reveal_id}",
+            post(reveal_secret),
         )
         .with_state(state)
 }
@@ -175,6 +180,26 @@ async fn remove_breakpoint(
         BreakpointKind::Http => app.observability.remove_http_breakpoint(&value),
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Secret reveal ─────────────────────────────────────────────────────────────
+
+/// `POST /api/v1/observability/reveal/{reveal_id}`
+///
+/// Returns the cleartext for the secret slot identified by `reveal_id`,
+/// or `410 Gone` once the parent record has been evicted from its ring.
+/// IDs are unguessable UUIDv4s minted at capture time; there is no
+/// separate reveal map to keep consistent — the ring is the
+/// authoritative source.  See `docs/observability-redesign.md`
+/// "Secrets (Decision 14 detail)".
+async fn reveal_secret(
+    State(app): State<AppState>,
+    Path(reveal_id): Path<Uuid>,
+) -> Result<String, (StatusCode, String)> {
+    match app.observability.reveal(reveal_id).await {
+        Some(cleartext) => Ok(cleartext),
+        None => Err((StatusCode::GONE, "reveal id evicted or unknown".into())),
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
