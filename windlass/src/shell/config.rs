@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use windlass_observability::ObservabilityConfig;
+use windlass_observability::ring::parse_byte_budget;
 use windlass_types::{MamSessionId, QbitPassword};
 
 pub struct Config {
@@ -80,6 +82,49 @@ fn execute_service_actions_setting(current: Option<&str>, legacy: Option<&str>) 
     current.or(legacy).is_none_or(parse_execute_service_actions)
 }
 
+/// Read the `WINDLASS_OBS_*` env vars into an [`ObservabilityConfig`].
+/// Each var is optional and defaults to the §37pre B7 locked constants
+/// (decision 19 — config-driven from day one with sensible defaults).
+///
+/// Byte budgets accept IEC binary suffixes (`KiB`, `MiB`); count
+/// budgets are plain `usize`.  Returns an error if a value is set but
+/// fails to parse — silently falling back would hide misconfiguration.
+///
+/// Recognized vars (all optional):
+/// - `WINDLASS_OBS_STEP_RECORDS_PER_CORE`
+/// - `WINDLASS_OBS_STEP_RECORD_BYTES_PER_CORE` (e.g. `4MiB`)
+/// - `WINDLASS_OBS_HTTP_EXCHANGES`
+/// - `WINDLASS_OBS_HTTP_EXCHANGE_BYTES_TOTAL` (e.g. `8MiB`)
+/// - `WINDLASS_OBS_MAX_REQUEST_BODY_BYTES` (e.g. `64KiB`)
+/// - `WINDLASS_OBS_MAX_RESPONSE_BODY_BYTES` (e.g. `256KiB`)
+pub fn load_observability_config() -> Result<ObservabilityConfig> {
+    use std::env::var;
+    let mut cfg = ObservabilityConfig::default();
+    if let Ok(v) = var("WINDLASS_OBS_STEP_RECORDS_PER_CORE") {
+        cfg.step_records_per_core = v
+            .parse()
+            .with_context(|| format!("WINDLASS_OBS_STEP_RECORDS_PER_CORE={v}"))?;
+    }
+    if let Ok(v) = var("WINDLASS_OBS_STEP_RECORD_BYTES_PER_CORE") {
+        cfg.step_record_bytes_per_core = parse_byte_budget(&v).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if let Ok(v) = var("WINDLASS_OBS_HTTP_EXCHANGES") {
+        cfg.http_exchanges_total = v
+            .parse()
+            .with_context(|| format!("WINDLASS_OBS_HTTP_EXCHANGES={v}"))?;
+    }
+    if let Ok(v) = var("WINDLASS_OBS_HTTP_EXCHANGE_BYTES_TOTAL") {
+        cfg.http_exchange_bytes_total = parse_byte_budget(&v).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if let Ok(v) = var("WINDLASS_OBS_MAX_REQUEST_BODY_BYTES") {
+        cfg.max_request_body_bytes = parse_byte_budget(&v).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if let Ok(v) = var("WINDLASS_OBS_MAX_RESPONSE_BODY_BYTES") {
+        cfg.max_response_body_bytes = parse_byte_budget(&v).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(cfg)
+}
+
 fn parse_execute_service_actions(value: &str) -> bool {
     !matches!(value, "0" | "false" | "FALSE" | "no" | "NO")
 }
@@ -118,6 +163,29 @@ mod tests {
     fn execute_service_actions_accepts_legacy_env_name() {
         assert!(!execute_service_actions_setting(None, Some("false")));
         assert!(execute_service_actions_setting(None, None));
+    }
+
+    #[test]
+    fn observability_config_defaults_when_no_env_vars() {
+        // Pre-emptively scrub the env vars so other tests can't leak
+        // into this one.  `unsafe` is required because env mutation
+        // is process-global in Rust 2024.
+        unsafe {
+            for k in [
+                "WINDLASS_OBS_STEP_RECORDS_PER_CORE",
+                "WINDLASS_OBS_STEP_RECORD_BYTES_PER_CORE",
+                "WINDLASS_OBS_HTTP_EXCHANGES",
+                "WINDLASS_OBS_HTTP_EXCHANGE_BYTES_TOTAL",
+                "WINDLASS_OBS_MAX_REQUEST_BODY_BYTES",
+                "WINDLASS_OBS_MAX_RESPONSE_BODY_BYTES",
+            ] {
+                std::env::remove_var(k);
+            }
+        }
+        let cfg = super::load_observability_config().expect("defaults parse");
+        let default = windlass_observability::ObservabilityConfig::default();
+        assert_eq!(cfg.step_records_per_core, default.step_records_per_core);
+        assert_eq!(cfg.max_request_body_bytes, default.max_request_body_bytes);
     }
 
     #[test]

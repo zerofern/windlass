@@ -13,9 +13,13 @@ use windlass_observability::{ObservabilityController, ObservabilityLogLayer};
 async fn main() -> anyhow::Result<()> {
     // Construct the observability controller first so the log layer
     // can capture every tracing event from boot onwards into the SSE
-    // stream.  PAUSE_ON_START is applied here so cores that should
-    // start paused are already paused before any runtime spawns.
-    let observability = ObservabilityController::new();
+    // stream.  Budgets come from `WINDLASS_OBS_*` env vars with the
+    // §37pre B7 constants as defaults (decision 19).
+    // PAUSE_ON_START is applied here so cores that should start
+    // paused are already paused before any runtime spawns.
+    let obs_config = shell::config::load_observability_config()
+        .map_err(|e| anyhow::anyhow!("WINDLASS_OBS_* config: {e}"))?;
+    let observability = ObservabilityController::with_config(obs_config);
     let pause_on_start_raw = std::env::var("PAUSE_ON_START").ok();
     let pre_paused = windlass_observability::parse_pause_on_start(pause_on_start_raw.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;

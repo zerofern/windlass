@@ -36,7 +36,8 @@ use windlass_types::{HttpAnomaly, HttpExchange, HttpRequestView, HttpTap};
 
 pub use ring::{
     HTTP_EXCHANGE_BYTES_TOTAL, HTTP_EXCHANGES_TOTAL, HttpExchangeRing, MAX_REQUEST_BODY_BYTES,
-    MAX_RESPONSE_BODY_BYTES, STEP_RECORD_BYTES_PER_CORE, STEP_RECORDS_PER_CORE, StepRecordRing,
+    MAX_RESPONSE_BODY_BYTES, ObservabilityConfig, STEP_RECORD_BYTES_PER_CORE,
+    STEP_RECORDS_PER_CORE, StepRecordRing,
 };
 pub use sse::{
     Breakpoint, CoreCounters, EvictedIds, HelloSnapshot, HttpCounters, LossCounters, SseMessage,
@@ -81,6 +82,9 @@ pub struct ObservabilityController {
     /// SSE broadcast.  Subscribers receive every record / status /
     /// eviction / loss update.
     sse_tx: broadcast::Sender<SseMessage>,
+    /// Runtime-configurable budgets.  Used at capture time for body
+    /// truncation; ring sizes were already baked at construction.
+    config: ObservabilityConfig,
 }
 
 /// Inner storage for the variant-keyed breakpoint registry.  One flat
@@ -103,36 +107,46 @@ struct CoreState {
 }
 
 impl CoreState {
-    fn new() -> Self {
+    fn new(config: ObservabilityConfig) -> Self {
         Self {
             paused: AtomicBool::new(false),
             step_permits: Semaphore::new(0),
             status: ArcSwap::from_pointee(CoreStatus::Running),
             ring: Mutex::new(StepRecordRing::new(
-                STEP_RECORDS_PER_CORE,
-                STEP_RECORD_BYTES_PER_CORE,
+                config.step_records_per_core,
+                config.step_record_bytes_per_core,
             )),
         }
     }
 }
 
 impl ObservabilityController {
-    /// Fresh controller with all seven cores running.  Constructs
-    /// empty rings sized by the compile-time §37pre B7 budgets.
+    /// Fresh controller with all seven cores running, using the
+    /// default budgets (§37pre B7).
     #[must_use]
     pub fn new() -> Arc<Self> {
+        Self::with_config(ObservabilityConfig::default())
+    }
+
+    /// Fresh controller with operator-supplied budgets.  Lets the
+    /// shell thread `[observability]` config into ring sizes + body
+    /// caps at construction time (decision 19 — config-driven from
+    /// day one).
+    #[must_use]
+    pub fn with_config(config: ObservabilityConfig) -> Arc<Self> {
         let (sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         Arc::new(Self {
-            cores: std::array::from_fn(|_| CoreState::new()),
+            cores: std::array::from_fn(|_| CoreState::new(config)),
             http_ring: Mutex::new(HttpExchangeRing::new(
-                HTTP_EXCHANGES_TOTAL,
-                HTTP_EXCHANGE_BYTES_TOTAL,
+                config.http_exchanges_total,
+                config.http_exchange_bytes_total,
             )),
             action_index: Mutex::new(HashMap::new()),
             publish_index: Mutex::new(HashMap::new()),
             loss: Mutex::new(LossCounters::default()),
             breakpoints: ArcSwap::from_pointee(BreakpointSet::default()),
             sse_tx,
+            config,
         })
     }
 
@@ -700,12 +714,14 @@ impl HttpTap for ObservabilityController {
 
     fn observed_exchange(&self, core: CoreId, exchange: &HttpExchange) {
         // Enforce request/response body byte budgets at capture time.
+        // Caps come from the operator-configured `ObservabilityConfig`,
+        // defaulting to the locked §37pre B7 constants.
         let (request_body, request_truncated) = exchange.request_body.as_deref().map_or_else(
             || (BodyCapture::None, false),
-            |body| BodyCapture::from_text(body, MAX_REQUEST_BODY_BYTES),
+            |body| BodyCapture::from_text(body, self.config.max_request_body_bytes),
         );
         let (response_body, response_truncated) =
-            BodyCapture::from_text(&exchange.response_body, MAX_RESPONSE_BODY_BYTES);
+            BodyCapture::from_text(&exchange.response_body, self.config.max_response_body_bytes);
 
         let stored = StoredHttpExchange {
             exchange_id: Uuid::new_v4(),

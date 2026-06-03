@@ -23,6 +23,75 @@ pub const HTTP_EXCHANGE_BYTES_TOTAL: usize = 8 * 1024 * 1024;
 pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
+// ── Configurable budgets ──────────────────────────────────────────────────────
+
+/// Runtime-configurable budgets for the observability rings and body
+/// captures.  The defaults match the locked §37pre B7 constants above;
+/// the operator overrides via environment variables in
+/// `windlass::shell::config::Config` (see
+/// `docs/observability-redesign.md` "Configuration").
+///
+/// Byte-budget keys honor IEC binary suffixes (`KiB` = 1024 B,
+/// `MiB` = 1024 KiB) — see [`parse_byte_budget`].
+#[derive(Debug, Clone, Copy)]
+pub struct ObservabilityConfig {
+    pub step_records_per_core: usize,
+    pub step_record_bytes_per_core: usize,
+    pub http_exchanges_total: usize,
+    pub http_exchange_bytes_total: usize,
+    pub max_request_body_bytes: usize,
+    pub max_response_body_bytes: usize,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            step_records_per_core: STEP_RECORDS_PER_CORE,
+            step_record_bytes_per_core: STEP_RECORD_BYTES_PER_CORE,
+            http_exchanges_total: HTTP_EXCHANGES_TOTAL,
+            http_exchange_bytes_total: HTTP_EXCHANGE_BYTES_TOTAL,
+            max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
+            max_response_body_bytes: MAX_RESPONSE_BODY_BYTES,
+        }
+    }
+}
+
+/// Parse a byte-budget value with IEC binary suffix.  Accepted forms:
+///
+/// - `"123"` → 123 bytes
+/// - `"64KiB"` → 65 536 bytes
+/// - `"4MiB"` → 4 194 304 bytes
+///
+/// Case-insensitive on the suffix.  Whitespace around the number is
+/// tolerated.  Returns `Err` on unknown suffix or non-numeric prefix —
+/// callers map that to a config-load failure.
+///
+/// # Errors
+/// Returns the offending input as the error so the operator can see
+/// what failed.
+pub fn parse_byte_budget(raw: &str) -> Result<usize, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(format!("empty byte budget: {raw:?}"));
+    }
+    let lower = s.to_ascii_lowercase();
+    let (number, multiplier) = if let Some(prefix) = lower.strip_suffix("mib") {
+        (prefix, 1024usize * 1024)
+    } else if let Some(prefix) = lower.strip_suffix("kib") {
+        (prefix, 1024usize)
+    } else if let Some(prefix) = lower.strip_suffix('b') {
+        (prefix, 1usize)
+    } else {
+        (lower.as_str(), 1usize)
+    };
+    let n: usize = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("byte budget not a number: {raw:?}"))?;
+    n.checked_mul(multiplier)
+        .ok_or_else(|| format!("byte budget overflows usize: {raw:?}"))
+}
+
 // ── StepRecordRing ────────────────────────────────────────────────────────────
 
 /// Per-core bounded ring for [`StoredStepRecord`].  Drop-oldest on
@@ -198,6 +267,25 @@ mod tests {
         let evicted = ring.push(small_record(2000));
         assert!(!evicted.is_empty(), "huge push should evict to fit");
         assert!(ring.len() <= before);
+    }
+
+    #[test]
+    fn parse_byte_budget_accepts_iec_suffixes() {
+        use super::parse_byte_budget;
+        assert_eq!(parse_byte_budget("123").unwrap(), 123);
+        assert_eq!(parse_byte_budget("64KiB").unwrap(), 64 * 1024);
+        assert_eq!(parse_byte_budget("4MiB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_byte_budget("256kib").unwrap(), 256 * 1024);
+        assert_eq!(parse_byte_budget(" 8MiB ").unwrap(), 8 * 1024 * 1024);
+        assert_eq!(parse_byte_budget("1024B").unwrap(), 1024);
+    }
+
+    #[test]
+    fn parse_byte_budget_rejects_invalid() {
+        use super::parse_byte_budget;
+        assert!(parse_byte_budget("").is_err());
+        assert!(parse_byte_budget("MiB").is_err());
+        assert!(parse_byte_budget("abc").is_err());
     }
 
     #[test]
