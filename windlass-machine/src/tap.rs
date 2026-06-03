@@ -59,15 +59,25 @@ pub enum CoreStatus {
     ParkedAtEvent {
         variant: String,
         since: DateTime<Utc>,
+        /// The event payload, so the operator can see what is about
+        /// to be handled while parked.  §37pre A11.
+        preview: serde_json::Value,
     },
     ParkedAtOutcome {
         source_variant: String,
         since: DateTime<Utc>,
+        /// Variant names of the actions the source event produced.
+        action_variants: Vec<String>,
+        /// Variant names of the publishes the source event produced.
+        publish_variants: Vec<String>,
     },
     ParkedAtHttp {
         method: String,
         url: String,
         since: DateTime<Utc>,
+        /// The request body about to be sent.  Empty `Value::Null` when
+        /// the client passes no body (GETs, etc.).
+        request_preview: serde_json::Value,
     },
     Stepping,
 }

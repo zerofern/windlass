@@ -623,6 +623,7 @@ impl RuntimeTap for ObservabilityController {
         let parked = CoreStatus::ParkedAtEvent {
             variant: view.variant.to_owned(),
             since: Utc::now(),
+            preview: view.event.clone(),
         };
         c.status.store(Arc::new(parked.clone()));
         self.broadcast(SseMessage::CoreStatus {
@@ -653,6 +654,16 @@ impl RuntimeTap for ObservabilityController {
         let parked = CoreStatus::ParkedAtOutcome {
             source_variant: view.source_event_variant.to_owned(),
             since: Utc::now(),
+            action_variants: view
+                .action_variants
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            publish_variants: view
+                .publish_variants
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         c.status.store(Arc::new(parked.clone()));
         self.broadcast(SseMessage::CoreStatus {
@@ -796,6 +807,7 @@ impl HttpTap for ObservabilityController {
             method: view.method.to_owned(),
             url: view.url.to_owned(),
             since: Utc::now(),
+            request_preview: view.body.cloned().unwrap_or(serde_json::Value::Null),
         };
         c.status.store(Arc::new(parked.clone()));
         self.broadcast(SseMessage::CoreStatus {
