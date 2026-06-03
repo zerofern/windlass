@@ -72,6 +72,59 @@ async fn stalling_tap_does_not_block_runtime_progress() {
     );
 }
 
+// ── Acceptance test #6 — Secret behavior ─────────────────────────────────────
+
+#[tokio::test]
+async fn secret_behavior_no_cleartext_on_wire() {
+    // D7: walk every secret-bearing wire type through
+    // `serde_json::to_value` and assert the result never carries
+    // cleartext.  Covers the three locked types:
+    //
+    // - `ServerSecretSlot` (server-side holder) → must serialize as
+    //   `WireRedacted { redacted: true, reveal_id }`.
+    // - `MaybeSecret::Secret(_)` → must redact.
+    // - `MaybeSecret::Plain(_)` → must pass through unchanged.
+    use windlass_observability::{MaybeSecret, ServerSecretSlot};
+
+    const SECRET: &str = "MAM_SESSION_v1_supersecret_token_value";
+
+    let slot = ServerSecretSlot::new(SECRET);
+    let slot_json = serde_json::to_string(&slot).expect("slot serializes");
+    assert!(
+        !slot_json.contains(SECRET),
+        "ServerSecretSlot must not leak cleartext: {slot_json}"
+    );
+    assert!(slot_json.contains("\"redacted\":true"));
+    assert!(slot_json.contains("reveal_id"));
+
+    let secret = MaybeSecret::secret(SECRET);
+    let secret_json = serde_json::to_string(&secret).expect("MaybeSecret serializes");
+    assert!(
+        !secret_json.contains(SECRET),
+        "MaybeSecret::Secret must not leak cleartext: {secret_json}"
+    );
+    assert!(secret_json.contains("\"redacted\":true"));
+
+    let plain = MaybeSecret::plain("application/json");
+    let plain_json = serde_json::to_value(&plain).expect("plain serializes");
+    assert_eq!(
+        plain_json,
+        serde_json::Value::String("application/json".into()),
+        "MaybeSecret::Plain must pass through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn reveal_endpoint_returns_410_for_unknown_id() {
+    // Decision 14 + B6: the reveal endpoint is the only path to
+    // cleartext, and missing IDs (evicted or never minted) must
+    // surface as 410 Gone via the controller method.  The HTTP
+    // route in `windlass-web` maps `None` → `StatusCode::GONE`.
+    use windlass_observability::ObservabilityController;
+    let ctrl = ObservabilityController::new();
+    assert!(ctrl.reveal(uuid::Uuid::new_v4()).await.is_none());
+}
+
 // ── Acceptance test #5 — Ring eviction cleans indices ────────────────────────
 
 #[tokio::test]
