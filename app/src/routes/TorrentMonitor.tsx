@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Badge } from '@/components/ui/badge'
-import { useObservations } from '@/hooks/useObservations'
+import { useActivitySignal } from '@/hooks/useActivitySignal'
 
 interface Torrent {
   hash: string
@@ -59,7 +59,7 @@ function fmtMb(bytes: number) {
 export function TorrentMonitor() {
   const [torrents, setTorrents] = useState<Torrent[]>([])
   const [error, setError] = useState('')
-  const { log } = useObservations()
+  const { tick } = useActivitySignal()
 
   const fetchTorrents = useCallback(() => {
     fetch('/api/v1/torrents')
@@ -73,7 +73,7 @@ export function TorrentMonitor() {
 
   useEffect(() => {
     fetchTorrents()
-  }, [fetchTorrents, log.length])
+  }, [fetchTorrents, tick])
 
   return (
     <div className="space-y-4">

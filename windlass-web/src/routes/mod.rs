@@ -7,7 +7,6 @@ mod download;
 mod download_queue;
 mod health;
 mod observability;
-mod stream;
 mod torrents;
 
 /// Combines all sub-routers into a single [`Router`].
@@ -19,7 +18,6 @@ pub fn router(state: AppState) -> Router {
         .merge(download_queue::router(state.clone()))
         .merge(activity_log::router(state.clone()))
         .merge(health::router(state.clone()))
-        .merge(stream::router(state.clone()))
         .merge(torrents::router(state.clone()))
         .merge(observability::router(state))
 }

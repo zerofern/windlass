@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Badge } from '@/components/ui/badge'
-import { useObservations } from '@/hooks/useObservations'
+import { useActivitySignal } from '@/hooks/useActivitySignal'
 
 interface QueueEntry {
   id: number
@@ -26,7 +26,7 @@ function statusVariant(s: string): string {
 export function DownloadQueue() {
   const [queue, setQueue] = useState<QueueEntry[]>([])
   const [error, setError] = useState('')
-  const { log } = useObservations()
+  const { tick } = useActivitySignal()
 
   const fetchQueue = useCallback(() => {
     fetch('/api/v1/download-queue')
@@ -40,7 +40,7 @@ export function DownloadQueue() {
 
   useEffect(() => {
     fetchQueue()
-  }, [fetchQueue, log.length])
+  }, [fetchQueue, tick])
 
   return (
     <div className="space-y-4">

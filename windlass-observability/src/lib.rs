@@ -11,11 +11,13 @@
 //! HTTP exchange ring, the backward-causal indices, and the SSE
 //! broadcast channel.
 
+pub mod log_layer;
 pub mod pause_on_start;
 pub mod ring;
 pub mod sse;
 pub mod stored;
 
+pub use log_layer::ObservabilityLogLayer;
 pub use pause_on_start::{PauseOnStartError, parse_pause_on_start};
 
 use std::collections::{HashMap, HashSet};
@@ -149,6 +151,13 @@ impl ObservabilityController {
         // Sender::send returns Err when there are no active receivers
         // — that is normal (no /observability page open).  Drop.
         let _ = self.sse_tx.send(msg);
+    }
+
+    /// Fire-and-forget log emission used by
+    /// [`crate::log_layer::ObservabilityLogLayer`].  Drops the
+    /// message on overflow rather than backpressuring tracing.
+    pub fn publish_log(&self, msg: SseMessage) {
+        self.broadcast(msg);
     }
 
     // ── Pause / step controls ─────────────────────────────────────────────────

@@ -13,3 +13,6 @@ user-profile-example.md
 rreading-glasses-main
 loadSearchJSONbasic.md
 book-recomendation/
+
+# Local agent worktrees managed by Claude Code
+.claude/

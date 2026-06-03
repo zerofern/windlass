@@ -8,10 +8,6 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// §36 step 9a: type-erased HTTP-observation callback used to feed the
-/// debug exchange channel.  Retained alongside [`HttpTap`] for now;
-/// removed entirely with §37j.
-pub type HttpObserver = Arc<dyn Fn(HttpExchange) + Send + Sync>;
 pub use uom::si::f64::Information;
 
 // ── CoreId ────────────────────────────────────────────────────────────────────

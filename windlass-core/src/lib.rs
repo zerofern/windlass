@@ -2,11 +2,8 @@
 
 pub mod actions;
 pub mod events;
-pub mod observation;
 pub mod torrent;
 pub mod types;
-
-pub use observation::{HttpObserver, Observation};
 
 /// Returned by [`SystemState::process_event`].
 pub struct EventOutcome {

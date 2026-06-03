@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useObservations } from '@/hooks/useObservations'
+import { useActivitySignal } from '@/hooks/useActivitySignal'
 
 interface EventEntry {
   id: number
@@ -13,7 +13,7 @@ interface EventEntry {
 export function EventLog() {
   const [events, setEvents] = useState<EventEntry[]>([])
   const [error, setError] = useState('')
-  const { log } = useObservations()
+  const { tick } = useActivitySignal()
 
   const fetchEvents = useCallback(() => {
     fetch('/api/v1/events?limit=100')
@@ -27,7 +27,7 @@ export function EventLog() {
 
   useEffect(() => {
     fetchEvents()
-  }, [fetchEvents, log.length])
+  }, [fetchEvents, tick])
 
   return (
     <div className="space-y-4">

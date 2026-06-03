@@ -9,7 +9,6 @@ members = [
     "windlass-disk-core",
     "windlass-docker-core",
     "windlass-domain-core",
-    "windlass-debug",
     "windlass-db-core",
     "windlass-qbit-core",
     "windlass-vpn-core",
@@ -49,7 +48,6 @@ tower-http       = { version = "0.6", features = ["cors"] }
 arc-swap         = "1"
 uuid             = { version = "1", features = ["v4", "serde"] }
 sqlx             = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "json", "migrate", "macros"] }
-windlass-debug   = { path = "windlass-debug" }
 windlass-db-core = { path = "windlass-db-core" }
 windlass-disk-core = { path = "windlass-disk-core" }
 windlass-docker-core = { path = "windlass-docker-core" }

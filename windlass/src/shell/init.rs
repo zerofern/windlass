@@ -10,7 +10,6 @@ use tracing::{info, warn};
 use windlass_clients::{mam, qbit};
 use windlass_core::{events::Event, types::SystemState};
 use windlass_db::DbPool;
-use windlass_debug::{DebugCommand, DebugController, DebugHistory, LogEntry};
 use windlass_local::{docker, vpn_files};
 use windlass_types::{VpnPort, WakeupId};
 
@@ -42,27 +41,26 @@ pub(super) struct ShellRuntime {
     pub(super) dependents: Vec<String>,
     pub(super) qbit: qbit::QbitClient,
     pub(super) mam: mam::MamClient,
-    pub(super) obs_tx: broadcast::Sender<windlass_core::Observation>,
     pub(super) tx: mpsc::Sender<Event>,
     pub(super) vpn_ip_file: String,
     pub(super) vpn_port_file: String,
     pub(super) data_path: String,
     pub(super) wakeups: HashMap<WakeupId, JoinHandle<()>>,
     pub(super) state: SystemState,
-    pub(super) history: DebugHistory,
-    pub(super) cmd_rx: mpsc::Receiver<DebugCommand>,
-    pub(super) log_rx: mpsc::Receiver<LogEntry>,
-    pub(super) exchange_rx: mpsc::Receiver<(uuid::Uuid, windlass_types::HttpExchange)>,
     pub(super) service_cores: ServiceCores,
     pub(super) execute_service_actions: bool,
 }
 
 /// Bootstraps all infrastructure and returns the runtime bundle.
 /// Spawns the HTTP server and sends the `Init` event before returning.
+///
+/// `observability` is constructed in `main` so its log layer can
+/// capture early-boot tracing events; this function only threads it
+/// into every spawn site, into clients (via `HttpTap`), and into the
+/// `AppState`.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn init_shell(
-    debug_ctrl: &DebugController,
-    debug_owned: windlass_debug::DebugOwnedPart,
+    observability: std::sync::Arc<windlass_observability::ObservabilityController>,
 ) -> Result<ShellRuntime> {
     let config = Config::from_env()?;
 
@@ -88,36 +86,16 @@ pub(super) async fn init_shell(
 
     info!("Windlass started");
 
-    let on_http = debug_ctrl.make_http_observer();
-
     let direct = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    // §37h: construct the live ObservabilityController and apply
-    // PAUSE_ON_START.  Threaded into every ServiceRuntime::spawn so
-    // gates and tap calls flow through it, and into AppState so the
-    // /api/v1/observability routes can drive it from the web side.
-    let observability = windlass_observability::ObservabilityController::new();
-    let pause_on_start_raw = std::env::var("PAUSE_ON_START").ok();
-    let pre_paused = windlass_observability::parse_pause_on_start(pause_on_start_raw.as_deref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for core in &pre_paused {
-        observability.pause(*core);
-    }
-    if !pre_paused.is_empty() {
-        info!(
-            "PAUSE_ON_START: pre-pausing cores: {}",
-            pre_paused
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    // §37j: the controller is the only observability surface.  It was
+    // constructed in `main` (so the log layer captures boot events)
+    // and is threaded through ServiceRuntime::spawn (as RuntimeTap +
+    // HttpTap) and into AppState for the /api/v1/observability routes.
     let runtime_tap: std::sync::Arc<dyn windlass_machine::RuntimeTap> = observability.clone();
     let http_tap: std::sync::Arc<dyn windlass_types::HttpTap> = observability.clone();
-    let _ = on_http; // legacy HttpObserver — no longer threaded into clients
 
     let qbit = qbit::QbitClient::new(
         direct,
@@ -139,12 +117,8 @@ pub(super) async fn init_shell(
     let vpn_port_file = config.vpn_port_file.clone();
     let data_path = config.data_path.clone();
 
-    let (obs_tx, _) = broadcast::channel::<windlass_core::Observation>(256);
-
-    // §37d closeout: the legacy DebuggableEventStream / dequeue_debug
-    // pause path is gone.  The main loop reads `rx` directly; the new
-    // observability system gates per-core inside ServiceRuntime, not
-    // at the central legacy-event intake.
+    // §37d closeout / §37j: the legacy debug intake/dispatch path is
+    // gone.  The main loop reads the central event channel directly.
     let event_rx = rx;
 
     // §36 step 5: HTTP server start is deferred until after the domain
@@ -401,9 +375,7 @@ pub(super) async fn init_shell(
     let app_state = windlass_web::AppState {
         event_tx: tx.clone(),
         domain_command_tx: domain_handles.commands.clone(),
-        debug_ctrl: debug_ctrl.clone(),
         observability: observability.clone(),
-        observations: obs_tx.clone(),
         chaos_url: std::env::var("CHAOS_URL").ok(),
         db_pool: db_pool.clone(),
     };
@@ -593,17 +565,13 @@ pub(super) async fn init_shell(
         forwarded_port,
     );
     let execute_service_actions = config.execute_service_actions;
-    let history = DebugHistory::new(SystemState::initial());
-    let cmd_rx = debug_owned.cmd_rx;
-    let log_rx = debug_owned.log_rx;
-    let exchange_rx = debug_owned.exchange_rx;
 
     if let Err(e) = mam.check_session().await {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
     }
 
     // Send Init into the central event channel.  The main loop in
-    // shell/mod.rs reads from `event_rx` directly post-§37d closeout.
+    // shell/mod.rs reads from `event_rx` directly post-§37j.
     tx.send(Event::Init {
         at: chrono::Utc::now(),
         is_gluetun_healthy: boot.is_gluetun_healthy,
@@ -618,17 +586,12 @@ pub(super) async fn init_shell(
         dependents: boot.dependents,
         qbit,
         mam,
-        obs_tx,
         tx,
         vpn_ip_file,
         vpn_port_file,
         data_path,
         wakeups,
         state,
-        history,
-        cmd_rx,
-        log_rx,
-        exchange_rx,
         service_cores,
         execute_service_actions,
     })

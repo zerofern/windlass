@@ -9,7 +9,6 @@ windlass-domain-core = { workspace = true }
 windlass-machine = { workspace = true }
 windlass-types = { workspace = true }
 windlass-core  = { workspace = true }
-windlass-debug = { workspace = true }
 windlass-observability = { workspace = true }
 arc-swap       = { workspace = true }
 axum           = { workspace = true }

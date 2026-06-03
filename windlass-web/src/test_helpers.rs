@@ -1,7 +1,7 @@
 use crate::AppState;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use windlass_observability::ObservabilityController;
 
 static TEST_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
@@ -30,14 +30,11 @@ pub(crate) async fn test_state_with_observability(
     let pool = windlass_db::DbPool::connect(&database_url).await.unwrap();
     pool.migrate().await.unwrap();
     let (event_tx, _rx) = mpsc::channel(1);
-    let (obs_tx, _) = broadcast::channel(1);
     let (domain_command_tx, _domain_cmd_rx) = mpsc::unbounded_channel();
     AppState {
         event_tx,
         domain_command_tx,
-        debug_ctrl: windlass_debug::DebugController::new(),
         observability,
-        observations: obs_tx,
         chaos_url: None,
         db_pool: pool,
     }
