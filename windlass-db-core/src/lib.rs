@@ -161,7 +161,7 @@ pub struct DownloadStateChange {
 // ── DbMachine ─────────────────────────────────────────────────────────────────
 
 /// Actions the DB shell executes on behalf of the machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum DbAction {
     Execute(DbCommand),
 }

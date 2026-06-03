@@ -570,21 +570,23 @@ impl RuntimeTap for ObservabilityController {
                 .action_ids
                 .iter()
                 .zip(view.action_variants.iter())
-                .map(|(id, variant)| StoredAction {
+                .zip(view.action_payloads.iter())
+                .map(|((id, variant), payload)| StoredAction {
                     action_id: *id,
                     variant: (*variant).to_owned(),
-                    payload: serde_json::Value::Null,
+                    payload: payload.clone(),
                 })
                 .collect(),
             publishes: view
                 .publish_ids
                 .iter()
                 .zip(view.publish_variants.iter())
-                .map(|(id, variant)| StoredPublish {
+                .zip(view.publish_payloads.iter())
+                .map(|((id, variant), payload)| StoredPublish {
                     publish_id: *id,
                     topic: String::new(),
                     variant: (*variant).to_owned(),
-                    payload: serde_json::Value::Null,
+                    payload: payload.clone(),
                 })
                 .collect(),
         };

@@ -150,14 +150,35 @@ pub struct CommandOutcome<A, P, R> {
     pub response: R,
 }
 
+/// Extracts the variant name from a serde-default-serialized enum value.
+///
+/// Default serde representation:
+/// - Unit variant → `Value::String("VariantName")`
+/// - Tuple/struct variant → `Value::Object({"VariantName": ...})`
+///
+/// Returns `"?"` when neither shape matches (anything other than an enum).
+#[must_use]
+pub fn variant_name(v: &serde_json::Value) -> &str {
+    match v {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(m) => m.keys().next().map_or("?", String::as_str),
+        _ => "?",
+    }
+}
+
 /// A pure, side-effect-free state machine.
 ///
 /// The machine owns state and decisions. Shells execute returned actions and
 /// report I/O results back as events.
 pub trait Machine: Sized {
     type Config;
-    type Event: Send + 'static;
-    type Action: Send + 'static;
+    /// `Serialize` is required so the runtime can capture the event payload
+    /// into [`crate::tap::StepRecordView`] and, via [`variant_name`], extract
+    /// the variant string the observability page renders.
+    type Event: Serialize + Send + 'static;
+    /// `Serialize` is required so the runtime can include action payloads
+    /// in the captured `StoredStepRecord` and extract variant names.
+    type Action: Serialize + Send + 'static;
     type Publish: HasTopic<Self::Topic> + Serialize + Clone + Send + 'static;
     type Topic: DeserializeOwned + PartialEq + Clone + Send + 'static;
     type Command: DeserializeOwned + Send + 'static;

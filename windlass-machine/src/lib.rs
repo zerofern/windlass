@@ -8,7 +8,7 @@ pub mod tap;
 
 pub use machine::{
     ActionEnvelope, CommandOutcome, EventCause, ExternalCause, Machine, Outcome, PublishEnvelope,
-    Timed,
+    Timed, variant_name,
 };
 pub use pubsub::{HasTopic, SubscriberReg, TopicFanout};
 pub use runtime::{Command, ServiceHandles, ServiceRuntime, spawn};

@@ -100,8 +100,10 @@ pub struct StepRecordView<'a> {
     pub state_after: &'a serde_json::Value,
     pub action_ids: &'a [Uuid],
     pub action_variants: &'a [&'a str],
+    pub action_payloads: &'a [serde_json::Value],
     pub publish_ids: &'a [Uuid],
     pub publish_variants: &'a [&'a str],
+    pub publish_payloads: &'a [serde_json::Value],
 }
 
 // ── RuntimeTap ────────────────────────────────────────────────────────────────

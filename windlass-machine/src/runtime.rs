@@ -80,13 +80,12 @@ where
                 event = self.event_rx.recv() => {
                     let Some(timed) = event else { break };
                     let event_cause = timed.cause.clone();
-                    // §37f will introduce a Serialize bound on M::Event
-                    // and replace this placeholder with the real
-                    // serialized payload + extracted variant name.
-                    let event_json = serde_json::Value::Null;
+                    let event_json = serde_json::to_value(&timed.inner)
+                        .unwrap_or(serde_json::Value::Null);
+                    let event_variant = crate::machine::variant_name(&event_json).to_owned();
 
                     self.tap.gate_event(self.core_id, &EventGateView {
-                        variant: "?",
+                        variant: &event_variant,
                         cause: &event_cause,
                         event: &event_json,
                     }).await;
@@ -96,6 +95,27 @@ where
                     let duration = t0.elapsed();
 
                     let step_id = Uuid::new_v4();
+                    // Serialize each action/publish once into a Value so the
+                    // variant name extraction and the StepRecord payload share
+                    // the same JSON representation.
+                    let action_jsons: Vec<serde_json::Value> = outcome
+                        .actions
+                        .iter()
+                        .map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    let publish_jsons: Vec<serde_json::Value> = outcome
+                        .publishes
+                        .iter()
+                        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    let action_variants_owned: Vec<String> = action_jsons
+                        .iter()
+                        .map(|v| crate::machine::variant_name(v).to_owned())
+                        .collect();
+                    let publish_variants_owned: Vec<String> = publish_jsons
+                        .iter()
+                        .map(|v| crate::machine::variant_name(v).to_owned())
+                        .collect();
                     let actions: Vec<ActionEnvelope<M::Action>> = outcome
                         .actions
                         .into_iter()
@@ -108,13 +128,13 @@ where
                         .collect();
                     let action_ids: Vec<Uuid> = actions.iter().map(|e| e.id).collect();
                     let publish_ids: Vec<Uuid> = publishes.iter().map(|e| e.id).collect();
-                    // §37f populates the variant-name slices once
-                    // M::Action / M::Publish gain a name accessor.
-                    let action_variants: Vec<&str> = action_ids.iter().map(|_| "?").collect();
-                    let publish_variants: Vec<&str> = publish_ids.iter().map(|_| "?").collect();
+                    let action_variants: Vec<&str> =
+                        action_variants_owned.iter().map(String::as_str).collect();
+                    let publish_variants: Vec<&str> =
+                        publish_variants_owned.iter().map(String::as_str).collect();
 
                     self.tap.gate_outcome(self.core_id, &OutcomeGateView {
-                        source_event_variant: "?",
+                        source_event_variant: &event_variant,
                         action_variants: &action_variants,
                         action_ids: &action_ids,
                         publish_variants: &publish_variants,
@@ -139,26 +159,43 @@ where
                         recorded_at: Utc::now(),
                         duration,
                         kind: StepKind::Event,
-                        event_variant: "?",
+                        event_variant: &event_variant,
                         event: &event_json,
                         event_cause: &event_cause,
                         state_after: &state_json,
                         action_ids: &action_ids,
                         action_variants: &action_variants,
+                        action_payloads: &action_jsons,
                         publish_ids: &publish_ids,
                         publish_variants: &publish_variants,
+                        publish_payloads: &publish_jsons,
                     });
                 }
                 command = self.command_rx.recv() => {
                     let Some((cmd, reply)) = command else { break };
-                    // Command bodies are opaque to the gate views in
-                    // §37d; the kind tag is enough to distinguish them
-                    // in the step record stream.
                     let t0 = Instant::now();
                     let outcome = self.machine.handle_command(t0, cmd);
                     let duration = t0.elapsed();
 
                     let step_id = Uuid::new_v4();
+                    let action_jsons: Vec<serde_json::Value> = outcome
+                        .actions
+                        .iter()
+                        .map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    let publish_jsons: Vec<serde_json::Value> = outcome
+                        .publishes
+                        .iter()
+                        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    let action_variants_owned: Vec<String> = action_jsons
+                        .iter()
+                        .map(|v| crate::machine::variant_name(v).to_owned())
+                        .collect();
+                    let publish_variants_owned: Vec<String> = publish_jsons
+                        .iter()
+                        .map(|v| crate::machine::variant_name(v).to_owned())
+                        .collect();
                     let actions: Vec<ActionEnvelope<M::Action>> = outcome
                         .actions
                         .into_iter()
@@ -171,8 +208,10 @@ where
                         .collect();
                     let action_ids: Vec<Uuid> = actions.iter().map(|e| e.id).collect();
                     let publish_ids: Vec<Uuid> = publishes.iter().map(|e| e.id).collect();
-                    let action_variants: Vec<&str> = action_ids.iter().map(|_| "?").collect();
-                    let publish_variants: Vec<&str> = publish_ids.iter().map(|_| "?").collect();
+                    let action_variants: Vec<&str> =
+                        action_variants_owned.iter().map(String::as_str).collect();
+                    let publish_variants: Vec<&str> =
+                        publish_variants_owned.iter().map(String::as_str).collect();
 
                     self.tap.reserve_step_ids(
                         self.core_id,
@@ -192,10 +231,10 @@ where
                     let snapshot = self.machine.state_snapshot();
                     let state_json = serde_json::to_value(snapshot)
                         .unwrap_or(serde_json::Value::Null);
-                    // Commands don't carry an upstream Timed::cause; use
-                    // External(ManualCommand) as a stand-in until §37f
-                    // distinguishes "domain command" causes from
-                    // "operator command" causes.
+                    // Commands don't carry an upstream Timed::cause; tag as
+                    // External(ManualCommand) since commands originate from
+                    // outside the per-core event loop (web handlers, the
+                    // legacy bridge, etc.).
                     let cause = crate::machine::EventCause::External(
                         crate::machine::ExternalCause::ManualCommand,
                     );
@@ -205,14 +244,16 @@ where
                         recorded_at: Utc::now(),
                         duration,
                         kind: StepKind::Command { response: response_status },
-                        event_variant: "?",
+                        event_variant: "Command",
                         event: &serde_json::Value::Null,
                         event_cause: &cause,
                         state_after: &state_json,
                         action_ids: &action_ids,
                         action_variants: &action_variants,
+                        action_payloads: &action_jsons,
                         publish_ids: &publish_ids,
                         publish_variants: &publish_variants,
+                        publish_payloads: &publish_jsons,
                     });
                 }
             }
@@ -282,12 +323,12 @@ mod tests {
     use crate::shell::Shell;
     use crate::tap::{CoreId, NullRuntimeTap};
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     enum Event {
         Ping,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     enum Action {
         Pong,
     }
