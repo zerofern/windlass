@@ -72,6 +72,75 @@ async fn stalling_tap_does_not_block_runtime_progress() {
     );
 }
 
+// ── Acceptance test #3 — Per-core pause isolation ────────────────────────────
+
+#[tokio::test]
+async fn pause_mam_does_not_block_qbit() {
+    // D4: drive two separately-spawned ServiceRuntimes attached to a
+    // single ObservabilityController.  Pause one core, feed events to
+    // both, assert only the paused core stalls — the other runs to
+    // completion.  EC-2: pause is per-core, gates are the only place
+    // a tap may park.
+    use windlass_machine::CoreId;
+    use windlass_observability::ObservabilityController;
+
+    let ctrl = ObservabilityController::new();
+
+    let (mam_sink_tx, mut mam_sink_rx) = mpsc::unbounded_channel::<TinyAction>();
+    let (mam_handles, _mam_join) = windlass_machine::spawn::<TinyMachine, TinyShell>(
+        CoreId::Mam,
+        ctrl.clone(),
+        (),
+        mam_sink_tx,
+    )
+    .await;
+
+    let (qbit_sink_tx, mut qbit_sink_rx) = mpsc::unbounded_channel::<TinyAction>();
+    let (qbit_handles, _qbit_join) = windlass_machine::spawn::<TinyMachine, TinyShell>(
+        CoreId::Qbit,
+        ctrl.clone(),
+        (),
+        qbit_sink_tx,
+    )
+    .await;
+
+    ctrl.pause(CoreId::Mam);
+    assert!(ctrl.is_paused(CoreId::Mam));
+    assert!(!ctrl.is_paused(CoreId::Qbit));
+
+    let now = std::time::Instant::now();
+    mam_handles
+        .events
+        .send(Timed::external(now, ExternalCause::Init, TinyEvent::Ping))
+        .unwrap();
+    qbit_handles
+        .events
+        .send(Timed::external(now, ExternalCause::Init, TinyEvent::Ping))
+        .unwrap();
+
+    // qBit must dispatch quickly — it's not paused.
+    let qbit_action = tokio::time::timeout(Duration::from_millis(500), qbit_sink_rx.recv())
+        .await
+        .expect("qbit dispatched within timeout")
+        .expect("qbit sink open");
+    assert_eq!(qbit_action, TinyAction::Pong);
+
+    // MAM must NOT dispatch while paused — gate_event parks it.
+    let mam_result = tokio::time::timeout(Duration::from_millis(150), mam_sink_rx.recv()).await;
+    assert!(
+        mam_result.is_err(),
+        "mam should remain parked at gate_event while paused"
+    );
+
+    // Release MAM and confirm its action lands.
+    ctrl.resume(CoreId::Mam);
+    let mam_action = tokio::time::timeout(Duration::from_millis(500), mam_sink_rx.recv())
+        .await
+        .expect("mam dispatched after resume")
+        .expect("mam sink open");
+    assert_eq!(mam_action, TinyAction::Pong);
+}
+
 #[tokio::test]
 async fn panic_catching_tap_keeps_runtime_alive() {
     // D3: every `observed_step` would have panicked internally; the
