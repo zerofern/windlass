@@ -102,7 +102,7 @@ impl Shell for VpnShell {
                 let ip_file = self.vpn_ip_file.clone();
                 let port_file = self.vpn_port_file.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         vpn_files::read_port_files(&ip_file, &port_file)
                     })
@@ -142,7 +142,7 @@ impl Shell for VpnShell {
                 let http = self.http.clone();
                 let url = self.public_ip_verify_url.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let event = verify_public_ip(&http, &url).await;
                     let _ = tx.send(Timed::external(
                         std::time::Instant::now(),
@@ -158,7 +158,7 @@ impl Shell for VpnShell {
                 let http = self.http.clone();
                 let url = self.mam_ip_verify_url.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let event = verify_mam_ip(&http, &url).await;
                     let _ = tx.send(Timed::external(
                         std::time::Instant::now(),
@@ -169,7 +169,7 @@ impl Shell for VpnShell {
             }
             VpnAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
                     let _ = tx.send(Timed::external(

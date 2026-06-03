@@ -49,7 +49,7 @@ impl Shell for DockerShell {
         match action {
             DockerAction::StartContainer { name } => {
                 let docker = self.docker.bollard().clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     if let Err(e) = docker
                         .start_container(&name, None::<StartContainerOptions<String>>)
                         .await
@@ -60,7 +60,7 @@ impl Shell for DockerShell {
             }
             DockerAction::StopContainer { name } => {
                 let docker = self.docker.bollard().clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let options = StopContainerOptions { t: 10 };
                     if let Err(e) = docker.stop_container(&name, Some(options)).await {
                         warn!("Docker stop_container({name}) failed: {e}");
@@ -69,7 +69,7 @@ impl Shell for DockerShell {
             }
             DockerAction::RestartContainer { name } => {
                 let docker = self.docker.bollard().clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let options = RestartContainerOptions { t: 0 };
                     if let Err(e) = docker.restart_container(&name, Some(options)).await {
                         warn!("Docker restart_container({name}) failed: {e}");
@@ -79,7 +79,7 @@ impl Shell for DockerShell {
             DockerAction::InspectContainer { name } => {
                 let docker = self.docker.bollard().clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     // §38 PR 6: also probe health here so domain can
                     // forward an initial ContainerHealthy/Unhealthy to
                     // the VPN core at boot, replacing the legacy
@@ -113,7 +113,7 @@ impl Shell for DockerShell {
                 let docker = self.docker.bollard().clone();
                 let dump_dir = self.docker.dump_dir.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     match dump_one(&docker, &dump_dir, &name).await {
                         Ok(path) => {
                             let _ = tx.send(Timed::external(
@@ -135,7 +135,7 @@ impl Shell for DockerShell {
             DockerAction::DiscoverDependents => {
                 let docker = self.docker.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let names = docker.discover_dependents().await;
                     let _ = tx.send(Timed::external(
                         std::time::Instant::now(),
@@ -154,7 +154,7 @@ impl Shell for DockerShell {
 /// spawn_event_watcher` which is anchor-only and feeds `Event::Docker
 /// Gluetun*` for the legacy path.
 fn spawn_event_watcher(docker: Docker, event_tx: UnboundedSender<Timed<DockerEvent>>) {
-    tokio::spawn(async move {
+    windlass_machine::causal::spawn(async move {
         loop {
             let mut stream = docker.events(None::<bollard::system::EventsOptions<String>>);
             while let Some(item) = stream.next().await {

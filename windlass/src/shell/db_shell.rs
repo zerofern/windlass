@@ -24,7 +24,7 @@ impl Shell for DbShell {
             DbAction::Execute(command) => {
                 let actor = self.actor.clone();
                 let event_tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let result = actor.handle(command).await;
                     let _ = event_tx.send(Timed::external(
                         std::time::Instant::now(),

@@ -28,7 +28,7 @@ impl Shell for QbitShell {
             QbitAction::Login => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     // §36 step 3 / §36 step 9a: credentials rejection
                     // (`QbitAuthResult::Rejected`) routes to AuthRejected
                     // so domain can fire a Critical alert.  Transient
@@ -56,7 +56,7 @@ impl Shell for QbitShell {
             QbitAction::ReadPreferences { cookie } => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let event = client.get_preferences(&cookie).await.map_or_else(
                         || QbitEvent::PreferencesFailed {
                             reason: "failed to fetch preferences".to_string(),
@@ -79,7 +79,7 @@ impl Shell for QbitShell {
             QbitAction::DisableBannedPrivacySettings { cookie } => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let event = if client.set_private_tracker_safe_prefs(&cookie).await {
                         QbitEvent::PrivacySettingsDisabled
                     } else {
@@ -97,7 +97,7 @@ impl Shell for QbitShell {
             QbitAction::SetListenPort { cookie, port } => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let event = match client.sync_port(&cookie, port).await {
                         QbitPortSyncResult::Success => QbitEvent::ListenPortSet { port },
                         QbitPortSyncResult::Failed(code) => QbitEvent::ListenPortSetFailed {
@@ -115,7 +115,7 @@ impl Shell for QbitShell {
             QbitAction::ListTorrents { cookie } => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let details = client.list_torrent_details(&cookie).await;
                     let now = chrono::Utc::now();
                     let torrents: Vec<TorrentRecord> = details
@@ -139,31 +139,31 @@ impl Shell for QbitShell {
             }
             QbitAction::DeleteTorrent { cookie, hash } => {
                 let client = self.client.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     client.delete_torrent(&cookie, &hash).await;
                 });
             }
             QbitAction::SetAllFilesPriority { cookie, hash } => {
                 let client = self.client.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     client.set_all_files_priority(&cookie, &hash).await;
                 });
             }
             QbitAction::PauseTorrent { cookie, hash } => {
                 let client = self.client.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     client.pause_torrent(&cookie, &hash).await;
                 });
             }
             QbitAction::ResumeTorrent { cookie, hash } => {
                 let client = self.client.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     client.resume_torrent(&cookie, &hash).await;
                 });
             }
             QbitAction::ForceResumeTorrent { cookie, hash } => {
                 let client = self.client.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     client.force_resume_torrent(&cookie, &hash).await;
                 });
             }
@@ -179,7 +179,7 @@ impl Shell for QbitShell {
             } => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let event = match client.add_torrent(&cookie, bytes).await {
                         Some(hash) => QbitEvent::TorrentAdded { mam_id, hash },
                         None => QbitEvent::TorrentAddFailed {
@@ -196,7 +196,7 @@ impl Shell for QbitShell {
             }
             QbitAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
                     let _ = tx.send(Timed::external(

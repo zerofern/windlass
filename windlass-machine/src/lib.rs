@@ -1,5 +1,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+pub mod causal;
 pub mod machine;
 pub mod pubsub;
 pub mod runtime;

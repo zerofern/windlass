@@ -56,16 +56,23 @@ where
     /// Apply one outcome: dispatch each action envelope through the
     /// shell, fan each publish envelope out through `TopicFanout`.
     ///
-    /// Action IDs ride along through `CausalTx` in §37e (HTTP tap).
-    /// Publish IDs ride along through `TopicFanout` once it switches
-    /// to envelope-aware sends (planned follow-up to §37d under C2).
+    /// Each `Shell::dispatch` call runs inside a
+    /// [`crate::causal::CURRENT_ACTION_ID`] scope keyed to the action
+    /// envelope's id.  Shells that spawn HTTP work must re-establish
+    /// the scope inside their spawned future via
+    /// [`crate::causal::scope`] so the eventual
+    /// `HttpTap::observed_exchange` call inside the HTTP client can
+    /// read the id and tag the captured exchange.
     fn apply(
         &mut self,
         actions: Vec<ActionEnvelope<M::Action>>,
         publishes: Vec<PublishEnvelope<M::Publish>>,
     ) {
         for env in actions {
-            self.shell.dispatch(env.payload, &self.event_tx);
+            let id = env.id;
+            crate::causal::CURRENT_ACTION_ID.sync_scope(Some(id), || {
+                self.shell.dispatch(env.payload, &self.event_tx);
+            });
         }
         for env in publishes {
             self.fanout.send(&env.payload);

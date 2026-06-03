@@ -664,7 +664,12 @@ impl HttpTap for ObservabilityController {
 
         let stored = StoredHttpExchange {
             exchange_id: Uuid::new_v4(),
-            action_id: None, // §37 follow-up: read from CausalTx task-local
+            // Read the action id from the task-local set by
+            // ServiceRuntime::apply → Shell::dispatch → causal::spawn
+            // (windlass-machine/src/causal.rs).  `None` is correct for
+            // exchanges captured outside any action (e.g. a timer-fire
+            // path that issues an HTTP request directly).
+            action_id: windlass_machine::causal::current(),
             core,
             at: Utc::now(),
             method: exchange.method.clone(),

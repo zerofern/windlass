@@ -24,7 +24,7 @@ impl Shell for MamShell {
             MamAction::FetchStatus => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     // §28: map the typed MamFetchError surface to the right
                     // MAM-core event so the machine can publish Unreachable
                     // vs StatusFailed vs RateLimited distinctly.
@@ -53,7 +53,7 @@ impl Shell for MamShell {
             MamAction::UpdateSeedbox => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     // §36 step 9a: typed result direct from the client —
                     // shell maps each variant to the matching MamEvent.
                     let event = match client.update_seedbox().await {
@@ -88,7 +88,7 @@ impl Shell for MamShell {
             }
             MamAction::ScheduleTimer { timer, after } => {
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
                     let _ = tx.send(Timed::external(
@@ -105,7 +105,7 @@ impl Shell for MamShell {
             MamAction::FetchTorrentBytes { mam_id } => {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                windlass_machine::causal::spawn(async move {
                     let event = match client.fetch_torrent(mam_id).await {
                         Some(bytes) => MamEvent::TorrentBytesFetched { mam_id, bytes },
                         None => MamEvent::TorrentBytesFetchFailed {
