@@ -55,6 +55,17 @@ pub const SSE_PROTOCOL_VERSION: u32 = 1;
 /// (drop-oldest); the runtime never backpressures (EC-5).
 const SSE_BROADCAST_CAPACITY: usize = 1024;
 
+/// §37pre B-locked: bounded internal channel for step-record writes.
+/// `observed_step` (called on the runtime task) `try_send`s into this
+/// channel; on overflow the runtime side drops with a per-core
+/// counter increment.  A single worker drains the channel and applies
+/// each write (lock acquisition + ring push + index update + SSE
+/// broadcast).
+const STEP_RECORD_CHANNEL_SIZE: usize = 4096;
+
+/// §37pre B-locked: bounded internal channel for HTTP-exchange writes.
+const HTTP_EXCHANGE_CHANNEL_SIZE: usize = 1024;
+
 // ── ObservabilityController ───────────────────────────────────────────────────
 
 /// The live observability backend.
@@ -85,6 +96,28 @@ pub struct ObservabilityController {
     /// Runtime-configurable budgets.  Used at capture time for body
     /// truncation; ring sizes were already baked at construction.
     config: ObservabilityConfig,
+    /// Bounded sender for step-record writes (EC-5).  The runtime
+    /// task `try_send`s into this; a worker drains it.
+    step_tx: tokio::sync::mpsc::Sender<StepWriteMsg>,
+    /// Bounded sender for HTTP-exchange writes (EC-5).
+    http_tx: tokio::sync::mpsc::Sender<HttpWriteMsg>,
+}
+
+/// Internal envelope carrying a captured step-record from the runtime
+/// task to the worker that owns ring + SSE writes.
+struct StepWriteMsg {
+    core: CoreId,
+    record: StoredStepRecord,
+}
+
+/// Internal envelope carrying a captured HTTP exchange from the
+/// runtime task to the worker.  Truncation flags ride along so the
+/// worker can advance the per-class drop counter atomically with the
+/// record push.
+struct HttpWriteMsg {
+    exchange: StoredHttpExchange,
+    request_truncated: bool,
+    response_truncated: bool,
 }
 
 /// Inner storage for the variant-keyed breakpoint registry.  One flat
@@ -135,7 +168,9 @@ impl ObservabilityController {
     #[must_use]
     pub fn with_config(config: ObservabilityConfig) -> Arc<Self> {
         let (sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
-        Arc::new(Self {
+        let (step_tx, step_rx) = tokio::sync::mpsc::channel(STEP_RECORD_CHANNEL_SIZE);
+        let (http_tx, http_rx) = tokio::sync::mpsc::channel(HTTP_EXCHANGE_CHANNEL_SIZE);
+        let this = Arc::new(Self {
             cores: std::array::from_fn(|_| CoreState::new(config)),
             http_ring: Mutex::new(HttpExchangeRing::new(
                 config.http_exchanges_total,
@@ -147,7 +182,18 @@ impl ObservabilityController {
             breakpoints: ArcSwap::from_pointee(BreakpointSet::default()),
             sse_tx,
             config,
-        })
+            step_tx,
+            http_tx,
+        });
+
+        // EC-5 worker tasks.  Each holds a Weak<Self> so the controller
+        // can be dropped (e.g. in tests) without the workers extending
+        // its lifetime.  When the controller drops, the channels close
+        // and the workers exit cleanly.
+        spawn_step_worker(Arc::downgrade(&this), step_rx);
+        spawn_http_worker(Arc::downgrade(&this), http_rx);
+
+        this
     }
 
     fn core(&self, id: CoreId) -> &CoreState {
@@ -498,6 +544,50 @@ impl ObservabilityController {
     }
 }
 
+// ── EC-5 write workers ────────────────────────────────────────────────────────
+
+/// Spawn the worker that drains the bounded step-record channel and
+/// applies each push to its per-core ring + indices + SSE.  Exits when
+/// the channel closes (controller dropped).
+fn spawn_step_worker(
+    weak: std::sync::Weak<ObservabilityController>,
+    mut rx: tokio::sync::mpsc::Receiver<StepWriteMsg>,
+) {
+    tokio::spawn(async move {
+        while let Some(StepWriteMsg { core, record }) = rx.recv().await {
+            let Some(this) = weak.upgrade() else { break };
+            this.push_step_record(core, record).await;
+        }
+    });
+}
+
+/// Spawn the worker that drains the bounded HTTP-exchange channel.
+fn spawn_http_worker(
+    weak: std::sync::Weak<ObservabilityController>,
+    mut rx: tokio::sync::mpsc::Receiver<HttpWriteMsg>,
+) {
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let Some(this) = weak.upgrade() else { break };
+            if msg.request_truncated || msg.response_truncated {
+                let mut loss = this.loss.lock().await;
+                if msg.request_truncated {
+                    loss.http.truncated_request_bodies =
+                        loss.http.truncated_request_bodies.saturating_add(1);
+                }
+                if msg.response_truncated {
+                    loss.http.truncated_response_bodies =
+                        loss.http.truncated_response_bodies.saturating_add(1);
+                }
+                let loss_msg = loss.clone();
+                drop(loss);
+                this.broadcast(SseMessage::Loss(loss_msg));
+            }
+            this.push_http_exchange(msg.exchange).await;
+        }
+    });
+}
+
 // ── Secret reveal helpers ─────────────────────────────────────────────────────
 
 /// Walk a stored step record for a `ServerSecretSlot` whose `reveal_id`
@@ -650,15 +740,25 @@ impl RuntimeTap for ObservabilityController {
                 .collect(),
         };
 
-        // Push into the async-locked ring on a detached task so this
-        // method stays non-blocking (EC-1).  The internal channel /
-        // worker pattern described in EC-5 is over-engineered while
-        // tokio::spawn is available; if we ever need backpressure
-        // accounting we can introduce a bounded channel here.
-        let this = self.clone_arc();
-        tokio::spawn(async move {
-            this.push_step_record(core, record).await;
-        });
+        // EC-1 + EC-5: hand off to the bounded internal channel.
+        // `try_send` is non-blocking; on overflow we drop the record
+        // and increment the per-core `dropped_steps` counter so the
+        // loss surfaces in the UI.  The dedicated worker drains the
+        // channel and applies the ring/index/SSE writes off the
+        // runtime task.
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+            self.step_tx.try_send(StepWriteMsg { core, record })
+        {
+            let this = self.clone_arc();
+            tokio::spawn(async move {
+                let mut loss = this.loss.lock().await;
+                let counters = loss.core_mut(core);
+                counters.dropped_steps = counters.dropped_steps.saturating_add(1);
+                let loss_msg = loss.clone();
+                drop(loss);
+                this.broadcast(SseMessage::Loss(loss_msg));
+            });
+        }
     }
 }
 
@@ -741,24 +841,24 @@ impl HttpTap for ObservabilityController {
             duration_ms: 0,
         };
 
-        let this = self.clone_arc();
-        tokio::spawn(async move {
-            if request_truncated || response_truncated {
+        // EC-1 + EC-5: bounded handoff.  Drop with a counter bump on
+        // overflow rather than blocking the runtime.
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+            self.http_tx.try_send(HttpWriteMsg {
+                exchange: stored,
+                request_truncated,
+                response_truncated,
+            })
+        {
+            let this = self.clone_arc();
+            tokio::spawn(async move {
                 let mut loss = this.loss.lock().await;
-                if request_truncated {
-                    loss.http.truncated_request_bodies =
-                        loss.http.truncated_request_bodies.saturating_add(1);
-                }
-                if response_truncated {
-                    loss.http.truncated_response_bodies =
-                        loss.http.truncated_response_bodies.saturating_add(1);
-                }
+                loss.http.dropped_exchanges = loss.http.dropped_exchanges.saturating_add(1);
                 let loss_msg = loss.clone();
                 drop(loss);
                 this.broadcast(SseMessage::Loss(loss_msg));
-            }
-            this.push_http_exchange(stored).await;
-        });
+            });
+        }
     }
 
     fn signal_anomaly(&self, core: CoreId, anomaly: HttpAnomaly) {
@@ -783,8 +883,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn controller_pause_resume_round_trip() {
+    #[tokio::test]
+    async fn controller_pause_resume_round_trip() {
         let c = ObservabilityController::new();
         assert!(!c.is_paused(CoreId::Vpn));
         c.pause(CoreId::Vpn);
@@ -793,8 +893,8 @@ mod tests {
         assert!(!c.is_paused(CoreId::Vpn));
     }
 
-    #[test]
-    fn pause_all_pauses_every_core() {
+    #[tokio::test]
+    async fn pause_all_pauses_every_core() {
         let c = ObservabilityController::new();
         c.pause_all();
         for id in CoreId::all() {
@@ -960,8 +1060,8 @@ mod tests {
         parked.await.unwrap();
     }
 
-    #[test]
-    fn active_breakpoints_returns_all_categories() {
+    #[tokio::test]
+    async fn active_breakpoints_returns_all_categories() {
         let ctrl = ObservabilityController::new();
         ctrl.add_event_breakpoint("E");
         ctrl.add_action_breakpoint("A");
@@ -971,6 +1071,53 @@ mod tests {
         assert_eq!(all.len(), 4);
         ctrl.remove_event_breakpoint("E");
         assert_eq!(ctrl.active_breakpoints().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn step_channel_overflow_increments_dropped_steps_counter() {
+        // EC-5: bounded internal channel + drop-on-overflow with a
+        // per-core counter increment.  Fill the channel by issuing
+        // `STEP_RECORD_CHANNEL_SIZE + N` records back-to-back without
+        // yielding so the worker can't drain; expect at least one
+        // drop counted.
+        let ctrl = ObservabilityController::new();
+        let view_event = serde_json::Value::Null;
+        let view_state = serde_json::Value::Null;
+        let cause = EventCause::External(ExternalCause::Init);
+        for _ in 0..(STEP_RECORD_CHANNEL_SIZE + 100) {
+            ctrl.observed_step(
+                CoreId::Vpn,
+                &StepRecordView {
+                    core: CoreId::Vpn,
+                    step_id: Uuid::new_v4(),
+                    recorded_at: Utc::now(),
+                    duration: Duration::from_millis(0),
+                    kind: windlass_machine::StepKind::Event,
+                    event_variant: "T",
+                    event: &view_event,
+                    event_cause: &cause,
+                    state_after: &view_state,
+                    action_ids: &[],
+                    action_variants: &[],
+                    action_payloads: &[],
+                    publish_ids: &[],
+                    publish_variants: &[],
+                    publish_payloads: &[],
+                },
+            );
+        }
+        // The drop-counter bump is itself async (we spawn into loss);
+        // give the runtime a chance to drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let loss = ctrl.loss.lock().await.clone();
+        let dropped = loss
+            .per_core
+            .get(&CoreId::Vpn)
+            .map_or(0, |c| c.dropped_steps);
+        assert!(
+            dropped > 0,
+            "expected at least one dropped step, got loss={loss:?}"
+        );
     }
 
     #[tokio::test]
