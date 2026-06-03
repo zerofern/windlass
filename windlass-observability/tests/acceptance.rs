@@ -50,6 +50,43 @@ async fn fanout_bridge_preserves_publish_id() {
     common::d8_fanout_bridge::run().await;
 }
 
+// ── Acceptance test #2 — Observer cannot block dispatch ──────────────────────
+
+#[tokio::test]
+async fn stalling_tap_does_not_block_runtime_progress() {
+    // D2: `observed_step` simulates "internal storage stalled" by
+    // spawning a forever-sleep on its own task and returning
+    // immediately.  EC-1: the runtime keeps making forward progress
+    // because the runtime task never awaits the tap's internal work.
+    use std::sync::atomic::Ordering;
+    let tap = Arc::new(common::d2_d3_stalling_panicking::StallingRuntimeTap::new());
+    let actions = drive_sequence(tap.clone() as _).await;
+    assert_eq!(
+        actions.len(),
+        5,
+        "runtime should dispatch all five actions even while the tap is stalled"
+    );
+    assert!(
+        tap.observed_count.load(Ordering::SeqCst) >= 5,
+        "tap should have been invoked at least once per dispatched action"
+    );
+}
+
+#[tokio::test]
+async fn panic_catching_tap_keeps_runtime_alive() {
+    // D3: every `observed_step` would have panicked internally; the
+    // tap impl catches its own panic (EC-1 trait-boundary contract)
+    // and increments a counter.  The runtime keeps dispatching.
+    let tap = Arc::new(common::d2_d3_stalling_panicking::PanickingRuntimeTap::new());
+    let actions = drive_sequence(tap.clone() as _).await;
+    assert_eq!(actions.len(), 5, "runtime should dispatch every action");
+    assert_eq!(
+        *tap.panics_caught.lock().unwrap(),
+        5,
+        "tap should have caught five would-be panics"
+    );
+}
+
 /// Drive a fixed `Ping` sequence into a runtime built with the given
 /// tap, returning the actions the shell dispatched in order.  The
 /// inputs are identical across taps so any observable difference must

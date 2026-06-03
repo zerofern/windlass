@@ -3,5 +3,6 @@
 //! separate integration-test crate.
 
 pub mod d1_recording_tap;
+pub mod d2_d3_stalling_panicking;
 pub mod d8_fanout_bridge;
 pub mod support;
