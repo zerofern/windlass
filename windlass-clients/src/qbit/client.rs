@@ -69,15 +69,21 @@ impl QbitClient {
     /// §37e: per-send-site `gate_request` helper.  Parks on qBit's
     /// pause flag when set; returns immediately otherwise.
     pub(crate) async fn gate_request(&self, method: &str, url: &str) {
+        self.gate_request_with_body(method, url, None).await;
+    }
+
+    /// Variant that carries the request body.  Used by POST sites
+    /// (auth, port sync, file-priority, torrent add/pause/resume/etc.)
+    /// so the operator can see what's about to be sent while parked
+    /// at `ParkedAtHttp`.
+    pub(crate) async fn gate_request_with_body(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&serde_json::Value>,
+    ) {
         self.hook
-            .gate_request(
-                CoreId::Qbit,
-                &HttpRequestView {
-                    method,
-                    url,
-                    body: None,
-                },
-            )
+            .gate_request(CoreId::Qbit, &HttpRequestView { method, url, body })
             .await;
     }
 
@@ -86,7 +92,13 @@ impl QbitClient {
     /// AuthFailed / AuthRejected` without depending on legacy core types.
     pub async fn authenticate(&self) -> QbitAuthResult {
         let url = format!("{}/api/v2/auth/login", self.base_url);
-        self.gate_request("POST", &url).await;
+        let body = serde_json::json!({
+            "username": self.user.as_str(),
+            // Cleartext password — wrapped by ServerSecretSlot at capture
+            // time so it serializes to WireRedacted on the wire.
+            "password": self.pass.expose_secret(),
+        });
+        self.gate_request_with_body("POST", &url, Some(&body)).await;
         match self
             .client
             .post(&url)
@@ -132,7 +144,9 @@ impl QbitClient {
     pub async fn sync_port(&self, cookie: &AuthCookie, port: VpnPort) -> QbitPortSyncResult {
         let url = format!("{}/api/v2/app/setPreferences", self.base_url);
         let req_body = format!(r#"{{"listen_port":"{}"}}"#, port.into_inner());
-        self.gate_request("POST", &url).await;
+        let body_view = serde_json::json!({ "json": &req_body });
+        self.gate_request_with_body("POST", &url, Some(&body_view))
+            .await;
         match self
             .client
             .post(&url)
