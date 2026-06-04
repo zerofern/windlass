@@ -180,7 +180,10 @@ pub trait Machine: Sized {
     /// in the captured `StoredStepRecord` and extract variant names.
     type Action: Serialize + Send + 'static;
     type Publish: HasTopic<Self::Topic> + Serialize + Clone + Send + 'static;
-    type Topic: DeserializeOwned + PartialEq + Clone + Send + 'static;
+    /// `Serialize` is required so the runtime can record the topic
+    /// each publish was emitted on into the captured `StoredPublish`
+    /// (`docs/observability-redesign.md` Stored records, line 419).
+    type Topic: Serialize + DeserializeOwned + PartialEq + Clone + Send + 'static;
     type Command: DeserializeOwned + Send + 'static;
     type Response: Serialize + Send + 'static;
 

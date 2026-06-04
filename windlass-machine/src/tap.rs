@@ -114,6 +114,11 @@ pub struct StepRecordView<'a> {
     pub publish_ids: &'a [Uuid],
     pub publish_variants: &'a [&'a str],
     pub publish_payloads: &'a [serde_json::Value],
+    /// Topic each publish was emitted on, parallel to `publish_ids`.
+    /// Recorded into `StoredPublish.topic` so the UI can filter and
+    /// the operator can audit which topic produced a downstream
+    /// event.  See `docs/observability-redesign.md` Stored records.
+    pub publish_topics: &'a [&'a str],
 }
 
 // ── RuntimeTap ────────────────────────────────────────────────────────────────

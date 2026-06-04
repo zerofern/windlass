@@ -115,6 +115,16 @@ where
                         .iter()
                         .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
                         .collect();
+                    let publish_topics_owned: Vec<String> = outcome
+                        .publishes
+                        .iter()
+                        .map(|p| {
+                            let topic = <M::Publish as crate::pubsub::HasTopic<M::Topic>>::topic(p);
+                            let v = serde_json::to_value(&topic)
+                                .unwrap_or(serde_json::Value::Null);
+                            crate::machine::variant_name(&v).to_owned()
+                        })
+                        .collect();
                     let action_variants_owned: Vec<String> = action_jsons
                         .iter()
                         .map(|v| crate::machine::variant_name(v).to_owned())
@@ -139,6 +149,8 @@ where
                         action_variants_owned.iter().map(String::as_str).collect();
                     let publish_variants: Vec<&str> =
                         publish_variants_owned.iter().map(String::as_str).collect();
+                    let publish_topics: Vec<&str> =
+                        publish_topics_owned.iter().map(String::as_str).collect();
 
                     self.tap.gate_outcome(self.core_id, &OutcomeGateView {
                         source_event_variant: &event_variant,
@@ -176,6 +188,7 @@ where
                         publish_ids: &publish_ids,
                         publish_variants: &publish_variants,
                         publish_payloads: &publish_jsons,
+                        publish_topics: &publish_topics,
                     });
                 }
                 command = self.command_rx.recv() => {
@@ -194,6 +207,16 @@ where
                         .publishes
                         .iter()
                         .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    let publish_topics_owned: Vec<String> = outcome
+                        .publishes
+                        .iter()
+                        .map(|p| {
+                            let topic = <M::Publish as crate::pubsub::HasTopic<M::Topic>>::topic(p);
+                            let v = serde_json::to_value(&topic)
+                                .unwrap_or(serde_json::Value::Null);
+                            crate::machine::variant_name(&v).to_owned()
+                        })
                         .collect();
                     let action_variants_owned: Vec<String> = action_jsons
                         .iter()
@@ -219,6 +242,8 @@ where
                         action_variants_owned.iter().map(String::as_str).collect();
                     let publish_variants: Vec<&str> =
                         publish_variants_owned.iter().map(String::as_str).collect();
+                    let publish_topics: Vec<&str> =
+                        publish_topics_owned.iter().map(String::as_str).collect();
 
                     self.tap.reserve_step_ids(
                         self.core_id,
@@ -261,6 +286,7 @@ where
                         publish_ids: &publish_ids,
                         publish_variants: &publish_variants,
                         publish_payloads: &publish_jsons,
+                        publish_topics: &publish_topics,
                     });
                 }
             }

@@ -765,9 +765,10 @@ impl RuntimeTap for ObservabilityController {
                 .iter()
                 .zip(view.publish_variants.iter())
                 .zip(view.publish_payloads.iter())
-                .map(|((id, variant), payload)| StoredPublish {
+                .zip(view.publish_topics.iter())
+                .map(|(((id, variant), payload), topic)| StoredPublish {
                     publish_id: *id,
-                    topic: String::new(),
+                    topic: (*topic).to_owned(),
                     variant: (*variant).to_owned(),
                     payload: payload.clone(),
                 })
@@ -1275,6 +1276,7 @@ mod tests {
                     publish_ids: &[],
                     publish_variants: &[],
                     publish_payloads: &[],
+                    publish_topics: &[],
                 },
             );
         }

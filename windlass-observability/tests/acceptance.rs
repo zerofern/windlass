@@ -42,6 +42,56 @@ async fn observer_equivalence_for_event_sequence() {
 }
 
 #[tokio::test]
+async fn step_record_publishes_carry_topic_name() {
+    // §37pre Stored records: `StoredPublish.topic` carries the topic
+    // name the publish was emitted on, so the UI can filter and the
+    // operator can audit which topic produced a downstream event.
+    use windlass_observability::{ObservabilityController, SseMessage};
+
+    let ctrl = ObservabilityController::new();
+    let mut rx = ctrl.subscribe();
+
+    let (sink_tx, _sink_rx) = mpsc::unbounded_channel::<TinyAction>();
+    let (handles, _join) = windlass_machine::spawn::<TinyMachine, TinyShell>(
+        windlass_machine::CoreId::Vpn,
+        ctrl.clone(),
+        (),
+        sink_tx,
+    )
+    .await;
+
+    handles
+        .events
+        .send(Timed::external(
+            std::time::Instant::now(),
+            ExternalCause::Init,
+            TinyEvent::Ping,
+        ))
+        .unwrap();
+
+    let mut saw_topic = false;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        if let Ok(msg) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            if let Ok(SseMessage::Step(record)) = msg {
+                for publish in &record.publishes {
+                    assert_eq!(
+                        publish.topic, "Beeps",
+                        "publish topic must round-trip into StoredPublish"
+                    );
+                    saw_topic = true;
+                }
+                if saw_topic {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_topic, "expected at least one publish with a topic");
+    drop(handles);
+}
+
+#[tokio::test]
 async fn fanout_bridge_preserves_publish_id() {
     // D8: a publish emitted by core A with publish_id X must arrive
     // at a subscriber bridge in core B with `Timed::from_publish(now,
@@ -172,6 +222,7 @@ async fn ring_eviction_emits_evicted_message_and_drops_indices() {
                 publish_ids: std::slice::from_ref(&publish_ids[i]),
                 publish_variants: &["P"],
                 publish_payloads: &publish_payload,
+                publish_topics: &["TestTopic"],
             },
         );
     }
