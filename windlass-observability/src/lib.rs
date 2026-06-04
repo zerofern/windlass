@@ -44,10 +44,13 @@ pub use sse::{
     StoredLogLine,
 };
 pub use stored::{
-    BodyCapture, BodyKind, MaybeSecret, ServerSecretSlot, StoredAction, StoredEventCause,
-    StoredExternalCause, StoredHttpExchange, StoredPublish, StoredStepRecord, WireRedacted,
-    redact_headers,
+    BodyCapture, BodyKind, MaybeSecret, ServerSecretSlot, StoredAction, StoredHttpExchange,
+    StoredPublish, StoredStepRecord, WireRedacted, redact_headers,
 };
+// Re-export the cause types from `windlass-machine` for backward
+// compatibility — they were moved upstream so `CoreStatus` can carry
+// `StoredEventCause` without a circular dep.
+pub use windlass_machine::{StoredEventCause, StoredExternalCause};
 
 /// SSE protocol version emitted in `HelloSnapshot.protocol_version`.
 pub const SSE_PROTOCOL_VERSION: u32 = 1;
@@ -646,6 +649,7 @@ impl RuntimeTap for ObservabilityController {
         let parked = CoreStatus::ParkedAtEvent {
             variant: view.variant.to_owned(),
             since: Utc::now(),
+            cause: view.cause.into(),
             preview: view.event.clone(),
         };
         c.status.store(Arc::new(parked.clone()));
@@ -979,6 +983,50 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         ctrl.step(CoreId::Vpn);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parked_at_event_carries_cause_and_preview() {
+        // §37pre A11: ParkedAtEvent must carry both the event preview
+        // and the upstream cause, so the cores rail can render "park
+        // @ event Foo (caused by …)" and the operator can jump back
+        // to the originating step.
+        use crate::StoredEventCause;
+        let ctrl = ObservabilityController::new();
+        ctrl.pause(CoreId::Mam);
+        let event_json = serde_json::json!({"PortReady": {"port": 51820}});
+        let action_id = Uuid::new_v4();
+        let cause = EventCause::Action(action_id);
+
+        let event_for_task = event_json.clone();
+        let ctrl2 = ctrl.clone();
+        let handle = tokio::spawn(async move {
+            ctrl2
+                .gate_event(
+                    CoreId::Mam,
+                    &EventGateView {
+                        variant: "PortReady",
+                        cause: &cause,
+                        event: &event_for_task,
+                    },
+                )
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let status = (*ctrl.status(CoreId::Mam)).clone();
+        match status {
+            CoreStatus::ParkedAtEvent {
+                cause: stored_cause,
+                preview,
+                ..
+            } => {
+                assert_eq!(stored_cause, StoredEventCause::Action { id: action_id });
+                assert_eq!(preview, event_json);
+            }
+            other => panic!("expected ParkedAtEvent, got {other:?}"),
+        }
+        ctrl.step(CoreId::Mam);
         handle.await.unwrap();
     }
 

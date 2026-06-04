@@ -223,7 +223,7 @@ mod tests {
     use uuid::Uuid;
     use windlass_machine::{CoreId, StepKind};
 
-    use crate::stored::StoredEventCause;
+    use windlass_machine::StoredEventCause;
 
     fn small_record(byte_padding: usize) -> StoredStepRecord {
         // Pad the event_variant string to drive the byte budget.
@@ -236,7 +236,7 @@ mod tests {
             kind: StepKind::Event,
             event_variant: pad,
             event: serde_json::Value::Null,
-            event_cause: StoredEventCause::External(crate::stored::StoredExternalCause::Init),
+            event_cause: StoredEventCause::External(windlass_machine::StoredExternalCause::Init),
             state_after: serde_json::Value::Null,
             actions: Vec::new(),
             publishes: Vec::new(),

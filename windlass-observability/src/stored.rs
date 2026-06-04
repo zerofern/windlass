@@ -8,60 +8,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use windlass_machine::{CoreId, StepKind};
-
-// ── Causal chain (wire-side mirror of `windlass_machine::EventCause`) ─────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "source", rename_all = "snake_case")]
-pub enum StoredExternalCause {
-    Timer { name: String },
-    FileWatcher { path: String },
-    DockerEvent { kind: String },
-    ManualCommand,
-    Init,
-    Unknown,
-}
-
-/// Wire/storage counterpart of [`windlass_machine::EventCause`].  Uses
-/// `String` instead of `&'static str` / `PathBuf` so the frontend sees
-/// owned data and the `PathBuf` serialization choice doesn't leak.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StoredEventCause {
-    Action { id: Uuid },
-    Publish { id: Uuid },
-    External(StoredExternalCause),
-}
-
-impl From<&windlass_machine::EventCause> for StoredEventCause {
-    fn from(cause: &windlass_machine::EventCause) -> Self {
-        match cause {
-            windlass_machine::EventCause::Action(id) => Self::Action { id: *id },
-            windlass_machine::EventCause::Publish(id) => Self::Publish { id: *id },
-            windlass_machine::EventCause::External(ext) => Self::External(ext.into()),
-        }
-    }
-}
-
-impl From<&windlass_machine::ExternalCause> for StoredExternalCause {
-    fn from(cause: &windlass_machine::ExternalCause) -> Self {
-        match cause {
-            windlass_machine::ExternalCause::Timer { name } => Self::Timer {
-                name: (*name).to_owned(),
-            },
-            windlass_machine::ExternalCause::FileWatcher { path } => Self::FileWatcher {
-                path: path.to_string_lossy().into_owned(),
-            },
-            windlass_machine::ExternalCause::DockerEvent { kind } => Self::DockerEvent {
-                kind: (*kind).to_owned(),
-            },
-            windlass_machine::ExternalCause::ManualCommand => Self::ManualCommand,
-            windlass_machine::ExternalCause::Init => Self::Init,
-            windlass_machine::ExternalCause::Unknown => Self::Unknown,
-        }
-    }
-}
+use windlass_machine::{CoreId, StepKind, StoredEventCause};
 
 // ── Secret slots ──────────────────────────────────────────────────────────────
 

@@ -59,6 +59,11 @@ pub enum CoreStatus {
     ParkedAtEvent {
         variant: String,
         since: DateTime<Utc>,
+        /// The upstream cause of the parked event — action / publish
+        /// id, or an external source.  Lets the cores rail show "park
+        /// @ event Foo (caused by publish ...)" and link back to the
+        /// originating step.  §37pre A11.
+        cause: crate::machine::StoredEventCause,
         /// The event payload, so the operator can see what is about
         /// to be handled while parked.  §37pre A11.
         preview: serde_json::Value,

@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::pubsub::HasTopic;
@@ -31,7 +31,7 @@ pub enum EventCause {
 ///
 /// Runtime-side only — uses zero-copy variants where it can
 /// (`&'static str` for timer / Docker-event names). The wire-side
-/// `StoredExternalCause` (everything as `String`) lands in §37f.
+/// counterpart is [`StoredExternalCause`] (everything as `String`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExternalCause {
     /// A timer fired. `name` identifies the timer (e.g. `"VpnHealthPoll"`).
@@ -49,6 +49,62 @@ pub enum ExternalCause {
     /// §37 migration; every `Unknown` site should be replaced before
     /// observability ships.
     Unknown,
+}
+
+// ── Wire-side cause mirror ────────────────────────────────────────────────────
+
+/// Wire/storage counterpart of [`ExternalCause`].  Uses `String`
+/// instead of `&'static str` / `PathBuf` so the frontend sees owned
+/// data and the `PathBuf` serialization choice doesn't leak.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum StoredExternalCause {
+    Timer { name: String },
+    FileWatcher { path: String },
+    DockerEvent { kind: String },
+    ManualCommand,
+    Init,
+    Unknown,
+}
+
+/// Wire/storage counterpart of [`EventCause`].  Lives in
+/// `windlass-machine` so [`crate::tap::CoreStatus::ParkedAtEvent`] can
+/// carry the cause without a circular dep on observability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredEventCause {
+    Action { id: Uuid },
+    Publish { id: Uuid },
+    External(StoredExternalCause),
+}
+
+impl From<&EventCause> for StoredEventCause {
+    fn from(cause: &EventCause) -> Self {
+        match cause {
+            EventCause::Action(id) => Self::Action { id: *id },
+            EventCause::Publish(id) => Self::Publish { id: *id },
+            EventCause::External(ext) => Self::External(ext.into()),
+        }
+    }
+}
+
+impl From<&ExternalCause> for StoredExternalCause {
+    fn from(cause: &ExternalCause) -> Self {
+        match cause {
+            ExternalCause::Timer { name } => Self::Timer {
+                name: (*name).to_owned(),
+            },
+            ExternalCause::FileWatcher { path } => Self::FileWatcher {
+                path: path.to_string_lossy().into_owned(),
+            },
+            ExternalCause::DockerEvent { kind } => Self::DockerEvent {
+                kind: (*kind).to_owned(),
+            },
+            ExternalCause::ManualCommand => Self::ManualCommand,
+            ExternalCause::Init => Self::Init,
+            ExternalCause::Unknown => Self::Unknown,
+        }
+    }
 }
 
 /// An event paired with the logical time it occurred and the upstream
