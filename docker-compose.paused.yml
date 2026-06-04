@@ -1,0 +1,10 @@
+# Compose override to pre-pause all observability cores on start.
+# Merge on top of docker-compose.dev.yml:
+#   just stack-up-paused
+#
+# See docs/observability.md for PAUSE_ON_START semantics (accepts
+# `true` or a comma-separated list of cores).
+services:
+  windlass:
+    environment:
+      PAUSE_ON_START: "true"

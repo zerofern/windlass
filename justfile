@@ -60,9 +60,9 @@ sqlx-prepare:
 stack-up:
     docker compose -f docker-compose.dev.yml up --build -d
 
-# Bring up the dev stack with debug mode enabled from start (for local UI dev)
-stack-up-debug:
-    docker compose -f docker-compose.dev.yml -f docker-compose.debug.yml up --build -d
+# Bring up the dev stack with all observability cores pre-paused (PAUSE_ON_START=true)
+stack-up-paused:
+    docker compose -f docker-compose.dev.yml -f docker-compose.paused.yml up --build -d
 
 # Tear down the dev/test stack
 stack-down:
