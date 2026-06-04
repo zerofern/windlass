@@ -372,6 +372,70 @@ async fn pause_mam_does_not_block_qbit() {
 }
 
 #[tokio::test]
+async fn closed_sse_channel_does_not_block_runtime() {
+    // Acceptance test #2 sub-case (b): a closed SSE subscriber set
+    // means `broadcast::Sender::send` returns Err (no active
+    // receivers).  Every controller broadcast path silently drops
+    // that error; the runtime must keep dispatching at full speed.
+    //
+    // We simulate the closed-channel condition by never subscribing —
+    // the broadcast channel exists but has zero receivers, which is
+    // observationally equivalent.  Then drive a full event sequence
+    // and assert every action lands.
+    use windlass_observability::ObservabilityController;
+    let ctrl = ObservabilityController::new();
+    // Explicitly drop any future subscribers by not calling
+    // `subscribe()`.  Every broadcast inside the controller will
+    // return Err and be silently dropped.
+    let actions = drive_sequence(ctrl.clone() as _).await;
+    assert_eq!(
+        actions.len(),
+        5,
+        "runtime must dispatch every action even when no SSE subscribers exist"
+    );
+}
+
+#[tokio::test]
+async fn http_exchange_ring_overflow_increments_dropped_exchanges_counter() {
+    // Acceptance test #2 sub-case (e): the HTTP-exchange internal
+    // channel + ring are bounded.  Flooding past
+    // `HTTP_EXCHANGE_CHANNEL_SIZE` (1024) must trip the controller
+    // into drop-with-counter mode without backpressuring the call
+    // site.  EC-5.
+    use std::time::Duration as StdDuration;
+    use windlass_machine::CoreId;
+    use windlass_observability::ObservabilityController;
+    use windlass_types::{HttpExchange, HttpTap};
+
+    let ctrl = ObservabilityController::new();
+    // 1024 channel + 100 overflow.  The channel-overflow path is the
+    // EC-5 contract; whether the ring also evicts is a separate
+    // concern (and the ring is the same size by default).
+    for i in 0..(1024 + 100) {
+        ctrl.observed_exchange(
+            CoreId::Qbit,
+            &HttpExchange {
+                module: "qbit".into(),
+                method: "GET".into(),
+                url: format!("https://qbit.local/api/v2/{i}"),
+                request_headers: Vec::new(),
+                request_body: None,
+                response_status: 200,
+                response_headers: Vec::new(),
+                response_body: String::new(),
+            },
+        );
+    }
+    // Give the worker + drop-counter task a tick to run.
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    let loss = ctrl.loss_snapshot().await;
+    assert!(
+        loss.http.dropped_exchanges > 0,
+        "channel + ring overflow must surface as dropped_exchanges > 0; got loss={loss:?}"
+    );
+}
+
+#[tokio::test]
 async fn panic_catching_tap_keeps_runtime_alive() {
     // D3: every `observed_step` would have panicked internally; the
     // tap impl catches its own panic (EC-1 trait-boundary contract)
