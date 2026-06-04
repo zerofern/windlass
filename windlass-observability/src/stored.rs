@@ -273,7 +273,11 @@ impl StoredPublish {
 // ── HTTP exchange ─────────────────────────────────────────────────────────────
 
 /// Owned, ring-storable HTTP exchange.  Joins back to its originating
-/// step via `action_id` (looked up in the controller's index).
+/// step via `action_id` (looked up in the controller's index).  Header
+/// values are wrapped in [`MaybeSecret`] so `Authorization` / `Cookie`
+/// / `Set-Cookie` (and any other class the redactor recognises)
+/// serialize as [`WireRedacted`] while everything else passes
+/// through.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredHttpExchange {
     pub exchange_id: Uuid,
@@ -282,8 +286,10 @@ pub struct StoredHttpExchange {
     pub at: DateTime<Utc>,
     pub method: String,
     pub url: String,
+    pub request_headers: Vec<(String, MaybeSecret)>,
     pub request_body: BodyCapture,
     pub response_status: u16,
+    pub response_headers: Vec<(String, MaybeSecret)>,
     pub response_body: BodyCapture,
     pub duration_ms: u64,
 }
@@ -291,11 +297,66 @@ pub struct StoredHttpExchange {
 impl StoredHttpExchange {
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
+        let header_bytes = |hs: &[(String, MaybeSecret)]| -> usize {
+            hs.iter()
+                .map(|(k, v)| {
+                    k.len()
+                        + match v {
+                            MaybeSecret::Plain(s) => s.len(),
+                            MaybeSecret::Secret(slot) => slot.cleartext.len(),
+                        }
+                })
+                .sum()
+        };
         128 + self.method.len()
             + self.url.len()
+            + header_bytes(&self.request_headers)
+            + header_bytes(&self.response_headers)
             + body_capture_size(&self.request_body)
             + body_capture_size(&self.response_body)
     }
+
+    /// Visit every [`ServerSecretSlot`] reachable from this exchange's
+    /// headers.  Used by `ObservabilityController::reveal` to find a
+    /// matching `reveal_id` and by eviction to surface the dropped
+    /// slot ids in `EvictedIds.reveal_ids`.
+    pub fn for_each_slot(&self, mut visit: impl FnMut(&ServerSecretSlot)) {
+        for (_, v) in &self.request_headers {
+            if let MaybeSecret::Secret(slot) = v {
+                visit(slot);
+            }
+        }
+        for (_, v) in &self.response_headers {
+            if let MaybeSecret::Secret(slot) = v {
+                visit(slot);
+            }
+        }
+    }
+}
+
+/// HTTP header names whose values are always secret-bearing and must
+/// be redacted at capture time without case-by-case opt-in.  Spec
+/// "Secrets (Decision 14 detail)" — known classes redacted at
+/// capture.  Match is case-insensitive.
+const REDACTED_HEADER_NAMES: &[&str] = &["authorization", "cookie", "set-cookie"];
+
+/// Build a header-pair list with the §37pre-locked redaction rules
+/// applied.  Used by the controller when converting an
+/// `HttpExchange` view into a `StoredHttpExchange`.
+#[must_use]
+pub fn redact_headers(pairs: &[(String, String)]) -> Vec<(String, MaybeSecret)> {
+    pairs
+        .iter()
+        .map(|(name, value)| {
+            let lower = name.to_ascii_lowercase();
+            let value = if REDACTED_HEADER_NAMES.contains(&lower.as_str()) {
+                MaybeSecret::secret(value.clone())
+            } else {
+                MaybeSecret::plain(value.clone())
+            };
+            (name.clone(), value)
+        })
+        .collect()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

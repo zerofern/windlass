@@ -333,8 +333,15 @@ impl MamClient {
                 if !status.is_success() {
                     return Err(MamFetchError::StatusFailed(format!("HTTP {status}")));
                 }
+                let resp_headers = response_headers(&resp);
                 let raw = resp.text().await.unwrap_or_default();
-                self.emit_http(&self.json_ip_url, status.as_u16(), &raw);
+                self.emit_http(
+                    &self.json_ip_url,
+                    Vec::new(),
+                    status.as_u16(),
+                    resp_headers,
+                    &raw,
+                );
                 match serde_json::from_str::<JsonIpResponse>(&raw) {
                     Err(e) => Err(MamFetchError::StatusFailed(format!("parse: {e}"))),
                     Ok(body) => match body.ip.trim().parse::<std::net::Ipv4Addr>() {
@@ -423,17 +430,26 @@ impl MamClient {
             }
             Ok(resp) => {
                 let status = resp.status();
+                let req_headers = vec![Self::cookie_header(session)];
                 if !status.is_success() {
                     let code = status.as_u16();
                     warn!("MAM status fetch HTTP {status}");
-                    self.emit_http(&self.load_url, code, "");
+                    let resp_headers = response_headers(&resp);
+                    self.emit_http(&self.load_url, req_headers, code, resp_headers, "");
                     return (
                         Err(MamFetchError::StatusFailed(format!("HTTP {code}"))),
                         new_session,
                     );
                 }
+                let resp_headers = response_headers(&resp);
                 let raw = resp.text().await.unwrap_or_default();
-                self.emit_http(&self.load_url, status.as_u16(), &raw);
+                self.emit_http(
+                    &self.load_url,
+                    req_headers,
+                    status.as_u16(),
+                    resp_headers,
+                    &raw,
+                );
                 match serde_json::from_str::<JsonLoadResponse>(&raw) {
                     Ok(body) => {
                         let connectable = body
@@ -516,18 +532,34 @@ impl MamClient {
         true
     }
 
-    fn emit_http(&self, url: &str, response_status: u16, response_body: &str) {
+    fn emit_http(
+        &self,
+        url: &str,
+        request_headers: Vec<(String, String)>,
+        response_status: u16,
+        response_headers: Vec<(String, String)>,
+        response_body: &str,
+    ) {
         self.hook.observed_exchange(
             CoreId::Mam,
             &HttpExchange {
                 module: "mam".into(),
                 method: "GET".into(),
                 url: url.into(),
+                request_headers,
                 request_body: None,
                 response_status,
+                response_headers,
                 response_body: response_body.into(),
             },
         );
+    }
+
+    /// Build a `Cookie: mam_id=…` header pair for a session-bearing
+    /// request.  The observability redactor wraps `Cookie` values in
+    /// a `ServerSecretSlot` at capture time.
+    fn cookie_header(session: &str) -> (String, String) {
+        ("Cookie".to_string(), format!("mam_id={session}"))
     }
 
     /// §37e: convenience for `hook.gate_request` at every MAM HTTP
@@ -568,8 +600,15 @@ impl MamClient {
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let resp_headers = response_headers(&resp);
                 let raw = resp.text().await.unwrap_or_default();
-                self.emit_http(&self.seedbox_url, status, &raw);
+                self.emit_http(
+                    &self.seedbox_url,
+                    vec![Self::cookie_header(session)],
+                    status,
+                    resp_headers,
+                    &raw,
+                );
                 match serde_json::from_str::<DynamicSeedboxResponse>(&raw) {
                     Err(e) => {
                         warn!("MAM seedbox response parse failed: {e}");
@@ -663,12 +702,21 @@ impl MamClient {
             .await
             .ok()?;
         let status = resp.status().as_u16();
+        let req_headers = vec![Self::cookie_header(&current)];
         if !resp.status().is_success() {
-            self.emit_http(&url, status, "");
+            let resp_headers = response_headers(&resp);
+            self.emit_http(&url, req_headers, status, resp_headers, "");
             return None;
         }
+        let resp_headers = response_headers(&resp);
         let bytes = resp.bytes().await.ok()?;
-        self.emit_http(&url, status, "<binary torrent data>");
+        self.emit_http(
+            &url,
+            req_headers,
+            status,
+            resp_headers,
+            "<binary torrent data>",
+        );
         Some(bytes.to_vec())
     }
 
@@ -678,6 +726,21 @@ impl MamClient {
         self.torrent_base_url = url;
         self
     }
+}
+
+/// Collect every response header into `(name, value)` pairs for
+/// observability capture.  Non-UTF-8 values are replaced with a
+/// placeholder so capture never panics.
+fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
+    resp.headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or("<non-utf8>").to_string(),
+            )
+        })
+        .collect()
 }
 
 fn extract_mam_cookie(resp: &reqwest::Response) -> Option<String> {

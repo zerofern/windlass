@@ -149,16 +149,28 @@ pub struct VpnPort(u16);
 pub struct HttpStatusCode(pub u16);
 
 /// A single HTTP request/response pair captured from a client call.
-/// Stored per-action in `ActionEntry.http_exchanges` when debug mode is on.
+/// Carries raw header pairs; the observability controller decides which
+/// header values are secret-bearing (Authorization / Cookie / Set-Cookie)
+/// at capture time and wraps those in `ServerSecretSlot`.
 #[derive(Debug, Clone, Serialize)]
 pub struct HttpExchange {
     /// Which client emitted this: `"qbit"` or `"mam"`.
     pub module: String,
     pub method: String,
     pub url: String,
+    /// Request headers as `(name, value)` pairs in send order.  The
+    /// controller decides at capture time which values get redacted
+    /// (Decision 14 — known classes redacted at capture without
+    /// case-by-case opt-in).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<(String, String)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body: Option<String>,
     pub response_status: u16,
+    /// Response headers in received order.  Same redaction rules as
+    /// request headers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_headers: Vec<(String, String)>,
     pub response_body: String,
 }
 

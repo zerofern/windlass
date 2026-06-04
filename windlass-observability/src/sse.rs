@@ -46,12 +46,18 @@ pub struct HelloSnapshot {
 
 /// IDs that have just left a ring (or had their reveal slot expire).
 /// Emitted by the controller on every eviction so the frontend can
-/// drop dangling references / revealed-secret state.
+/// drop dangling references / revealed-secret state.  `exchange_ids`
+/// is populated on HTTP-ring eviction (EC-3 covers both ring kinds);
+/// the spec wire shape carries `step_ids` / `action_ids` /
+/// `publish_ids` for step rings and `exchange_ids` / `reveal_ids` for
+/// HTTP rings, with `reveal_ids` shared by both.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvictedIds {
     pub step_ids: Vec<Uuid>,
     pub action_ids: Vec<Uuid>,
     pub publish_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub exchange_ids: Vec<Uuid>,
     pub reveal_ids: Vec<Uuid>,
 }
 
@@ -61,6 +67,7 @@ impl EvictedIds {
         self.step_ids.is_empty()
             && self.action_ids.is_empty()
             && self.publish_ids.is_empty()
+            && self.exchange_ids.is_empty()
             && self.reveal_ids.is_empty()
     }
 }

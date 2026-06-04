@@ -49,8 +49,10 @@ impl QbitClient {
         &self,
         method: &str,
         url: &str,
+        request_headers: Vec<(String, String)>,
         request_body: Option<String>,
         response_status: u16,
+        response_headers: Vec<(String, String)>,
         response_body: &str,
     ) {
         self.hook.observed_exchange(
@@ -59,11 +61,24 @@ impl QbitClient {
                 module: "qbit".into(),
                 method: method.into(),
                 url: url.into(),
+                request_headers,
                 request_body,
                 response_status,
+                response_headers,
                 response_body: response_body.into(),
             },
         );
+    }
+
+    /// Build a `Cookie: SID=…` header pair for a cookie-bearing
+    /// request.  The observability redactor (Decision 14) recognises
+    /// `Cookie` as a secret-bearing header name and wraps the value in
+    /// a `ServerSecretSlot` at capture time.
+    pub(crate) fn cookie_header(cookie: &AuthCookie) -> (String, String) {
+        (
+            "Cookie".to_string(),
+            format!("SID={}", cookie.expose_secret()),
+        )
     }
 
     /// §37e: per-send-site `gate_request` helper.  Parks on qBit's
@@ -118,8 +133,17 @@ impl QbitClient {
             Ok(resp) => {
                 let status = resp.status();
                 let sid = extract_sid_cookie(&resp);
+                let response_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
-                self.emit_http("POST", &url, None, status.as_u16(), &body);
+                self.emit_http(
+                    "POST",
+                    &url,
+                    Vec::new(),
+                    None,
+                    status.as_u16(),
+                    response_headers,
+                    &body,
+                );
 
                 if status.is_success() && (body.trim() == "Ok." || body.trim().is_empty()) {
                     let Some(cookie) = sid else {
@@ -164,8 +188,17 @@ impl QbitClient {
             }
             Ok(resp) => {
                 let status = resp.status();
+                let response_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
-                self.emit_http("POST", &url, Some(req_body), status.as_u16(), &body);
+                self.emit_http(
+                    "POST",
+                    &url,
+                    vec![Self::cookie_header(cookie)],
+                    Some(req_body),
+                    status.as_u16(),
+                    response_headers,
+                    &body,
+                );
                 if status.is_success() {
                     debug!("qBit port sync success");
                     QbitPortSyncResult::Success
@@ -269,6 +302,23 @@ impl QbitClient {
             },
         }
     }
+}
+
+/// Collect every response header into `(name, value)` pairs for
+/// observability capture.  Non-UTF-8 values are replaced with a
+/// placeholder so capture never panics.  The observability redactor
+/// flips `Set-Cookie` (and a small fixed list) to `ServerSecretSlot`
+/// at capture time.
+pub(crate) fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
+    resp.headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or("<non-utf8>").to_string(),
+            )
+        })
+        .collect()
 }
 
 fn extract_sid_cookie(resp: &reqwest::Response) -> Option<String> {

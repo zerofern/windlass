@@ -4,6 +4,7 @@ use tracing::warn;
 use windlass_types::{AuthCookie, TorrentHash};
 
 use super::QbitClient;
+use super::client::response_headers;
 
 impl QbitClient {
     /// Disables DHT, Peer Exchange (`PeX`), and Local Service Discovery (`LSD`) in
@@ -33,12 +34,15 @@ impl QbitClient {
             }
             Ok(resp) => {
                 let status = resp.status();
+                let resp_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
                 self.emit_http(
                     "POST",
                     &url,
+                    vec![Self::cookie_header(cookie)],
                     Some(req_body.to_owned()),
                     status.as_u16(),
+                    resp_headers,
                     &body,
                 );
                 if status.is_success() {
@@ -90,8 +94,17 @@ impl QbitClient {
             }
             Ok(resp) => {
                 let status = resp.status();
+                let resp_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
-                self.emit_http("POST", &url, None, status.as_u16(), &body);
+                self.emit_http(
+                    "POST",
+                    &url,
+                    vec![Self::cookie_header(cookie)],
+                    None,
+                    status.as_u16(),
+                    resp_headers,
+                    &body,
+                );
                 if !status.is_success() {
                     warn!("add_torrent: non-success status {status}");
                     return None;

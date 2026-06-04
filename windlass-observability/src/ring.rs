@@ -299,8 +299,10 @@ mod tests {
                 at: Utc::now(),
                 method: "GET".into(),
                 url: "https://example/".into(),
+                request_headers: Vec::new(),
                 request_body: crate::stored::BodyCapture::None,
                 response_status: 200,
+                response_headers: Vec::new(),
                 response_body: crate::stored::BodyCapture::None,
                 duration_ms: 0,
             });
@@ -312,8 +314,10 @@ mod tests {
             at: Utc::now(),
             method: "GET".into(),
             url: "https://example/".into(),
+            request_headers: Vec::new(),
             request_body: crate::stored::BodyCapture::None,
             response_status: 200,
+            response_headers: Vec::new(),
             response_body: crate::stored::BodyCapture::None,
             duration_ms: 0,
         });

@@ -46,6 +46,7 @@ pub use sse::{
 pub use stored::{
     BodyCapture, BodyKind, MaybeSecret, ServerSecretSlot, StoredAction, StoredEventCause,
     StoredExternalCause, StoredHttpExchange, StoredPublish, StoredStepRecord, WireRedacted,
+    redact_headers,
 };
 
 /// SSE protocol version emitted in `HelloSnapshot.protocol_version`.
@@ -479,12 +480,25 @@ impl ObservabilityController {
         };
 
         if !evicted.is_empty() {
+            // EC-3 also covers HTTP-ring eviction: surface the dropped
+            // exchange ids + any reveal_ids the headers carried so the
+            // frontend can drop dangling references and revealed-secret
+            // state.  HTTP exchanges don't own action_id/publish_id
+            // index entries (those belong to the parent step), so
+            // there is no controller-side index cleanup to do here.
+            let mut evicted_ids = EvictedIds::default();
+            for old in &evicted {
+                evicted_ids.exchange_ids.push(old.exchange_id);
+                old.for_each_slot(|slot| evicted_ids.reveal_ids.push(slot.reveal_id));
+            }
+
             let dropped = u64::try_from(evicted.len()).unwrap_or(u64::MAX);
             let mut loss = self.loss.lock().await;
             loss.http.dropped_exchanges = loss.http.dropped_exchanges.saturating_add(dropped);
             let loss_msg = loss.clone();
             drop(loss);
             self.broadcast(SseMessage::Loss(loss_msg));
+            self.broadcast(SseMessage::Evicted(evicted_ids));
         }
 
         self.broadcast(SseMessage::HttpExchange(exchange));
@@ -591,18 +605,27 @@ fn spawn_http_worker(
 // ── Secret reveal helpers ─────────────────────────────────────────────────────
 
 /// Walk a stored step record for a `ServerSecretSlot` whose `reveal_id`
-/// matches.  Currently records hold no typed secret slots — header
-/// capture is wired in a follow-up gap — so this returns `None`.  The
-/// hook lives here so the scan loop in [`ObservabilityController::reveal`]
-/// doesn't need to change when header types start carrying slots.
+/// matches.  Step records do not currently embed typed slots (machine
+/// state snapshots redact secrets via `SecretString`'s own `Serialize`
+/// impl, which never produces a slot), so this returns `None`.  The
+/// hook lives here so future record extensions can plug in without
+/// changing the scan loop in [`ObservabilityController::reveal`].
 fn find_reveal_in_step(_record: &stored::StoredStepRecord, _reveal_id: Uuid) -> Option<String> {
     None
 }
 
-/// Walk a stored HTTP exchange for a matching `ServerSecretSlot`.  See
-/// [`find_reveal_in_step`] for the eventual wiring.
-fn find_reveal_in_http(_exchange: &stored::StoredHttpExchange, _reveal_id: Uuid) -> Option<String> {
-    None
+/// Walk a stored HTTP exchange for a matching `ServerSecretSlot`.  The
+/// scan visits every `MaybeSecret::Secret` reachable from the
+/// exchange's request and response headers (the redaction set is
+/// decided at capture time by [`stored::redact_headers`]).
+fn find_reveal_in_http(exchange: &stored::StoredHttpExchange, reveal_id: Uuid) -> Option<String> {
+    let mut found = None;
+    exchange.for_each_slot(|slot| {
+        if found.is_none() && slot.reveal_id == reveal_id {
+            found = Some(slot.cleartext.clone());
+        }
+    });
+    found
 }
 
 // ── RuntimeTap impl ───────────────────────────────────────────────────────────
@@ -847,8 +870,10 @@ impl HttpTap for ObservabilityController {
             at: Utc::now(),
             method: exchange.method.clone(),
             url: exchange.url.clone(),
+            request_headers: stored::redact_headers(&exchange.request_headers),
             request_body,
             response_status: exchange.response_status,
+            response_headers: stored::redact_headers(&exchange.response_headers),
             response_body,
             duration_ms: 0,
         };
@@ -1083,6 +1108,141 @@ mod tests {
         assert_eq!(all.len(), 4);
         ctrl.remove_event_breakpoint("E");
         assert_eq!(ctrl.active_breakpoints().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cookie_header_captured_as_secret_and_revealable_then_410_after_eviction() {
+        // End-to-end secrets lock (Decision 14): a `Cookie` header
+        // arriving via `HttpTap::observed_exchange` lands in the ring
+        // as a `ServerSecretSlot`, the wire form redacts, the reveal
+        // endpoint returns cleartext while in-ring, and an
+        // operator-triggered eviction collapses both the lookup and
+        // the reveal back to 410.
+        let cfg = ObservabilityConfig {
+            http_exchanges_total: 1,
+            ..ObservabilityConfig::default()
+        };
+        let ctrl = ObservabilityController::with_config(cfg);
+
+        const CLEARTEXT: &str = "SID=opaque-session-value-xyz";
+        ctrl.observed_exchange(
+            CoreId::Qbit,
+            &HttpExchange {
+                module: "qbit".into(),
+                method: "GET".into(),
+                url: "https://qbit.local/api/v2/torrents/info".into(),
+                request_headers: vec![("Cookie".into(), CLEARTEXT.into())],
+                request_body: None,
+                response_status: 200,
+                response_headers: Vec::new(),
+                response_body: String::new(),
+            },
+        );
+
+        // Let the EC-5 worker drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The Cookie value must have landed as a slot — look it up by
+        // walking the ring directly so we capture its reveal_id.
+        let reveal_id = {
+            let ring = ctrl.http_ring.lock().await;
+            let mut found = None;
+            for exchange in ring.iter() {
+                exchange.for_each_slot(|slot| {
+                    if found.is_none() {
+                        assert_eq!(slot.cleartext, CLEARTEXT);
+                        found = Some(slot.reveal_id);
+                    }
+                });
+            }
+            found.expect("captured Cookie header should be a ServerSecretSlot")
+        };
+
+        // Reveal returns cleartext while the parent exchange is in-ring.
+        assert_eq!(
+            ctrl.reveal(reveal_id).await.as_deref(),
+            Some(CLEARTEXT),
+            "reveal_id should resolve to cleartext while in-ring"
+        );
+
+        // Push another exchange to force eviction (ring is size 1).
+        ctrl.observed_exchange(
+            CoreId::Qbit,
+            &HttpExchange {
+                module: "qbit".into(),
+                method: "GET".into(),
+                url: "https://qbit.local/api/v2/sync/maindata".into(),
+                request_headers: Vec::new(),
+                request_body: None,
+                response_status: 200,
+                response_headers: Vec::new(),
+                response_body: String::new(),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // After eviction the slot is gone — reveal returns None
+        // (the HTTP route maps this to 410 Gone, EC-3 + B6).
+        assert!(
+            ctrl.reveal(reveal_id).await.is_none(),
+            "reveal_id should resolve to None after parent eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_eviction_emits_evicted_with_exchange_and_reveal_ids() {
+        // EC-3 (HTTP-ring side): dropping an exchange must emit an
+        // Evicted SSE message listing the dropped `exchange_id` and
+        // any `reveal_id`s the headers carried, so the React mirror
+        // can drop dangling rows and revealed-secret state.
+        let cfg = ObservabilityConfig {
+            http_exchanges_total: 1,
+            ..ObservabilityConfig::default()
+        };
+        let ctrl = ObservabilityController::with_config(cfg);
+        let mut rx = ctrl.subscribe();
+
+        ctrl.observed_exchange(
+            CoreId::Mam,
+            &HttpExchange {
+                module: "mam".into(),
+                method: "GET".into(),
+                url: "https://mam.example/api".into(),
+                request_headers: vec![("Cookie".into(), "mam_id=alpha".into())],
+                request_body: None,
+                response_status: 200,
+                response_headers: Vec::new(),
+                response_body: String::new(),
+            },
+        );
+        ctrl.observed_exchange(
+            CoreId::Mam,
+            &HttpExchange {
+                module: "mam".into(),
+                method: "GET".into(),
+                url: "https://mam.example/api".into(),
+                request_headers: vec![("Cookie".into(), "mam_id=beta".into())],
+                request_body: None,
+                response_status: 200,
+                response_headers: Vec::new(),
+                response_body: String::new(),
+            },
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut saw_eviction_with_both = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let SseMessage::Evicted(ids) = msg {
+                if !ids.exchange_ids.is_empty() && !ids.reveal_ids.is_empty() {
+                    saw_eviction_with_both = true;
+                }
+            }
+        }
+        assert!(
+            saw_eviction_with_both,
+            "expected an Evicted with exchange_ids + reveal_ids set"
+        );
     }
 
     #[tokio::test]
