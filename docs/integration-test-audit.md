@@ -121,44 +121,84 @@ will eventually remove).
     once a chaos hook can produce a real `StartedAt` predating
     Gluetun's `healthy_since`.
 
-## New chaos hooks needed
+## Punch list reshape under the locked §34 purpose (2026-06-05)
 
-These don't exist yet in `windlass-testkit/src/chaos.rs` but are
-prerequisites for the Tier 1/2 tests above.
+§34's planning lock (operator-readiness.md) restated integration tests'
+purpose as **contract verification between Windlass and its external
+dependencies** — wire-format fidelity for services we don't own
+(qBit, MAM, Gluetun), side effects across the trust boundary, and
+real-I/O wiring between cores.  Pure behavior tests move to the
+property-test layer.  Applied to the punch list above:
 
-- `qbit-torrent-list` — return a configurable torrent list from
-  `/api/v2/torrents/info`, with fields for downloaded_bytes, seed_time,
-  state.  Needed by tests 1, and indirectly by §19/§20/§21/§24/§25
-  integration coverage.
-- `mam-status-network-error` — make `/jsonLoad.php` respond with
-  TCP RST / connection drop (not 5xx).  Needed by test 6.
-- `mam-jsonip-mismatch` — `/json/jsonIp.php` returns an IP that
-  disagrees with Gluetun's file.  Needed by test 9.
-- `mam-update-recorder` — track every `/dynamicSeedbox.php` POST and
-  its IP-source.  Needed by tests 5 and 8.
+| Audit # | Disposition under contract framing |
+|---|---|
+| 1 (torrent-records persistence) | **Keep.**  Real qBit `/torrents/info` parses; fields round-trip to DB.  Uses a real `.torrent` fixture (no `qbit-torrent-list` mock). |
+| 2 (§29 blocked path) | **Keep, slim.**  Real qBit `/app/preferences` shape; flipping `dht: true` is observable; assert no `add` call lands. |
+| 3 (§29 success path) | **Keep.**  Real qBit `/torrents/add` accepts Windlass's multipart body. |
+| 4 (§30 ASN-mismatch alert routing) | **Move to proptest.**  Pure behavior — fake MAM's ASN-mismatch shape parsing covered by the drift smoke pass. |
+| 5 (§31 IP-driven seedbox update) | **Keep.**  Real Gluetun IP-file write triggers POST to fake MAM with the documented body shape; fake MAM journals it. |
+| 6 (§28 Unreachable vs NotConnectable) | **Move to proptest.**  Pure behavior. |
+| 7 (§27 keep-alive degraded) | **Move to proptest.**  Timer-driven behavior. |
+| 8 (§32 client-side 1/h rate limit) | **Keep.**  Fake MAM journal asserts exactly-one POST in window. |
+| 9 (§33 multi-source verification) | **Keep.**  Fake MAM `/jsonIp.php` shape parses; mismatch triggers Critical alert. |
+
+## API-drift smoke pass (new class, introduced by §34)
+
+For every qBit endpoint Windlass calls, a smoke test issues the call
+against real qBit and asserts the response parses through
+`windlass-clients`'s types.  A qBit version bump that changes a field
+shape fails here loudly — before any operator test exercises the
+field.
+
+Equivalent pass over fake MAM: every endpoint's canned response
+decodes through `windlass-clients`'s MAM types.  The fake is only as
+good as the contract it encodes; this test pins that contract.
+
+## Dropped chaos hooks (legacy plan)
+
+The four chaos hooks the original plan called for are no longer
+prerequisites; the new harness reshapes them:
+
+- ~~`qbit-torrent-list`~~ — replaced by **real torrent fixtures**
+  (small `.torrent` from a 1 KB local file, qBit reaches
+  `Complete + Seeding` in seconds).
+- ~~`mam-status-network-error`~~ — replaced by fake-MAM control-plane
+  endpoint to inject TCP RST / connection drop on `/jsonLoad.php`.
+- ~~`mam-jsonip-mismatch`~~ — replaced by fake-MAM control-plane
+  setter for `/json/jsonIp.php`.
+- ~~`mam-update-recorder`~~ — replaced by the fake-MAM request
+  journal; tests query it directly.
 
 ## Behaviors intentionally left at property-test layer
 
 - **Per-machine output-shape invariants.**  Every `[safety]` invariant
   in `docs/invariants.md` is covered by a fully-arbitrary-state
-  property test.  Integration is for wiring + ordering, not for
+  property test.  Integration is for contract verification, not for
   re-verifying the per-event predicate.
 - **Total-vs-reachable classification.**  Story 10's argument is that
   proptest covers the full `(state × event)` cross-product; integration
   cannot beat that.
-- **Debug-mode replay** (deferred to §37).
+- **Synthetic torrent states.**  qBit's web API doesn't let tests
+  write `seed_time`, `downloaded_bytes`, or internal `state` fields.
+  Tests that need synthetic state stay at proptest.
+- **Notifications / alerts.**  The current notification surface is
+  in-app only: `SendAlert` action → `alerts` DB table → `GET
+  /api/v1/alerts`.  Trigger logic is proptested per core.  Integration
+  coverage is deferred until external notification surfaces are
+  added (Telegram / Pushover / webhook / SMTP); each new surface
+  will get its own contract test against a fake notification
+  endpoint in the testkit.
+- **§35 stale-namespace / crash-recovery netns side effects.**
+  Fake Gluetun cannot reproduce real netns invalidation on restart.
+  Integration tests cover Windlass's reaction to "Gluetun
+  unhealthy" signals from the fake; the real netns behavior is
+  Docker's contract, not Windlass's, and is verified by proptest at
+  the docker-core layer.
 
 ## Action plan
 
-This story (§34) **does not write** the new tests — that work is sized
-per-tier and will land as its own commits.  This story:
-
-- Produces this document (the audit + punch list).
-- Identifies the **chaos-hook additions** needed before Tier 1 / Tier 2
-  tests can be written.
-- Provides §36 with a concrete safety-net plan: Tier 1 must precede
-  step 7 of the cutover plan.
-
-The new test-writing work tracks against §36's per-handler cutover
-commits; expect Tier 1 tests to land in the same PRs as the cutover
-steps that retire the corresponding legacy behavior.
+This document is §34 phase 1.  §34 itself (operator-readiness.md)
+is the harness rebuild plus the reshaped punch list above.  The
+new test-writing work tracks against §36's per-handler cutover
+commits where overlap exists; Tier 1 contract tests should land
+before §36 step 7 (compliance retirement).
