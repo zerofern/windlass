@@ -74,7 +74,7 @@ services:
       TESTKIT_MODE: mam
       RUST_LOG: info
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/control/journal >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/control/journal >/dev/null || exit 1"]
       interval: 3s
       timeout: 2s
       retries: 10

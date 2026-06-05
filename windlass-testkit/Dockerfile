@@ -26,7 +26,7 @@ RUN cargo build --release -p windlass-testkit
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/windlass-testkit /usr/local/bin/windlass-testkit
