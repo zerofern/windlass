@@ -672,10 +672,19 @@ impl MamClient {
         self.current_session()
     }
 
-    #[cfg(test)]
+    /// Overrides the `/json/checkCookie.php` URL.  Used by tests and by
+    /// the testkit fake-MAM drift harness.
     #[must_use]
     pub fn with_check_session_url(mut self, url: String) -> Self {
         self.check_session_url = url;
+        self
+    }
+
+    /// Overrides the `/json/jsonIp.php` URL.  Used by the testkit
+    /// fake-MAM drift harness.
+    #[must_use]
+    pub fn with_json_ip_url(mut self, url: String) -> Self {
+        self.json_ip_url = url;
         self
     }
 

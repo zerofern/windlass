@@ -3,6 +3,9 @@ name = "windlass-testkit"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "windlass-testkit"
 path = "src/main.rs"
@@ -18,3 +21,7 @@ bollard  = { workspace = true }
 anyhow   = { workspace = true }
 tracing  = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+windlass-clients = { path = "../windlass-clients" }
+windlass-types   = { path = "../windlass-types" }

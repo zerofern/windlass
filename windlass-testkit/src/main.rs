@@ -5,6 +5,8 @@ mod gluetun;
 mod scenarios;
 mod wiremock_admin;
 
+use windlass_testkit::mam;
+
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -38,7 +40,10 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "http://mock-gluetun:9001".to_string());
             chaos::run(&qbit_admin, &mam_admin, &gluetun_control).await?;
         }
-        other => anyhow::bail!("Unknown TESTKIT_MODE: {other}. Use 'gluetun' or 'chaos'"),
+        "mam" => {
+            mam::run().await?;
+        }
+        other => anyhow::bail!("Unknown TESTKIT_MODE: {other}. Use 'gluetun', 'chaos', or 'mam'"),
     }
 
     Ok(())
