@@ -1,9 +1,19 @@
 # Development and integration test stack for Windlass.
 #
-# Runs Windlass against mock services. Use for:
-#   - Viewing the web UI locally without a production VPN stack
-#   - Running integration tests: just integration
-#   - Manual chaos testing via the chaos controller API
+# §34 (post-rebuild): runs Windlass against the contract-verification stack
+# documented in `docs/operator-readiness.md`:
+#
+#   - Real qBittorrent (testkit qbit image)
+#   - Fake MAM        (windlass-testkit, TESTKIT_MODE=mam)
+#   - Fake Gluetun    (windlass-testkit, TESTKIT_MODE=gluetun)
+#   - Real Postgres
+#   - Windlass        (built from source)
+#
+# WireMock and the chaos-controller were retired in §34 PR 2.  Per-test
+# control surfaces:
+#   - Fake MAM    : POST http://localhost:18082/control/...
+#   - Fake Gluetun: POST http://localhost:9001/...
+#   - qBittorrent : real web API at http://localhost:18080/api/v2/...
 #
 # ⚠ Uses container_name: gluetun — do NOT run alongside the production stack.
 #
@@ -12,7 +22,7 @@
 #   docker compose -f docker-compose.dev.yml down -v
 
 services:
-  # ── Gluetun mock ─────────────────────────────────────────────────────────────
+  # ── Fake Gluetun (testkit) ───────────────────────────────────────────────────
   mock-gluetun:
     build:
       context: .
@@ -34,62 +44,37 @@ services:
       retries: 5
       start_period: 5s
 
-  # ── Mock qBittorrent (WireMock) ───────────────────────────────────────────────
-  mock-qbittorrent:
-    image: wiremock/wiremock:3.5.4-alpine
+  # ── Real qBittorrent ─────────────────────────────────────────────────────────
+  # Reuses the same image as windlass-clients/tests/qbit-image used by the
+  # standalone client-layer suite (docker-compose.qbit-integration.yml).  In
+  # this stack Windlass talks to the WebUI directly; no Gluetun netns share.
+  qbittorrent:
+    build:
+      context: ./windlass-clients/tests/qbit-image
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      WEBUI_PORT: "8080"
     ports:
       - "18080:8080"
-    command: ["--port", "8080"]
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "wget -qO- http://localhost:8080/__admin/health | grep -q healthy",
-        ]
-      interval: 3s
-      timeout: 2s
-      retries: 10
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/app/version || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
 
-  # ── Mock MAM (WireMock) ───────────────────────────────────────────────────────
+  # ── Fake MAM (testkit TESTKIT_MODE=mam) ──────────────────────────────────────
   mock-mam:
-    image: wiremock/wiremock:3.5.4-alpine
-    ports:
-      - "18082:8080"
-    command: ["--port", "8080"]
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "wget -qO- http://localhost:8080/__admin/health | grep -q healthy",
-        ]
-      interval: 3s
-      timeout: 2s
-      retries: 10
-
-  # ── Chaos controller ──────────────────────────────────────────────────────────
-  chaos-controller:
     build:
       context: .
       dockerfile: windlass-testkit/Dockerfile
     ports:
-      - "9000:9000"
+      - "18082:8080"
     environment:
-      TESTKIT_MODE: chaos
-      QBIT_ADMIN_URL: http://mock-qbittorrent:8080/__admin
-      MAM_ADMIN_URL: http://mock-mam:8080/__admin
-      GLUETUN_CONTROL_URL: http://mock-gluetun:9001
+      TESTKIT_MODE: mam
       RUST_LOG: info
-    depends_on:
-      mock-qbittorrent:
-        condition: service_healthy
-      mock-mam:
-        condition: service_healthy
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "bash -c 'echo -e \"GET /health HTTP/1.0\\r\\n\\r\\n\" > /dev/tcp/localhost/9000' 2>/dev/null || exit 1",
-        ]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/control/journal >/dev/null 2>&1 || exit 1"]
       interval: 3s
       timeout: 2s
       retries: 10
@@ -123,11 +108,9 @@ services:
     depends_on:
       mock-gluetun:
         condition: service_healthy
-      mock-qbittorrent:
+      qbittorrent:
         condition: service_healthy
       mock-mam:
-        condition: service_healthy
-      chaos-controller:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -135,7 +118,7 @@ services:
       - vpn-files:/tmp/gluetun:ro
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      QBITTORRENT_URL: http://mock-qbittorrent:8080
+      QBITTORRENT_URL: http://qbittorrent:8080
       QBITTORRENT_USER: admin
       QBITTORRENT_PASS: adminadmin
       MAM_SESSION: test_session
@@ -146,7 +129,6 @@ services:
       VPN_IP_FILE: /tmp/gluetun/ip
       VPN_PORT_FILE: /tmp/gluetun/forwarded_port
       WINDLASS_BIND: 0.0.0.0:5010
-      CHAOS_URL: http://localhost:9000
       DATABASE_URL: postgres://windlass:windlass@postgres:5432/windlass
       WINDLASS_EXECUTE_SERVICE_ACTIONS: ${WINDLASS_EXECUTE_SERVICE_ACTIONS:-${WINDLASS_EXECUTE_SHADOW_ACTIONS:-true}}
       RUST_LOG: windlass=debug,info

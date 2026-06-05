@@ -18,12 +18,16 @@ test-all:
     cargo test -- --include-ignored
 
 integration:
+    # §34 (PR 2 of 6): the pre-rebuild `windlass/tests/integration.rs` suite
+    # is temporarily disabled — it talks to chaos-controller + WireMock,
+    # both of which were removed.  PR 4 ports the tests onto the new
+    # harness.  Until then `just integration` only runs the windlass-local
+    # docker tests and the standalone qbit_integration suite.
     set -e; \
     cleanup() { docker compose -f docker-compose.dev.yml down -v --remove-orphans; docker compose -f docker-compose.qbit-integration.yml down -v --remove-orphans; }; \
     trap cleanup EXIT; \
     docker compose -f docker-compose.dev.yml up --build -d; \
     docker compose -f docker-compose.qbit-integration.yml up --build --wait -d; \
-    cargo test --test integration -- --ignored --test-threads=1 --nocapture; \
     cargo test -p windlass-local -- --include-ignored --test-threads=1 --nocapture; \
     cargo test --test qbit_integration -- --ignored --test-threads=1 --nocapture
 
