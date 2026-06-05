@@ -729,7 +729,9 @@ impl MamClient {
         Some(bytes.to_vec())
     }
 
-    #[cfg(test)]
+    /// Overrides the base URL for `/tor/download.php/{hash}`.  Used by
+    /// the integration stack to point at the fake MAM so tests never
+    /// reach real MAM.
     #[must_use]
     pub fn with_torrent_base_url(mut self, url: String) -> Self {
         self.torrent_base_url = url;

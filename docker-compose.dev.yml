@@ -122,8 +122,13 @@ services:
       QBITTORRENT_USER: admin
       QBITTORRENT_PASS: adminadmin
       MAM_SESSION: test_session
+      # All MAM URLs point at the testkit fake; any default that fell
+      # back to real MAM would be a test-isolation bug.
       MAM_SEEDBOX_URL: http://mock-mam:8080/json/dynamicSeedbox.php
       MAM_LOAD_URL: "http://mock-mam:8080/jsonLoad.php?snatch_summary=true&clientStats"
+      MAM_CHECK_SESSION_URL: http://mock-mam:8080/json/checkCookie.php
+      MAM_JSON_IP_URL: http://mock-mam:8080/json/jsonIp.php
+      MAM_TORRENT_BASE_URL: http://mock-mam:8080
       DATA_PATH: /tmp
       DUMP_DIR: /tmp/windlass_dumps
       VPN_IP_FILE: /tmp/gluetun/ip

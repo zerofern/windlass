@@ -19,6 +19,20 @@ pub struct Config {
     /// Full URL for the MAM jsonLoad endpoint.
     /// Override via `MAM_LOAD_URL` to point at a mock in integration tests.
     pub mam_load_url: String,
+    /// Full URL for the MAM `checkCookie.php` endpoint.
+    /// Override via `MAM_CHECK_SESSION_URL` to point at a mock in
+    /// integration tests; the default goes to real MAM and **must not**
+    /// be reached from any test stack.
+    pub mam_check_session_url: String,
+    /// Full URL for the MAM `jsonIp.php` endpoint.
+    /// Override via `MAM_JSON_IP_URL` to point at a mock in integration
+    /// tests; the default goes to real MAM.
+    pub mam_json_ip_url: String,
+    /// Base URL (no trailing slash) for the MAM torrent download
+    /// endpoint (`/tor/download.php/{hash}`).  Override via
+    /// `MAM_TORRENT_BASE_URL` to point at a mock in integration tests;
+    /// the default goes to real MAM.
+    pub mam_torrent_base_url: String,
     pub mam_user_agent: String,
     /// Mount path to check for available disk space.
     pub data_path: String,
@@ -54,6 +68,13 @@ impl Config {
                 "https://www.myanonamouse.net/jsonLoad.php?snatch_summary=true&clientStats"
                     .to_string()
             }),
+            mam_check_session_url: var("MAM_CHECK_SESSION_URL").unwrap_or_else(|_| {
+                "https://www.myanonamouse.net/json/checkCookie.php".to_string()
+            }),
+            mam_json_ip_url: var("MAM_JSON_IP_URL")
+                .unwrap_or_else(|_| "https://t.myanonamouse.net/json/jsonIp.php".to_string()),
+            mam_torrent_base_url: var("MAM_TORRENT_BASE_URL")
+                .unwrap_or_else(|_| "https://www.myanonamouse.net".to_string()),
             mam_user_agent: var("MAM_USER_AGENT").unwrap_or_else(|_| "windlass".to_string()),
             data_path: var("DATA_PATH").unwrap_or_else(|_| "/mnt/Data".to_string()),
             dump_dir: var("DUMP_DIR").unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),

@@ -108,7 +108,10 @@ pub(super) async fn init_shell(
         config.mam_load_url.clone(),
         &config.mam_user_agent,
         http_tap,
-    )?;
+    )?
+    .with_check_session_url(config.mam_check_session_url.clone())
+    .with_json_ip_url(config.mam_json_ip_url.clone())
+    .with_torrent_base_url(config.mam_torrent_base_url.clone());
 
     let vpn_ip_file = config.vpn_ip_file.clone();
     let vpn_port_file = config.vpn_port_file.clone();
