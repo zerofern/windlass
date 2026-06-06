@@ -21,12 +21,15 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(45);
 /// 1. Clear fake-MAM journal + restore endpoint defaults.
 /// 2. Reset fake-Gluetun IP/port files + healthy state.
 /// 3. Delete every torrent from qBit.
-/// 4. Truncate Windlass DB tables (`alerts`, `activity_log`,
-///    `download_queue`, `torrents`, `system_snapshots`).
+/// 4. Truncate Windlass DB tables.
 /// 5. Restart the Windlass container; wait for `/api/v1/health` to
 ///    answer 200.
-/// 6. Clear the fake-MAM journal again so the new test sees no
-///    boot-time noise.
+///
+/// **Boot-time activity is preserved in the fake-MAM journal** on
+/// purpose — contract tests like "boot_updates_mam_seedbox" rely on
+/// seeing what Windlass did during boot.  Tests that want a clean
+/// post-boot journal can call `FakeMam::new(MAM_BASE).reset()`
+/// themselves after `reset_stack()` returns.
 pub async fn reset_stack() -> Result<()> {
     // 1. fake-MAM.
     mam::FakeMam::new(MAM_BASE)
@@ -59,13 +62,6 @@ pub async fn reset_stack() -> Result<()> {
         .await
         .context("restart windlass")?;
     wait_for_windlass_ready(RESTART_TIMEOUT).await;
-
-    // 6. Re-clear the fake-MAM journal: Windlass made check-session +
-    //    keep-alive calls during boot that the next test shouldn't see.
-    mam::FakeMam::new(MAM_BASE)
-        .reset()
-        .await
-        .context("fake-mam reset (post-restart)")?;
 
     Ok(())
 }
