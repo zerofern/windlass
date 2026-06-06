@@ -332,7 +332,14 @@ const fn torrent_state_str(state: &TorrentStateRecord) -> &str {
         TorrentStateRecord::StalledUploading => "stalledUP",
         TorrentStateRecord::Checking => "checking",
         TorrentStateRecord::Error => "error",
-        TorrentStateRecord::Unknown(value) => value.as_str(),
+        // qBit emits ~12 states that don't map to the 9 explicit
+        // variants (metaDL, queuedDL/UP, checkingDL/UP/ResumeData,
+        // allocating, moving, missingFiles, forcedDL, unknown).  The
+        // `torrents_state_valid` CHECK constraint (migration 0002)
+        // covers these under the catch-all `'other'`; writing the raw
+        // qBit state string violates the CHECK and silently drops the
+        // upsert.
+        TorrentStateRecord::Unknown(_) => "other",
     }
 }
 
@@ -459,6 +466,39 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hash, "abc123");
         assert_eq!(rows[0].state, "forcedUP");
+    }
+
+    /// Regression: qBit emits ~12 transient states (`metaDL`,
+    /// `queuedDL`, `checkingDL`, `allocating`, etc.) that don't map to
+    /// the 9 explicit `TorrentStateRecord` variants and end up as
+    /// `Unknown(raw_string)`.  Writing the raw qBit string violates
+    /// the `torrents_state_valid` CHECK constraint (migration 0002),
+    /// so `Unknown(_)` must lower to the catch-all `'other'`.
+    #[tokio::test]
+    async fn handle_upsert_torrent_unknown_state_maps_to_other() {
+        let pool = test_pool().await;
+        let actor = PostgresDbActor::new(pool.clone());
+
+        let event = actor
+            .handle(DbCommand::UpsertTorrent(TorrentRecord {
+                hash: TorrentHash("metaDL-test".to_string()),
+                book_id: None,
+                mam_id: None,
+                name: "transient-state-torrent".to_string(),
+                state: TorrentStateRecord::Unknown("metaDL".to_string()),
+                seeding_time_secs: 0,
+                downloaded_bytes: 0,
+                seen_at: Utc::now(),
+            }))
+            .await;
+
+        assert!(
+            matches!(event, DbEvent::TorrentUpserted { .. }),
+            "upsert should succeed; got {event:?}"
+        );
+        let rows = torrents::get_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "other");
     }
 
     #[tokio::test]

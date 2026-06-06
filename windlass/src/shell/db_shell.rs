@@ -26,6 +26,13 @@ impl Shell for DbShell {
                 let event_tx = event_tx.clone();
                 windlass_machine::causal::spawn(async move {
                     let result = actor.handle(command).await;
+                    if let DbEvent::Failed(ref f) = result {
+                        // Surface DB failures at WARN — silent failures
+                        // hid the torrents_state_valid CHECK violation
+                        // that turned out to be a real qBit-state
+                        // mapping bug (fixed in actor::torrent_state_str).
+                        tracing::warn!("DB operation {} failed: {}", f.operation, f.message);
+                    }
                     let _ = event_tx.send(Timed::external(
                         std::time::Instant::now(),
                         ExternalCause::Unknown,
