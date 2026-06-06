@@ -236,7 +236,7 @@ impl MamClient {
     /// Returns an error if the reqwest client cannot be built (e.g. invalid proxy URL).
     pub fn new(
         proxy_url: Option<&str>,
-        session: MamSessionId,
+        session: &MamSessionId,
         seedbox_url: String,
         load_url: String,
         user_agent: &str,
@@ -853,7 +853,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -878,7 +878,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -909,7 +909,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("old_cookie".into()),
+            &MamSessionId::new("old_cookie".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -935,7 +935,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -962,7 +962,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -983,7 +983,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -1007,7 +1007,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("old_session".into()),
+            &MamSessionId::new("old_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -1033,7 +1033,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -1056,7 +1056,7 @@ mod tests {
         // and TLS failures as healthy operator state).
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             "http://127.0.0.1:1".into(),
             "http://127.0.0.1:1".into(),
             "windlass",
@@ -1081,7 +1081,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -1105,7 +1105,7 @@ mod tests {
 
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
             "windlass",
@@ -1123,7 +1123,7 @@ mod tests {
         // A local socks5 proxy address — client builds without error.
         let result = MamClient::new(
             Some("socks5://127.0.0.1:1080"),
-            MamSessionId::new("session".into()),
+            &MamSessionId::new("session".into()),
             "http://example.com".into(),
             "http://example.com".into(),
             "windlass",
@@ -1149,7 +1149,7 @@ mod tests {
         let base = server.uri();
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             base.clone(),
             base.clone(),
             "windlass",
@@ -1176,7 +1176,7 @@ mod tests {
         let base = server.uri();
         let mam = MamClient::new(
             None,
-            MamSessionId::new("my_session".into()),
+            &MamSessionId::new("my_session".into()),
             base.clone(),
             base.clone(),
             "windlass",

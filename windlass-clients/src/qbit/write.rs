@@ -4,7 +4,7 @@ use tracing::warn;
 use windlass_types::{AuthCookie, TorrentHash};
 
 use super::QbitClient;
-use super::client::response_headers;
+use super::client::{HttpCapture, response_headers};
 
 impl QbitClient {
     /// Disables DHT, Peer Exchange (`PeX`), and Local Service Discovery (`LSD`) in
@@ -36,15 +36,15 @@ impl QbitClient {
                 let status = resp.status();
                 let resp_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
-                self.emit_http(
-                    "POST",
-                    &url,
-                    vec![Self::cookie_header(cookie)],
-                    Some(req_body.to_owned()),
-                    status.as_u16(),
-                    resp_headers,
-                    &body,
-                );
+                self.emit_http(HttpCapture {
+                    method: "POST",
+                    url: &url,
+                    request_headers: vec![Self::cookie_header(cookie)],
+                    request_body: Some(req_body.to_owned()),
+                    response_status: status.as_u16(),
+                    response_headers: resp_headers,
+                    response_body: &body,
+                });
                 if status.is_success() {
                     true
                 } else {
@@ -96,15 +96,15 @@ impl QbitClient {
                 let status = resp.status();
                 let resp_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
-                self.emit_http(
-                    "POST",
-                    &url,
-                    vec![Self::cookie_header(cookie)],
-                    None,
-                    status.as_u16(),
-                    resp_headers,
-                    &body,
-                );
+                self.emit_http(HttpCapture {
+                    method: "POST",
+                    url: &url,
+                    request_headers: vec![Self::cookie_header(cookie)],
+                    request_body: None,
+                    response_status: status.as_u16(),
+                    response_headers: resp_headers,
+                    response_body: &body,
+                });
                 if !status.is_success() {
                     warn!("add_torrent: non-success status {status}");
                     return None;

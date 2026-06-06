@@ -1,4 +1,4 @@
-pub(crate) mod config;
+pub mod config;
 mod db_shell;
 mod disk_shell;
 mod docker_shell;

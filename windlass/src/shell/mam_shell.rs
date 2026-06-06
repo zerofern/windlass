@@ -106,13 +106,13 @@ impl Shell for MamShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 windlass_machine::causal::spawn(async move {
-                    let event = match client.fetch_torrent(mam_id).await {
-                        Some(bytes) => MamEvent::TorrentBytesFetched { mam_id, bytes },
-                        None => MamEvent::TorrentBytesFetchFailed {
+                    let event = client.fetch_torrent(mam_id).await.map_or_else(
+                        || MamEvent::TorrentBytesFetchFailed {
                             mam_id,
                             reason: "MAM torrent fetch failed (network or HTTP error)".to_string(),
                         },
-                    };
+                        |bytes| MamEvent::TorrentBytesFetched { mam_id, bytes },
+                    );
                     let _ = tx.send(Timed::external(
                         std::time::Instant::now(),
                         ExternalCause::Unknown,

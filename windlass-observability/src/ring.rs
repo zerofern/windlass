@@ -25,11 +25,10 @@ pub const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
 // ── Configurable budgets ──────────────────────────────────────────────────────
 
-/// Runtime-configurable budgets for the observability rings and body
-/// captures.  The defaults match the locked §37pre B7 constants above;
-/// the operator overrides via environment variables in
-/// `windlass::shell::config::Config` (see
-/// `docs/observability-redesign.md` "Configuration").
+/// Runtime-configurable budgets for observability.
+///
+/// Defaults match the locked §37pre B7 constants above. Operators override via
+/// environment variables in `windlass::shell::config::Config`.
 ///
 /// Byte-budget keys honor IEC binary suffixes (`KiB` = 1024 B,
 /// `MiB` = 1024 KiB) — see [`parse_byte_budget`].
@@ -75,15 +74,19 @@ pub fn parse_byte_budget(raw: &str) -> Result<usize, String> {
         return Err(format!("empty byte budget: {raw:?}"));
     }
     let lower = s.to_ascii_lowercase();
-    let (number, multiplier) = if let Some(prefix) = lower.strip_suffix("mib") {
-        (prefix, 1024usize * 1024)
-    } else if let Some(prefix) = lower.strip_suffix("kib") {
-        (prefix, 1024usize)
-    } else if let Some(prefix) = lower.strip_suffix('b') {
-        (prefix, 1usize)
-    } else {
-        (lower.as_str(), 1usize)
-    };
+    let (number, multiplier) = lower.strip_suffix("mib").map_or_else(
+        || {
+            lower.strip_suffix("kib").map_or_else(
+                || {
+                    lower
+                        .strip_suffix('b')
+                        .map_or((lower.as_str(), 1usize), |p| (p, 1usize))
+                },
+                |p| (p, 1024usize),
+            )
+        },
+        |p| (p, 1024usize * 1024),
+    );
     let n: usize = number
         .trim()
         .parse()
@@ -148,7 +151,7 @@ impl StepRecordRing {
     }
 
     #[must_use]
-    pub fn total_bytes(&self) -> usize {
+    pub const fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 

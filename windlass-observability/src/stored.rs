@@ -1,7 +1,6 @@
-//! Owned, wire-shaped records that live in the rings and on the SSE
-//! stream.  These are the §37pre-locked types described in
-//! `docs/observability-redesign.md` under "Borrowed views vs owned
-//! stored records".
+//! Owned, wire-shaped records that live in the rings and on the SSE stream.
+//!
+//! These are the §37pre-locked types described in `docs/observability-redesign.md`.
 
 use std::time::Duration;
 
@@ -12,13 +11,10 @@ use windlass_machine::{CoreId, StepKind, StoredEventCause};
 
 // ── Secret slots ──────────────────────────────────────────────────────────────
 
-/// Server-side holder for one cleartext secret captured into a stored
-/// record.  Lives only inside the ring; the wire serializer (below)
-/// flips it to [`WireRedacted`] so cleartext never leaves the process
-/// over SSE.  The matching cleartext is exposed only through the
-/// `POST /api/v1/observability/reveal/{reveal_id}` endpoint, which
-/// scans the rings for `reveal_id` and returns `410 Gone` once the
-/// parent record is evicted.
+/// Server-side holder for one cleartext secret captured into a stored record.
+///
+/// Lives only inside the ring; the wire serializer flips it to
+/// [`WireRedacted`] so cleartext never leaves the process over SSE.
 ///
 /// See `docs/observability-redesign.md` "Secrets (Decision 14 detail)".
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -56,21 +52,20 @@ impl Serialize for ServerSecretSlot {
     }
 }
 
-/// The wire form `ServerSecretSlot` serializes to.  Defined as a
-/// separate type so deserialize paths (tests, transport round-trips)
-/// can target it explicitly; the server never *constructs* one
-/// directly — the `Serialize` impl on [`ServerSecretSlot`] is the
-/// only producer.
+/// The wire form `ServerSecretSlot` serializes to.
+///
+/// Defined separately so deserialize paths can target it explicitly; the
+/// server never constructs one directly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WireRedacted {
     pub redacted: bool,
     pub reveal_id: Uuid,
 }
 
-/// A header value (or other captured field) that is either plaintext
-/// passed through unchanged, or a secret slot that serializes to
-/// `WireRedacted`.  Stored alongside the rest of the record; the
-/// serializer chooses the right wire form automatically.
+/// A header value or other captured field.
+///
+/// Plaintext passes through unchanged; secret slots serialize to
+/// `WireRedacted`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum MaybeSecret {
@@ -219,12 +214,11 @@ impl StoredPublish {
 
 // ── HTTP exchange ─────────────────────────────────────────────────────────────
 
-/// Owned, ring-storable HTTP exchange.  Joins back to its originating
-/// step via `action_id` (looked up in the controller's index).  Header
-/// values are wrapped in [`MaybeSecret`] so `Authorization` / `Cookie`
-/// / `Set-Cookie` (and any other class the redactor recognises)
-/// serialize as [`WireRedacted`] while everything else passes
-/// through.
+/// Owned, ring-storable HTTP exchange.
+///
+/// Joins back to its originating step via `action_id`. Header values are
+/// wrapped in [`MaybeSecret`] so known secret-bearing headers serialize as
+/// [`WireRedacted`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredHttpExchange {
     pub exchange_id: Uuid,

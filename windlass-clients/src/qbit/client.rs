@@ -12,6 +12,16 @@ use super::types::{
     QbitAuthResult, QbitPortSyncResult, QbitPreferences, QbitTorrentDetails, QbitTorrentState,
 };
 
+pub struct HttpCapture<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub request_headers: Vec<(String, String)>,
+    pub request_body: Option<String>,
+    pub response_status: u16,
+    pub response_headers: Vec<(String, String)>,
+    pub response_body: &'a str,
+}
+
 /// Wraps a `reqwest::Client` together with the qBittorrent connection details.
 /// All qBittorrent operations are methods so call sites only pass `&self`.
 ///
@@ -45,27 +55,18 @@ impl QbitClient {
         }
     }
 
-    pub(crate) fn emit_http(
-        &self,
-        method: &str,
-        url: &str,
-        request_headers: Vec<(String, String)>,
-        request_body: Option<String>,
-        response_status: u16,
-        response_headers: Vec<(String, String)>,
-        response_body: &str,
-    ) {
+    pub(crate) fn emit_http(&self, capture: HttpCapture<'_>) {
         self.hook.observed_exchange(
             CoreId::Qbit,
             &HttpExchange {
                 module: "qbit".into(),
-                method: method.into(),
-                url: url.into(),
-                request_headers,
-                request_body,
-                response_status,
-                response_headers,
-                response_body: response_body.into(),
+                method: capture.method.into(),
+                url: capture.url.into(),
+                request_headers: capture.request_headers,
+                request_body: capture.request_body,
+                response_status: capture.response_status,
+                response_headers: capture.response_headers,
+                response_body: capture.response_body.into(),
             },
         );
     }
@@ -135,15 +136,15 @@ impl QbitClient {
                 let sid = extract_sid_cookie(&resp);
                 let response_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
-                self.emit_http(
-                    "POST",
-                    &url,
-                    Vec::new(),
-                    None,
-                    status.as_u16(),
+                self.emit_http(HttpCapture {
+                    method: "POST",
+                    url: &url,
+                    request_headers: Vec::new(),
+                    request_body: None,
+                    response_status: status.as_u16(),
                     response_headers,
-                    &body,
-                );
+                    response_body: &body,
+                });
 
                 if status.is_success() && (body.trim() == "Ok." || body.trim().is_empty()) {
                     let Some(cookie) = sid else {
@@ -190,15 +191,15 @@ impl QbitClient {
                 let status = resp.status();
                 let response_headers = response_headers(&resp);
                 let body = resp.text().await.unwrap_or_default();
-                self.emit_http(
-                    "POST",
-                    &url,
-                    vec![Self::cookie_header(cookie)],
-                    Some(req_body),
-                    status.as_u16(),
+                self.emit_http(HttpCapture {
+                    method: "POST",
+                    url: &url,
+                    request_headers: vec![Self::cookie_header(cookie)],
+                    request_body: Some(req_body),
+                    response_status: status.as_u16(),
                     response_headers,
-                    &body,
-                );
+                    response_body: &body,
+                });
                 if status.is_success() {
                     debug!("qBit port sync success");
                     QbitPortSyncResult::Success
@@ -309,7 +310,7 @@ impl QbitClient {
 /// placeholder so capture never panics.  The observability redactor
 /// flips `Set-Cookie` (and a small fixed list) to `ServerSecretSlot`
 /// at capture time.
-pub(crate) fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
+pub fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
     resp.headers()
         .iter()
         .map(|(k, v)| {

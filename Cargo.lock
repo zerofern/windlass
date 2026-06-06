@@ -3282,6 +3282,7 @@ dependencies = [
 name = "windlass-disk-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "proptest",
  "serde",
  "serde_json",
@@ -3353,6 +3354,7 @@ dependencies = [
 name = "windlass-mam-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "proptest",
  "serde",
  "serde_json",

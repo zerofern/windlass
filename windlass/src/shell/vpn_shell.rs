@@ -89,7 +89,6 @@ impl Shell for VpnShell {
 
     fn dispatch(&mut self, action: VpnAction, event_tx: &UnboundedSender<Timed<VpnEvent>>) {
         match action {
-            VpnAction::StartMonitoring => {}
             // §38 PR 6: Docker core (via its own bollard watcher +
             // boot-time anchor inspect) is now the source of
             // ContainerHealthy/Unhealthy.  Domain forwards them as
@@ -97,7 +96,7 @@ impl Shell for VpnShell {
             // poll.  Kept as a no-op so the VPN machine's existing
             // emit sites (Init / HealthPoll timer / RefreshState) stay
             // stable; a follow-up can drop them from the enum.
-            VpnAction::InspectContainer => {}
+            VpnAction::StartMonitoring | VpnAction::InspectContainer => {}
             VpnAction::ReadPortFiles => {
                 let ip_file = self.vpn_ip_file.clone();
                 let port_file = self.vpn_port_file.clone();

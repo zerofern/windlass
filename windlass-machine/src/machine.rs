@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -171,7 +172,7 @@ pub struct ActionEnvelope<A> {
 
 /// A publish paired with a runtime-minted id.
 ///
-/// The publish_id flows through `TopicFanout` so subscriber bridges
+/// The `publish_id` flows through `TopicFanout` so subscriber bridges
 /// can construct downstream events with
 /// `Timed::from_publish(now, envelope.id, e)` — preserving the
 /// cross-core causal chain.
@@ -261,12 +262,14 @@ pub trait Machine: Sized {
     fn handle(
         &mut self,
         now: Instant,
+        wall_now: DateTime<Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish>;
 
     fn handle_command(
         &mut self,
         now: Instant,
+        wall_now: DateTime<Utc>,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response>;
 

@@ -3,10 +3,10 @@
 use serde::Deserialize;
 use windlass_types::{AuthCookie, MamTorrentId, TorrentName, VpnPort};
 
-/// §36 step 9a: typed result for `QbitClient::authenticate`.  Replaces
-/// the legacy `windlass_core::Event::QbitAuthSuccess / QbitAuthFailed /
-/// QbitConnectionRefused / QbitApiError` return shape so the shell can
-/// own the protocol mapping without depending on legacy core types.
+/// §36 step 9a: typed result for `QbitClient::authenticate`.
+///
+/// Replaces the legacy auth event shape so the shell can own protocol mapping
+/// without depending on legacy core types.
 #[derive(Debug, Clone)]
 pub enum QbitAuthResult {
     Success(AuthCookie),

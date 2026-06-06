@@ -49,10 +49,10 @@ pub fn propagate<F: Future>(fut: F) -> tokio::task::futures::TaskLocalFuture<Opt
     CURRENT_ACTION_ID.scope(current(), fut)
 }
 
-/// Convenience: `tokio::spawn` the future with [`CURRENT_ACTION_ID`]
-/// propagated.  Use as a drop-in replacement for `tokio::spawn`
-/// inside `Shell::dispatch` so HTTP captures inside the spawned task
-/// can be tagged with the originating action id.
+/// Convenience wrapper around `tokio::spawn`.
+///
+/// Propagates [`CURRENT_ACTION_ID`] into spawned shell work so HTTP captures can
+/// be tagged with the originating action id.
 ///
 /// ```ignore
 /// causal::spawn(async move {

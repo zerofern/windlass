@@ -64,6 +64,7 @@ impl Machine for TinyMachine {
     fn handle(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
@@ -83,6 +84,7 @@ impl Machine for TinyMachine {
     fn handle_command(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         (): Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         Self::outcome(Vec::new(), ())

@@ -219,6 +219,7 @@ pub struct SystemStateView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionState {
     pub upload_health_ok: bool,
+    pub upload_buffer_ok: bool,
     pub unsatisfied_quota_full: bool,
     pub qbit_privacy_clean: bool,
     pub qbit_listen_port: Option<VpnPort>,
@@ -235,6 +236,7 @@ impl AdmissionState {
     const fn fail_closed() -> Self {
         Self {
             upload_health_ok: false,
+            upload_buffer_ok: false,
             unsatisfied_quota_full: true,
             qbit_privacy_clean: false,
             qbit_listen_port: None,
@@ -289,13 +291,14 @@ impl WindlassMachine {
     fn handle_manual_download(
         &self,
         mam_id: MamTorrentId,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> CommandOutcome<WindlassAction, WindlassPublish, WindlassResponse> {
         // Blacklist gate — legacy `if self.blacklisted_mam_ids.contains(&mam_id)`.
         if self.is_blacklisted(mam_id) {
             return Self::outcome(
                 vec![WindlassAction::Db(DbCommand::RecordActivity(
                     ActivityRecord {
-                        at: chrono::Utc::now(),
+                        at,
                         source: ActivitySource::Download,
                         action: "download_blocked".to_string(),
                         book_id: None,
@@ -372,13 +375,9 @@ impl WindlassMachine {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Vec<GateFailure>> {
         let mut failures = Vec::new();
-        // Upload health: freeleech bypasses ratio but still needs the buffer
-        // (semantics owned by MAM core's `upload_health_ok(freeleech)`).
-        // We only have the non-freeleech result wired in admission state;
-        // for freeleech, treat upload-health-ok as true (buffer is rolled in
-        // via the §26 publish for now).  This mirrors the MAM-7 semantics
-        // and the librarian-readiness A1 cost-rule docs.
-        if !candidate.freeleech && !self.admission.upload_health_ok {
+        if !self.admission.upload_buffer_ok
+            || (!candidate.freeleech && !self.admission.upload_health_ok)
+        {
             failures.push(GateFailure::UploadHealth);
         }
         if self.admission.unsatisfied_quota_full {
@@ -468,6 +467,7 @@ impl Machine for WindlassMachine {
     fn handle(
         &mut self,
         _now: Instant,
+        wall_now: chrono::DateTime<chrono::Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
@@ -565,7 +565,7 @@ impl Machine for WindlassMachine {
                 source,
             }) => {
                 self.admission.vpn_ip_compliant = Some(false);
-                Self::on_public_ip_mismatch(file_ip, verified_ip, source)
+                Self::on_public_ip_mismatch(file_ip, verified_ip, source, wall_now)
             }
             // §31 / DOM-22: persistent ifconfig.co failure.  Warning alert
             // + Activity, does NOT block admission (Gluetun file is still
@@ -573,13 +573,19 @@ impl Machine for WindlassMachine {
             WindlassEvent::Vpn(VpnPublish::PublicIpVerificationDegraded {
                 consecutive_failures,
                 last_reason,
-            }) => Self::on_public_ip_verification_degraded(consecutive_failures, &last_reason),
+            }) => Self::on_public_ip_verification_degraded(
+                consecutive_failures,
+                &last_reason,
+                wall_now,
+            ),
             // §33 / DOM-24: same Warning shape for the MAM-jsonIp source.
             // Independent counter, distinct alert title.
             WindlassEvent::Vpn(VpnPublish::MamIpVerificationDegraded {
                 consecutive_failures,
                 last_reason,
-            }) => Self::on_mam_ip_verification_degraded(consecutive_failures, &last_reason),
+            }) => {
+                Self::on_mam_ip_verification_degraded(consecutive_failures, &last_reason, wall_now)
+            }
             // §35 / DOM-25 (§38 migrated to Docker core): stale-namespace
             // dependent — Critical alert + admission block.  Docker core
             // has already requested the restart; the Critical signal makes
@@ -594,20 +600,21 @@ impl Machine for WindlassMachine {
                     &name,
                     dependent_started_at,
                     gluetun_healthy_since,
+                    wall_now,
                 )
             }
             // §35 (§38 migrated to Docker core): dependent's namespace is
             // fresh again.  Activity only; admission stays blocked until
             // §31/§32/§33 re-confirm the IP/ASN gates.
             WindlassEvent::Docker(DockerPublish::DependentNetworkTrusted { name }) => {
-                Self::on_dependent_network_trusted(&name)
+                Self::on_dependent_network_trusted(&name, wall_now)
             }
             // §35 / DOM-26 (§38 migrated to Docker core): restart circuit
             // breaker tripped.  Critical alert + Activity; admission stays
             // blocked.
             WindlassEvent::Docker(DockerPublish::RestartStorm { window_count, max }) => {
                 self.admission.vpn_ip_compliant = Some(false);
-                Self::on_restart_storm(window_count, max)
+                Self::on_restart_storm(window_count, max, wall_now)
             }
             // §38 PR 6: Docker-core anchor lifecycle drives VPN core.
             // Translate per-name publishes for the anchor into
@@ -640,7 +647,9 @@ impl Machine for WindlassMachine {
                 DockerPublish::Stopped { .. }
                 | DockerPublish::Started { .. }
                 | DockerPublish::LogsDumped { .. },
-            ) => Outcome::none(),
+            )
+            | WindlassEvent::Qbit(QbitPublish::TorrentsUpdated { .. })
+            | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
             WindlassEvent::Qbit(QbitPublish::Ready) => {
                 // §36 step 3 / DOM-29: rising-edge auth success — emit the
                 // `qbit_authenticated` activity entry that the legacy
@@ -655,7 +664,7 @@ impl Machine for WindlassMachine {
                     out.actions
                         .push(WindlassAction::Db(DbCommand::RecordActivity(
                             ActivityRecord {
-                                at: chrono::Utc::now(),
+                                at: wall_now,
                                 source: ActivitySource::Qbit,
                                 action: "authenticated".to_string(),
                                 book_id: None,
@@ -716,7 +725,7 @@ impl Machine for WindlassMachine {
                     Outcome {
                         actions: vec![WindlassAction::Db(DbCommand::RecordActivity(
                             ActivityRecord {
-                                at: chrono::Utc::now(),
+                                at: wall_now,
                                 source: ActivitySource::Qbit,
                                 action: "port_synced".to_string(),
                                 book_id: None,
@@ -733,8 +742,6 @@ impl Machine for WindlassMachine {
                 self.admission.mam_healthy = true;
                 Outcome::none()
             }
-            WindlassEvent::Qbit(QbitPublish::TorrentsUpdated { .. })
-            | WindlassEvent::Disk(DiskPublish::AboveFloor { .. }) => Outcome::none(),
             // §36 step 6 / DOM-40: persist the full qBit snapshot to the
             // `torrents` DB table that backs `/api/v1/torrents` + the
             // Torrent Monitor UI.  Ported from legacy
@@ -822,7 +829,7 @@ impl Machine for WindlassMachine {
                         ),
                     },
                     WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                        at: chrono::Utc::now(),
+                        at: wall_now,
                         source: ActivitySource::Download,
                         action: "torrent_add_failed".to_string(),
                         book_id: None,
@@ -846,10 +853,10 @@ impl Machine for WindlassMachine {
                     WindlassAction::SendAlert {
                         priority: AlertPriority::Info,
                         title: "Download started".to_string(),
-                        body: format!("MAM #{} added to qBittorrent.", mam_id.into_inner(),),
+                        body: format!("MAM #{} added to qBittorrent.", mam_id.into_inner()),
                     },
                     WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                        at: chrono::Utc::now(),
+                        at: wall_now,
                         source: ActivitySource::Download,
                         action: "torrent_added".to_string(),
                         book_id: None,
@@ -880,7 +887,7 @@ impl Machine for WindlassMachine {
                         ),
                     },
                     WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                        at: chrono::Utc::now(),
+                        at: wall_now,
                         source: ActivitySource::Download,
                         action: "torrent_add_failed".to_string(),
                         book_id: None,
@@ -929,12 +936,12 @@ impl Machine for WindlassMachine {
             WindlassEvent::Qbit(QbitPublish::QueueOrchestrated {
                 ref paused,
                 ref force_resumed,
-            }) => Self::on_queue_orchestrated(paused, force_resumed),
+            }) => Self::on_queue_orchestrated(paused, force_resumed, wall_now),
             // DOM-12: UnsatisfiedQuotaCritical → one RecordAlert(Critical) + one Activity publish.
             // §29: also marks the unsatisfied-quota gate as full.
             WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit }) => {
                 self.admission.unsatisfied_quota_full = true;
-                Self::on_unsatisfied_quota_critical(unsatisfied, limit)
+                Self::on_unsatisfied_quota_critical(unsatisfied, limit, wall_now)
             }
             // DOM-12: UnsatisfiedQuotaApproaching → one RecordAlert(Warning) + one Activity publish.
             // §29: approaching is below the limit (within 5), so the gate is NOT full.
@@ -943,7 +950,7 @@ impl Machine for WindlassMachine {
                 limit,
             }) => {
                 self.admission.unsatisfied_quota_full = false;
-                Self::on_unsatisfied_quota_approaching(unsatisfied, limit)
+                Self::on_unsatisfied_quota_approaching(unsatisfied, limit, wall_now)
             }
             // §29: positive-side counterpart — quota is safely under threshold.
             WindlassEvent::Qbit(QbitPublish::UnsatisfiedQuotaOk { .. }) => {
@@ -962,7 +969,7 @@ impl Machine for WindlassMachine {
             // §29: also marks the qBit privacy gate as unclean.
             WindlassEvent::Qbit(QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd }) => {
                 self.admission.qbit_privacy_clean = false;
-                Self::on_banned_privacy_settings_observed(dht, pex, lsd)
+                Self::on_banned_privacy_settings_observed(dht, pex, lsd, wall_now)
             }
             // §29: positive-side counterpart — DHT/PeX/LSD all off.
             WindlassEvent::Qbit(QbitPublish::PrivacyClean) => {
@@ -998,7 +1005,7 @@ impl Machine for WindlassMachine {
             WindlassEvent::Mam(MamPublish::NotConnectable { reason }) => {
                 self.state.mam = ServiceStatus::Degraded;
                 self.admission.mam_healthy = false;
-                self.on_mam_not_connectable(&reason)
+                self.on_mam_not_connectable(&reason, wall_now)
             }
             // DOM-16 (§28): Unreachable is a transient transport failure
             // (DNS, TCP, TLS, timeout).  Activity + ServiceStatus::Degraded
@@ -1019,18 +1026,26 @@ impl Machine for WindlassMachine {
                 buffer_ok,
             }) => {
                 self.admission.upload_health_ok = false;
-                Self::on_upload_health_degraded(ratio, upload_credit_bytes, ratio_ok, buffer_ok)
+                self.admission.upload_buffer_ok = buffer_ok;
+                Self::on_upload_health_degraded(
+                    ratio,
+                    upload_credit_bytes,
+                    ratio_ok,
+                    buffer_ok,
+                    wall_now,
+                )
             }
             // §29: positive-side counterpart — both metrics meet the minimums.
             WindlassEvent::Mam(MamPublish::UploadHealthOk { .. }) => {
                 self.admission.upload_health_ok = true;
+                self.admission.upload_buffer_ok = true;
                 Outcome::none()
             }
             // DOM-20 (§30): MAM rejected our IP with an ASN mismatch.
             // Blocks admission and fires a Critical alert.
             WindlassEvent::Mam(MamPublish::AsnMismatch { ip }) => {
                 self.admission.vpn_ip_compliant = Some(false);
-                Self::on_mam_asn_mismatch(ip)
+                Self::on_mam_asn_mismatch(ip, wall_now)
             }
             // §30: MAM accepted our IP — clear the admission gate.
             WindlassEvent::Mam(MamPublish::AsnAccepted) => {
@@ -1041,7 +1056,7 @@ impl Machine for WindlassMachine {
             WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
                 consecutive_failures,
                 last_reason,
-            }) => Self::on_keep_alive_degraded(consecutive_failures, &last_reason),
+            }) => Self::on_keep_alive_degraded(consecutive_failures, &last_reason, wall_now),
             // §36 step 4 / DOM-34: rate-limited gets a Critical alert
             // (ported from legacy `on_mam_rate_limit_violation`).  The
             // operator needs to know — MAM rate-limit hits typically
@@ -1110,6 +1125,7 @@ impl Machine for WindlassMachine {
     fn handle_command(
         &mut self,
         _now: Instant,
+        wall_now: chrono::DateTime<chrono::Utc>,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         match cmd {
@@ -1127,8 +1143,7 @@ impl Machine for WindlassMachine {
             // `TorrentBytesReady` which the domain then forwards as
             // `QbitCommand::AddTorrent` (§36 step 5 / DOM-35).
             WindlassCommand::TryAddTorrent { candidate } => {
-                let now = chrono::Utc::now();
-                match self.admit(&candidate, now) {
+                match self.admit(&candidate, wall_now) {
                     Ok(()) => Self::outcome(
                         vec![WindlassAction::Mam(MamCommand::FetchTorrent {
                             mam_id: candidate.mam_id,
@@ -1150,7 +1165,9 @@ impl Machine for WindlassMachine {
             // admission — blacklist, unsatisfied-quota, qBit-ready — and
             // dispatches `MamCommand::FetchTorrent` on pass.  Failures
             // emit a Warning alert.
-            WindlassCommand::ManualDownload { mam_id } => self.handle_manual_download(mam_id),
+            WindlassCommand::ManualDownload { mam_id } => {
+                self.handle_manual_download(mam_id, wall_now)
+            }
         }
     }
 
@@ -1228,6 +1245,7 @@ impl WindlassMachine {
         dht: bool,
         pex: bool,
         lsd: bool,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let mut enabled = Vec::new();
         if dht {
@@ -1248,13 +1266,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Critical,
                     title: "Banned qBit privacy setting enabled".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Domain,
                     action: "privacy_auto_revert".to_string(),
                     book_id: None,
@@ -1298,13 +1316,14 @@ impl WindlassMachine {
     fn on_queue_orchestrated(
         paused: &windlass_types::TorrentHash,
         force_resumed: &windlass_types::TorrentHash,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let detail = format!("paused={paused:?} resumed={force_resumed:?}");
         let message = format!("Queue orchestrated: {detail}");
         Outcome {
             actions: vec![WindlassAction::Db(DbCommand::RecordActivity(
                 ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Qbit,
                     action: "queue_orchestrated".to_string(),
                     book_id: None,
@@ -1324,19 +1343,20 @@ impl WindlassMachine {
     fn on_unsatisfied_quota_critical(
         unsatisfied: u32,
         limit: u32,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!("{unsatisfied}/{limit} unsatisfied torrents — download disabled.");
         let message = format!("Quota limit reached: {body}");
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Critical,
                     title: "Quota limit reached".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Qbit,
                     action: "unsatisfied_quota_critical".to_string(),
                     book_id: None,
@@ -1356,19 +1376,20 @@ impl WindlassMachine {
     fn on_unsatisfied_quota_approaching(
         unsatisfied: u32,
         limit: u32,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!("{unsatisfied}/{limit} unsatisfied torrents.");
         let message = format!("Approaching quota limit: {body}");
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Warning,
                     title: "Approaching quota limit".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Qbit,
                     action: "unsatisfied_quota_approaching".to_string(),
                     book_id: None,
@@ -1392,6 +1413,7 @@ impl WindlassMachine {
         upload_credit_bytes: u64,
         ratio_ok: bool,
         buffer_ok: bool,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let buffer_gib = upload_credit_bytes / (1024 * 1024 * 1024);
         let mut reasons = Vec::new();
@@ -1409,13 +1431,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Warning,
                     title: "Upload health degraded".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Domain,
                     action: "upload_health_degraded".to_string(),
                     book_id: None,
@@ -1440,6 +1462,7 @@ impl WindlassMachine {
         file_ip: VpnIp,
         verified_ip: VpnIp,
         source: VerificationSource,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let (source_label, source_human, action_label) = match source {
             VerificationSource::IfConfigCo => (
@@ -1466,13 +1489,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Critical,
                     title: format!("VPN public IP mismatch ({source_label})"),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Vpn,
                     action: action_label.to_string(),
                     book_id: None,
@@ -1492,6 +1515,7 @@ impl WindlassMachine {
     fn on_mam_ip_verification_degraded(
         consecutive_failures: u32,
         last_reason: &str,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "MAM /json/jsonIp.php verification failed {consecutive_failures} \
@@ -1505,13 +1529,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Warning,
                     title: "MAM IP verification failing".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Vpn,
                     action: "vpn_mam_ip_verification_degraded".to_string(),
                     book_id: None,
@@ -1534,6 +1558,7 @@ impl WindlassMachine {
         name: &str,
         dependent_started_at: chrono::DateTime<chrono::Utc>,
         gluetun_healthy_since: chrono::DateTime<chrono::Utc>,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "Dependent container `{name}` started at {dependent_started_at} \
@@ -1548,13 +1573,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Critical,
                     title: format!("Dependent `{name}` network untrusted"),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Vpn,
                     action: "vpn_dependent_network_untrusted".to_string(),
                     book_id: None,
@@ -1571,12 +1596,15 @@ impl WindlassMachine {
     /// The dependent's namespace is fresh again.  No alert; just an
     /// activity note so the operator can see recovery.  Admission stays
     /// where it was (§31/§32/§33 own the IP-side gate).
-    fn on_dependent_network_trusted(name: &str) -> Outcome<WindlassAction, WindlassPublish> {
+    fn on_dependent_network_trusted(
+        name: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
         let message = format!("dependent `{name}` network trusted (fresh namespace)");
         Outcome {
             actions: vec![WindlassAction::Db(DbCommand::RecordActivity(
                 ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Vpn,
                     action: "vpn_dependent_network_trusted".to_string(),
                     book_id: None,
@@ -1595,7 +1623,11 @@ impl WindlassMachine {
     /// slides.  Operator must intervene.  Emits one
     /// `RecordAlert(Critical)`, one `RecordActivity`, and one
     /// `Activity` publish.  Admission stays blocked.
-    fn on_restart_storm(window_count: u32, max: u32) -> Outcome<WindlassAction, WindlassPublish> {
+    fn on_restart_storm(
+        window_count: u32,
+        max: u32,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "Restart circuit breaker tripped: {window_count} dependent \
              restarts in the current window (limit {max}). Further \
@@ -1607,13 +1639,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Critical,
                     title: "Dependent restart storm".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Vpn,
                     action: "vpn_restart_storm".to_string(),
                     book_id: None,
@@ -1633,6 +1665,7 @@ impl WindlassMachine {
     fn on_public_ip_verification_degraded(
         consecutive_failures: u32,
         last_reason: &str,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "Public-IP verification (ifconfig.co) failed {consecutive_failures} \
@@ -1646,13 +1679,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Warning,
                     title: "VPN IP verification failing".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Vpn,
                     action: "vpn_public_ip_verification_degraded".to_string(),
                     book_id: None,
@@ -1672,7 +1705,10 @@ impl WindlassMachine {
     /// gate is already blocked by the caller, so the alert is the operator's
     /// signal to register the new ASN with MAM (or wait for Windlass
     /// automation to do so in a future story).
-    fn on_mam_asn_mismatch(ip: VpnIp) -> Outcome<WindlassAction, WindlassPublish> {
+    fn on_mam_asn_mismatch(
+        ip: VpnIp,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "MAM rejected the dynamic-seedbox update from IP {}: ASN not \
              registered for this account. Autograb is blocked until the \
@@ -1683,13 +1719,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Critical,
                     title: "MAM ASN mismatch".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Mam,
                     action: "mam_asn_mismatch".to_string(),
                     book_id: None,
@@ -1708,19 +1744,23 @@ impl WindlassMachine {
     /// transient network blip.  Emits one `RecordAlert(Warning)` and one
     /// Activity.  Distinct from `Unreachable` (transport failure, no alert)
     /// and `Unavailable` (broad degradation, no alert).
-    fn on_mam_not_connectable(&self, reason: &str) -> Outcome<WindlassAction, WindlassPublish> {
+    fn on_mam_not_connectable(
+        &self,
+        reason: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!("MAM reports the client as not connectable: {reason}");
         let message = format!("MAM not connectable: {reason}");
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Warning,
                     title: "MAM reports not connectable".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Mam,
                     action: "mam_not_connectable".to_string(),
                     book_id: None,
@@ -1747,6 +1787,7 @@ impl WindlassMachine {
     fn on_keep_alive_degraded(
         consecutive_failures: u32,
         last_reason: &str,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "MAM keep-alive failing — {consecutive_failures} consecutive failures. \
@@ -1759,13 +1800,13 @@ impl WindlassMachine {
         Outcome {
             actions: vec![
                 WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     priority: AlertPriority::Warning,
                     title: "MAM heartbeat failing".to_string(),
                     body,
                 })),
                 WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at: chrono::Utc::now(),
+                    at,
                     source: ActivitySource::Domain,
                     action: "mam_keep_alive_degraded".to_string(),
                     book_id: None,
@@ -1810,8 +1851,8 @@ mod tests {
     use windlass_vpn_core::VpnPublish;
 
     use crate::{
-        ServiceStatus, WindlassAction, WindlassConfig, WindlassEvent, WindlassMachine,
-        WindlassPublish,
+        AdmissionState, DownloadCandidate, GateFailure, ServiceStatus, WindlassAction,
+        WindlassConfig, WindlassEvent, WindlassMachine, WindlassPublish,
     };
 
     fn machine() -> WindlassMachine {
@@ -1831,8 +1872,40 @@ mod tests {
     ) -> Outcome<WindlassAction, WindlassPublish> {
         machine.handle(
             Instant::now(),
+            chrono::Utc::now(),
             Timed::external(Instant::now(), ExternalCause::Unknown, event),
         )
+    }
+
+    #[test]
+    fn freeleech_admission_still_requires_upload_buffer() {
+        let now = chrono::Utc::now();
+        let mut machine = machine();
+        machine.admission = AdmissionState {
+            upload_health_ok: false,
+            upload_buffer_ok: false,
+            unsatisfied_quota_full: false,
+            qbit_privacy_clean: true,
+            qbit_listen_port: Some(VpnPort::try_new(51_820).unwrap()),
+            mam_healthy: true,
+            vpn_ip_compliant: Some(true),
+        };
+        machine.state.forwarded_port = Some(VpnPort::try_new(51_820).unwrap());
+        let candidate = DownloadCandidate {
+            mam_id: windlass_types::MamTorrentId::try_new(1).unwrap(),
+            dl_url: "https://example.invalid/t/1".to_string(),
+            size_bytes: 1024,
+            numfiles: 1,
+            freeleech: true,
+            est_download_duration: Duration::from_secs(60),
+            my_snatched: false,
+            freeleech_window_end: Some(now + chrono::Duration::hours(1)),
+        };
+
+        assert_eq!(
+            machine.admit(&candidate, now),
+            Err(vec![GateFailure::UploadHealth])
+        );
     }
 
     #[test]
@@ -2822,6 +2895,7 @@ mod prop_tests {
             any::<bool>(),
             any::<bool>(),
             any::<bool>(),
+            any::<bool>(),
             proptest::option::of(any_vpn_port()),
             any::<bool>(),
             proptest::option::of(any::<bool>()),
@@ -2829,6 +2903,7 @@ mod prop_tests {
             .prop_map(
                 |(
                     upload_health_ok,
+                    upload_buffer_ok,
                     unsatisfied_quota_full,
                     qbit_privacy_clean,
                     qbit_listen_port,
@@ -2836,6 +2911,7 @@ mod prop_tests {
                     vpn_ip_compliant,
                 )| AdmissionState {
                     upload_health_ok,
+                    upload_buffer_ok,
                     unsatisfied_quota_full,
                     qbit_privacy_clean,
                     qbit_listen_port,
@@ -3049,7 +3125,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic).
         #[test]
         fn handle_never_panics(mut machine in any_windlass_machine(), event in any_windlass_event()) {
-            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let _ = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // DOM-1 (Guarantee C, marquee): the domain never commands qBit or MAM to
@@ -3059,7 +3135,7 @@ mod prop_tests {
             mut machine in any_windlass_machine(),
             event in any_windlass_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for action in &out.actions {
                 if let WindlassAction::Qbit(QbitCommand::EnsureListenPort { port })
                     | WindlassAction::Mam(MamCommand::EnsureSeedboxPort { port }) = action
@@ -3079,7 +3155,7 @@ mod prop_tests {
                 Just(VpnPublish::PortUnavailable),
             ],
         ) {
-            machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(lost)));
+            machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(lost)));
             prop_assert!(machine.state().forwarded_port.is_none());
         }
 
@@ -3096,6 +3172,7 @@ mod prop_tests {
             use windlass_types::AlertPriority;
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Disk(DiskPublish::BelowFloor { free_bytes })),
             );
             // §36 step 4: BelowFloor now emits 2 actions (evict + Warning
@@ -3130,6 +3207,7 @@ mod prop_tests {
             use windlass_disk_core::DiskPublish;
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Disk(DiskPublish::AboveFloor { free_bytes })),
             );
             prop_assert!(out.actions.is_empty(), "AboveFloor must emit no actions");
@@ -3159,6 +3237,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Qbit(
                     QbitPublish::BannedPrivacySettingsObserved { dht, pex, lsd },
                 )),
@@ -3206,6 +3285,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Qbit(
                     QbitPublish::UnsatisfiedQuotaCritical { unsatisfied, limit },
                 )),
@@ -3251,6 +3331,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Qbit(
                     QbitPublish::UnsatisfiedQuotaApproaching { unsatisfied, limit },
                 )),
@@ -3297,6 +3378,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::UploadHealthDegraded {
                     ratio,
                     upload_credit_bytes,
@@ -3344,6 +3426,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::KeepAliveDegraded {
                     consecutive_failures,
                     last_reason,
@@ -3387,6 +3470,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::NotConnectable { reason })),
             );
 
@@ -3428,6 +3512,7 @@ mod prop_tests {
 
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::Unreachable { reason })),
             );
 
@@ -3463,6 +3548,7 @@ mod prop_tests {
             let pre_admit = machine.admit(&candidate, now);
             let out = machine.handle_command(
                 Instant::now(),
+                chrono::Utc::now(),
                 WindlassCommand::TryAddTorrent { candidate: candidate.clone() },
             );
             let add_count = out.actions.iter().filter(|a| matches!(
@@ -3495,6 +3581,7 @@ mod prop_tests {
             let will_block = machine.admit(&candidate, now).is_err();
             let out = machine.handle_command(
                 Instant::now(),
+                chrono::Utc::now(),
                 WindlassCommand::TryAddTorrent { candidate },
             );
             if will_block {
@@ -3527,6 +3614,7 @@ mod prop_tests {
             let ip = VpnIp(std::net::Ipv4Addr::from(ip_bytes));
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Mam(MamPublish::AsnMismatch { ip })),
             );
 
@@ -3571,6 +3659,7 @@ mod prop_tests {
             let verified_ip = VpnIp(std::net::Ipv4Addr::from(verified_ip_bytes));
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
                     file_ip,
                     verified_ip,
@@ -3611,6 +3700,7 @@ mod prop_tests {
             let pre_compliant = machine.admission().vpn_ip_compliant;
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::PublicIpVerificationDegraded {
                     consecutive_failures,
                     last_reason,
@@ -3645,6 +3735,7 @@ mod prop_tests {
             let verified_ip = VpnIp(std::net::Ipv4Addr::from(verified_ip_bytes));
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::PublicIpMismatch {
                     file_ip,
                     verified_ip,
@@ -3684,6 +3775,7 @@ mod prop_tests {
             let pre_compliant = machine.admission().vpn_ip_compliant;
             let out = machine.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::MamIpVerificationDegraded {
                     consecutive_failures,
                     last_reason,
@@ -3716,7 +3808,7 @@ mod prop_tests {
 
             let healthy = chrono::Utc::now() - chrono::Duration::seconds(healthy_offset);
             let started = chrono::Utc::now() - chrono::Duration::seconds(dep_offset + healthy_offset);
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 WindlassEvent::Docker(windlass_docker_core::DockerPublish::DependentNetworkUntrusted {
                     name,
                     dependent_started_at: started,
@@ -3745,7 +3837,7 @@ mod prop_tests {
             use windlass_db_core::{AlertRecord, DbCommand};
             use windlass_types::AlertPriority;
 
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 WindlassEvent::Docker(windlass_docker_core::DockerPublish::RestartStorm { window_count, max }),
             ));
             let critical = out.actions.iter().filter(|a| matches!(

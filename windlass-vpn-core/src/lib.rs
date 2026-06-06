@@ -323,6 +323,7 @@ impl Machine for VpnMachine {
     fn handle(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
@@ -576,6 +577,7 @@ impl Machine for VpnMachine {
     fn handle_command(
         &mut self,
         now: Instant,
+        wall_now: chrono::DateTime<chrono::Utc>,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         // §38 PR 6: ContainerHealthy/Unhealthy commands delegate to the
@@ -589,6 +591,7 @@ impl Machine for VpnMachine {
                 // flow through TopicFanout, thread the publish_id through.
                 let out = self.handle(
                     now,
+                    wall_now,
                     Timed::external(now, ExternalCause::Unknown, VpnEvent::ContainerHealthy),
                 );
                 Self::outcome_with_publish(out.actions, out.publishes, VpnResponse::Accepted)
@@ -597,6 +600,7 @@ impl Machine for VpnMachine {
                 // TODO(§37d): see ContainerHealthy above.
                 let out = self.handle(
                     now,
+                    wall_now,
                     Timed::external(now, ExternalCause::Unknown, VpnEvent::ContainerUnhealthy),
                 );
                 Self::outcome_with_publish(out.actions, out.publishes, VpnResponse::Accepted)
@@ -644,6 +648,7 @@ mod tests {
     fn handle(machine: &mut VpnMachine, event: VpnEvent) -> Outcome<VpnAction, VpnPublish> {
         machine.handle(
             Instant::now(),
+            chrono::Utc::now(),
             Timed::external(Instant::now(), ExternalCause::Unknown, event),
         )
     }
@@ -665,7 +670,11 @@ mod tests {
     fn start_monitoring_command_matches_init_actions() {
         let mut machine = machine();
 
-        let out = machine.handle_command(Instant::now(), VpnCommand::StartMonitoring);
+        let out = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            VpnCommand::StartMonitoring,
+        );
 
         assert_eq!(
             out.actions,
@@ -1014,7 +1023,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic): handle tolerates any (state, event).
         #[test]
         fn handle_never_panics(mut machine in any_vpn_machine(), event in any_vpn_event()) {
-            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let _ = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // VPN-2 (Guarantee C): every published `PortReady` carries the port the
@@ -1024,7 +1033,7 @@ mod prop_tests {
             mut machine in any_vpn_machine(),
             event in any_vpn_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             for publish in &out.publishes {
                 if let VpnPublish::PortReady { port } = publish {
                     prop_assert_eq!(machine.port(), Some(*port));
@@ -1043,7 +1052,7 @@ mod prop_tests {
             ip in any_vpn_ip(),
         ) {
             let pre = machine.observed_ip();
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpFromFile { ip },
             ));
             prop_assert_eq!(machine.observed_ip(), Some(ip));
@@ -1066,7 +1075,7 @@ mod prop_tests {
             info in any_verified_ip_info(),
         ) {
             let pre_observed = machine.observed_ip();
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpVerified { info: info.clone() },
             ));
             let mismatch_count = out.publishes.iter()
@@ -1093,7 +1102,7 @@ mod prop_tests {
         ) {
             let threshold = machine.config.public_ip_verify_failure_threshold;
             let pre = machine.verification_failures;
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::PublicIpVerifyFailed { reason },
             ));
             let degraded_count = out.publishes.iter()
@@ -1115,7 +1124,7 @@ mod prop_tests {
         fn public_ip_verify_timer_always_reschedules(
             mut machine in any_vpn_machine(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
                 VpnEvent::TimerFired(VpnTimer::PublicIpVerify),
             ));
             let verify_count = out.actions.iter()

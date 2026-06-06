@@ -147,6 +147,7 @@ impl Machine for DiskMachine {
     fn handle(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
@@ -167,6 +168,7 @@ impl Machine for DiskMachine {
     fn handle_command(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         match cmd {
@@ -194,6 +196,7 @@ mod tests {
     fn observe(m: &mut DiskMachine, free_bytes: u64) -> Vec<DiskPublish> {
         m.handle(
             Instant::now(),
+            chrono::Utc::now(),
             Timed::external(
                 Instant::now(),
                 ExternalCause::Unknown,
@@ -247,6 +250,7 @@ mod tests {
         let mut m = machine(1_000_000);
         let out = m.handle(
             Instant::now(),
+            chrono::Utc::now(),
             Timed::external(Instant::now(), ExternalCause::Unknown, DiskEvent::Init),
         );
         assert!(out.publishes.is_empty());
@@ -303,7 +307,7 @@ mod prop_tests {
         // GLOBAL-1 (no panic).
         #[test]
         fn handle_never_panics(mut machine in any_disk_machine(), event in any_disk_event()) {
-            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let _ = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // DISK-1 [safety] (Guarantee A): BelowFloor is published iff
@@ -316,6 +320,7 @@ mod prop_tests {
         ) {
             let out = machine.handle(
                 Instant::now(),
+            chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, DiskEvent::DiskSpaceObserved { free_bytes }),
             );
             // Exactly one publish must be emitted.
@@ -346,7 +351,7 @@ mod prop_tests {
             mut machine in any_disk_machine(),
             event in any_disk_event(),
         ) {
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
             prop_assert!(out.actions.is_empty());
         }
     }

@@ -12,10 +12,10 @@ pub use uom::si::f64::Information;
 
 // ── CoreId ────────────────────────────────────────────────────────────────────
 
-/// Identifies a per-system service runtime.  Lives here so HTTP clients
-/// (which don't depend on `windlass-machine`) can tag their tap calls
-/// with the owning core.  `windlass-machine::tap` re-exports this so
-/// runtime-side code can keep using `windlass_machine::CoreId`.
+/// Identifies a per-system service runtime.
+///
+/// Lives here so HTTP clients can tag tap calls without depending on
+/// `windlass-machine`. `windlass-machine::tap` re-exports this for runtime code.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CoreId {
@@ -61,10 +61,10 @@ impl std::fmt::Display for CoreId {
 
 // ── HttpTap ───────────────────────────────────────────────────────────────────
 
-/// Borrowed view of an HTTP request, handed to [`HttpTap::gate_request`]
-/// just before `client.execute(req)` is called.  Constructed from the
-/// typed inputs the client used to build the request — never from the
-/// built `reqwest::Request` (whose body is not always inspectable).
+/// Borrowed view of an HTTP request, handed to [`HttpTap::gate_request`].
+///
+/// Constructed from the typed inputs the client used to build the request,
+/// never from the built `reqwest::Request` whose body is not always inspectable.
 /// See `docs/observability-redesign.md` "HTTP request capture rule".
 pub struct HttpRequestView<'a> {
     pub method: &'a str,
@@ -149,9 +149,9 @@ pub struct VpnPort(u16);
 pub struct HttpStatusCode(pub u16);
 
 /// A single HTTP request/response pair captured from a client call.
+///
 /// Carries raw header pairs; the observability controller decides which
-/// header values are secret-bearing (Authorization / Cookie / Set-Cookie)
-/// at capture time and wraps those in `ServerSecretSlot`.
+/// header values are secret-bearing at capture time.
 #[derive(Debug, Clone, Serialize)]
 pub struct HttpExchange {
     /// Which client emitted this: `"qbit"` or `"mam"`.

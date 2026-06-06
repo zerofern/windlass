@@ -200,7 +200,7 @@ impl ObservabilityController {
         this
     }
 
-    fn core(&self, id: CoreId) -> &CoreState {
+    const fn core(&self, id: CoreId) -> &CoreState {
         &self.cores[id as usize]
     }
 
@@ -507,10 +507,9 @@ impl ObservabilityController {
         self.broadcast(SseMessage::HttpExchange(exchange));
     }
 
-    /// Build a HelloSnapshot containing every ring's current contents
-    /// + per-core statuses + loss counters.  Sent to a fresh SSE
-    /// subscriber so the frontend can hydrate its local store from one
-    /// payload (§37pre B9).
+    /// Build a `HelloSnapshot` from every ring's current contents.
+    ///
+    /// Includes per-core statuses and loss counters for fresh SSE subscribers.
     /// Look up the cleartext for a `reveal_id` by scanning the per-core
     /// step rings and the cross-core HTTP ring for a matching
     /// [`ServerSecretSlot`].  Returns `None` once the parent record has
@@ -536,6 +535,7 @@ impl ObservabilityController {
                 return Some(value);
             }
         }
+        drop(http_ring);
         None
     }
 
@@ -613,7 +613,10 @@ fn spawn_http_worker(
 /// impl, which never produces a slot), so this returns `None`.  The
 /// hook lives here so future record extensions can plug in without
 /// changing the scan loop in [`ObservabilityController::reveal`].
-fn find_reveal_in_step(_record: &stored::StoredStepRecord, _reveal_id: Uuid) -> Option<String> {
+const fn find_reveal_in_step(
+    _record: &stored::StoredStepRecord,
+    _reveal_id: Uuid,
+) -> Option<String> {
     None
 }
 

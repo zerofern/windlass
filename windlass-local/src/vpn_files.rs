@@ -5,10 +5,10 @@ use tokio::sync::mpsc;
 
 use windlass_types::{VpnIp, VpnPort};
 
-/// §36 step 9b: typed result for the VPN-file watcher channel.  Replaces
-/// the legacy `windlass_core::Event::PortFileReadResult` shape so
-/// `windlass-local` doesn't depend on the legacy core crate.  Callers map
-/// each variant to `VpnEvent` themselves.
+/// §36 step 9b: typed result for the VPN-file watcher channel.
+///
+/// Replaces the legacy `windlass_core::Event::PortFileReadResult` shape.
+/// Callers map each variant to `VpnEvent` themselves.
 pub type PortFileResult = Result<(VpnIp, VpnPort), String>;
 
 /// Reads and parses both VPN files.

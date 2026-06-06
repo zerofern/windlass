@@ -23,10 +23,10 @@ integration:
     # (`integration_support`), the windlass-local docker tests, and the
     # standalone qbit_integration suite.
     set -e; \
-    cleanup() { docker compose -f docker-compose.dev.yml down -v --remove-orphans; docker compose -f docker-compose.qbit-integration.yml down -v --remove-orphans; }; \
+    cleanup() { docker compose -f docker-compose.dev.yml down -v --remove-orphans; docker compose -p windlass-qbit-integration -f docker-compose.qbit-integration.yml down -v --remove-orphans; }; \
     trap cleanup EXIT; \
     docker compose -f docker-compose.dev.yml up --build -d; \
-    docker compose -f docker-compose.qbit-integration.yml up --build --wait -d; \
+    docker compose -p windlass-qbit-integration -f docker-compose.qbit-integration.yml up --build --wait -d; \
     cargo test -p windlass-local -- --include-ignored --test-threads=1 --nocapture; \
     cargo test --test integration_support -- --ignored --test-threads=1 --nocapture; \
     cargo test --test integration_contracts -- --ignored --test-threads=1 --nocapture; \
@@ -35,9 +35,9 @@ integration:
 # Run qBit-specific integration tests (requires docker-compose.qbit-integration.yml up)
 integration-qbit:
     set -e; \
-    cleanup() { docker compose -f docker-compose.qbit-integration.yml down -v --remove-orphans; }; \
+    cleanup() { docker compose -p windlass-qbit-integration -f docker-compose.qbit-integration.yml down -v --remove-orphans; }; \
     trap cleanup EXIT; \
-    docker compose -f docker-compose.qbit-integration.yml up --build --wait -d; \
+    docker compose -p windlass-qbit-integration -f docker-compose.qbit-integration.yml up --build --wait -d; \
     cargo test --test qbit_integration -- --ignored --test-threads=1 --nocapture
 
 # Bring up only Postgres for DB development.
@@ -84,10 +84,10 @@ fmt-check:
     cargo fmt -- --check
 
 clippy:
-    DATABASE_URL=postgres://windlass:windlass@localhost:15432/windlass cargo clippy -- -W clippy::pedantic -W clippy::nursery
+    DATABASE_URL=postgres://windlass:windlass@localhost:15432/windlass cargo clippy -- -D warnings -W clippy::pedantic -W clippy::nursery
 
-coverage:
-    cargo tarpaulin \
+coverage: db-up db-migrate
+    DATABASE_URL=postgres://windlass:windlass@localhost:15432/windlass cargo tarpaulin \
         --exclude-files "mlm/*" "mousehole/*" \
         --exclude-files "windlass/src/main.rs" \
         --exclude-files "windlass/src/shell/*" \

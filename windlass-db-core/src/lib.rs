@@ -62,7 +62,7 @@ pub enum ActivitySource {
     Web,
     System,
     /// §36 step 5: manual-download activity entries
-    /// (download_blocked / torrent_added / torrent_add_failed).
+    /// (`download_blocked` / `torrent_added` / `torrent_add_failed`).
     Download,
 }
 
@@ -222,6 +222,7 @@ impl Machine for DbMachine {
     fn handle(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         let publishes = match event.inner {
@@ -254,6 +255,7 @@ impl Machine for DbMachine {
     fn handle_command(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         Self::outcome(vec![DbAction::Execute(cmd)], DbResponse::Accepted)
@@ -408,7 +410,7 @@ mod prop_tests {
             let mut machine = DbMachine::new((), Instant::now());
             let is_failure = matches!(event, DbEvent::Failed(_));
 
-            let out = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let out = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
 
             prop_assert!(out.actions.is_empty());
             prop_assert_eq!(out.publishes.len(), 1);
@@ -423,7 +425,7 @@ mod prop_tests {
         fn command_executes_verbatim(command in any_db_command()) {
             let mut machine = DbMachine::new((), Instant::now());
 
-            let out = machine.handle_command(Instant::now(), command.clone());
+            let out = machine.handle_command(Instant::now(), chrono::Utc::now(), command.clone());
 
             prop_assert!(out.publishes.is_empty());
             prop_assert_eq!(out.response, DbResponse::Accepted);

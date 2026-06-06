@@ -98,7 +98,8 @@ where
                     }).await;
 
                     let t0 = Instant::now();
-                    let outcome = self.machine.handle(t0, timed);
+                    let wall_now = Utc::now();
+                    let outcome = self.machine.handle(t0, wall_now, timed);
                     let duration = t0.elapsed();
 
                     let step_id = Uuid::new_v4();
@@ -194,7 +195,8 @@ where
                 command = self.command_rx.recv() => {
                     let Some((cmd, reply)) = command else { break };
                     let t0 = Instant::now();
-                    let outcome = self.machine.handle_command(t0, cmd);
+                    let wall_now = Utc::now();
+                    let outcome = self.machine.handle_command(t0, wall_now, cmd);
                     let duration = t0.elapsed();
 
                     let step_id = Uuid::new_v4();
@@ -406,6 +408,7 @@ mod tests {
         fn handle(
             &mut self,
             _now: Instant,
+            _wall_now: chrono::DateTime<chrono::Utc>,
             event: Timed<Self::Event>,
         ) -> Outcome<Self::Action, Self::Publish> {
             match event.inner {
@@ -419,6 +422,7 @@ mod tests {
         fn handle_command(
             &mut self,
             _now: Instant,
+            _wall_now: chrono::DateTime<chrono::Utc>,
             (): Self::Command,
         ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
             self.asks += 1;
@@ -507,7 +511,7 @@ mod tests {
         // snapshot. The FakeMachine's snapshot is itself; after one Ask
         // command the asks counter is visible in the JSON.
         let mut machine = FakeMachine::new((), Instant::now());
-        let _ = machine.handle_command(Instant::now(), ());
+        let _ = machine.handle_command(Instant::now(), chrono::Utc::now(), ());
         let value = serde_json::to_value(machine.state_snapshot())
             .expect("state snapshot should serialize");
         assert_eq!(value["asks"], 1);

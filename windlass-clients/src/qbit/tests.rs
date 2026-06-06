@@ -303,6 +303,69 @@ async fn sync_port_network_error_returns_failed_with_code_zero() {
     );
 }
 
+// ── private tracker safe prefs ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn set_private_tracker_safe_prefs_posts_banned_settings_off() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/app/setPreferences"))
+        .and(wiremock::matchers::body_string_contains(
+            "json=%7B%22dht%22%3Afalse%2C%22pex%22%3Afalse%2C%22lsd%22%3Afalse%7D",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let qbit = QbitClient::new(
+        reqwest::Client::new(),
+        server.uri(),
+        "admin".into(),
+        QbitPassword::new("password".into()),
+        windlass_types::NullHttpTap::arc(),
+    );
+    let cookie = AuthCookie::new("abc123".to_string());
+
+    assert!(qbit.set_private_tracker_safe_prefs(&cookie).await);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn set_private_tracker_safe_prefs_returns_false_on_error_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/app/setPreferences"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+        .mount(&server)
+        .await;
+
+    let qbit = QbitClient::new(
+        reqwest::Client::new(),
+        server.uri(),
+        "admin".into(),
+        QbitPassword::new("password".into()),
+        windlass_types::NullHttpTap::arc(),
+    );
+    let cookie = AuthCookie::new("abc123".to_string());
+
+    assert!(!qbit.set_private_tracker_safe_prefs(&cookie).await);
+}
+
+#[tokio::test]
+async fn set_private_tracker_safe_prefs_returns_false_on_network_error() {
+    let qbit = QbitClient::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:1".into(),
+        "admin".into(),
+        QbitPassword::new("password".into()),
+        windlass_types::NullHttpTap::arc(),
+    );
+    let cookie = AuthCookie::new("abc123".to_string());
+
+    assert!(!qbit.set_private_tracker_safe_prefs(&cookie).await);
+}
+
 // ── list_torrent_details ──────────────────────────────────────────────────────
 
 #[tokio::test]

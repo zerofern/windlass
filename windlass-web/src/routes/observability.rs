@@ -188,7 +188,7 @@ async fn remove_breakpoint(
 ///
 /// Returns the cleartext for the secret slot identified by `reveal_id`,
 /// or `410 Gone` once the parent record has been evicted from its ring.
-/// IDs are unguessable UUIDv4s minted at capture time; there is no
+/// IDs are unguessable `UUIDv4`s minted at capture time; there is no
 /// separate reveal map to keep consistent — the ring is the
 /// authoritative source.  See `docs/observability-redesign.md`
 /// "Secrets (Decision 14 detail)".
@@ -196,10 +196,10 @@ async fn reveal_secret(
     State(app): State<AppState>,
     Path(reveal_id): Path<Uuid>,
 ) -> Result<String, (StatusCode, String)> {
-    match app.observability.reveal(reveal_id).await {
-        Some(cleartext) => Ok(cleartext),
-        None => Err((StatusCode::GONE, "reveal id evicted or unknown".into())),
-    }
+    app.observability.reveal(reveal_id).await.map_or_else(
+        || Err((StatusCode::GONE, "reveal id evicted or unknown".into())),
+        Ok,
+    )
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

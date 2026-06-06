@@ -180,13 +180,13 @@ impl Shell for QbitShell {
                 let client = self.client.clone();
                 let tx = event_tx.clone();
                 windlass_machine::causal::spawn(async move {
-                    let event = match client.add_torrent(&cookie, bytes).await {
-                        Some(hash) => QbitEvent::TorrentAdded { mam_id, hash },
-                        None => QbitEvent::TorrentAddFailed {
+                    let event = client.add_torrent(&cookie, bytes).await.map_or_else(
+                        || QbitEvent::TorrentAddFailed {
                             mam_id,
                             reason: "qBittorrent rejected the torrent add request".to_string(),
                         },
-                    };
+                        |hash| QbitEvent::TorrentAdded { mam_id, hash },
+                    );
                     let _ = tx.send(Timed::external(
                         std::time::Instant::now(),
                         ExternalCause::Unknown,

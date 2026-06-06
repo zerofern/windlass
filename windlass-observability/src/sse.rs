@@ -45,6 +45,7 @@ pub struct HelloSnapshot {
 }
 
 /// IDs that have just left a ring (or had their reveal slot expire).
+///
 /// Emitted by the controller on every eviction so the frontend can
 /// drop dangling references / revealed-secret state.  `exchange_ids`
 /// is populated on HTTP-ring eviction (EC-3 covers both ring kinds);
@@ -63,7 +64,7 @@ pub struct EvictedIds {
 
 impl EvictedIds {
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.step_ids.is_empty()
             && self.action_ids.is_empty()
             && self.publish_ids.is_empty()

@@ -103,7 +103,7 @@ pub(super) async fn init_shell(
     );
     let mam = mam::MamClient::new(
         config.gluetun_proxy_url.as_deref(),
-        config.mam_session.clone(),
+        &config.mam_session,
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
         &config.mam_user_agent,

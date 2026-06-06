@@ -344,8 +344,11 @@ impl DockerMachine {
     /// Shared by the stale-namespace path (`ContainerStarted` for a stale
     /// dependent) and the autoheal path (`ContainerUnhealthy` for a known
     /// dependent), so a single restart budget covers both.
-    fn try_restart(&mut self, name: String) -> (Vec<DockerAction>, Vec<DockerPublish>) {
-        let now = Utc::now();
+    fn try_restart(
+        &mut self,
+        name: String,
+        now: DateTime<Utc>,
+    ) -> (Vec<DockerAction>, Vec<DockerPublish>) {
         self.prune_restart_window(now);
         let max = self.config.max_restarts_per_window;
         let window_count = u32::try_from(self.restart_window.len()).unwrap_or(u32::MAX);
@@ -398,6 +401,7 @@ impl Machine for DockerMachine {
     fn handle(
         &mut self,
         _now: Instant,
+        wall_now: chrono::DateTime<chrono::Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
@@ -432,7 +436,7 @@ impl Machine for DockerMachine {
                         // Rising-edge anchor recovery — new incident
                         // starts, dump dedup resets, all dependents are
                         // marked untrusted until re-inspected.
-                        self.anchor_healthy_since = Some(Utc::now());
+                        self.anchor_healthy_since = Some(wall_now);
                         self.incident_id = self.incident_id.saturating_add(1);
                         self.crash_dump_emitted_for_current_incident = false;
                         for dep_name in self.dependents.clone() {
@@ -475,7 +479,7 @@ impl Machine for DockerMachine {
                     // enabled, every unhealthy event for a known
                     // dependent triggers a circuit-breakered restart.
                     if self.config.autoheal_dependents && self.dependents.contains(&name) {
-                        let (restart_actions, restart_publish) = self.try_restart(name);
+                        let (restart_actions, restart_publish) = self.try_restart(name, wall_now);
                         actions.extend(restart_actions);
                         publishes.extend(restart_publish);
                     }
@@ -518,7 +522,7 @@ impl Machine for DockerMachine {
                             dependent_started_at: started_at,
                             gluetun_healthy_since: healthy_since,
                         });
-                        let (restart_actions, restart_publish) = self.try_restart(name);
+                        let (restart_actions, restart_publish) = self.try_restart(name, wall_now);
                         actions.extend(restart_actions);
                         publishes.extend(restart_publish);
                     }
@@ -534,6 +538,7 @@ impl Machine for DockerMachine {
     fn handle_command(
         &mut self,
         _now: Instant,
+        _wall_now: chrono::DateTime<chrono::Utc>,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         match cmd {
@@ -611,6 +616,7 @@ mod tests {
     fn discover(m: &mut DockerMachine, names: &[&str]) {
         m.handle(
             Instant::now(),
+            chrono::Utc::now(),
             Timed::external(
                 Instant::now(),
                 ExternalCause::Unknown,
@@ -643,6 +649,7 @@ mod tests {
         let mut m = machine();
         let out = m.handle(
             Instant::now(),
+            chrono::Utc::now(),
             Timed::external(Instant::now(), ExternalCause::Unknown, DockerEvent::Init),
         );
         assert_eq!(
@@ -669,7 +676,11 @@ mod tests {
     fn stop_dependents_emits_one_action_per_dependent() {
         let mut m = machine();
         discover(&mut m, &["qbittorrent", "mlm"]);
-        let out = m.handle_command(Instant::now(), DockerCommand::StopDependents);
+        let out = m.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            DockerCommand::StopDependents,
+        );
         assert_eq!(
             out.actions,
             vec![
@@ -688,7 +699,11 @@ mod tests {
     fn start_dependents_with_empty_registry_emits_nothing() {
         // DOCKER-3: StartDependents/StopDependents is a no-op on empty registry.
         let mut m = machine();
-        let out = m.handle_command(Instant::now(), DockerCommand::StartDependents);
+        let out = m.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            DockerCommand::StartDependents,
+        );
         assert!(out.actions.is_empty());
         assert_eq!(out.response, DockerResponse::Accepted);
     }
@@ -697,7 +712,11 @@ mod tests {
     fn stop_dependents_with_empty_registry_emits_nothing() {
         // DOCKER-3.
         let mut m = machine();
-        let out = m.handle_command(Instant::now(), DockerCommand::StopDependents);
+        let out = m.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            DockerCommand::StopDependents,
+        );
         assert!(out.actions.is_empty());
     }
 
@@ -706,6 +725,7 @@ mod tests {
         let mut m = machine();
         let out = m.handle_command(
             Instant::now(),
+            chrono::Utc::now(),
             DockerCommand::RestartContainer {
                 name: "gluetun".to_string(),
             },
@@ -722,7 +742,11 @@ mod tests {
     fn dump_all_logs_includes_anchor_and_dependents() {
         let mut m = machine();
         discover(&mut m, &["qbittorrent"]);
-        let out = m.handle_command(Instant::now(), DockerCommand::DumpAllLogs);
+        let out = m.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            DockerCommand::DumpAllLogs,
+        );
         assert_eq!(
             out.actions,
             vec![
@@ -740,7 +764,11 @@ mod tests {
     fn list_dependents_returns_current_registry() {
         let mut m = machine();
         discover(&mut m, &["qbittorrent", "mlm"]);
-        let out = m.handle_command(Instant::now(), DockerCommand::ListDependents);
+        let out = m.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            DockerCommand::ListDependents,
+        );
         assert!(out.actions.is_empty());
         assert_eq!(
             out.response,
@@ -772,6 +800,7 @@ mod tests {
     ) -> crate::Outcome<DockerAction, DockerPublish> {
         m.handle(
             Instant::now(),
+            chrono::Utc::now(),
             Timed::external(Instant::now(), ExternalCause::Unknown, event),
         )
     }
@@ -1279,6 +1308,7 @@ mod prop_tests {
             let mut m = DockerMachine::new(DockerConfig::default(), Instant::now());
             m.handle(
                 Instant::now(),
+                chrono::Utc::now(),
                 Timed::external(
                     Instant::now(),
                     ExternalCause::Unknown,
@@ -1324,13 +1354,13 @@ mod prop_tests {
         // GLOBAL-1: handle never panics.
         #[test]
         fn handle_never_panics(mut machine in any_machine(), event in any_event()) {
-            let _ = machine.handle(Instant::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
+            let _ = machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown, event));
         }
 
         // GLOBAL-1: handle_command never panics.
         #[test]
         fn handle_command_never_panics(mut machine in any_machine(), cmd in any_command()) {
-            let _ = machine.handle_command(Instant::now(), cmd);
+            let _ = machine.handle_command(Instant::now(), chrono::Utc::now(), cmd);
         }
 
         // DOCKER-1 [safety] (§35): ContainerCrashed publishes at most once
@@ -1346,6 +1376,7 @@ mod prop_tests {
                 .map_or(crate::ContainerHealth::Unknown, |s| s.health);
             let out = machine.handle(
                 Instant::now(),
+            chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, DockerEvent::ContainerUnhealthy { name: name.clone() }),
             );
             let crashed_count = out
@@ -1381,6 +1412,7 @@ mod prop_tests {
                 .unwrap_or_else(chrono::Utc::now);
             let out = machine.handle(
                 Instant::now(),
+            chrono::Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown, DockerEvent::ContainerStarted {
                     name,
                     started_at,
