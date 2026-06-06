@@ -161,15 +161,13 @@ async fn fetch_mam_status_decodes_rate_limit_shape() {
 async fn journal_records_calls_for_assertions() {
     let base = spawn_fake_mam().await;
     let mam = build_client(&base);
-    // Drive a few requests through MamClient.  Pause between calls to
-    // clear the client's 400 ms inter-request guard
-    // (`MamClient::check_rate_limit`); otherwise the second / third
-    // call short-circuits to `LocalRateLimit` and never journals.
-    let pause = std::time::Duration::from_millis(450);
+    // Drive a few requests through MamClient.  The client's 400 ms
+    // inter-request guard now *waits* instead of dropping the second
+    // call (2026-06-06 fix in `wait_for_rate_limit`), so no manual
+    // sleeps are needed — three sequential awaits will serialize at
+    // ~400 ms intervals automatically.
     let _ = mam.check_session().await;
-    tokio::time::sleep(pause).await;
     let _ = mam.fetch_mam_status().await;
-    tokio::time::sleep(pause).await;
     let _ = mam.fetch_mam_ip().await;
 
     let http = reqwest::Client::new();

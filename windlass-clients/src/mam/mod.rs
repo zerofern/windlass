@@ -5,9 +5,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use windlass_types::{
-    CoreId, HttpAnomaly, HttpExchange, HttpRequestView, HttpTap, MamSessionId, VpnIp,
-};
+use windlass_types::{CoreId, HttpExchange, HttpRequestView, HttpTap, MamSessionId, VpnIp};
 
 /// §36 step 9a: typed result for `MamClient::update_seedbox`.  Replaces
 /// the legacy `windlass_core::Event::Mam*` shape so the shell can map
@@ -221,7 +219,11 @@ pub struct MamClient {
     /// source alongside `ifconfig.co`.
     json_ip_url: String,
     torrent_base_url: String,
-    last_request_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Held across `wait_for_rate_limit().await` so concurrent callers
+    /// serialize through the 400 ms inter-request guard instead of
+    /// short-circuiting on the second-and-after caller.  See the
+    /// `wait_for_rate_limit` doc comment for the rationale.
+    last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     /// §32: timestamp of the last successful (or attempted) call to the
     /// dynamic-seedbox endpoint.  Enforces MAM's documented 1-hour rolling
     /// limit on top of the existing 400 ms inter-request guard.
@@ -263,7 +265,7 @@ impl MamClient {
             load_url: ensure_client_stats(load_url),
             json_ip_url: "https://t.myanonamouse.net/json/jsonIp.php".into(),
             torrent_base_url: "https://www.myanonamouse.net".into(),
-            last_request_at: Arc::new(Mutex::new(None)),
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             last_seedbox_call_at: Arc::new(Mutex::new(None)),
             hook,
         })
@@ -279,6 +281,7 @@ impl MamClient {
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn check_session(&self) -> anyhow::Result<()> {
+        self.wait_for_rate_limit().await;
         let current = self.current_session();
         self.gate_request("GET", &self.check_session_url).await;
         let resp = self
@@ -321,9 +324,7 @@ impl MamClient {
     /// `MamFetchError::StatusFailed` on a non-success HTTP response or a
     /// parse error.
     pub async fn fetch_mam_ip(&self) -> Result<MamIpInfo, MamFetchError> {
-        if !self.check_rate_limit() {
-            return Err(MamFetchError::LocalRateLimit);
-        }
+        self.wait_for_rate_limit().await;
         self.gate_request("GET", &self.json_ip_url).await;
         let result = self.client.get(&self.json_ip_url).send().await;
         match result {
@@ -371,9 +372,7 @@ impl MamClient {
             warn!("MAM dynamic-seedbox 1h client-side rate limit triggered");
             return MamSeedboxResult::RateLimited;
         }
-        if !self.check_rate_limit() {
-            return MamSeedboxResult::RateLimited;
-        }
+        self.wait_for_rate_limit().await;
         let current = self.current_session();
         let (result, new_session) = self.do_update_seedbox(&current).await;
         if let Some(rotated) = new_session {
@@ -399,9 +398,7 @@ impl MamClient {
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn fetch_mam_status(&self) -> Result<MamStatusResult, MamFetchError> {
-        if !self.check_rate_limit() {
-            return Err(MamFetchError::LocalRateLimit);
-        }
+        self.wait_for_rate_limit().await;
         let current = self.current_session();
         let (result, new_session) = self.do_fetch_mam_status(&current).await;
         if let Some(rotated) = new_session {
@@ -497,25 +494,24 @@ impl MamClient {
     /// `gate_request` call then parks the offending request before it
     /// is sent (P7 in the redesign doc — the bad request never leaves
     /// the host).
-    fn check_rate_limit(&self) -> bool {
-        let mut last = self.last_request_at.lock().unwrap();
-        if let Some(t) = *last
-            && t.elapsed() < std::time::Duration::from_millis(400)
-        {
-            warn!("MAM rate limit guard triggered");
-            self.hook.signal_anomaly(
-                CoreId::Mam,
-                HttpAnomaly::RateLimitViolation {
-                    reason: format!(
-                        "MAM rate limit guard — last request {} ms ago, minimum 400 ms",
-                        t.elapsed().as_millis()
-                    ),
-                },
-            );
-            return false;
+    /// 400 ms inter-request guard.  Holds the tokio mutex across the
+    /// sleep so concurrent callers serialize through the guard instead
+    /// of getting `LocalRateLimit` back when they raced.  This is the
+    /// 2026-06-06 fix for the boot-time race where `check_session`,
+    /// `update_seedbox`, and `fetch_mam_status` all fired within a
+    /// millisecond of each other and only the first reached MAM —
+    /// the others returned `LocalRateLimit` and the operator silently
+    /// missed the seedbox registration.
+    async fn wait_for_rate_limit(&self) {
+        let mut last = self.last_request_at.lock().await;
+        let min = std::time::Duration::from_millis(400);
+        if let Some(t) = *last {
+            let elapsed = t.elapsed();
+            if let Some(remaining) = min.checked_sub(elapsed) {
+                tokio::time::sleep(remaining).await;
+            }
         }
         *last = Some(std::time::Instant::now());
-        true
     }
 
     /// §32: enforces the documented 1-hour rolling rate limit on
