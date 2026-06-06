@@ -1388,9 +1388,16 @@ compliance issue.
 
 ## Story: Rebuild The Integration-Test Suite Around A Real Docker Stack
 
-Status: Planning locked (2026-06-05) — ready to implement as a single
-story (no substories).  Purpose, architecture, and the seven open
-questions from the original planning sketch are settled below.
+Status: Done (2026-06-06) — shipped over 6 PRs (planning lock +
+fake-MAM bin mode, compose rewrite, support helpers, ports +
+deletions, contract tests + bug fixes, docs).  The current state of
+the suite is documented in `docs/integration-tests.md`.  Two real
+Windlass bugs uncovered by the new harness landed alongside PR 5:
+qBit transient-state mapping (silent torrents-table upsert failure)
+and MAM 400 ms guard race (silent dynamicSeedbox.php loss at boot).
+The §34 follow-ups that didn't make this story (§29 admission
+tests, external notification tests) are tracked in
+`docs/integration-test-audit.md`.
 
 ### Problem
 

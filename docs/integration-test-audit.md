@@ -1,24 +1,29 @@
-# Integration-Test Audit (§34)
+# Integration-Test Audit (§34 phase 1)
 
-State of `just integration` after §27–§35 shipped.  This document is the
-§34 deliverable: a per-story coverage table, a punch list of recommended
-new integration tests, and the explicit list of behaviors we have decided
-to keep at the property-test layer only.
+**Historical document.**  This was §34's planning input — the
+per-story coverage analysis of the pre-§34 suite and the punch list
+of recommended new tests.  §34 the implementation has now landed
+(see `docs/integration-tests.md` for how the harness works today and
+`docs/operator-readiness.md` §34 for the locked architecture).
 
-Used by §36's per-handler cutover as the regression safety net.
+This doc is preserved as the audit trail of what was covered before,
+what got reshaped under the contract-verification lens, and which
+audit items have been delivered.
 
-## How the existing suite is shaped
+## How the suite was shaped (pre-§34)
 
 Two integration-test crates:
 
 - **`windlass/tests/integration.rs`** — 16 `#[tokio::test]` cases, all
   `#[ignore = "requires dev stack"]`, run against the real
-  Postgres + chaos-controller + mock qBit/MAM stack.
+  Postgres + chaos-controller + mock qBit/MAM stack.  **Deleted in
+  §34 PR 4.**
 - **`windlass-clients/tests/qbit_integration.rs`** — qBit client
-  integration against a real qBittorrent container; not covered here.
+  integration against a real qBittorrent container; still standalone
+  in the post-§34 setup.
 
-Chaos scenarios available via `POST /scenario/{name}`
-(`windlass-testkit/src/chaos.rs`):
+Chaos scenarios were available via `POST /scenario/{name}` on
+`windlass-testkit/src/chaos.rs`:
 
 | Scenario name              | Used by | Notes |
 |----------------------------|---|---|
@@ -30,6 +35,10 @@ Chaos scenarios available via `POST /scenario/{name}`
 
 Chaos endpoints for Gluetun: `POST /gluetun/set-files`,
 `POST /gluetun/health/{up|down}`.
+
+The chaos controller, the WireMock-based mocks, and the 16 legacy
+tests were all retired in §34 PRs 2-4.  The replacement architecture
+lives in `docs/integration-tests.md`.
 
 ## Per-story coverage
 
@@ -128,19 +137,32 @@ purpose as **contract verification between Windlass and its external
 dependencies** — wire-format fidelity for services we don't own
 (qBit, MAM, Gluetun), side effects across the trust boundary, and
 real-I/O wiring between cores.  Pure behavior tests move to the
-property-test layer.  Applied to the punch list above:
+property-test layer.
 
-| Audit # | Disposition under contract framing |
-|---|---|
-| 1 (torrent-records persistence) | **Keep.**  Real qBit `/torrents/info` parses; fields round-trip to DB.  Uses a real `.torrent` fixture (no `qbit-torrent-list` mock). |
-| 2 (§29 blocked path) | **Keep, slim.**  Real qBit `/app/preferences` shape; flipping `dht: true` is observable; assert no `add` call lands. |
-| 3 (§29 success path) | **Keep.**  Real qBit `/torrents/add` accepts Windlass's multipart body. |
-| 4 (§30 ASN-mismatch alert routing) | **Move to proptest.**  Pure behavior — fake MAM's ASN-mismatch shape parsing covered by the drift smoke pass. |
-| 5 (§31 IP-driven seedbox update) | **Keep.**  Real Gluetun IP-file write triggers POST to fake MAM with the documented body shape; fake MAM journals it. |
-| 6 (§28 Unreachable vs NotConnectable) | **Move to proptest.**  Pure behavior. |
-| 7 (§27 keep-alive degraded) | **Move to proptest.**  Timer-driven behavior. |
-| 8 (§32 client-side 1/h rate limit) | **Keep.**  Fake MAM journal asserts exactly-one POST in window. |
-| 9 (§33 multi-source verification) | **Keep.**  Fake MAM `/jsonIp.php` shape parses; mismatch triggers Critical alert. |
+Applied to the original punch list, with delivery status as of
+2026-06-06:
+
+| Audit # | Disposition under contract framing | Status |
+|---|---|---|
+| 1 (torrent-records persistence) | **Keep.**  Real qBit `/torrents/info` parses; fields round-trip to DB.  Uses a real magnet fixture. | ✅ `qbit_torrent_persists_to_db_via_api` (PR 5).  Uncovered + fixed a real bug in `torrent_state_str` along the way. |
+| 2 (§29 blocked path) | **Keep, slim.**  Real qBit `/app/preferences` shape; flipping `dht: true` is observable; assert no `add` call lands. | ⏸ Deferred.  Requires a working manual-download flow with valid `.torrent` bytes from fake MAM; revisit when librarian work lands. |
+| 3 (§29 success path) | **Keep.**  Real qBit `/torrents/add` accepts Windlass's multipart body. | ⏸ Deferred (same reason as #2). |
+| 4 (§30 ASN-mismatch alert routing) | **Move to proptest.**  Pure behavior — fake MAM's ASN-mismatch shape parsing covered by the drift smoke pass. | ⏭ Proptest at `windlass-domain-core`. |
+| 5 (§31 IP-driven seedbox update) | **Keep.**  Gluetun IP-file write triggers a fresh POST to fake MAM (the body itself is empty per `docs/mam-api.md`; the contract is "call happens after IP change"). | ✅ `gluetun_ip_change_triggers_new_seedbox_call` (PR 5). |
+| 6 (§28 Unreachable vs NotConnectable) | **Move to proptest.**  Pure behavior. | ⏭ Proptest at `windlass-mam-core`. |
+| 7 (§27 keep-alive degraded) | **Move to proptest.**  Timer-driven behavior. | ⏭ Proptest at `windlass-mam-core`. |
+| 8 (§32 client-side 1/h rate limit) | **Keep.**  Fake MAM journal asserts exactly-one POST in window. | ✅ `seedbox_rate_limit_suppresses_second_call_within_hour` (PR 5). |
+| 9 (§33 multi-source verification) | **Move to proptest.**  Alert wire is deferred per §34 lock #9; the `/jsonIp.php` shape itself is pinned by the mam_drift smoke pass. | ⏭ Proptest at `windlass-domain-core` / `windlass-vpn-core`. |
+
+Plus contract tests beyond the original audit that landed as part of
+the rebuild:
+
+- `boot_authenticates_qbit`, `boot_syncs_default_port_to_qbit_preferences`,
+  `boot_updates_mam_seedbox`, `boot_writes_system_snapshot_to_db`,
+  `gluetun_set_files_resyncs_port_to_qbit` — the five §34 PR 4 ports
+  from the pre-§34 suite.
+- `qbit_endpoints_match_windlass_clients_types` — qBit API-drift
+  smoke pass (PR 5).
 
 ## API-drift smoke pass (new class, introduced by §34)
 
@@ -197,8 +219,18 @@ prerequisites; the new harness reshapes them:
 
 ## Action plan
 
-This document is §34 phase 1.  §34 itself (operator-readiness.md)
-is the harness rebuild plus the reshaped punch list above.  The
-new test-writing work tracks against §36's per-handler cutover
-commits where overlap exists; Tier 1 contract tests should land
-before §36 step 7 (compliance retirement).
+This document was §34 phase 1.  §34 phase 2 — the harness rebuild
+plus the reshaped punch list — landed in 6 PRs through 2026-06-06.
+For the current state of the suite see
+`docs/integration-tests.md`.
+
+Open follow-ups from the reshape:
+
+- §29 admission gate (audit #2 + #3) needs the manual-download path
+  to round-trip through fake MAM with valid `.torrent` bytes.
+  Revisit when librarian work lands a torrent-bytes fixture in
+  the testkit.
+- Notifications (per §34 lock #9): when external surfaces are
+  added (Telegram / Pushover / webhook / SMTP), each one gets its
+  own contract test against a fake delivery endpoint in the
+  testkit — same pattern as fake MAM.
