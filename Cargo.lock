@@ -3363,6 +3363,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-net"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "windlass-machine",
+ "windlass-tunnel-core",
+ "windlass-types",
+]
+
+[[package]]
 name = "windlass-observability"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "windlass-net"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait           = { workspace = true }
+chrono                = { workspace = true }
+secrecy               = { workspace = true }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
+tokio                 = { workspace = true }
+tracing               = { workspace = true }
+windlass-machine      = { workspace = true }
+windlass-tunnel-core  = { workspace = true }
+windlass-types        = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
