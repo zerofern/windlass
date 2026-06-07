@@ -5,7 +5,6 @@ use tokio::sync::mpsc;
 use windlass_db_core::DbMachine;
 use windlass_disk_core::DiskMachine;
 use windlass_domain_core::WindlassMachine;
-use windlass_local::vpn_files::PortFileResult;
 use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
 use windlass_mam_core::{MamEvent, MamMachine};
 use windlass_qbit_core::{QbitEvent, QbitMachine};
@@ -68,7 +67,14 @@ impl ServiceCores {
     /// `init_shell` after every runtime is spawned and every
     /// forwarder task is running, so the first events each core sees
     /// have causes tagged `ExternalCause::Init`.
-    pub fn dispatch_init(&self, is_gluetun_healthy: bool, port_files: &PortFileResult) {
+    ///
+    /// Phase 5 (docs/vpn-ownership.md): the Gluetun-boot priming
+    /// (`is_gluetun_healthy`, port-file replay) is gone.  The
+    /// `TunnelMachine` surfaces its own first-pass state through the
+    /// bridge in `init_shell`; downstream cores see the same
+    /// `VpnEvent` shape they always did, but sourced from the tunnel
+    /// core instead of file polls.
+    pub fn dispatch_init(&self) {
         let now = Instant::now();
         let _ = self.domain.events.send(Timed::external(
             now,
@@ -87,20 +93,6 @@ impl ServiceCores {
             .mam
             .events
             .send(Timed::external(now, ExternalCause::Init, MamEvent::Init));
-        if is_gluetun_healthy {
-            let _ = self.vpn.events.send(Timed::external(
-                now,
-                ExternalCause::Init,
-                VpnEvent::ContainerHealthy,
-            ));
-        }
-        if let Ok((_, port)) = port_files {
-            let _ = self.vpn.events.send(Timed::external(
-                now,
-                ExternalCause::Init,
-                VpnEvent::PortFileChanged { port: *port },
-            ));
-        }
     }
 }
 

@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use windlass_clients::{mam, qbit};
 use windlass_db::DbPool;
-use windlass_local::{docker, vpn_files};
+use windlass_local::docker;
 use windlass_types::{VpnPort, WakeupId};
 
 use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand, DbMachine, DbPublish, DbTopic};
@@ -18,7 +18,7 @@ use windlass_docker_core::{DockerConfig, DockerMachine};
 use windlass_domain_core::{
     WindlassConfig, WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic,
 };
-use windlass_machine::{ExternalCause, Timed};
+use windlass_machine::Timed;
 use windlass_mam_core::{MamConfig, MamMachine, MamPublish, MamTopic};
 use windlass_net::{TunnelShell, TunnelShellConfig};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
@@ -45,8 +45,6 @@ pub(super) struct ShellRuntime {
     pub(super) dependents: Vec<String>,
     pub(super) qbit: qbit::QbitClient,
     pub(super) mam: mam::MamClient,
-    pub(super) vpn_ip_file: String,
-    pub(super) vpn_port_file: String,
     pub(super) data_path: String,
     pub(super) wakeups: HashMap<WakeupId, JoinHandle<()>>,
     pub(super) service_cores: ServiceCores,
@@ -76,14 +74,10 @@ pub(super) async fn init_shell(
         .await
         .map_err(|e| anyhow::anyhow!("Database migration failed: {e}"))?;
 
-    // §36 step 9b: vpn_files now emits a typed `PortFileResult`; the
-    // forwarder task is spawned below (after VPN handles exist) to feed
-    // VpnEvent::PortFileChanged / PublicIpFromFile / StateReadFailed
-    // directly into the VpnMachine.
-    let (file_result_tx, file_result_rx) = mpsc::channel::<vpn_files::PortFileResult>(16);
-    let port_files =
-        vpn_files::read_and_watch(&config.vpn_ip_file, &config.vpn_port_file, file_result_tx).await;
-
+    // Phase 5 (docs/vpn-ownership.md): the Gluetun file-watcher
+    // pump is gone.  Tunnel mode is the only source of VPN-state
+    // truth now; the bridge below synthesizes VpnEvents from
+    // TunnelPublishes for the legacy VpnMachine state translator.
     info!("Windlass started");
 
     let direct = reqwest::Client::builder()
@@ -105,7 +99,6 @@ pub(super) async fn init_shell(
         http_tap.clone(),
     );
     let mam = mam::MamClient::new(
-        config.gluetun_proxy_url.as_deref(),
         &config.mam_session,
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
@@ -116,8 +109,6 @@ pub(super) async fn init_shell(
     .with_json_ip_url(config.mam_json_ip_url.clone())
     .with_torrent_base_url(config.mam_torrent_base_url.clone());
 
-    let vpn_ip_file = config.vpn_ip_file.clone();
-    let vpn_port_file = config.vpn_port_file.clone();
     let data_path = config.data_path.clone();
 
     // §36 step 5: HTTP server start is deferred until after the domain
@@ -216,15 +207,7 @@ pub(super) async fn init_shell(
             public_ip_verify_interval: Duration::from_hours(6),
             public_ip_verify_failure_threshold: 3,
         },
-        VpnShellConfig {
-            vpn_ip_file: config.vpn_ip_file.clone(),
-            vpn_port_file: config.vpn_port_file.clone(),
-            // §31: route ifconfig.co through Gluetun so the verified IP is
-            // the VPN exit IP, not the host's public IP.
-            vpn_proxy_url: config.gluetun_proxy_url.clone(),
-            public_ip_verify_url: None,
-            mam_ip_verify_url: None,
-        },
+        VpnShellConfig,
     )
     .await;
     let (vpn_pub_tx, mut vpn_pub_rx) =
@@ -251,7 +234,8 @@ pub(super) async fn init_shell(
     // into the existing VpnMachine event channel so PortReady/
     // Disconnected/etc. drive the same downstream paths Gluetun-
     // sourced events do today.
-    if let Some(wg_path) = config.wg_config_path.as_deref() {
+    {
+        let wg_path = config.wg_config_path.as_str();
         let wg_content = tokio::fs::read_to_string(wg_path)
             .await
             .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
@@ -328,38 +312,9 @@ pub(super) async fn init_shell(
         );
     }
 
-    // §36 step 9b: pump vpn_files results (typed) directly into the
-    // VpnMachine.  Replaces the legacy `Event::PortFileReadResult` path
-    // via service_cores.observe — that bridge entry is now redundant.
-    {
-        let vpn_event_tx = vpn_handles.events.clone();
-        let mut file_result_rx = file_result_rx;
-        tokio::spawn(async move {
-            while let Some(result) = file_result_rx.recv().await {
-                match result {
-                    Ok((ip, port)) => {
-                        let _ = vpn_event_tx.send(Timed::external(
-                            std::time::Instant::now(),
-                            ExternalCause::Unknown,
-                            windlass_vpn_core::VpnEvent::PortFileChanged { port },
-                        ));
-                        let _ = vpn_event_tx.send(Timed::external(
-                            std::time::Instant::now(),
-                            ExternalCause::Unknown,
-                            windlass_vpn_core::VpnEvent::PublicIpFromFile { ip },
-                        ));
-                    }
-                    Err(reason) => {
-                        let _ = vpn_event_tx.send(Timed::external(
-                            std::time::Instant::now(),
-                            ExternalCause::Unknown,
-                            windlass_vpn_core::VpnEvent::StateReadFailed { reason },
-                        ));
-                    }
-                }
-            }
-        });
-    }
+    // Phase 5: the Gluetun file-watcher pump is gone.  TunnelMachine
+    // owns the IP + port state and the bridge above synthesizes
+    // VpnEvents directly from TunnelPublishes.
 
     let (qbit_handles, _qbit_join) = windlass_machine::spawn::<QbitMachine, QbitShell>(
         windlass_machine::CoreId::Qbit,
@@ -691,15 +646,13 @@ pub(super) async fn init_shell(
     // runtime's typed event channel.  Replaces the legacy
     // `tx.send(Event::Init { ... })` + `service_cores.observe` bridge
     // that used to translate one untyped Init into four typed ones.
-    service_cores.dispatch_init(boot.is_gluetun_healthy, &port_files);
+    service_cores.dispatch_init();
 
     Ok(ShellRuntime {
         docker,
         dependents: boot.dependents,
         qbit,
         mam,
-        vpn_ip_file,
-        vpn_port_file,
         data_path,
         wakeups,
         service_cores,

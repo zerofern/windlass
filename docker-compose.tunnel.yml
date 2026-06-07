@@ -31,11 +31,6 @@ services:
     network_mode: "bridge"
     environment:
       WG_CONFIG_PATH: /config/wg.conf
-      # Disable the Gluetun-side integration paths.  In tunnel mode
-      # the file watchers and proxy URL are unused; the runtime
-      # picks up the tunnel-core publishes via the bridge in
-      # `windlass/src/shell/init.rs`.
-      GLUETUN_PROXY_URL: ""
     volumes:
       - ./wg.conf:/config/wg.conf:ro
     # Map the qBit WebUI through the windlass container so qBit's

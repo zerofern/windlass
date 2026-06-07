@@ -113,27 +113,20 @@ Windlass is configured entirely via environment variables.
 | `QBITTORRENT_USER`  | ✓        | —                             | qBittorrent WebUI username          |
 | `QBITTORRENT_PASS`  | ✓        | —                             | qBittorrent WebUI password          |
 | `MAM_SESSION`       | ✓        | —                             | MyAnonamouse session cookie value   |
-| `GLUETUN_PROXY_URL` |          | —                             | Gluetun HTTP proxy for MAM traffic  |
+| `WG_CONFIG_PATH`    | ✓        | —                             | Path to the ProtonVPN-generated `wg.conf` Windlass uses to bring up the in-process WireGuard tunnel.  See `docs/vpn-ownership.md`. |
 | `MAM_USER_AGENT`    |          | `windlass`                    | User-Agent sent to MAM              |
 | `DATA_PATH`         |          | `/mnt/Data`                   | Path to monitor for disk space      |
 | `DUMP_DIR`          |          | `/mnt/Data/windlass_dumps`    | Directory for crash log dumps       |
-| `VPN_IP_FILE`       |          | `/tmp/gluetun/ip`             | Gluetun IP file path                |
-| `VPN_PORT_FILE`     |          | `/tmp/gluetun/forwarded_port` | Gluetun forwarded port file path    |
 | `WINDLASS_BIND`     |          | `0.0.0.0:5010`                | Address for the embedded web server |
 | `WINDLASS_EXECUTE_SERVICE_ACTIONS` | | `true` | Execute the sans-I/O service-core action path; disabling is diagnostic only |
-| `WG_CONFIG_PATH`    |          | —                             | Path to a ProtonVPN-generated `wg.conf`. When set, Windlass owns the WireGuard tunnel in-process and Gluetun is not used. See `docs/vpn-ownership.md`. |
-| `WG_INTERFACE_NAME` |          | `wg0`                         | Tunnel interface name (tunnel mode only) |
-| `NATPMP_GATEWAY`    |          | `10.2.0.1:5351`               | NAT-PMP gateway address for the in-process port-forwarding flow (tunnel mode only) |
+| `WG_INTERFACE_NAME` |          | `wg0`                         | Tunnel interface name |
+| `NATPMP_GATEWAY`    |          | `10.2.0.1:5351`               | NAT-PMP gateway address for the in-process port-forwarding flow |
 
 `WINDLASS_EXECUTE_SHADOW_ACTIONS` is still accepted as a deprecated alias for
 the service action switch. Legacy service orchestration has been retired from
 `windlass-core`, so this is no longer a rollback to a complete legacy path.
 
 ## Running with Docker Compose
-
-Windlass supports two VPN topologies.  Pick one.
-
-### Tunnel mode (new — `docs/vpn-ownership.md`)
 
 Windlass owns the WireGuard tunnel in-process: no Gluetun container,
 no proxy URL, no file watchers.  qBittorrent shares Windlass's
@@ -145,28 +138,5 @@ docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
 ```
 
 See `docker-compose.tunnel.yml` for the override skeleton and the
-required `WG_CONFIG_PATH` env var.
-
-### Gluetun mode (legacy)
-
-Windlass shares Gluetun's network namespace so it can reach qBittorrent
-and read the VPN files.
-
-```yaml
-windlass:
-  image: ghcr.io/stirlingmouse/windlass:main
-  container_name: windlass
-  network_mode: "service:gluetun"
-  volumes:
-    - /opt/gluetun/tmp:/tmp/gluetun:ro
-  environment:
-    - QBITTORRENT_URL=http://localhost:8080
-    - QBITTORRENT_USER=admin
-    - QBITTORRENT_PASS=changeme
-    - MAM_SESSION=your_session_cookie
-    - GLUETUN_PROXY_URL=http://localhost:8888
-  restart: unless-stopped
-  depends_on:
-    gluetun:
-      condition: service_healthy
-```
+required `WG_CONFIG_PATH` env var.  Background on the design:
+`docs/vpn-ownership.md`.

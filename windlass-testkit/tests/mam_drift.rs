@@ -30,7 +30,6 @@ async fn spawn_fake_mam() -> String {
 
 fn build_client(base: &str) -> MamClient {
     MamClient::new(
-        None,
         &MamSessionId::new("drift-test-session".to_owned()),
         format!("{base}/json/dynamicSeedbox.php"),
         format!("{base}/jsonLoad.php"),

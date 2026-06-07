@@ -9,10 +9,6 @@ pub struct Config {
     pub qbit_user: String,
     pub qbit_pass: QbitPassword,
     pub mam_session: MamSessionId,
-    /// Gluetun's built-in HTTP proxy, used to route MAM traffic through the VPN.
-    /// When `None` (env var absent), the VPN client makes direct connections — useful
-    /// in integration tests and local dev where no VPN tunnel is running.
-    pub gluetun_proxy_url: Option<String>,
     /// Full URL for the MAM dynamic-seedbox endpoint.
     /// Override via `MAM_SEEDBOX_URL` to point at a mock in integration tests.
     pub mam_seedbox_url: String,
@@ -38,16 +34,12 @@ pub struct Config {
     pub data_path: String,
     pub dump_dir: String,
     pub database_url: String,
-    pub vpn_ip_file: String,
-    pub vpn_port_file: String,
-    /// Path to a `ProtonVPN`-generated `wg.conf` file.  When set,
-    /// Windlass owns the `WireGuard` tunnel in-process via
-    /// `windlass-tunnel-core` + `windlass-net` and skips the Gluetun
-    /// integration paths (file watchers, `GLUETUN_PROXY_URL`, the
-    /// §31/§33 cross-check).  Requires `NET_ADMIN` and
-    /// `network_mode` that gives Windlass its own namespace.
-    /// See `docs/vpn-ownership.md`.
-    pub wg_config_path: Option<String>,
+    /// Path to a `ProtonVPN`-generated `wg.conf` file.  Windlass owns
+    /// the `WireGuard` tunnel in-process via `windlass-tunnel-core` +
+    /// `windlass-net`.  Requires `NET_ADMIN` and `network_mode` that
+    /// gives Windlass its own namespace.  See
+    /// `docs/vpn-ownership.md`.
+    pub wg_config_path: String,
     /// Interface name for the in-process tunnel (when
     /// `wg_config_path` is set).  Defaults to `wg0`.
     pub wg_interface_name: String,
@@ -75,7 +67,6 @@ impl Config {
                 var("QBITTORRENT_PASS").context("QBITTORRENT_PASS missing")?,
             ),
             mam_session: MamSessionId::new(var("MAM_SESSION").context("MAM_SESSION missing")?),
-            gluetun_proxy_url: var("GLUETUN_PROXY_URL").ok(),
             mam_seedbox_url: var("MAM_SEEDBOX_URL").unwrap_or_else(|_| {
                 "https://t.myanonamouse.net/json/dynamicSeedbox.php".to_string()
             }),
@@ -95,10 +86,7 @@ impl Config {
             dump_dir: var("DUMP_DIR").unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),
             database_url: var("DATABASE_URL")
                 .context("DATABASE_URL missing; expected postgres:// URL")?,
-            vpn_ip_file: var("VPN_IP_FILE").unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),
-            vpn_port_file: var("VPN_PORT_FILE")
-                .unwrap_or_else(|_| "/tmp/gluetun/forwarded_port".to_string()),
-            wg_config_path: var("WG_CONFIG_PATH").ok(),
+            wg_config_path: var("WG_CONFIG_PATH").context("WG_CONFIG_PATH missing")?,
             wg_interface_name: var("WG_INTERFACE_NAME").unwrap_or_else(|_| "wg0".to_string()),
             natpmp_gateway: var("NATPMP_GATEWAY").unwrap_or_else(|_| "10.2.0.1:5351".to_string()),
             compliance_poll_interval_secs: var("COMPLIANCE_POLL_INTERVAL_SECS")

@@ -235,22 +235,20 @@ impl MamClient {
     /// # Errors
     /// Returns an error if the reqwest client cannot be built (e.g. invalid proxy URL).
     pub fn new(
-        proxy_url: Option<&str>,
         session: &MamSessionId,
         seedbox_url: String,
         load_url: String,
         user_agent: &str,
         hook: Arc<dyn HttpTap>,
     ) -> anyhow::Result<Self> {
-        let builder = reqwest::Client::builder()
+        // Tunnel mode (docs/vpn-ownership.md) gives Windlass its own
+        // namespace whose only egress is `wg0`.  No application-level
+        // proxy is needed — the kernel routes via the tunnel and the
+        // nftables kill switch drops anything else.
+        let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent(user_agent);
-        let builder = if let Some(url) = proxy_url {
-            builder.proxy(reqwest::Proxy::all(url)?)
-        } else {
-            builder
-        };
-        let client = builder.build()?;
+            .user_agent(user_agent)
+            .build()?;
         Ok(Self {
             client,
             session: Arc::new(Mutex::new(SecretString::from(
@@ -852,7 +850,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -877,7 +874,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -908,7 +904,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("old_cookie".into()),
             server.uri(),
             server.uri(),
@@ -934,7 +929,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -961,7 +955,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -982,7 +975,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -1006,7 +998,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("old_session".into()),
             server.uri(),
             server.uri(),
@@ -1032,7 +1023,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -1055,7 +1045,6 @@ mod tests {
         // (was Event::MamUpdateSuccess — the historical lie that masked DNS
         // and TLS failures as healthy operator state).
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             "http://127.0.0.1:1".into(),
             "http://127.0.0.1:1".into(),
@@ -1080,7 +1069,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -1104,7 +1092,6 @@ mod tests {
             .await;
 
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             server.uri(),
             server.uri(),
@@ -1122,7 +1109,6 @@ mod tests {
     fn new_with_proxy_url_builds_client() {
         // A local socks5 proxy address — client builds without error.
         let result = MamClient::new(
-            Some("socks5://127.0.0.1:1080"),
             &MamSessionId::new("session".into()),
             "http://example.com".into(),
             "http://example.com".into(),
@@ -1148,7 +1134,6 @@ mod tests {
 
         let base = server.uri();
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             base.clone(),
             base.clone(),
@@ -1175,7 +1160,6 @@ mod tests {
 
         let base = server.uri();
         let mam = MamClient::new(
-            None,
             &MamSessionId::new("my_session".into()),
             base.clone(),
             base.clone(),
