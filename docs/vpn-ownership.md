@@ -35,10 +35,11 @@ that calls `reqwest::Client::builder()` without going through a
 proxy is a fresh leak path.  The runtime cross-check (§31/§33)
 detects leaks but does not prevent them.
 
-If Windlass owns the only network egress its container has, leak
+If Windlass owns the network namespace and tunnel control plane, leak
 prevention becomes a property of the namespace and firewall, not the
 HTTP client configuration.  Wrong code cannot leak because there is
-no non-tunnel path for packets to take.
+no non-tunnel path for packets to take, except the explicitly allowed
+underlay traffic needed to establish the WireGuard session itself.
 
 **3.  Cross-container coordination is the wrong abstraction.**  Today
 Windlass watches `/tmp/gluetun/ip` and `/tmp/gluetun/forwarded_port`,
@@ -52,6 +53,32 @@ A single process that owns the tunnel sees handshake state, port
 forwarding state, and connectivity state directly.  There are no
 files to watch, no proxies to configure, and no other process to
 coordinate with.
+
+## Ownership boundary
+
+This redesign does not mean business logic performs privileged
+networking operations.  It means Windlass owns the VPN control plane
+inside its process boundary while preserving the existing
+functional-core / imperative-shell split.
+
+The tunnel core is a pure, sans-IO state machine.  It receives typed
+events such as handshake observed, endpoint unreachable, NAT-PMP
+lease granted, NAT-PMP renewal failed, leak probe succeeded, leak
+probe failed, and timer fired.  It returns typed actions such as
+configure interface, install firewall policy, renew lease, rotate
+endpoint, run leak probe, and publish tunnel state.
+
+The tunnel shell is Linux-only and executes the privileged work:
+netlink/WireGuard interface configuration, firewall rule changes,
+NAT-PMP packet exchange, route inspection, DNS/leak probes, and
+`wg show`-equivalent introspection.  It translates I/O results back
+into tunnel-core events.
+
+Docker remains the owner of container lifecycle and namespace
+relationships.  The tunnel core owns tunnel state; the Docker core
+owns dependent containers; the domain core owns cross-service policy
+between them.  qBit, MAM, and disk cores continue to consume typed
+facts through the existing runtime/fanout architecture.
 
 ## Objectives
 
@@ -67,9 +94,10 @@ recovery actions.
 **Leak prevention as a system property.**  After boot, the only
 internet egress Windlass's network namespace has is the WireGuard
 interface.  A non-tunnel route is either absent or actively blocked
-by firewall rules.  Code that constructs a `reqwest::Client` without
-any proxy still cannot leak because the kernel has no non-tunnel
-route to use.
+by firewall rules, except for the minimal underlay allowlist required
+to reach the configured WireGuard endpoint.  Code that constructs a
+`reqwest::Client` without any proxy still cannot leak because the
+kernel has no non-tunnel route to use for ordinary internet traffic.
 
 **Single source of truth for VPN state.**  The tunnel's handshake
 time, current endpoint, forwarded port, and observed public IP are
@@ -94,7 +122,17 @@ tunnel core.
 **qBit and Windlass share egress.**  Both processes appear to MAM
 and to remote peers under the same public IP.  MAM's connectability
 check continues to succeed.  qBit's forwarded port is the one
-Windlass negotiated with Proton.
+Windlass negotiated with Proton.  Windlass restarts, upgrades, and
+configuration restarts have an explicit qBit lifecycle policy so qBit
+never continues running with an ambiguous or stale namespace.
+
+**Privileged operations are narrow.**  `NET_ADMIN` is treated as a
+deployment requirement for the tunnel shell, not a license for broad
+privileged behavior throughout the program.  Privileged operations are
+small, typed, observable shell actions.  If the container/runtime can
+drop capabilities after boot-time setup without breaking renewals or
+recovery, the design should do so; otherwise the residual risk is
+documented and covered by integration tests.
 
 ## External requirements
 
@@ -110,16 +148,28 @@ gateway, 60-second TTL, renewal required).
 mounted into the container.  Windlass parses it at boot.  Hot-reload
 is not required; configuration changes mean a Windlass restart.
 
+If the `Endpoint` in the file is a hostname, the design must define
+how it is resolved without creating a DNS leak.  Acceptable policies
+are: require an IP literal endpoint, resolve the endpoint before
+deployment, or implement an explicit pre-tunnel DNS allowlist path
+that is covered by the same leak-prevention tests as the WireGuard
+underlay.
+
 **Operating system.**  Linux only.  Kernel 5.6 or later (kernel
 WireGuard support).  The deployment environment is Linux 6.12.
 
 **Deployment.**  Docker Compose.  qBittorrent runs in a separate
 container that shares Windlass's network namespace via
-`network_mode: container:windlass`.
+`network_mode: container:windlass`.  Because that ties qBit's network
+namespace lifecycle to Windlass's container lifecycle, the deployment
+must specify whether Windlass restarts also restart qBit, pause qBit,
+or otherwise prevent qBit from running against a stale namespace.
 
 **Privilege.**  Windlass's container requires `NET_ADMIN`.  This
 covers both kernel WireGuard interface management and firewall
-configuration inside the namespace.
+configuration inside the namespace.  The privileged surface must be
+limited to the tunnel shell; pure cores do not call privileged APIs,
+perform I/O, or inspect process-global network state directly.
 
 **MAM connectability invariant.**  MAM marks a seedbox not
 connectable if qBit's listen port is open on a different public IP
@@ -145,8 +195,14 @@ The redesign is complete when all of these can be demonstrated.
 - Windlass refuses to start if the WireGuard configuration file is
   absent, unreadable, or malformed.  The failure message names the
   problem.
-- Windlass refuses to start if it can construct a working TCP
-  connection that does not traverse the tunnel.
+- Windlass refuses to start if the WireGuard endpoint cannot be
+  resolved according to the configured endpoint-resolution policy.
+- Before the tunnel is established, firewall policy allows only
+  loopback and the explicit WireGuard underlay path required to reach
+  the configured peer endpoint.
+- After the tunnel is established, Windlass refuses to start if it
+  can construct a working ordinary internet connection that does not
+  traverse the tunnel.
 - The first MAM call after boot succeeds and reports the Proton egress
   IP, not the host IP.
 
@@ -162,6 +218,9 @@ The redesign is complete when all of these can be demonstrated.
 - MAM reports `connectable: yes` for the seedbox.
 - Windlass's IP (as observed locally via the tunnel) equals the IP
   MAM's `/json/jsonIp.php` reports for our requests.
+- qBit either shares the live Windlass namespace or is stopped/paused;
+  it never continues running after Windlass namespace replacement with
+  stale egress assumptions.
 
 **Failure and recovery.**
 
@@ -183,8 +242,12 @@ The redesign is complete when all of these can be demonstrated.
   cores.  Pause, step, and breakpoints behave the same way.
 - Netlink operations and NAT-PMP exchanges are captured in the same
   ring as HTTP exchanges, typed appropriately.
+- Capture stores typed summaries by default and redacts or suppresses
+  secrets such as private keys, session cookies, and sensitive
+  configuration material.
 - An operator can dump the last N raw netlink and NAT-PMP packet
-  pairs without restarting Windlass or attaching a debugger.
+  pairs without restarting Windlass or attaching a debugger, subject
+  to the same redaction rules.
 - State transitions in the tunnel core carry causal links back to the
   events that produced them, consistent with how every other core
   records causality.
@@ -192,11 +255,15 @@ The redesign is complete when all of these can be demonstrated.
 **Leak prevention.**
 
 - The container's network namespace exposes `wg0` and `lo` as the
-  only interfaces with internet routing.
+  only interfaces with internet routing after the tunnel is
+  established.
+- The only permitted non-tunnel underlay traffic is the WireGuard
+  endpoint path required to establish and maintain the tunnel.
 - Firewall rules drop egress on any other interface, including IPv6
   routes that the host stack might offer.
 - DNS resolution inside the namespace uses the tunnel-routed
-  resolver, not the host resolver.
+  resolver, not the host resolver, except for any explicitly designed
+  and tested pre-tunnel endpoint-resolution path.
 
 **Notification hook.**
 
