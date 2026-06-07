@@ -3,7 +3,7 @@
 //! Locked syntax per `docs/observability-37pre-checklist.md` §B8:
 //!
 //! - `None` or empty string → no pauses (every core runs).
-//! - `"true"` or `"all"` (case-insensitive) → all seven cores pre-paused.
+//! - `"true"` or `"all"` (case-insensitive) → all eight cores pre-paused.
 //! - Comma-separated list of lowercase core names (whitespace
 //!   tolerated) → exactly those cores.
 //! - Unknown token → `Err` so `main` can fail loudly at startup
@@ -84,18 +84,18 @@ mod tests {
     #[test]
     fn true_pauses_all_cores() {
         let all = parse_pause_on_start(Some("true")).unwrap();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
     }
 
     #[test]
     fn all_alias_pauses_all_cores() {
-        assert_eq!(parse_pause_on_start(Some("all")).unwrap().len(), 7);
+        assert_eq!(parse_pause_on_start(Some("all")).unwrap().len(), 8);
     }
 
     #[test]
     fn case_insensitive_true() {
-        assert_eq!(parse_pause_on_start(Some("TRUE")).unwrap().len(), 7);
-        assert_eq!(parse_pause_on_start(Some("True")).unwrap().len(), 7);
+        assert_eq!(parse_pause_on_start(Some("TRUE")).unwrap().len(), 8);
+        assert_eq!(parse_pause_on_start(Some("True")).unwrap().len(), 8);
     }
 
     #[test]

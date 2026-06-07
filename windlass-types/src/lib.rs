@@ -26,12 +26,16 @@ pub enum CoreId {
     Disk,
     Docker,
     Domain,
+    /// In-process `WireGuard` tunnel — the core that replaces the
+    /// Gluetun container after the vpn-branch cutover.  See
+    /// `docs/vpn-ownership.md`.
+    Tunnel,
 }
 
 impl CoreId {
-    /// All seven cores in cores-rail display order.
+    /// All eight cores in cores-rail display order.
     #[must_use]
-    pub const fn all() -> [Self; 7] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::Vpn,
             Self::Qbit,
@@ -40,6 +44,7 @@ impl CoreId {
             Self::Disk,
             Self::Docker,
             Self::Domain,
+            Self::Tunnel,
         ]
     }
 }
@@ -54,6 +59,7 @@ impl std::fmt::Display for CoreId {
             Self::Disk => "disk",
             Self::Docker => "docker",
             Self::Domain => "domain",
+            Self::Tunnel => "tunnel",
         };
         f.write_str(name)
     }

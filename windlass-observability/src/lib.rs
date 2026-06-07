@@ -80,7 +80,7 @@ const HTTP_EXCHANGE_CHANNEL_SIZE: usize = 1024;
 /// to drive cross-core gating.  Subscribe to [`Self::subscribe`] for
 /// the SSE event stream.
 pub struct ObservabilityController {
-    cores: [CoreState; 7],
+    cores: [CoreState; 8],
     /// Cross-core HTTP exchange ring.
     http_ring: Mutex<HttpExchangeRing>,
     /// `action_id → (core, step_id)` index for backward-causal lookups.
@@ -158,7 +158,7 @@ impl CoreState {
 }
 
 impl ObservabilityController {
-    /// Fresh controller with all seven cores running, using the
+    /// Fresh controller with all eight cores running, using the
     /// default budgets (§37pre B7).
     #[must_use]
     pub fn new() -> Arc<Self> {
@@ -1072,7 +1072,7 @@ mod tests {
         let ctrl = ObservabilityController::new();
         let h = ctrl.hello().await;
         assert_eq!(h.protocol_version, SSE_PROTOCOL_VERSION);
-        assert_eq!(h.cores.len(), 7);
+        assert_eq!(h.cores.len(), 8);
         for (_id, status) in &h.cores {
             assert!(matches!(status, CoreStatus::Running));
         }

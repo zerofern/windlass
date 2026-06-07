@@ -155,12 +155,22 @@ impl Shell for TunnelShell {
             TunnelAction::RunLeakProbe => {
                 spawn_run_leak_probe(self.runner.clone(), self.config.clone(), event_tx.clone());
             }
-            // Timer scheduling is owned by the runtime (`ScheduleTimer`
-            // becomes a sleep + `TimerFired` event).  For now, this
-            // shell uses the generic timer infrastructure that lands
-            // in Phase 4 — the action is a no-op at this layer so
-            // building the shell does not block on runtime work.
-            TunnelAction::ScheduleTimer { .. } => {}
+            TunnelAction::ScheduleTimer { timer, after } => {
+                // Same pattern as VpnShell: sleep then re-inject a
+                // `TimerFired` event causally tagged with the named
+                // timer so the observability layer can render the
+                // timer as the external cause of the next step.
+                let tx = event_tx.clone();
+                windlass_machine::causal::spawn(async move {
+                    let scheduled_at = std::time::Instant::now() + after;
+                    tokio::time::sleep(after).await;
+                    let _ = tx.send(Timed::external(
+                        scheduled_at,
+                        ExternalCause::Timer { name: timer.name() },
+                        TunnelEvent::TimerFired(timer),
+                    ));
+                });
+            }
         }
     }
 }
