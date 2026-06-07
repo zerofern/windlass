@@ -18,6 +18,7 @@ use windlass_machine::{ExternalCause, Shell, Timed};
 use windlass_tunnel_core::config::{Endpoint, PeerConfig, WgConfig};
 use windlass_tunnel_core::natpmp::Protocol;
 use windlass_tunnel_core::{NatPmpRequest, TunnelAction, TunnelEvent};
+use windlass_types::{CoreId, HttpTap, NullHttpTap};
 
 use crate::command::{Runner, SystemRunner};
 use crate::handshake::{HandshakeAge, latest_handshake_age};
@@ -39,10 +40,16 @@ pub struct TunnelShellConfig {
     pub natpmp_gateway: SocketAddr,
     /// Per-request NAT-PMP timeout.  Default 2 s.
     pub natpmp_timeout: Duration,
+    /// Observability tap.  Every subprocess invocation and NAT-PMP
+    /// exchange is captured here so the `/observability` ring sees
+    /// tunnel ops alongside MAM/qBit HTTP.
+    pub tap: Arc<dyn HttpTap>,
 }
 
 impl TunnelShellConfig {
-    /// Convenience constructor with the `ProtonVPN`-typical defaults.
+    /// Convenience constructor with the `ProtonVPN`-typical defaults
+    /// and a no-op observability tap.  Production callers (and
+    /// runtime wiring) inject a live [`HttpTap`] before spawn.
     ///
     /// # Panics
     ///
@@ -56,7 +63,14 @@ impl TunnelShellConfig {
             interface_name: "wg0".to_string(),
             natpmp_gateway: "10.2.0.1:5351".parse().expect("static literal"),
             natpmp_timeout: Duration::from_secs(2),
+            tap: NullHttpTap::arc(),
         }
+    }
+
+    /// Returns a clone of the supplied [`HttpTap`].
+    #[must_use]
+    pub fn tap(&self) -> Arc<dyn HttpTap> {
+        Arc::clone(&self.tap)
     }
 }
 
@@ -72,7 +86,7 @@ impl Shell for TunnelShell {
     type Action = TunnelAction;
 
     async fn new(config: Self::Config, _event_tx: UnboundedSender<Timed<Self::Event>>) -> Self {
-        let runner: Arc<dyn Runner> = Arc::new(SystemRunner);
+        let runner: Arc<dyn Runner> = Arc::new(SystemRunner::new(CoreId::Tunnel, config.tap()));
         // The NAT-PMP client binds a UDP socket; we defer the bind
         // until the first request because the tunnel interface is
         // not yet up at shell-construction time.  `Option<Arc<...>>`
@@ -103,22 +117,25 @@ impl Shell for TunnelShell {
                 let gateway = self.config.natpmp_gateway;
                 let timeout = self.config.natpmp_timeout;
                 let existing = self.natpmp.clone();
+                let tap = self.config.tap();
                 let tx = event_tx.clone();
                 windlass_machine::causal::spawn(async move {
                     let client = match existing {
                         Some(c) => c,
-                        None => match NatPmpClient::new(gateway, timeout).await {
-                            Ok(c) => Arc::new(c),
-                            Err(e) => {
-                                send_event(
-                                    &tx,
-                                    TunnelEvent::NatPmpFailed {
-                                        reason: e.to_string(),
-                                    },
-                                );
-                                return;
+                        None => {
+                            match NatPmpClient::new(gateway, timeout, CoreId::Tunnel, tap).await {
+                                Ok(c) => Arc::new(c),
+                                Err(e) => {
+                                    send_event(
+                                        &tx,
+                                        TunnelEvent::NatPmpFailed {
+                                            reason: e.to_string(),
+                                        },
+                                    );
+                                    return;
+                                }
                             }
-                        },
+                        }
                     };
                     let req = NatPmpRequest {
                         protocol: Protocol::Tcp,

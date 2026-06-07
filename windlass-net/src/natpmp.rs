@@ -5,24 +5,34 @@
 //! `ProtonVPN` gateway, awaits the response within a configurable
 //! timeout, and returns the typed
 //! [`windlass_tunnel_core::NatPmpLease`] or a typed error.
+//!
+//! Every request/response pair is captured via the supplied
+//! [`HttpTap`] as an [`HttpExchange`] with `module = "natpmp"`,
+//! `method = "udp"`, request/response bodies as hex-encoded byte
+//! strings.  That's how tunnel ops land in the same observability
+//! ring as MAM/qBit HTTP and become visible to the existing
+//! `/observability` UI.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use windlass_tunnel_core::{NatPmpDecodeError, NatPmpLease, NatPmpRequest};
+use windlass_types::{CoreId, HttpExchange, HttpRequestView, HttpTap};
 
 /// UDP client for the NAT-PMP port-map flow.
 ///
 /// One instance per shell — the underlying socket is bound at
 /// construction time and reused across requests so subsequent calls
 /// don't pay the bind cost again.
-#[derive(Debug)]
 pub struct NatPmpClient {
     socket: UdpSocket,
     gateway: SocketAddr,
     request_timeout: Duration,
+    tap: Arc<dyn HttpTap>,
+    core_id: CoreId,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +68,8 @@ impl NatPmpClient {
     pub async fn new(
         gateway: SocketAddr,
         request_timeout: Duration,
+        core_id: CoreId,
+        tap: Arc<dyn HttpTap>,
     ) -> Result<Self, NatPmpClientError> {
         // Bind to an ephemeral port on all interfaces inside the
         // namespace.  The kernel will route via `wg0` because the
@@ -69,6 +81,8 @@ impl NatPmpClient {
             socket,
             gateway,
             request_timeout,
+            tap,
+            core_id,
         })
     }
 
@@ -80,24 +94,89 @@ impl NatPmpClient {
     /// [`NatPmpClientError::Recv`] / [`NatPmpClientError::Decode`].
     pub async fn request(&self, req: NatPmpRequest) -> Result<NatPmpLease, NatPmpClientError> {
         let bytes = req.encode();
+        let url = self.gateway.to_string();
+        self.tap
+            .gate_request(
+                self.core_id,
+                &HttpRequestView {
+                    method: "udp",
+                    url: &url,
+                    body: None,
+                },
+            )
+            .await;
         self.socket
             .send_to(&bytes, self.gateway)
             .await
-            .map_err(|source| NatPmpClientError::Send {
-                gateway: self.gateway,
-                source,
+            .map_err(|source| {
+                self.emit_exchange(&url, &bytes, &[], None);
+                NatPmpClientError::Send {
+                    gateway: self.gateway,
+                    source,
+                }
             })?;
 
         let mut buf = [0u8; 16];
         match tokio::time::timeout(self.request_timeout, self.socket.recv(&mut buf)).await {
-            Err(_) => Err(NatPmpClientError::Timeout {
-                gateway: self.gateway,
-                timeout: self.request_timeout,
-            }),
-            Ok(Err(e)) => Err(NatPmpClientError::Recv(e)),
-            Ok(Ok(n)) => Ok(NatPmpLease::decode(&buf[..n])?),
+            Err(_) => {
+                self.emit_exchange(&url, &bytes, &[], Some("timeout"));
+                Err(NatPmpClientError::Timeout {
+                    gateway: self.gateway,
+                    timeout: self.request_timeout,
+                })
+            }
+            Ok(Err(e)) => {
+                self.emit_exchange(&url, &bytes, &[], Some("recv-error"));
+                Err(NatPmpClientError::Recv(e))
+            }
+            Ok(Ok(n)) => {
+                let response_bytes = &buf[..n];
+                self.emit_exchange(&url, &bytes, response_bytes, None);
+                Ok(NatPmpLease::decode(response_bytes)?)
+            }
         }
     }
+
+    fn emit_exchange(
+        &self,
+        url: &str,
+        request_bytes: &[u8],
+        response_bytes: &[u8],
+        error_tag: Option<&str>,
+    ) {
+        let response_headers =
+            error_tag.map_or_else(Vec::new, |tag| vec![("error".to_string(), tag.to_string())]);
+        // For a parsed NAT-PMP response, the op + result code are in
+        // bytes 1..4; the encoded response_status is the result code
+        // so the operator sees success/failure at a glance.
+        let status = if response_bytes.len() >= 4 {
+            u16::from_be_bytes([response_bytes[2], response_bytes[3]])
+        } else {
+            0
+        };
+        self.tap.observed_exchange(
+            self.core_id,
+            &HttpExchange {
+                module: "natpmp".to_string(),
+                method: "udp".to_string(),
+                url: url.to_string(),
+                request_headers: Vec::new(),
+                request_body: Some(hex_encode(request_bytes)),
+                response_status: status,
+                response_headers,
+                response_body: hex_encode(response_bytes),
+            },
+        );
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -136,9 +215,14 @@ mod tests {
             server.send_to(&resp, peer).await.unwrap();
         });
 
-        let client = NatPmpClient::new(gateway, Duration::from_secs(2))
-            .await
-            .expect("local bind succeeds");
+        let client = NatPmpClient::new(
+            gateway,
+            Duration::from_secs(2),
+            CoreId::Tunnel,
+            windlass_types::NullHttpTap::arc(),
+        )
+        .await
+        .expect("local bind succeeds");
         let lease = client
             .request(NatPmpRequest {
                 protocol: Protocol::Udp,
@@ -157,9 +241,14 @@ mod tests {
         // Pick an address that won't respond.  We don't bind a fake
         // server so the recv side will time out.
         let gateway = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let client = NatPmpClient::new(gateway, Duration::from_millis(50))
-            .await
-            .expect("local bind succeeds");
+        let client = NatPmpClient::new(
+            gateway,
+            Duration::from_millis(50),
+            CoreId::Tunnel,
+            windlass_types::NullHttpTap::arc(),
+        )
+        .await
+        .expect("local bind succeeds");
         let err = client
             .request(NatPmpRequest {
                 protocol: Protocol::Udp,
