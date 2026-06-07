@@ -40,7 +40,10 @@ pub struct TunnelConfig {
     /// endpoint rotation.  Default 3.
     pub stall_count_before_rotate: u32,
     /// How many consecutive rotations before we enter `Stuck`.
-    /// Default = `peer_count` (try every peer once).
+    /// A value of `0` is a sentinel meaning "try every peer once"
+    /// (normalized to `peer_count` by [`TunnelMachine::new`]); any
+    /// value higher than `peer_count` is clamped down because the
+    /// rotation index wraps.  Default `0`.
     pub rotations_before_stuck: u32,
     /// Fraction of the granted port lease at which we renew.  Default
     /// 0.5 — Proton's 60 s leases get a 30 s renewal cadence.
@@ -65,7 +68,9 @@ impl Default for TunnelConfig {
             handshake_poll_interval: Duration::from_secs(30),
             handshake_stall_after: Duration::from_mins(3),
             stall_count_before_rotate: 3,
-            rotations_before_stuck: 1,
+            // Sentinel: `0` is "try every peer once".
+            // `TunnelMachine::new` normalizes to `peer_count`.
+            rotations_before_stuck: 0,
             port_renewal_basis_points: 5_000,
             leak_probe_interval: Duration::from_hours(6),
             natpmp_failure_threshold: 3,
@@ -300,6 +305,11 @@ pub enum TunnelHealth {
     Stuck { attempted_recoveries: u32 },
 }
 
+// `struct_excessive_bools`: the four boot/flag fields are independent
+// state slots (interface up, firewall up, port published, degraded
+// publish fired), not a state enum.  Collapsing them into one enum
+// would obscure the orthogonal rising-edge gates we drive each from.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TunnelMachine {
     config: TunnelConfig,
@@ -322,6 +332,12 @@ pub struct TunnelMachine {
     /// Most recently granted external port.  `None` until the first
     /// successful NAT-PMP response, or after a `PortUnavailable`.
     forwarded_port: Option<u16>,
+    /// Whether the held `forwarded_port` has already been published
+    /// via `PortReady`.  We hold a port even when the
+    /// publish-preconditions (`firewall_installed`) are not met yet;
+    /// the publish then fires later, on the next transition that
+    /// satisfies them.  Resets when the port changes or is lost.
+    port_published: bool,
     /// Last NAT-PMP epoch we saw.  A decrease means the gateway
     /// rebooted (RFC 6886 §3.6) and the previous lease is invalid.
     last_natpmp_epoch: Option<u32>,
@@ -356,6 +372,74 @@ impl TunnelMachine {
             (self.active_peer_index + 1) % n
         }
     }
+
+    /// If a forwarded port is held but has not yet been published,
+    /// and the publish preconditions are satisfied (kill switch
+    /// installed), returns the publish to fire.  Caller is
+    /// responsible for flipping `port_published` to true.
+    fn pending_port_ready(&self) -> Option<TunnelPublish> {
+        if self.port_published || !self.firewall_installed {
+            return None;
+        }
+        let port = self.forwarded_port?;
+        let typed = VpnPort::try_new(port).ok()?;
+        Some(TunnelPublish::PortReady { port: typed })
+    }
+
+    /// Stall-path logic shared by [`TunnelEvent::HandshakeStalled`]
+    /// and an over-threshold [`TunnelEvent::HandshakeReported`].
+    /// Counts the stall, drives endpoint rotation when the count
+    /// crosses the configured threshold, escalates to `Stuck` when
+    /// rotations are exhausted, and always reschedules the watchdog
+    /// so a dropped event cannot kill the chain.
+    fn apply_handshake_stalled(
+        &mut self,
+        wall_now: DateTime<Utc>,
+    ) -> Outcome<TunnelAction, TunnelPublish> {
+        self.consecutive_stalls = self.consecutive_stalls.saturating_add(1);
+        let mut actions = Vec::new();
+        let mut publishes = Vec::new();
+        let was_up = matches!(self.health, TunnelHealth::Up);
+
+        if self.consecutive_stalls < self.config.stall_count_before_rotate {
+            // Stay in current health; just wait for the next poll.
+        } else if self.rotation_count < self.config.rotations_before_stuck
+            && self.config.peer_count > 1
+        {
+            self.active_peer_index = self.next_peer_index();
+            self.rotation_count = self.rotation_count.saturating_add(1);
+            self.consecutive_stalls = 0;
+            actions.push(TunnelAction::RotateEndpoint {
+                peer_index: self.active_peer_index,
+            });
+            if was_up {
+                self.health = TunnelHealth::Down;
+                publishes.push(TunnelPublish::Down {
+                    reason: "handshake stalled; rotating endpoint".to_string(),
+                    since: wall_now,
+                });
+            }
+        } else {
+            // Exhausted automatic recovery.
+            let was_stuck = matches!(self.health, TunnelHealth::Stuck { .. });
+            self.health = TunnelHealth::Stuck {
+                attempted_recoveries: self.rotation_count,
+            };
+            if !was_stuck {
+                publishes.push(TunnelPublish::Stuck {
+                    reason: "handshake stalled past recovery threshold".to_string(),
+                    since: wall_now,
+                    attempted_recoveries: self.rotation_count,
+                });
+            }
+        }
+
+        actions.push(TunnelAction::ScheduleTimer {
+            timer: TunnelTimer::HandshakeWatchdog,
+            after: self.config.handshake_poll_interval,
+        });
+        Outcome { actions, publishes }
+    }
 }
 
 impl Machine for TunnelMachine {
@@ -369,6 +453,24 @@ impl Machine for TunnelMachine {
     type StateSnapshot = Self;
 
     fn new(config: Self::Config, _now: Instant) -> Self {
+        // Normalize `rotations_before_stuck`:
+        // - 0 means "try every peer once" (the documented Default
+        //   intent; the literal 0 in the field is the sentinel).
+        // - Anything higher than `peer_count` is meaningless because
+        //   we wrap around — clamp it so the rotation budget matches
+        //   the actual peer set.
+        let peers = config.peer_count.max(1);
+        let raw_rotations = config.rotations_before_stuck;
+        #[allow(clippy::cast_possible_truncation)]
+        let normalized_rotations = if raw_rotations == 0 {
+            peers as u32
+        } else {
+            raw_rotations.min(peers as u32)
+        };
+        let config = TunnelConfig {
+            rotations_before_stuck: normalized_rotations,
+            ..config
+        };
         Self {
             config,
             active_peer_index: 0,
@@ -380,6 +482,7 @@ impl Machine for TunnelMachine {
             rotation_count: 0,
             consecutive_natpmp_failures: 0,
             forwarded_port: None,
+            port_published: false,
             last_natpmp_epoch: None,
             port_degraded_published: false,
         }
@@ -424,6 +527,15 @@ impl Machine for TunnelMachine {
                 if was_initializing {
                     self.health = TunnelHealth::Connecting;
                 }
+                // If a NAT-PMP grant landed before the firewall
+                // (out-of-order or shell-bug case), the port is held
+                // but not yet published.  Now that the kill switch is
+                // up, downstream consumers may safely sync the port.
+                let mut publishes = Vec::new();
+                if let Some(p) = self.pending_port_ready() {
+                    publishes.push(p);
+                    self.port_published = true;
+                }
                 Outcome {
                     actions: vec![
                         TunnelAction::PollHandshake,
@@ -438,7 +550,7 @@ impl Machine for TunnelMachine {
                             after: self.config.leak_probe_interval,
                         },
                     ],
-                    publishes: Vec::new(),
+                    publishes,
                 }
             }
             TunnelEvent::FirewallInstallFailed { reason } => {
@@ -456,6 +568,21 @@ impl Machine for TunnelMachine {
             }
 
             TunnelEvent::HandshakeReported { age_seconds } => {
+                // Fail-closed precondition: a handshake report cannot
+                // promote health to `Up` before the interface is
+                // configured and the kill switch is installed.  An
+                // out-of-order or stale event under these conditions
+                // is silently dropped — never a health transition.
+                if !self.interface_configured || !self.firewall_installed {
+                    return Outcome::none();
+                }
+                // Freshness check lives in core (not the shell): a
+                // report with `age_seconds` above the configured
+                // threshold is routed to the stall path so the
+                // recovery state machine sees it.
+                if Duration::from_secs(age_seconds) > self.config.handshake_stall_after {
+                    return self.apply_handshake_stalled(wall_now);
+                }
                 self.last_handshake_age_seconds = Some(age_seconds);
                 self.consecutive_stalls = 0;
                 let was_up = matches!(self.health, TunnelHealth::Up);
@@ -469,60 +596,20 @@ impl Machine for TunnelMachine {
                     publishes.push(TunnelPublish::Recovered);
                     self.rotation_count = 0;
                 }
+                // Publish a held-but-unpublished port now that
+                // preconditions are satisfied (this is the
+                // belt-and-braces path; the firewall-install handler
+                // is the main one).
+                if let Some(p) = self.pending_port_ready() {
+                    publishes.push(p);
+                    self.port_published = true;
+                }
                 Outcome {
                     actions: Vec::new(),
                     publishes,
                 }
             }
-            TunnelEvent::HandshakeStalled => {
-                self.consecutive_stalls = self.consecutive_stalls.saturating_add(1);
-                let mut actions = Vec::new();
-                let mut publishes = Vec::new();
-                let was_up = matches!(self.health, TunnelHealth::Up);
-
-                if self.consecutive_stalls < self.config.stall_count_before_rotate {
-                    // Stay in current health; just wait for the next
-                    // poll.  Watchdog reschedules unconditionally
-                    // below.
-                } else if self.rotation_count < self.config.rotations_before_stuck
-                    && self.config.peer_count > 1
-                {
-                    self.active_peer_index = self.next_peer_index();
-                    self.rotation_count = self.rotation_count.saturating_add(1);
-                    self.consecutive_stalls = 0;
-                    actions.push(TunnelAction::RotateEndpoint {
-                        peer_index: self.active_peer_index,
-                    });
-                    if was_up {
-                        self.health = TunnelHealth::Down;
-                        publishes.push(TunnelPublish::Down {
-                            reason: "handshake stalled; rotating endpoint".to_string(),
-                            since: wall_now,
-                        });
-                    }
-                } else {
-                    // Exhausted automatic recovery.
-                    let was_stuck = matches!(self.health, TunnelHealth::Stuck { .. });
-                    self.health = TunnelHealth::Stuck {
-                        attempted_recoveries: self.rotation_count,
-                    };
-                    if !was_stuck {
-                        publishes.push(TunnelPublish::Stuck {
-                            reason: "handshake stalled past recovery threshold".to_string(),
-                            since: wall_now,
-                            attempted_recoveries: self.rotation_count,
-                        });
-                    }
-                }
-
-                // Always reschedule the watchdog so a dropped event
-                // cannot kill the chain.
-                actions.push(TunnelAction::ScheduleTimer {
-                    timer: TunnelTimer::HandshakeWatchdog,
-                    after: self.config.handshake_poll_interval,
-                });
-                Outcome { actions, publishes }
-            }
+            TunnelEvent::HandshakeStalled => self.apply_handshake_stalled(wall_now),
 
             TunnelEvent::NatPmpLeaseGranted {
                 external_port,
@@ -548,15 +635,22 @@ impl Machine for TunnelMachine {
                     // diff.
                 }
 
-                let new_port = VpnPort::try_new(external_port).ok();
                 let port_changed = self.forwarded_port != Some(external_port);
                 self.forwarded_port = Some(external_port);
+                if port_changed {
+                    // The held port has changed; whatever was
+                    // published before is stale.
+                    self.port_published = false;
+                }
 
+                // Fail-closed: do not publish a forwarded port until
+                // the kill switch is in place.  We still hold the
+                // port in state and schedule renewal; the publish
+                // fires later on the firewall-installed transition.
                 let mut publishes = Vec::new();
-                if let Some(port) = new_port
-                    && port_changed
-                {
-                    publishes.push(TunnelPublish::PortReady { port });
+                if let Some(p) = self.pending_port_ready() {
+                    publishes.push(p);
+                    self.port_published = true;
                 }
                 let actions = vec![TunnelAction::ScheduleTimer {
                     timer: TunnelTimer::PortRenewal,
@@ -580,7 +674,13 @@ impl Machine for TunnelMachine {
                     });
                     self.port_degraded_published = true;
                     if self.forwarded_port.take().is_some() {
-                        publishes.push(TunnelPublish::PortUnavailable);
+                        // Only surface PortUnavailable to consumers
+                        // if we had actually published the port to
+                        // them.  Otherwise this is bookkeeping only.
+                        if self.port_published {
+                            publishes.push(TunnelPublish::PortUnavailable);
+                        }
+                        self.port_published = false;
                     }
                 }
                 // Bounded retry: schedule another attempt with
@@ -764,6 +864,16 @@ mod tests {
         )
     }
 
+    /// Walks the boot sequence (`Init` → `InterfaceConfigured` →
+    /// `FirewallInstalled`) so per-test setup arrives at the
+    /// preconditions a handshake or NAT-PMP grant now requires
+    /// (`interface_configured && firewall_installed`).
+    fn boot(m: &mut TunnelMachine) {
+        handle(m, TunnelEvent::Init);
+        handle(m, TunnelEvent::InterfaceConfigured);
+        handle(m, TunnelEvent::FirewallInstalled);
+    }
+
     #[test]
     fn init_asks_shell_to_configure_interface() {
         let mut m = machine();
@@ -841,6 +951,7 @@ mod tests {
     #[test]
     fn first_handshake_publishes_up_once() {
         let mut m = machine();
+        boot(&mut m);
         let out = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 5 });
         assert!(out.publishes.contains(&TunnelPublish::Up));
         let out2 = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
@@ -848,8 +959,79 @@ mod tests {
     }
 
     #[test]
+    fn handshake_before_firewall_is_silently_dropped() {
+        // Fail-closed precondition: an out-of-order HandshakeReported
+        // cannot promote health to Up before the kill switch is in.
+        let mut m = machine();
+        // Interface up but no firewall yet.
+        handle(&mut m, TunnelEvent::Init);
+        handle(&mut m, TunnelEvent::InterfaceConfigured);
+        let out = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 5 });
+        assert!(
+            out.publishes.is_empty(),
+            "expected drop, got {:?}",
+            out.publishes
+        );
+        assert!(
+            out.actions.is_empty(),
+            "expected drop, got {:?}",
+            out.actions
+        );
+        assert!(!matches!(m.health(), TunnelHealth::Up));
+    }
+
+    #[test]
+    fn handshake_before_interface_is_silently_dropped() {
+        let mut m = machine();
+        let out = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
+        assert!(out.publishes.is_empty());
+        assert!(out.actions.is_empty());
+        assert!(matches!(m.health(), TunnelHealth::Initializing));
+    }
+
+    #[test]
+    fn over_threshold_handshake_routes_to_stall_path() {
+        // Freshness is a core decision: an `age_seconds` past
+        // `handshake_stall_after` must NOT publish `Up`, must
+        // increment the stall counter, and must reschedule the
+        // watchdog like a regular `HandshakeStalled`.
+        let mut m = machine();
+        boot(&mut m);
+        let stale_age = m.config.handshake_stall_after.as_secs() + 1;
+        let out = handle(
+            &mut m,
+            TunnelEvent::HandshakeReported {
+                age_seconds: stale_age,
+            },
+        );
+        assert!(!out.publishes.contains(&TunnelPublish::Up));
+        assert!(out.actions.iter().any(|a| matches!(
+            a,
+            TunnelAction::ScheduleTimer {
+                timer: TunnelTimer::HandshakeWatchdog,
+                ..
+            }
+        )));
+        // Reaching the rotate threshold (2) by sending one more stale
+        // report must trigger an endpoint rotation just like
+        // back-to-back `HandshakeStalled` events do.
+        let out2 = handle(
+            &mut m,
+            TunnelEvent::HandshakeReported {
+                age_seconds: stale_age,
+            },
+        );
+        assert!(
+            out2.actions
+                .iter()
+                .any(|a| matches!(a, TunnelAction::RotateEndpoint { .. }))
+        );
+    }
+
+    #[test]
     fn handshake_stalls_below_threshold_do_not_rotate() {
         let mut m = machine();
+        boot(&mut m);
         // Get to Up first.
         handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
         // One stall; threshold is 2.
@@ -865,6 +1047,7 @@ mod tests {
     #[test]
     fn handshake_stalls_at_threshold_rotate_endpoint() {
         let mut m = machine();
+        boot(&mut m);
         handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
         handle(&mut m, TunnelEvent::HandshakeStalled);
         let out = handle(&mut m, TunnelEvent::HandshakeStalled);
@@ -885,6 +1068,7 @@ mod tests {
     #[test]
     fn stalls_after_all_rotations_publish_stuck_once() {
         let mut m = machine();
+        boot(&mut m);
         // Fast-forward to one rotation already done.
         handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
         handle(&mut m, TunnelEvent::HandshakeStalled);
@@ -913,6 +1097,7 @@ mod tests {
     #[test]
     fn handshake_recovers_from_stuck_publishes_recovered() {
         let mut m = machine();
+        boot(&mut m);
         // Walk to Stuck.
         handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
         for _ in 0..4 {
@@ -927,6 +1112,7 @@ mod tests {
     #[test]
     fn natpmp_grant_publishes_port_ready_and_schedules_renewal() {
         let mut m = machine();
+        boot(&mut m);
         let out = handle(
             &mut m,
             TunnelEvent::NatPmpLeaseGranted {
@@ -951,8 +1137,47 @@ mod tests {
     }
 
     #[test]
+    fn natpmp_grant_before_firewall_holds_port_without_publish() {
+        // Defense-in-depth: even if the shell sends a NAT-PMP grant
+        // before the firewall is up (out-of-order or shell bug), we
+        // must not publish `PortReady` until the kill switch is in
+        // place — otherwise qBit could sync a port over an
+        // un-protected egress.
+        let mut m = machine();
+        handle(&mut m, TunnelEvent::Init);
+        handle(&mut m, TunnelEvent::InterfaceConfigured);
+        // Firewall NOT yet installed.
+        let out = handle(
+            &mut m,
+            TunnelEvent::NatPmpLeaseGranted {
+                external_port: 51820,
+                lifetime_seconds: 60,
+                epoch_seconds: 100,
+            },
+        );
+        assert!(
+            !out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::PortReady { .. })),
+            "must not publish PortReady before firewall is installed"
+        );
+        // Port is still held internally so we don't lose it.
+        assert_eq!(m.forwarded_port(), Some(51820));
+        // The deferred publish fires on the FirewallInstalled
+        // transition.
+        let out2 = handle(&mut m, TunnelEvent::FirewallInstalled);
+        assert!(
+            out2.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::PortReady { .. })),
+            "deferred PortReady should fire on FirewallInstalled"
+        );
+    }
+
+    #[test]
     fn natpmp_same_port_does_not_republish() {
         let mut m = machine();
+        boot(&mut m);
         handle(
             &mut m,
             TunnelEvent::NatPmpLeaseGranted {
@@ -979,6 +1204,7 @@ mod tests {
     #[test]
     fn natpmp_failures_publish_degraded_once_at_threshold() {
         let mut m = machine();
+        boot(&mut m);
         handle(
             &mut m,
             TunnelEvent::NatPmpLeaseGranted {
@@ -1045,6 +1271,7 @@ mod tests {
     #[test]
     fn leak_detected_publishes_and_takes_health_down() {
         let mut m = machine();
+        boot(&mut m);
         handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
         assert!(matches!(m.health(), TunnelHealth::Up));
         let out = handle(
@@ -1072,6 +1299,7 @@ mod tests {
     #[test]
     fn leak_no_egress_just_reschedules() {
         let mut m = machine();
+        boot(&mut m);
         handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
         let out = handle(
             &mut m,
@@ -1163,8 +1391,42 @@ mod tests {
     }
 
     #[test]
+    fn rotations_before_stuck_zero_normalizes_to_peer_count() {
+        // Sentinel: `rotations_before_stuck = 0` means "try every
+        // peer once" (the Default doc-comment's intent).  Built into
+        // `new` so a TunnelConfig literal with ..Default::default()
+        // gets the right behavior for multi-peer configs.
+        let m = TunnelMachine::new(
+            TunnelConfig {
+                peer_count: 3,
+                rotations_before_stuck: 0,
+                ..TunnelConfig::default()
+            },
+            Instant::now(),
+        );
+        assert_eq!(m.config.rotations_before_stuck, 3);
+    }
+
+    #[test]
+    fn rotations_before_stuck_clamped_to_peer_count() {
+        // Over-set values get clamped down because the rotation loop
+        // wraps anyway; this keeps "consecutive_rotations" honest as
+        // "how many peers we have tried".
+        let m = TunnelMachine::new(
+            TunnelConfig {
+                peer_count: 2,
+                rotations_before_stuck: 99,
+                ..TunnelConfig::default()
+            },
+            Instant::now(),
+        );
+        assert_eq!(m.config.rotations_before_stuck, 2);
+    }
+
+    #[test]
     fn snapshot_serializes_with_health_and_peer() {
         let mut m = machine();
+        boot(&mut m);
         handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 5 });
         let value = serde_json::to_value(m.state_snapshot()).expect("snapshot should serialize");
         // Health snapshot reflects up.
@@ -1221,31 +1483,52 @@ mod prop_tests {
             );
         }
 
-        /// TUN-1 (safety): `Up` publishes are rising-edge only.  Two
-        /// consecutive `HandshakeReported` events publish `Up` at most
-        /// once.
+        /// TUN-1 (safety): `Up` publishes are rising-edge only and
+        /// gated on the kill switch being installed.  Walking the
+        /// boot sequence first, two consecutive in-threshold
+        /// `HandshakeReported` events publish `Up` exactly once.
         #[test]
-        fn up_publish_is_rising_edge(age1 in 0u64..1000, age2 in 0u64..1000) {
-            let mut m = TunnelMachine::new(TunnelConfig::default(), Instant::now());
-            let _ = m.handle(
+        fn up_publish_is_rising_edge(
+            age1 in 0u64..30,
+            age2 in 0u64..30,
+        ) {
+            let cfg = TunnelConfig::default();
+            let mut m = TunnelMachine::new(cfg, Instant::now());
+            // Boot through preconditions.
+            for e in [
+                TunnelEvent::Init,
+                TunnelEvent::InterfaceConfigured,
+                TunnelEvent::FirewallInstalled,
+            ] {
+                let _ = m.handle(
+                    Instant::now(),
+                    Utc::now(),
+                    Timed::external(Instant::now(), ExternalCause::Unknown, e),
+                );
+            }
+            let out1 = m.handle(
                 Instant::now(),
                 Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown,
                     TunnelEvent::HandshakeReported { age_seconds: age1 }),
             );
-            let out = m.handle(
+            let out2 = m.handle(
                 Instant::now(),
                 Utc::now(),
                 Timed::external(Instant::now(), ExternalCause::Unknown,
                     TunnelEvent::HandshakeReported { age_seconds: age2 }),
             );
-            let up_count = out.publishes.iter()
+            let total_up = out1.publishes.iter().chain(out2.publishes.iter())
                 .filter(|p| matches!(p, TunnelPublish::Up)).count();
-            prop_assert_eq!(up_count, 0);
+            prop_assert_eq!(total_up, 1);
         }
 
         /// TUN-2 (safety): a NAT-PMP grant always records the port
-        /// and always schedules a renewal timer.  Total invariant.
+        /// internally and always schedules a renewal timer,
+        /// regardless of whether the kill switch is yet installed.
+        /// The `PortReady` publish is deferred separately
+        /// (`natpmp_grant_before_firewall_holds_port_without_publish`
+        /// in the unit tests).
         #[test]
         fn natpmp_grant_records_port_and_schedules(
             port in 1u16..=u16::MAX,

@@ -176,6 +176,15 @@ pub enum WgConfigError {
     InvalidPrivateKey(String),
     #[error("public key for peer {peer_index} is not valid base64 of a 32-byte key: {reason}")]
     InvalidPublicKey { peer_index: usize, reason: String },
+    #[error("preshared key for peer {peer_index} is not valid base64 of a 32-byte key: {reason}")]
+    InvalidPresharedKey { peer_index: usize, reason: String },
+    #[error("line {line}: directive `{key}` in [{section}] is not supported: {reason}")]
+    UnsupportedDirective {
+        line: usize,
+        section: String,
+        key: String,
+        reason: String,
+    },
 }
 
 impl WgConfig {
@@ -340,12 +349,41 @@ impl InterfaceBuilder {
                     }
                 })?);
             }
-            // wg-quick allows extra keys like PreUp/PostUp/Table; we ignore
-            // them rather than failing, because Proton has been observed
-            // to add `Table = off` and similar.  Unknown keys we do not
-            // understand are silently dropped at this layer — the shell
-            // will only act on what `WgConfig` exposes.
-            "PreUp" | "PostUp" | "PreDown" | "PostDown" | "Table" | "FwMark" | "SaveConfig" => {}
+            // `Table = off` is the one accepted no-op: it tells
+            // `wg-quick` not to install routes, which is exactly what
+            // we want here (Windlass installs its own routes).  Any
+            // other Table value is route policy that would conflict
+            // with our routing decisions.
+            "Table" => {
+                if value.trim() != "off" {
+                    return Err(WgConfigError::UnsupportedDirective {
+                        line,
+                        section: "Interface".to_string(),
+                        key: "Table".to_string(),
+                        reason: "only `Table = off` is accepted; other values would conflict with \
+                             Windlass-managed routing"
+                            .to_string(),
+                    });
+                }
+            }
+            // Hook directives can contain arbitrary shell commands
+            // that materially change the tunnel's behavior; accepting
+            // them silently would mean Windlass runs a different
+            // tunnel than the config file describes.  FwMark affects
+            // the firewall the kill switch installs.  SaveConfig
+            // would persist runtime state.  All four are rejected so
+            // an operator sees the divergence at boot.
+            "PreUp" | "PostUp" | "PreDown" | "PostDown" | "FwMark" | "SaveConfig" => {
+                return Err(WgConfigError::UnsupportedDirective {
+                    line,
+                    section: "Interface".to_string(),
+                    key: key.to_string(),
+                    reason: format!(
+                        "`{key}` is a wg-quick directive that affects tunnel behavior; \
+                         Windlass does not honor it.  Remove it from wg.conf"
+                    ),
+                });
+            }
             other => {
                 return Err(WgConfigError::UnknownKey {
                     line,
@@ -458,6 +496,10 @@ impl PeerBuilder {
         })?;
         validate_base64_key(&public_key)
             .map_err(|reason| WgConfigError::InvalidPublicKey { peer_index, reason })?;
+        if let Some(ref psk) = self.preshared_key {
+            validate_base64_key(psk)
+                .map_err(|reason| WgConfigError::InvalidPresharedKey { peer_index, reason })?;
+        }
         if self.allowed_ips.is_empty() {
             return Err(WgConfigError::MissingPeerKey {
                 peer_index,
@@ -968,13 +1010,14 @@ PersistentKeepalive = 25
     }
 
     #[test]
-    fn wg_quick_ignored_keys_do_not_error() {
+    fn table_off_is_accepted_as_noop() {
+        // `Table = off` declares "don't manage routes" — exactly
+        // what Windlass needs since it installs its own routes.
         let content = "\
 [Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address = 10.2.0.2/32
 Table = off
-PostUp = some-hook-command
 
 [Peer]
 PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
@@ -982,7 +1025,122 @@ AllowedIPs = 0.0.0.0/0
 Endpoint = 198.51.100.7:51820
 ";
         let _ = WgConfig::parse(content, EndpointResolutionPolicy::RequireIpLiteral)
-            .expect("wg-quick directives should be ignored");
+            .expect("Table = off should be accepted");
+    }
+
+    #[test]
+    fn table_other_values_are_rejected() {
+        // Anything other than `off` would assign routes to a custom
+        // table, conflicting with Windlass-managed routing.
+        let content = "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+Table = 51820
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+";
+        let err = WgConfig::parse(content, EndpointResolutionPolicy::RequireIpLiteral)
+            .expect_err("non-`off` Table values should be rejected");
+        assert!(matches!(
+            err,
+            WgConfigError::UnsupportedDirective { key, .. } if key == "Table"
+        ));
+    }
+
+    #[test]
+    fn hook_directives_are_rejected() {
+        // PreUp/PostUp/PreDown/PostDown can run arbitrary commands
+        // that change tunnel behavior; accepting them silently
+        // means Windlass runs a different tunnel than the file
+        // describes.
+        for hook in ["PreUp", "PostUp", "PreDown", "PostDown"] {
+            let content = format!(
+                "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+{hook} = /usr/local/bin/do-something
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+"
+            );
+            let err = WgConfig::parse(&content, EndpointResolutionPolicy::RequireIpLiteral)
+                .expect_err("hook directive should be rejected");
+            match err {
+                WgConfigError::UnsupportedDirective { key, .. } => {
+                    assert_eq!(key, hook, "wrong key in error for {hook}");
+                }
+                other => panic!("expected UnsupportedDirective for {hook}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fwmark_and_saveconfig_are_rejected() {
+        for key in ["FwMark", "SaveConfig"] {
+            let content = format!(
+                "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+{key} = something
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+"
+            );
+            let err = WgConfig::parse(&content, EndpointResolutionPolicy::RequireIpLiteral)
+                .expect_err("rejected directive should fail");
+            assert!(matches!(
+                err,
+                WgConfigError::UnsupportedDirective { key: ref k, .. } if k == key
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_base64_preshared_key_is_rejected() {
+        let content = "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+PresharedKey = not-a-valid-base64-key
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+";
+        let err = WgConfig::parse(content, EndpointResolutionPolicy::RequireIpLiteral)
+            .expect_err("invalid PSK should be rejected");
+        assert!(matches!(err, WgConfigError::InvalidPresharedKey { .. }));
+    }
+
+    #[test]
+    fn valid_base64_preshared_key_is_accepted() {
+        let content = "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+PresharedKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+";
+        let cfg = WgConfig::parse(content, EndpointResolutionPolicy::RequireIpLiteral)
+            .expect("valid PSK should be accepted");
+        assert!(cfg.peers[0].preshared_key.is_some());
     }
 
     #[test]
