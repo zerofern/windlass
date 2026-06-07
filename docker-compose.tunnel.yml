@@ -1,0 +1,60 @@
+# Compose override that runs Windlass in tunnel mode.
+#
+# Windlass owns the WireGuard tunnel in-process (see
+# docs/vpn-ownership.md).  Gluetun is NOT used.  qBittorrent shares
+# Windlass's network namespace via `network_mode: container:windlass`
+# so its egress is the same Proton exit IP — required for MAM's
+# connectability check.
+#
+# Apply with:
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
+#
+# Required env vars (in addition to the base compose):
+#   WG_CONFIG_PATH   - path *inside* the windlass container to a
+#                       ProtonVPN-generated wg.conf
+#
+# Optional env vars:
+#   WG_INTERFACE_NAME  - tunnel interface name, default `wg0`
+#   NATPMP_GATEWAY     - host:port, default `10.2.0.1:5351` (Proton)
+#
+# Before first run, place your Proton wg.conf at the host path you mount
+# (defaults to ./wg.conf in this example).  See `docs/vpn-ownership.md`
+# for the EndpointResolutionPolicy and the kill-switch invariants.
+
+services:
+  windlass:
+    cap_add:
+      - NET_ADMIN
+    # Replace any Gluetun network_mode from the base compose.  Tunnel
+    # mode requires Windlass to have its own namespace so it can
+    # create `wg0` and install the nftables kill switch.
+    network_mode: "bridge"
+    environment:
+      WG_CONFIG_PATH: /config/wg.conf
+      # Disable the Gluetun-side integration paths.  In tunnel mode
+      # the file watchers and proxy URL are unused; the runtime
+      # picks up the tunnel-core publishes via the bridge in
+      # `windlass/src/shell/init.rs`.
+      GLUETUN_PROXY_URL: ""
+    volumes:
+      - ./wg.conf:/config/wg.conf:ro
+    # Map the qBit WebUI through the windlass container so qBit's
+    # `network_mode: container:windlass` keeps its admin port
+    # reachable from the host.
+    ports:
+      - "5010:5010"   # windlass dashboard
+      - "8080:8080"   # qBittorrent WebUI (routed via shared namespace)
+
+  qbittorrent:
+    # qBit uses Windlass's namespace — all torrent egress goes through
+    # `wg0`.  Windlass must be healthy before qBit starts; if Windlass
+    # restarts, the runtime drops qBit so it never resumes against a
+    # stale namespace (docs/vpn-ownership.md "qBit lifecycle policy").
+    network_mode: "container:windlass"
+    depends_on:
+      windlass:
+        condition: service_healthy
+
+  # Gluetun is intentionally omitted.  Remove it from your base
+  # compose when migrating, or run this override against a base that
+  # doesn't define it.

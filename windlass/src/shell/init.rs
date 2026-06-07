@@ -20,8 +20,11 @@ use windlass_domain_core::{
 };
 use windlass_machine::{ExternalCause, Timed};
 use windlass_mam_core::{MamConfig, MamMachine, MamPublish, MamTopic};
+use windlass_net::{TunnelShell, TunnelShellConfig};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
-use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
+use windlass_tunnel_core::config::{EndpointResolutionPolicy, WgConfig};
+use windlass_tunnel_core::{TunnelConfig, TunnelMachine, TunnelPublish, TunnelTopic};
+use windlass_vpn_core::{VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
 use super::db_shell::DbShell;
@@ -107,7 +110,7 @@ pub(super) async fn init_shell(
         config.mam_seedbox_url.clone(),
         config.mam_load_url.clone(),
         &config.mam_user_agent,
-        http_tap,
+        http_tap.clone(),
     )?
     .with_check_session_url(config.mam_check_session_url.clone())
     .with_json_ip_url(config.mam_json_ip_url.clone())
@@ -233,6 +236,97 @@ pub(super) async fn init_shell(
             vpn_pub_tx,
         ))
         .expect("vpn pub subscription");
+
+    // ── In-process WireGuard tunnel (docs/vpn-ownership.md) ──────────────────
+    //
+    // When `WG_CONFIG_PATH` is set, Windlass owns the tunnel:
+    // `windlass-tunnel-core` + `windlass-net` bring up `wg0`, install
+    // the nftables kill switch, talk NAT-PMP to the ProtonVPN gateway,
+    // poll handshake age, and run the leak probe.  The legacy
+    // VpnMachine still spawns alongside for the moment so the
+    // domain core's existing VpnPublish consumers don't have to
+    // change — a follow-up commit on this branch retires VpnMachine
+    // and the Gluetun-aware code paths once the tunnel-mode
+    // deployment has been verified.  Tunnel publishes are bridged
+    // into the existing VpnMachine event channel so PortReady/
+    // Disconnected/etc. drive the same downstream paths Gluetun-
+    // sourced events do today.
+    if let Some(wg_path) = config.wg_config_path.as_deref() {
+        let wg_content = tokio::fs::read_to_string(wg_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
+        let wg = WgConfig::parse(&wg_content, EndpointResolutionPolicy::RequireIpLiteral)
+            .map_err(|e| anyhow::anyhow!("parse {wg_path}: {e}"))?;
+        let peer_count = wg.peers.len();
+        let natpmp_gateway = config
+            .natpmp_gateway
+            .parse()
+            .map_err(|e| anyhow::anyhow!("NATPMP_GATEWAY: {e}"))?;
+        let (tunnel_handles, _tunnel_join) = windlass_machine::spawn::<TunnelMachine, TunnelShell>(
+            windlass_machine::CoreId::Tunnel,
+            runtime_tap.clone(),
+            TunnelConfig {
+                peer_count,
+                ..TunnelConfig::default()
+            },
+            TunnelShellConfig {
+                wg,
+                interface_name: config.wg_interface_name.clone(),
+                natpmp_gateway,
+                natpmp_timeout: Duration::from_secs(2),
+                tap: http_tap.clone(),
+            },
+        )
+        .await;
+        let (tunnel_pub_tx, mut tunnel_pub_rx) =
+            mpsc::channel::<windlass_machine::PublishEnvelope<TunnelPublish>>(128);
+        tunnel_handles
+            .subscribe
+            .send((
+                vec![TunnelTopic::Health, TunnelTopic::Port, TunnelTopic::Leak],
+                tunnel_pub_tx,
+            ))
+            .expect("tunnel pub subscription");
+
+        // Bridge TunnelPublish → VpnEvent so the domain core sees
+        // tunnel state transitions through the same channel it
+        // already consumes for VpnMachine.  Lossy by design — the
+        // tunnel core carries strictly more information (Stuck,
+        // PortForwardingDegraded, leak interface/remote), but the
+        // domain layer is satisfied with the older shape until
+        // Phase 5 retires VpnMachine.
+        let vpn_event_tx_bridge = vpn_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(envelope) = tunnel_pub_rx.recv().await {
+                let events: Vec<VpnEvent> = match envelope.payload {
+                    TunnelPublish::Up | TunnelPublish::Recovered => {
+                        vec![VpnEvent::ContainerHealthy]
+                    }
+                    TunnelPublish::Down { .. }
+                    | TunnelPublish::Stuck { .. }
+                    | TunnelPublish::LeakDetected { .. } => vec![VpnEvent::ContainerUnhealthy],
+                    TunnelPublish::PortReady { port } => {
+                        vec![VpnEvent::PortFileChanged { port }]
+                    }
+                    TunnelPublish::PortUnavailable
+                    | TunnelPublish::PortForwardingDegraded { .. } => {
+                        vec![]
+                    }
+                };
+                for ev in events {
+                    let _ = vpn_event_tx_bridge.send(Timed::from_publish(
+                        std::time::Instant::now(),
+                        envelope.id,
+                        ev,
+                    ));
+                }
+            }
+        });
+        info!(
+            wg_path,
+            peer_count, "tunnel mode active — TunnelMachine bridged to VpnMachine event channel"
+        );
+    }
 
     // §36 step 9b: pump vpn_files results (typed) directly into the
     // VpnMachine.  Replaces the legacy `Event::PortFileReadResult` path

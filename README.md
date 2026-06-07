@@ -121,6 +121,9 @@ Windlass is configured entirely via environment variables.
 | `VPN_PORT_FILE`     |          | `/tmp/gluetun/forwarded_port` | Gluetun forwarded port file path    |
 | `WINDLASS_BIND`     |          | `0.0.0.0:5010`                | Address for the embedded web server |
 | `WINDLASS_EXECUTE_SERVICE_ACTIONS` | | `true` | Execute the sans-I/O service-core action path; disabling is diagnostic only |
+| `WG_CONFIG_PATH`    |          | —                             | Path to a ProtonVPN-generated `wg.conf`. When set, Windlass owns the WireGuard tunnel in-process and Gluetun is not used. See `docs/vpn-ownership.md`. |
+| `WG_INTERFACE_NAME` |          | `wg0`                         | Tunnel interface name (tunnel mode only) |
+| `NATPMP_GATEWAY`    |          | `10.2.0.1:5351`               | NAT-PMP gateway address for the in-process port-forwarding flow (tunnel mode only) |
 
 `WINDLASS_EXECUTE_SHADOW_ACTIONS` is still accepted as a deprecated alias for
 the service action switch. Legacy service orchestration has been retired from
@@ -128,7 +131,25 @@ the service action switch. Legacy service orchestration has been retired from
 
 ## Running with Docker Compose
 
-Windlass must share Gluetun's network namespace so it can reach qBittorrent
+Windlass supports two VPN topologies.  Pick one.
+
+### Tunnel mode (new — `docs/vpn-ownership.md`)
+
+Windlass owns the WireGuard tunnel in-process: no Gluetun container,
+no proxy URL, no file watchers.  qBittorrent shares Windlass's
+network namespace so both processes egress under the same Proton
+exit IP (required for MAM connectability).  Requires `NET_ADMIN`.
+
+```fish
+docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
+```
+
+See `docker-compose.tunnel.yml` for the override skeleton and the
+required `WG_CONFIG_PATH` env var.
+
+### Gluetun mode (legacy)
+
+Windlass shares Gluetun's network namespace so it can reach qBittorrent
 and read the VPN files.
 
 ```yaml
