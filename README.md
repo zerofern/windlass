@@ -134,7 +134,7 @@ network namespace so both processes egress under the same Proton
 exit IP (required for MAM connectability).  Requires `NET_ADMIN`.
 
 ```fish
-docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
+docker compose -f docker-compose.tunnel.yml up -d
 ```
 
 See `docker-compose.tunnel.yml` for the override skeleton and the

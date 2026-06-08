@@ -17,7 +17,12 @@ use tracing::warn;
 use windlass_machine::{ExternalCause, Shell, Timed};
 use windlass_tunnel_core::config::{Endpoint, PeerConfig, WgConfig};
 use windlass_tunnel_core::natpmp::Protocol;
-use windlass_tunnel_core::{NatPmpRequest, TunnelAction, TunnelEvent};
+use windlass_tunnel_core::{
+    FirewallInstallFailure, InterfaceConfigureFailure, NatPmpFailure, NatPmpRequest, TunnelAction,
+    TunnelEvent,
+};
+
+use crate::natpmp::NatPmpClientError;
 use windlass_types::{CoreId, HttpTap, NullHttpTap};
 
 use crate::command::{Runner, SystemRunner};
@@ -110,8 +115,13 @@ impl Shell for TunnelShell {
             TunnelAction::InstallFirewall => {
                 spawn_install_firewall(self.runner.clone(), self.config.clone(), event_tx.clone());
             }
-            TunnelAction::PollHandshake => {
-                spawn_poll_handshake(self.runner.clone(), self.config.clone(), event_tx.clone());
+            TunnelAction::PollHandshake { peer_index } => {
+                spawn_poll_handshake(
+                    self.runner.clone(),
+                    self.config.clone(),
+                    peer_index,
+                    event_tx.clone(),
+                );
             }
             TunnelAction::RequestNatPmp => {
                 let gateway = self.config.natpmp_gateway;
@@ -129,7 +139,7 @@ impl Shell for TunnelShell {
                                     send_event(
                                         &tx,
                                         TunnelEvent::NatPmpFailed {
-                                            reason: e.to_string(),
+                                            reason: natpmp_failure(&e),
                                         },
                                     );
                                     return;
@@ -155,7 +165,7 @@ impl Shell for TunnelShell {
                         Err(e) => send_event(
                             &tx,
                             TunnelEvent::NatPmpFailed {
-                                reason: e.to_string(),
+                                reason: natpmp_failure(&e),
                             },
                         ),
                     }
@@ -210,72 +220,185 @@ fn spawn_configure_interface(
 async fn configure_interface(
     runner: &dyn Runner,
     config: &TunnelShellConfig,
-) -> Result<(), String> {
+) -> Result<(), InterfaceConfigureFailure> {
     let iface = &config.interface_name;
-    // `ip link add wg0 type wireguard` — create the device.
-    runner
-        .run("ip", &["link", "add", "dev", iface, "type", "wireguard"])
-        .await
-        .map_err(|e| format!("ip link add: {e}"))?;
-    // Configure WG: private key + first peer.
-    set_wg_interface(runner, config, 0).await?;
-    // Add addresses.
-    for addr in &config.wg.interface.addresses {
-        let cidr = format!("{}/{}", addr.ip, addr.prefix_len);
+    // Idempotency: a previous boot or a partial-failure retry can
+    // leave `wg0` half-configured.  Tear down any prior interface
+    // before recreating so we always start from a clean slate.
+    // Errors here are ignored — the interface may simply not exist.
+    let _ = runner.run("ip", &["link", "del", "dev", iface]).await;
+
+    // Build the interface.  Each step records what we created so we
+    // can roll back on failure.
+    let mut created_interface = false;
+    let outcome: Result<(), InterfaceConfigureFailure> = async {
         runner
-            .run("ip", &["addr", "add", &cidr, "dev", iface])
+            .run("ip", &["link", "add", "dev", iface, "type", "wireguard"])
             .await
-            .map_err(|e| format!("ip addr add {cidr}: {e}"))?;
+            .map_err(|e| InterfaceConfigureFailure::LinkAdd(e.to_string()))?;
+        created_interface = true;
+        set_wg_interface(runner, config, 0, /*replace = */ true).await?;
+        if let Some(mtu) = config.wg.interface.mtu {
+            let mtu_s = mtu.to_string();
+            runner
+                .run("ip", &["link", "set", "dev", iface, "mtu", &mtu_s])
+                .await
+                .map_err(|e| InterfaceConfigureFailure::MtuSet(e.to_string()))?;
+        }
+        for addr in &config.wg.interface.addresses {
+            let cidr = format!("{}/{}", addr.ip, addr.prefix_len);
+            runner
+                .run("ip", &["addr", "add", &cidr, "dev", iface])
+                .await
+                .map_err(|e| InterfaceConfigureFailure::AddressAdd(format!("{cidr}: {e}")))?;
+        }
+        runner
+            .run("ip", &["link", "set", "dev", iface, "up"])
+            .await
+            .map_err(|e| InterfaceConfigureFailure::LinkUp(e.to_string()))?;
+        runner
+            .run("ip", &["route", "add", "default", "dev", iface])
+            .await
+            .map_err(|e| InterfaceConfigureFailure::RouteAdd(format!("v4: {e}")))?;
+        if config
+            .wg
+            .interface
+            .addresses
+            .iter()
+            .any(|a| matches!(a.ip, std::net::IpAddr::V6(_)))
+        {
+            runner
+                .run("ip", &["-6", "route", "add", "default", "dev", iface])
+                .await
+                .map_err(|e| InterfaceConfigureFailure::RouteAdd(format!("v6: {e}")))?;
+        }
+        if !config.wg.interface.dns_servers.is_empty() {
+            let mut body = String::new();
+            for ip in &config.wg.interface.dns_servers {
+                use std::fmt::Write as _;
+                let _ = writeln!(body, "nameserver {ip}");
+            }
+            runner
+                .run_with_stdin("tee", &["/etc/resolv.conf"], &body)
+                .await
+                .map_err(|e| InterfaceConfigureFailure::DnsWrite(e.to_string()))?;
+        }
+        Ok(())
     }
-    // Bring it up.
-    runner
-        .run("ip", &["link", "set", "dev", iface, "up"])
-        .await
-        .map_err(|e| format!("ip link set up: {e}"))?;
-    // Default route through the tunnel.  We add 0.0.0.0/0 and ::/0
-    // separately to mirror `wg-quick`'s behavior under `Table = off`
-    // semantics — Windlass owns the routing decision.
-    runner
-        .run("ip", &["route", "add", "default", "dev", iface])
-        .await
-        .map_err(|e| format!("ip route add default v4: {e}"))?;
-    Ok(())
+    .await;
+
+    if let Err(ref reason) = outcome
+        && created_interface
+    {
+        let _ = runner.run("ip", &["link", "del", "dev", iface]).await;
+        tracing::warn!(reason = %reason, "tunnel interface configure failed; rolled back");
+    }
+    outcome
 }
 
+/// Programs the kernel's `WireGuard` interface with `wg set`.
+///
+/// When `replace` is true, the peer set is replaced wholesale
+/// (`wg-quick` parlance: `replace-peers`).  This is the correct
+/// semantics for endpoint rotation — without it, the previous peer
+/// stays configured and a second `0.0.0.0/0` `AllowedIPs` entry
+/// either errors or leaves ambiguous routing.
 async fn set_wg_interface(
     runner: &dyn Runner,
     config: &TunnelShellConfig,
     peer_index: usize,
-) -> Result<(), String> {
+    replace: bool,
+) -> Result<(), InterfaceConfigureFailure> {
     let iface = &config.interface_name;
     let private_key = config.wg.interface.private_key.expose_secret().to_string();
-    let peer = config
-        .wg
-        .peers
-        .get(peer_index)
-        .ok_or_else(|| format!("peer index {peer_index} out of range"))?;
-    let endpoint = endpoint_for_args(&peer.endpoint)?;
+    let peer = config.wg.peers.get(peer_index).ok_or_else(|| {
+        InterfaceConfigureFailure::Other(format!("peer index {peer_index} out of range"))
+    })?;
+    let endpoint = endpoint_for_args(&peer.endpoint).map_err(InterfaceConfigureFailure::Other)?;
     let allowed = allowed_ips_for_args(peer);
-    // Use stdin for the private key so it doesn't appear on the
-    // process argv (visible to other processes via `/proc`).  `wg set`
-    // accepts `private-key /dev/stdin` to read from stdin.
-    let args: Vec<&str> = vec![
-        "set",
-        iface,
-        "private-key",
-        "/dev/stdin",
-        "peer",
-        &peer.public_key,
-        "endpoint",
-        &endpoint,
-        "allowed-ips",
-        &allowed,
-    ];
+    let listen_port_arg = config.wg.interface.listen_port.map(|p| p.to_string());
+    let keepalive_arg = peer.persistent_keepalive.map(|s| s.to_string());
+
+    // Build argv.  Private key + optional preshared key flow via
+    // stdin; everything else is plain argv.  `wg set` reads multiple
+    // `key /dev/stdin` references from the same stdin stream in the
+    // order they appear, separated by newlines.
+    let mut args: Vec<&str> = vec!["set", iface];
+    if replace {
+        // Drop the existing peer set first so we never leave the
+        // previous endpoint configured after a rotation.
+        args.push("replace-peers");
+    }
+    args.push("private-key");
+    args.push("/dev/stdin");
+    if let Some(ref lp) = listen_port_arg {
+        args.push("listen-port");
+        args.push(lp.as_str());
+    }
+    args.push("peer");
+    args.push(&peer.public_key);
+    args.push("endpoint");
+    args.push(&endpoint);
+    args.push("allowed-ips");
+    args.push(&allowed);
+    if let Some(ref ka) = keepalive_arg {
+        args.push("persistent-keepalive");
+        args.push(ka.as_str());
+    }
+    let preshared_clear = peer
+        .preshared_key
+        .as_ref()
+        .map(|s| s.expose_secret().to_string());
+    if preshared_clear.is_some() {
+        args.push("preshared-key");
+        args.push("/dev/stdin");
+    }
+    // Compose the stdin stream — private key on the first line,
+    // optional preshared key on the second.  wg(8) reads one key per
+    // /dev/stdin reference in argv order.
+    let mut stdin = private_key;
+    if let Some(ref psk) = preshared_clear {
+        stdin.push('\n');
+        stdin.push_str(psk);
+    }
     runner
-        .run_with_stdin("wg", &args, &private_key)
+        .run_with_stdin("wg", &args, &stdin)
         .await
-        .map_err(|e| format!("wg set: {e}"))?;
+        .map_err(|e| InterfaceConfigureFailure::WgSet(e.to_string()))?;
     Ok(())
+}
+
+/// Converts a [`NatPmpClientError`] from the shell-level UDP client
+/// into the typed [`NatPmpFailure`] the core consumes.
+fn natpmp_failure(err: &NatPmpClientError) -> NatPmpFailure {
+    match err {
+        NatPmpClientError::Bind(e) => NatPmpFailure::Bind(e.to_string()),
+        NatPmpClientError::Send { source, .. } => NatPmpFailure::Send(source.to_string()),
+        NatPmpClientError::Timeout { .. } => NatPmpFailure::Timeout,
+        NatPmpClientError::Recv(e) => NatPmpFailure::Recv(e.to_string()),
+        NatPmpClientError::Decode(decode) => match decode {
+            windlass_tunnel_core::NatPmpDecodeError::ErrorCode(code) => {
+                NatPmpFailure::GatewayError {
+                    code: u16::from_be_bytes(code_to_be_u16(*code)),
+                }
+            }
+            other => NatPmpFailure::MalformedResponse(other.to_string()),
+        },
+    }
+}
+
+const fn code_to_be_u16(code: windlass_tunnel_core::NatPmpResponseCode) -> [u8; 2] {
+    use windlass_tunnel_core::NatPmpResponseCode as C;
+    let n: u16 = match code {
+        C::Success => 0,
+        C::UnsupportedVersion => 1,
+        C::NotAuthorized => 2,
+        C::NetworkFailure => 3,
+        C::OutOfResources => 4,
+        C::UnsupportedOpcode => 5,
+        C::Other(c) => c,
+    };
+    n.to_be_bytes()
 }
 
 fn endpoint_for_args(endpoint: &Endpoint) -> Result<String, String> {
@@ -312,12 +435,20 @@ fn spawn_install_firewall(
         let ruleset = build_nft_ruleset(&config);
         match runner.run_with_stdin("nft", &["-f", "-"], &ruleset).await {
             Ok(_) => send_event(&tx, TunnelEvent::FirewallInstalled),
-            Err(e) => send_event(
-                &tx,
-                TunnelEvent::FirewallInstallFailed {
-                    reason: e.to_string(),
-                },
-            ),
+            Err(e) => {
+                let reason = match e {
+                    crate::command::CommandError::Spawn { .. } => {
+                        FirewallInstallFailure::NftMissing(e.to_string())
+                    }
+                    crate::command::CommandError::NonZeroExit { .. } => {
+                        FirewallInstallFailure::RulesetRejected(e.to_string())
+                    }
+                    crate::command::CommandError::Signal { .. } => {
+                        FirewallInstallFailure::Other(e.to_string())
+                    }
+                };
+                send_event(&tx, TunnelEvent::FirewallInstallFailed { reason });
+            }
         }
     });
 }
@@ -367,16 +498,26 @@ pub fn build_nft_ruleset(config: &TunnelShellConfig) -> String {
 fn spawn_poll_handshake(
     runner: Arc<dyn Runner>,
     config: Arc<TunnelShellConfig>,
+    peer_index: usize,
     tx: UnboundedSender<Timed<TunnelEvent>>,
 ) {
     windlass_machine::causal::spawn(async move {
         let iface = &config.interface_name;
-        let peer_pubkey = config
+        let Some(peer_pubkey) = config
             .wg
             .peers
-            .first()
+            .get(peer_index)
             .map(|p| p.public_key.clone())
-            .unwrap_or_default();
+        else {
+            // Core sent us a stale peer index — shouldn't happen but
+            // surface it as a stall so the watchdog reschedules.
+            warn!(
+                peer_index,
+                "PollHandshake action for unknown peer; treating as stalled"
+            );
+            send_event(&tx, TunnelEvent::HandshakeStalled);
+            return;
+        };
         match runner
             .run("wg", &["show", iface, "latest-handshakes"])
             .await
@@ -408,18 +549,20 @@ fn spawn_rotate_endpoint(
     tx: UnboundedSender<Timed<TunnelEvent>>,
 ) {
     windlass_machine::causal::spawn(async move {
-        match set_wg_interface(&*runner, &config, peer_index).await {
+        match set_wg_interface(&*runner, &config, peer_index, /*replace = */ true).await {
             Ok(()) => {
                 // Rotating doesn't have its own confirmation event;
                 // the next handshake poll surfaces the result through
                 // the existing Reported/Stalled path.
             }
             Err(reason) => {
-                warn!(reason, "endpoint rotation failed");
+                warn!(reason = %reason, "endpoint rotation failed");
                 send_event(
                     &tx,
                     TunnelEvent::InterfaceConfigureFailed {
-                        reason: format!("rotate endpoint to peer {peer_index}: {reason}"),
+                        reason: InterfaceConfigureFailure::Other(format!(
+                            "rotate endpoint to peer {peer_index}: {reason}"
+                        )),
                     },
                 );
             }
@@ -552,5 +695,254 @@ Endpoint = 198.51.100.8:51821
         let peer = &cfg.wg.peers[0];
         let joined = allowed_ips_for_args(peer);
         assert_eq!(joined, "0.0.0.0/0");
+    }
+
+    // ── Action-dispatch tests with a recording fake runner ──────────────────
+
+    use crate::command::{CommandError, CommandOutcome, Runner};
+    use std::sync::Mutex;
+
+    /// Records every spawn the shell would have made.  Returns
+    /// caller-supplied responses in order, defaulting to an empty
+    /// stdout success.
+    #[derive(Default)]
+    struct RecordingRunner {
+        calls: Mutex<Vec<(String, Vec<String>, Option<String>)>>,
+        responses: Mutex<Vec<Result<CommandOutcome, CommandError>>>,
+    }
+
+    impl RecordingRunner {
+        fn record(&self, program: &str, args: &[&str], stdin: Option<&str>) {
+            self.calls.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| (*s).to_string()).collect(),
+                stdin.map(str::to_string),
+            ));
+        }
+        fn next_response(&self) -> Result<CommandOutcome, CommandError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or(Ok(CommandOutcome {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Runner for RecordingRunner {
+        async fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutcome, CommandError> {
+            self.record(program, args, None);
+            self.next_response()
+        }
+        async fn run_with_stdin(
+            &self,
+            program: &str,
+            args: &[&str],
+            stdin: &str,
+        ) -> Result<CommandOutcome, CommandError> {
+            self.record(program, args, Some(stdin));
+            self.next_response()
+        }
+    }
+
+    fn argv_strings(calls: &[(String, Vec<String>, Option<String>)]) -> Vec<String> {
+        calls
+            .iter()
+            .map(|(p, a, _)| format!("{p} {}", a.join(" ")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn configure_interface_runs_steps_in_order_and_applies_mtu_dns() {
+        let content = "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+DNS = 10.2.0.1
+MTU = 1380
+ListenPort = 51820
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+PresharedKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+PersistentKeepalive = 25
+";
+        let wg = WgConfig::parse(content, EndpointResolutionPolicy::RequireIpLiteral).unwrap();
+        let config = TunnelShellConfig::new(wg);
+        let runner = RecordingRunner::default();
+
+        configure_interface(&runner, &config)
+            .await
+            .expect("configure should succeed");
+
+        let calls = runner.calls.lock().unwrap();
+        let lines = argv_strings(&calls);
+        // The first call after the leading idempotent `link del`
+        // attempt is the real `link add`.
+        assert!(lines.iter().any(|l| l == "ip link del dev wg0"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ip link add dev wg0 type wireguard")
+        );
+        // wg set carries replace-peers + listen-port + peer/endpoint/allowed-ips
+        let wg_set = lines
+            .iter()
+            .find(|l| l.starts_with("wg set"))
+            .expect("wg set call");
+        assert!(wg_set.contains("replace-peers"));
+        assert!(wg_set.contains("private-key /dev/stdin"));
+        assert!(wg_set.contains("listen-port 51820"));
+        assert!(wg_set.contains("persistent-keepalive 25"));
+        // MTU is applied.
+        assert!(lines.iter().any(|l| l == "ip link set dev wg0 mtu 1380"));
+        // DNS is written via tee.
+        assert!(lines.iter().any(|l| l.starts_with("tee /etc/resolv.conf")));
+        // Address + link up + default route happen after wg set.
+        assert!(lines.iter().any(|l| l == "ip addr add 10.2.0.2/32 dev wg0"));
+        assert!(lines.iter().any(|l| l == "ip link set dev wg0 up"));
+        assert!(lines.iter().any(|l| l == "ip route add default dev wg0"));
+    }
+
+    #[tokio::test]
+    async fn configure_interface_rolls_back_on_failure() {
+        let content = "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+";
+        let wg = WgConfig::parse(content, EndpointResolutionPolicy::RequireIpLiteral).unwrap();
+        let config = TunnelShellConfig::new(wg);
+        let runner = RecordingRunner::default();
+        // Set up responses (popped in reverse).  We want:
+        //   1. link del  → succeed (idempotent)
+        //   2. link add  → succeed
+        //   3. wg set    → fail
+        // After failure, the rollback link del is expected at the end.
+        runner.responses.lock().unwrap().extend(vec![
+            // Ordering of the Vec is LIFO when we `pop`, so push in
+            // reverse: rollback success, wg-set failure, link-add
+            // success, idempotent del success.
+            Ok(CommandOutcome {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            }),
+            Err(CommandError::NonZeroExit {
+                program: "wg".to_string(),
+                code: 1,
+                stderr: "fake wg set failure".to_string(),
+            }),
+            Ok(CommandOutcome {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            }),
+            Ok(CommandOutcome {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            }),
+        ]);
+
+        let err = configure_interface(&runner, &config)
+            .await
+            .expect_err("wg set failure should propagate");
+        assert!(matches!(err, InterfaceConfigureFailure::WgSet(_)));
+
+        let calls = runner.calls.lock().unwrap();
+        let lines = argv_strings(&calls);
+        // The rollback `link del` runs after the failed wg set.
+        let positions: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| *l == "ip link del dev wg0")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            positions.len() >= 2,
+            "expected pre-config and rollback `link del` calls"
+        );
+        let wg_set_pos = lines
+            .iter()
+            .position(|l| l.starts_with("wg set"))
+            .expect("wg set was attempted");
+        assert!(
+            positions.iter().any(|p| *p > wg_set_pos),
+            "rollback link del did not run after wg set failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_uses_replace_peers_so_old_peer_is_dropped() {
+        let multi_peer = "\
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.2.0.2/32
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.7:51820
+
+[Peer]
+PublicKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 198.51.100.8:51821
+";
+        let wg = WgConfig::parse(multi_peer, EndpointResolutionPolicy::RequireIpLiteral).unwrap();
+        let config = TunnelShellConfig::new(wg);
+        let runner = RecordingRunner::default();
+
+        set_wg_interface(&runner, &config, 1, /*replace = */ true)
+            .await
+            .expect("rotate to peer 1 succeeds");
+
+        let calls = runner.calls.lock().unwrap();
+        let wg_set = argv_strings(&calls)
+            .into_iter()
+            .find(|l| l.starts_with("wg set"))
+            .expect("wg set call");
+        assert!(
+            wg_set.contains("replace-peers"),
+            "missing replace-peers: {wg_set}"
+        );
+        // The rotation should configure peer 1's public key, not peer 0's.
+        assert!(wg_set.contains("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="));
+        assert!(!wg_set.contains("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="));
+    }
+
+    #[tokio::test]
+    async fn private_key_flows_via_stdin_only_never_argv() {
+        let wg = WgConfig::parse(VALID_CONFIG, EndpointResolutionPolicy::RequireIpLiteral).unwrap();
+        let config = TunnelShellConfig::new(wg);
+        let runner = RecordingRunner::default();
+        set_wg_interface(&runner, &config, 0, false)
+            .await
+            .expect("set wg ok");
+        let calls = runner.calls.lock().unwrap();
+        let (_, args, stdin) = calls.first().expect("a wg set call");
+        // The private-key cleartext must appear in stdin, NEVER in argv.
+        let secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let joined_argv = args.join(" ");
+        assert!(
+            !joined_argv.contains(secret),
+            "private key leaked into argv: {joined_argv}"
+        );
+        assert!(
+            stdin.as_deref().unwrap_or("").contains(secret),
+            "private key missing from stdin"
+        );
     }
 }

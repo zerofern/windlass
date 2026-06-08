@@ -64,7 +64,9 @@ pub(super) async fn init_shell(
 ) -> Result<ShellRuntime> {
     let config = Config::from_env()?;
 
-    let (docker, boot) = docker::DockerClient::boot(config.dump_dir.clone()).await?;
+    let (docker, boot) =
+        docker::DockerClient::boot(config.dump_dir.clone(), config.anchor_container.clone())
+            .await?;
 
     let db_pool = DbPool::connect(&config.database_url)
         .await
@@ -234,7 +236,7 @@ pub(super) async fn init_shell(
     // into the existing VpnMachine event channel so PortReady/
     // Disconnected/etc. drive the same downstream paths Gluetun-
     // sourced events do today.
-    {
+    let (tunnel_handles, _tunnel_join) = {
         let wg_path = config.wg_config_path.as_str();
         let wg_content = tokio::fs::read_to_string(wg_path)
             .await
@@ -246,7 +248,7 @@ pub(super) async fn init_shell(
             .natpmp_gateway
             .parse()
             .map_err(|e| anyhow::anyhow!("NATPMP_GATEWAY: {e}"))?;
-        let (tunnel_handles, _tunnel_join) = windlass_machine::spawn::<TunnelMachine, TunnelShell>(
+        let handles = windlass_machine::spawn::<TunnelMachine, TunnelShell>(
             windlass_machine::CoreId::Tunnel,
             runtime_tap.clone(),
             TunnelConfig {
@@ -262,55 +264,49 @@ pub(super) async fn init_shell(
             },
         )
         .await;
-        let (tunnel_pub_tx, mut tunnel_pub_rx) =
-            mpsc::channel::<windlass_machine::PublishEnvelope<TunnelPublish>>(128);
-        tunnel_handles
-            .subscribe
-            .send((
-                vec![TunnelTopic::Health, TunnelTopic::Port, TunnelTopic::Leak],
-                tunnel_pub_tx,
-            ))
-            .expect("tunnel pub subscription");
-
-        // Bridge TunnelPublish → VpnEvent so the domain core sees
-        // tunnel state transitions through the same channel it
-        // already consumes for VpnMachine.  Lossy by design — the
-        // tunnel core carries strictly more information (Stuck,
-        // PortForwardingDegraded, leak interface/remote), but the
-        // domain layer is satisfied with the older shape until
-        // Phase 5 retires VpnMachine.
-        let vpn_event_tx_bridge = vpn_handles.events.clone();
-        tokio::spawn(async move {
-            while let Some(envelope) = tunnel_pub_rx.recv().await {
-                let events: Vec<VpnEvent> = match envelope.payload {
-                    TunnelPublish::Up | TunnelPublish::Recovered => {
-                        vec![VpnEvent::ContainerHealthy]
-                    }
-                    TunnelPublish::Down { .. }
-                    | TunnelPublish::Stuck { .. }
-                    | TunnelPublish::LeakDetected { .. } => vec![VpnEvent::ContainerUnhealthy],
-                    TunnelPublish::PortReady { port } => {
-                        vec![VpnEvent::PortFileChanged { port }]
-                    }
-                    TunnelPublish::PortUnavailable
-                    | TunnelPublish::PortForwardingDegraded { .. } => {
-                        vec![]
-                    }
-                };
-                for ev in events {
-                    let _ = vpn_event_tx_bridge.send(Timed::from_publish(
-                        std::time::Instant::now(),
-                        envelope.id,
-                        ev,
-                    ));
-                }
-            }
-        });
         info!(
             wg_path,
-            peer_count, "tunnel mode active — TunnelMachine bridged to VpnMachine event channel"
+            peer_count, "tunnel mode active — TunnelMachine spawned"
         );
-    }
+        handles
+    };
+    let (tunnel_pub_tx, mut tunnel_pub_rx) =
+        mpsc::channel::<windlass_machine::PublishEnvelope<TunnelPublish>>(128);
+    tunnel_handles
+        .subscribe
+        .send((
+            vec![TunnelTopic::Health, TunnelTopic::Port, TunnelTopic::Leak],
+            tunnel_pub_tx,
+        ))
+        .expect("tunnel pub subscription");
+
+    // Tunnel address used as the "observed IP" placeholder forwarded
+    // to MAM when the tunnel comes up.  This is the tunnel's INSIDE
+    // address (e.g. 10.2.0.2 for Proton), not the public exit IP —
+    // but it serves the dedup purpose correctly: the MAM core treats
+    // it as an opaque "is this a new tunnel state" identifier, and
+    // MAM's dynamic-seedbox endpoint uses the connection source
+    // address anyway (not what we send).  See
+    // `docs/vpn-ownership.md`.
+    let tunnel_inside_ip: Option<windlass_types::VpnIp> = {
+        let path = config.wg_config_path.as_str();
+        let raw = tokio::fs::read_to_string(path).await.ok();
+        raw.and_then(|c| WgConfig::parse(&c, EndpointResolutionPolicy::RequireIpLiteral).ok())
+            .and_then(|cfg| {
+                cfg.interface
+                    .addresses
+                    .into_iter()
+                    .find_map(|a| match a.ip {
+                        std::net::IpAddr::V4(v4) => Some(windlass_types::VpnIp(v4)),
+                        std::net::IpAddr::V6(_) => None,
+                    })
+            })
+    };
+
+    // The actual bridge forwarder is spawned later, once
+    // `domain_handles` exists — it needs both `vpn_handles.events`
+    // (for VpnEvent injection) and `domain_handles.events` (for
+    // direct VpnPublish synthesis into the §29 admission path).
 
     // Phase 5: the Gluetun file-watcher pump is gone.  TunnelMachine
     // owns the IP + port state and the bridge above synthesizes
@@ -468,6 +464,66 @@ pub(super) async fn init_shell(
                     publish_id,
                     WindlassEvent::Vpn(publish),
                 ));
+            }
+        });
+    }
+
+    // ── Tunnel forwarder task ─────────────────────────────────────────────────
+    // Drains TunnelPublish, emits VpnEvent into the VpnMachine
+    // (which still produces VpnPublish that the VPN forwarder above
+    // routes to the domain), AND synthesizes WindlassEvent::Vpn
+    // directly into the domain channel for the compliance signals
+    // the domain still tracks: PublicIpObserved, PublicIpUnavailable,
+    // PublicIpMismatch.  This is what hooks the tunnel-core
+    // LeakDetected publish into the §29 admission gate.
+    {
+        let vpn_event_tx_bridge = vpn_handles.events.clone();
+        let domain_ev_tx_bridge = domain_handles.events.clone();
+        tokio::spawn(async move {
+            while let Some(envelope) = tunnel_pub_rx.recv().await {
+                let (vpn_events, vpn_publishes): (Vec<VpnEvent>, Vec<VpnPublish>) =
+                    match &envelope.payload {
+                        TunnelPublish::Up | TunnelPublish::Recovered => {
+                            let publishes = tunnel_inside_ip
+                                .map(|ip| vec![VpnPublish::PublicIpObserved { ip }])
+                                .unwrap_or_default();
+                            (vec![VpnEvent::ContainerHealthy], publishes)
+                        }
+                        TunnelPublish::Down { .. } | TunnelPublish::Stuck { .. } => (
+                            vec![VpnEvent::ContainerUnhealthy],
+                            vec![VpnPublish::PublicIpUnavailable],
+                        ),
+                        TunnelPublish::LeakDetected { .. } => {
+                            let zero = windlass_types::VpnIp(std::net::Ipv4Addr::UNSPECIFIED);
+                            (
+                                vec![VpnEvent::ContainerUnhealthy],
+                                vec![VpnPublish::PublicIpMismatch {
+                                    file_ip: tunnel_inside_ip.unwrap_or(zero),
+                                    verified_ip: zero,
+                                    source: windlass_vpn_core::VerificationSource::IfConfigCo,
+                                }],
+                            )
+                        }
+                        TunnelPublish::PortReady { port } => {
+                            (vec![VpnEvent::PortFileChanged { port: *port }], vec![])
+                        }
+                        TunnelPublish::PortUnavailable
+                        | TunnelPublish::PortForwardingDegraded { .. } => (vec![], vec![]),
+                    };
+                for ev in vpn_events {
+                    let _ = vpn_event_tx_bridge.send(Timed::from_publish(
+                        std::time::Instant::now(),
+                        envelope.id,
+                        ev,
+                    ));
+                }
+                for pub_ in vpn_publishes {
+                    let _ = domain_ev_tx_bridge.send(Timed::from_publish(
+                        std::time::Instant::now(),
+                        envelope.id,
+                        WindlassEvent::Vpn(pub_),
+                    ));
+                }
             }
         });
     }
@@ -634,6 +690,7 @@ pub(super) async fn init_shell(
         qbit_handles,
         mam_handles,
         disk_handles,
+        tunnel_handles,
         forwarded_port,
     );
     let execute_service_actions = config.execute_service_actions;

@@ -40,11 +40,11 @@ pub struct TunnelConfig {
     /// endpoint rotation.  Default 3.
     pub stall_count_before_rotate: u32,
     /// How many consecutive rotations before we enter `Stuck`.
-    /// A value of `0` is a sentinel meaning "try every peer once"
-    /// (normalized to `peer_count` by [`TunnelMachine::new`]); any
-    /// value higher than `peer_count` is clamped down because the
-    /// rotation index wraps.  Default `0`.
-    pub rotations_before_stuck: u32,
+    /// `None` means "try every peer once" — [`TunnelMachine::new`]
+    /// resolves it to `peer_count`.  An explicit `Some(n)` higher
+    /// than `peer_count` is clamped down because the rotation
+    /// index wraps.  Default `None`.
+    pub rotations_before_stuck: Option<u32>,
     /// Fraction of the granted port lease at which we renew.  Default
     /// 0.5 — Proton's 60 s leases get a 30 s renewal cadence.
     /// Stored as basis points (1/`10_000`) instead of `f32` so the
@@ -68,9 +68,9 @@ impl Default for TunnelConfig {
             handshake_poll_interval: Duration::from_secs(30),
             handshake_stall_after: Duration::from_mins(3),
             stall_count_before_rotate: 3,
-            // Sentinel: `0` is "try every peer once".
-            // `TunnelMachine::new` normalizes to `peer_count`.
-            rotations_before_stuck: 0,
+            // `None` = "try every peer once".  TunnelMachine::new
+            // resolves it against `peer_count`.
+            rotations_before_stuck: None,
             port_renewal_basis_points: 5_000,
             leak_probe_interval: Duration::from_hours(6),
             natpmp_failure_threshold: 3,
@@ -88,14 +88,15 @@ pub enum TunnelEvent {
     /// The shell finished bringing the interface up (`ip link add`,
     /// `wg set`, address + route).
     InterfaceConfigured,
-    /// The shell failed to bring the interface up.  Carried reason
-    /// is for logs and the typed `Down` publish.
-    InterfaceConfigureFailed { reason: String },
+    /// The shell failed to bring the interface up.  The typed
+    /// variant lets the core distinguish wg-set failures from
+    /// routing failures without substring matching.
+    InterfaceConfigureFailed { reason: InterfaceConfigureFailure },
     /// The shell installed the firewall kill switch.
     FirewallInstalled,
     /// The shell failed to install the firewall kill switch.  We
     /// treat this as fail-closed — no tunnel can come up without it.
-    FirewallInstallFailed { reason: String },
+    FirewallInstallFailed { reason: FirewallInstallFailure },
     /// The shell polled the kernel and observed a handshake; the
     /// `age_seconds` is `now - latest_handshake` from `wg show`.
     HandshakeReported { age_seconds: u64 },
@@ -110,13 +111,108 @@ pub enum TunnelEvent {
         epoch_seconds: u32,
     },
     /// The NAT-PMP request did not complete successfully.
-    NatPmpFailed { reason: String },
+    NatPmpFailed { reason: NatPmpFailure },
     /// The leak probe finished — either the probe failed to reach
     /// non-tunnel egress (good — no leak path), or it did reach
     /// something (bad — leak detected).
     LeakProbeCompleted { outcome: LeakProbeOutcome },
     /// A scheduled timer fired.
     TimerFired(TunnelTimer),
+}
+
+/// Typed reasons the shell reports for `InterfaceConfigureFailed`.
+///
+/// The string fields carry the underlying error message for the
+/// operator's logs; the variants let downstream code react to the
+/// failure class without parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterfaceConfigureFailure {
+    /// `ip link add ... type wireguard` failed (kernel module
+    /// missing, name in use, etc.).
+    LinkAdd(String),
+    /// `wg set` failed — usually means an invalid key, invalid
+    /// endpoint, or wg userland missing.
+    WgSet(String),
+    /// `ip addr add` failed.
+    AddressAdd(String),
+    /// `ip link set ... up` failed.
+    LinkUp(String),
+    /// `ip route add` failed.
+    RouteAdd(String),
+    /// `ip link set ... mtu` failed.
+    MtuSet(String),
+    /// DNS resolver write failed.
+    DnsWrite(String),
+    /// Any other failure shape (operator wrote a wrong policy, etc.).
+    Other(String),
+}
+
+impl std::fmt::Display for InterfaceConfigureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LinkAdd(s) => write!(f, "ip link add: {s}"),
+            Self::WgSet(s) => write!(f, "wg set: {s}"),
+            Self::AddressAdd(s) => write!(f, "ip addr add: {s}"),
+            Self::LinkUp(s) => write!(f, "ip link set up: {s}"),
+            Self::RouteAdd(s) => write!(f, "ip route add: {s}"),
+            Self::MtuSet(s) => write!(f, "ip link set mtu: {s}"),
+            Self::DnsWrite(s) => write!(f, "DNS resolver write: {s}"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+/// Typed reasons the shell can report for `FirewallInstallFailed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FirewallInstallFailure {
+    /// `nft` not available on the host.
+    NftMissing(String),
+    /// `nft` rejected the ruleset (parse / syntax / unsupported).
+    RulesetRejected(String),
+    /// Any other failure shape.
+    Other(String),
+}
+
+impl std::fmt::Display for FirewallInstallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NftMissing(s) => write!(f, "nft missing: {s}"),
+            Self::RulesetRejected(s) => write!(f, "nft ruleset rejected: {s}"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+/// Typed reasons the shell can report for `NatPmpFailed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NatPmpFailure {
+    /// Local UDP socket bind failed.
+    Bind(String),
+    /// Sending the request to the gateway failed (no route, refused).
+    Send(String),
+    /// Gateway did not respond within the configured timeout.
+    Timeout,
+    /// Reading the response from the socket failed.
+    Recv(String),
+    /// Gateway returned a non-success NAT-PMP result code.  See
+    /// `windlass_tunnel_core::natpmp::NatPmpResponseCode` for the
+    /// documented codes.
+    GatewayError { code: u16 },
+    /// Response was malformed (wrong length, version, op).
+    MalformedResponse(String),
+}
+
+impl std::fmt::Display for NatPmpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bind(s) => write!(f, "NAT-PMP socket bind: {s}"),
+            Self::Send(s) => write!(f, "NAT-PMP send: {s}"),
+            Self::Timeout => f.write_str("NAT-PMP gateway timeout"),
+            Self::Recv(s) => write!(f, "NAT-PMP recv: {s}"),
+            Self::GatewayError { code } => write!(f, "NAT-PMP gateway error code {code}"),
+            Self::MalformedResponse(s) => write!(f, "NAT-PMP malformed response: {s}"),
+        }
+    }
 }
 
 /// Outcome of one leak-probe attempt.
@@ -173,10 +269,15 @@ pub enum TunnelAction {
     /// Install the nftables kill switch.  One-shot at boot, after the
     /// interface is up.
     InstallFirewall,
-    /// Read the kernel's `latest_handshake` for the current peer.  Result
-    /// arrives back as [`TunnelEvent::HandshakeReported`] or
+    /// Read the kernel's `latest_handshake` for the named peer.  The
+    /// `peer_index` identifies which peer in the operator's `wg.conf`
+    /// the shell should poll — required because endpoint rotation
+    /// changes the active peer, and asking the shell to "poll the
+    /// current peer" leaks core state into the shell (it would have
+    /// to guess from config).  Result arrives back as
+    /// [`TunnelEvent::HandshakeReported`] or
     /// [`TunnelEvent::HandshakeStalled`].
-    PollHandshake,
+    PollHandshake { peer_index: usize },
     /// Send a NAT-PMP port-map request to the gateway.
     RequestNatPmp,
     /// Switch the active peer (`Endpoint` setting in `wg set`) to the
@@ -403,7 +504,10 @@ impl TunnelMachine {
 
         if self.consecutive_stalls < self.config.stall_count_before_rotate {
             // Stay in current health; just wait for the next poll.
-        } else if self.rotation_count < self.config.rotations_before_stuck
+        } else if self
+            .config
+            .rotations_before_stuck
+            .is_some_and(|max| self.rotation_count < max)
             && self.config.peer_count > 1
         {
             self.active_peer_index = self.next_peer_index();
@@ -454,19 +558,16 @@ impl Machine for TunnelMachine {
 
     fn new(config: Self::Config, _now: Instant) -> Self {
         // Normalize `rotations_before_stuck`:
-        // - 0 means "try every peer once" (the documented Default
-        //   intent; the literal 0 in the field is the sentinel).
-        // - Anything higher than `peer_count` is meaningless because
-        //   we wrap around — clamp it so the rotation budget matches
-        //   the actual peer set.
+        // - `None`  → "try every peer once" (= peer_count).
+        // - `Some(n)` capped at peer_count because rotation wraps.
         let peers = config.peer_count.max(1);
-        let raw_rotations = config.rotations_before_stuck;
         #[allow(clippy::cast_possible_truncation)]
-        let normalized_rotations = if raw_rotations == 0 {
-            peers as u32
-        } else {
-            raw_rotations.min(peers as u32)
-        };
+        let peers_u32 = peers as u32;
+        let normalized_rotations = Some(
+            config
+                .rotations_before_stuck
+                .map_or(peers_u32, |n| n.min(peers_u32)),
+        );
         let config = TunnelConfig {
             rotations_before_stuck: normalized_rotations,
             ..config
@@ -538,7 +639,9 @@ impl Machine for TunnelMachine {
                 }
                 Outcome {
                     actions: vec![
-                        TunnelAction::PollHandshake,
+                        TunnelAction::PollHandshake {
+                            peer_index: self.active_peer_index,
+                        },
                         TunnelAction::RequestNatPmp,
                         TunnelAction::RunLeakProbe,
                         TunnelAction::ScheduleTimer {
@@ -670,7 +773,7 @@ impl Machine for TunnelMachine {
                 if crossed {
                     publishes.push(TunnelPublish::PortForwardingDegraded {
                         consecutive_failures: self.consecutive_natpmp_failures,
-                        last_reason: reason,
+                        last_reason: reason.to_string(),
                     });
                     self.port_degraded_published = true;
                     if self.forwarded_port.take().is_some() {
@@ -729,7 +832,9 @@ impl Machine for TunnelMachine {
             }
 
             TunnelEvent::TimerFired(TunnelTimer::HandshakeWatchdog) => Outcome {
-                actions: vec![TunnelAction::PollHandshake],
+                actions: vec![TunnelAction::PollHandshake {
+                    peer_index: self.active_peer_index,
+                }],
                 publishes: Vec::new(),
             },
             TunnelEvent::TimerFired(TunnelTimer::PortRenewal) => Outcome {
@@ -750,9 +855,12 @@ impl Machine for TunnelMachine {
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         match cmd {
-            TunnelCommand::PollHandshakeNow => {
-                Self::outcome(vec![TunnelAction::PollHandshake], TunnelResponse::Accepted)
-            }
+            TunnelCommand::PollHandshakeNow => Self::outcome(
+                vec![TunnelAction::PollHandshake {
+                    peer_index: self.active_peer_index,
+                }],
+                TunnelResponse::Accepted,
+            ),
             TunnelCommand::RequestPortNow => {
                 Self::outcome(vec![TunnelAction::RequestNatPmp], TunnelResponse::Accepted)
             }
@@ -847,7 +955,7 @@ mod tests {
                 handshake_poll_interval: Duration::from_secs(30),
                 handshake_stall_after: Duration::from_mins(3),
                 stall_count_before_rotate: 2,
-                rotations_before_stuck: 1,
+                rotations_before_stuck: Some(1),
                 port_renewal_basis_points: 5_000,
                 leak_probe_interval: Duration::from_hours(6),
                 natpmp_failure_threshold: 3,
@@ -903,7 +1011,7 @@ mod tests {
         assert!(
             out.actions
                 .iter()
-                .any(|a| matches!(a, TunnelAction::PollHandshake))
+                .any(|a| matches!(a, TunnelAction::PollHandshake { .. }))
         );
         assert!(
             out.actions
@@ -938,7 +1046,7 @@ mod tests {
         let out = handle(
             &mut m,
             TunnelEvent::FirewallInstallFailed {
-                reason: "nft load failed".to_string(),
+                reason: FirewallInstallFailure::RulesetRejected("nft load failed".to_string()),
             },
         );
         assert!(matches!(m.health(), TunnelHealth::Down));
@@ -1216,19 +1324,19 @@ mod tests {
         let out1 = handle(
             &mut m,
             TunnelEvent::NatPmpFailed {
-                reason: "timeout".to_string(),
+                reason: NatPmpFailure::Timeout,
             },
         );
         let out2 = handle(
             &mut m,
             TunnelEvent::NatPmpFailed {
-                reason: "timeout".to_string(),
+                reason: NatPmpFailure::Timeout,
             },
         );
         let out3 = handle(
             &mut m,
             TunnelEvent::NatPmpFailed {
-                reason: "timeout".to_string(),
+                reason: NatPmpFailure::Timeout,
             },
         );
         assert!(
@@ -1257,7 +1365,7 @@ mod tests {
         let out4 = handle(
             &mut m,
             TunnelEvent::NatPmpFailed {
-                reason: "timeout".to_string(),
+                reason: NatPmpFailure::Timeout,
             },
         );
         assert!(
@@ -1328,7 +1436,7 @@ mod tests {
         assert!(
             out.actions
                 .iter()
-                .any(|a| matches!(a, TunnelAction::PollHandshake))
+                .any(|a| matches!(a, TunnelAction::PollHandshake { .. }))
         );
     }
 
@@ -1391,36 +1499,33 @@ mod tests {
     }
 
     #[test]
-    fn rotations_before_stuck_zero_normalizes_to_peer_count() {
-        // Sentinel: `rotations_before_stuck = 0` means "try every
-        // peer once" (the Default doc-comment's intent).  Built into
-        // `new` so a TunnelConfig literal with ..Default::default()
-        // gets the right behavior for multi-peer configs.
+    fn rotations_before_stuck_none_normalizes_to_peer_count() {
+        // `None` means "try every peer once".  TunnelMachine::new
+        // resolves it against the supplied peer_count.
         let m = TunnelMachine::new(
             TunnelConfig {
                 peer_count: 3,
-                rotations_before_stuck: 0,
+                rotations_before_stuck: None,
                 ..TunnelConfig::default()
             },
             Instant::now(),
         );
-        assert_eq!(m.config.rotations_before_stuck, 3);
+        assert_eq!(m.config.rotations_before_stuck, Some(3));
     }
 
     #[test]
     fn rotations_before_stuck_clamped_to_peer_count() {
         // Over-set values get clamped down because the rotation loop
-        // wraps anyway; this keeps "consecutive_rotations" honest as
-        // "how many peers we have tried".
+        // wraps anyway.
         let m = TunnelMachine::new(
             TunnelConfig {
                 peer_count: 2,
-                rotations_before_stuck: 99,
+                rotations_before_stuck: Some(99),
                 ..TunnelConfig::default()
             },
             Instant::now(),
         );
-        assert_eq!(m.config.rotations_before_stuck, 2);
+        assert_eq!(m.config.rotations_before_stuck, Some(2));
     }
 
     #[test]
@@ -1448,9 +1553,13 @@ mod prop_tests {
         prop_oneof![
             Just(TunnelEvent::Init),
             Just(TunnelEvent::InterfaceConfigured),
-            any::<String>().prop_map(|r| TunnelEvent::InterfaceConfigureFailed { reason: r }),
+            any::<String>().prop_map(|r| TunnelEvent::InterfaceConfigureFailed {
+                reason: InterfaceConfigureFailure::Other(r),
+            }),
             Just(TunnelEvent::FirewallInstalled),
-            any::<String>().prop_map(|r| TunnelEvent::FirewallInstallFailed { reason: r }),
+            any::<String>().prop_map(|r| TunnelEvent::FirewallInstallFailed {
+                reason: FirewallInstallFailure::Other(r),
+            }),
             (0u64..=1_000_000u64)
                 .prop_map(|age| TunnelEvent::HandshakeReported { age_seconds: age }),
             Just(TunnelEvent::HandshakeStalled),
@@ -1461,7 +1570,9 @@ mod prop_tests {
                     epoch_seconds: epoch,
                 }
             ),
-            any::<String>().prop_map(|r| TunnelEvent::NatPmpFailed { reason: r }),
+            any::<String>().prop_map(|r| TunnelEvent::NatPmpFailed {
+                reason: NatPmpFailure::Recv(r),
+            }),
             Just(TunnelEvent::LeakProbeCompleted {
                 outcome: LeakProbeOutcome::NoEgressDetected
             }),

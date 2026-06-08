@@ -1,4 +1,4 @@
-# Compose override that runs Windlass in tunnel mode.
+# Self-contained Compose file that runs Windlass in tunnel mode.
 #
 # Windlass owns the WireGuard tunnel in-process (see
 # docs/vpn-ownership.md).  Gluetun is NOT used.  qBittorrent shares
@@ -7,49 +7,82 @@
 # connectability check.
 #
 # Apply with:
-#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
+#   docker compose -f docker-compose.tunnel.yml up -d
 #
-# Required env vars (in addition to the base compose):
-#   WG_CONFIG_PATH   - path *inside* the windlass container to a
-#                       ProtonVPN-generated wg.conf
+# Before first run:
+#   1. Place a ProtonVPN-generated wg.conf at the host path you mount
+#      (defaults to ./wg.conf in this example).
+#   2. Copy .env.example to .env (or supply env vars another way) and
+#      fill in the MAM / qBit credentials.
 #
-# Optional env vars:
-#   WG_INTERFACE_NAME  - tunnel interface name, default `wg0`
-#   NATPMP_GATEWAY     - host:port, default `10.2.0.1:5351` (Proton)
-#
-# Before first run, place your Proton wg.conf at the host path you mount
-# (defaults to ./wg.conf in this example).  See `docs/vpn-ownership.md`
-# for the EndpointResolutionPolicy and the kill-switch invariants.
+# See `docs/vpn-ownership.md` for the EndpointResolutionPolicy and
+# the kill-switch invariants.
 
 services:
   windlass:
+    image: ghcr.io/stirlingmouse/windlass:vpn
+    container_name: windlass
     cap_add:
       - NET_ADMIN
-    # Replace any Gluetun network_mode from the base compose.  Tunnel
-    # mode requires Windlass to have its own namespace so it can
-    # create `wg0` and install the nftables kill switch.
+    # Tunnel mode requires Windlass to have its own network namespace
+    # so it can create `wg0` and install the nftables kill switch.
+    # Default Docker bridge gives the container a private namespace.
     network_mode: "bridge"
     environment:
       WG_CONFIG_PATH: /config/wg.conf
+      # qBit is reachable on localhost inside the shared namespace.
+      QBITTORRENT_URL: http://localhost:8080
+      QBITTORRENT_USER: ${QBITTORRENT_USER:-admin}
+      QBITTORRENT_PASS: ${QBITTORRENT_PASS:?QBITTORRENT_PASS missing}
+      MAM_SESSION: ${MAM_SESSION:?MAM_SESSION missing}
+      DATABASE_URL: ${DATABASE_URL:-postgres://windlass:windlass@postgres:5432/windlass}
     volumes:
       - ./wg.conf:/config/wg.conf:ro
-    # Map the qBit WebUI through the windlass container so qBit's
-    # `network_mode: container:windlass` keeps its admin port
-    # reachable from the host.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
       - "5010:5010"   # windlass dashboard
       - "8080:8080"   # qBittorrent WebUI (routed via shared namespace)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
   qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
     # qBit uses Windlass's namespace — all torrent egress goes through
-    # `wg0`.  Windlass must be healthy before qBit starts; if Windlass
-    # restarts, the runtime drops qBit so it never resumes against a
-    # stale namespace (docs/vpn-ownership.md "qBit lifecycle policy").
+    # `wg0`.  When Windlass restarts, qBit must come down with it so
+    # it never resumes against a stale namespace
+    # (docs/vpn-ownership.md "qBit lifecycle policy").
     network_mode: "container:windlass"
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Etc/UTC}
+      WEBUI_PORT: 8080
+    volumes:
+      - ./qbit-config:/config
+      - ./downloads:/downloads
     depends_on:
       windlass:
         condition: service_healthy
+    restart: unless-stopped
 
-  # Gluetun is intentionally omitted.  Remove it from your base
-  # compose when migrating, or run this override against a base that
-  # doesn't define it.
+  postgres:
+    image: postgres:16-alpine
+    container_name: windlass-postgres
+    environment:
+      POSTGRES_USER: windlass
+      POSTGRES_PASSWORD: windlass
+      POSTGRES_DB: windlass
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "windlass"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

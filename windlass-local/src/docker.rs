@@ -8,11 +8,17 @@ use tracing::{error, info, warn};
 // Re-exported so docker_tests.rs (via `use super::*`) can use it in Tier 4 tests.
 pub use bollard::container::StopContainerOptions;
 
-const GLUETUN: &str = "gluetun";
-
 /// Wraps a `bollard::Docker` connection together with the project-level
 /// configuration it needs. All Docker operations are methods so call sites
 /// only pass `&self` instead of a long argument list.
+///
+/// `gluetun_anchor` historically named the Gluetun container in the
+/// legacy topology.  In tunnel mode (`docs/vpn-ownership.md`) it names
+/// the Windlass container itself — qBittorrent shares Windlass's
+/// network namespace via `network_mode: container:<anchor>`.  The
+/// field name is preserved to keep the surface diff small; the new
+/// `anchor_container` config knob (`WINDLASS_ANCHOR_CONTAINER`)
+/// decides what name it actually carries.
 #[derive(Clone)]
 pub struct DockerClient {
     pub(crate) inner: Docker,
@@ -28,32 +34,31 @@ pub struct DockerBootInfo {
 
 impl DockerClient {
     /// Connects to the Docker socket using the default system path.
+    /// `anchor` names the container whose network namespace
+    /// dependents share — see [`DockerClient`] docs.
     ///
     /// # Errors
     /// Returns an error if the Docker socket is unavailable.
-    pub fn connect(dump_dir: String) -> anyhow::Result<Self> {
+    pub fn connect(dump_dir: String, anchor: String) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Docker::connect_with_socket_defaults()?,
-            gluetun_anchor: GLUETUN.to_string(),
+            gluetun_anchor: anchor,
             dump_dir,
         })
     }
 
-    /// Connects, probes Gluetun state, and discovers dependents.  Returns
-    /// the boot snapshot needed for the legacy `Event::Init` bridge.
-    /// §36 step 9b: the legacy bollard event watcher
-    /// (`spawn_event_watcher`) is retired — `DockerShell` (in the
-    /// windlass binary) owns its own watcher that feeds `DockerMachine`
-    /// directly; the legacy path is redundant.
+    /// Connects, probes anchor health, and discovers dependents.
+    /// Returns the boot snapshot.
     ///
     /// # Errors
     /// Returns an error if the Docker socket is unavailable.
-    pub async fn boot(dump_dir: String) -> anyhow::Result<(Self, DockerBootInfo)> {
-        let client = Self::connect(dump_dir)?;
+    pub async fn boot(dump_dir: String, anchor: String) -> anyhow::Result<(Self, DockerBootInfo)> {
+        let client = Self::connect(dump_dir, anchor)?;
         let is_gluetun_healthy = client.is_gluetun_healthy().await;
         let dependents = client.discover_dependents().await;
         info!(
-            gluetun_healthy = is_gluetun_healthy,
+            anchor = client.gluetun_anchor,
+            anchor_healthy = is_gluetun_healthy,
             dependents = ?dependents,
             "Docker ready"
         );

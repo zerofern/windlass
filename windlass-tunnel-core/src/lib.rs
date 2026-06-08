@@ -25,7 +25,8 @@ pub mod natpmp;
 
 pub use config::{Endpoint, PeerConfig, WgConfig, WgConfigError};
 pub use machine::{
-    LeakProbeOutcome, TunnelAction, TunnelCommand, TunnelConfig, TunnelEvent, TunnelHealth,
-    TunnelMachine, TunnelPublish, TunnelResponse, TunnelTimer, TunnelTopic,
+    FirewallInstallFailure, InterfaceConfigureFailure, LeakProbeOutcome, NatPmpFailure,
+    TunnelAction, TunnelCommand, TunnelConfig, TunnelEvent, TunnelHealth, TunnelMachine,
+    TunnelPublish, TunnelResponse, TunnelTimer, TunnelTopic,
 };
 pub use natpmp::{NatPmpDecodeError, NatPmpLease, NatPmpRequest, NatPmpResponseCode};

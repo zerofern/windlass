@@ -47,6 +47,14 @@ pub struct Config {
     /// `10.2.0.1:5351` — `ProtonVPN`'s documented address.  Override
     /// for other WireGuard-with-NAT-PMP providers.
     pub natpmp_gateway: String,
+    /// Name of the Docker container whose network namespace
+    /// dependents (like qBittorrent) share via
+    /// `network_mode: container:<name>`.  In tunnel mode this is
+    /// Windlass itself; the default is `windlass` to match the
+    /// shipped `docker-compose.tunnel.yml`.  Operators with a
+    /// different container name (or legacy Gluetun mode during
+    /// migration) can override with `WINDLASS_ANCHOR_CONTAINER`.
+    pub anchor_container: String,
     /// Interval between compliance polls in seconds (default: 60).
     pub compliance_poll_interval_secs: u64,
     /// Maximum unsatisfied torrents before alerting (default: 50).
@@ -89,6 +97,8 @@ impl Config {
             wg_config_path: var("WG_CONFIG_PATH").context("WG_CONFIG_PATH missing")?,
             wg_interface_name: var("WG_INTERFACE_NAME").unwrap_or_else(|_| "wg0".to_string()),
             natpmp_gateway: var("NATPMP_GATEWAY").unwrap_or_else(|_| "10.2.0.1:5351".to_string()),
+            anchor_container: var("WINDLASS_ANCHOR_CONTAINER")
+                .unwrap_or_else(|_| "windlass".to_string()),
             compliance_poll_interval_secs: var("COMPLIANCE_POLL_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
