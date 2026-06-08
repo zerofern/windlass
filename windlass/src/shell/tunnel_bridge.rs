@@ -103,6 +103,22 @@ pub(super) fn bridge_tunnel_publish(
                 clear_forwarded_port: true,
             }
         }
+        // Exit-IP verification has failed past the threshold.  We
+        // surface it as a Warning via PublicIpVerificationDegraded
+        // so the operator sees it in the alert log, but admission
+        // is NOT flipped — the tunnel itself is still up; we just
+        // can't confirm the exit IP for now.
+        TunnelPublish::ExitIpVerificationDegraded {
+            consecutive_failures,
+            last_reason,
+        } => TunnelBridgeOutput {
+            vpn_events: vec![],
+            vpn_publishes: vec![VpnPublish::PublicIpVerificationDegraded {
+                consecutive_failures: *consecutive_failures,
+                last_reason: last_reason.clone(),
+            }],
+            clear_forwarded_port: false,
+        },
         TunnelPublish::ExitIpObserved { ip } => TunnelBridgeOutput {
             // Real exit IP from the §31-equivalent query through
             // the tunnel.  Publish to the domain so MAM's

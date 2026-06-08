@@ -402,6 +402,11 @@ pub(super) async fn init_shell(
         WindlassConfig {
             snapshot_interval: Duration::from_secs(config.compliance_poll_interval_secs),
             gluetun_anchor: docker.gluetun_anchor.clone(),
+            // vpn-branch H1: tunnel mode owns recovery in-process,
+            // so the domain must NOT issue
+            // `Docker(RestartContainer { name = windlass })` on
+            // Crashed.  Legacy Gluetun deploys would set this true.
+            restart_anchor_on_crash: false,
             initial_blacklist,
         },
         DomainShellConfig {

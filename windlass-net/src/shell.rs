@@ -134,6 +134,13 @@ impl Shell for TunnelShell {
 
     fn dispatch(&mut self, action: TunnelAction, event_tx: &UnboundedSender<Timed<TunnelEvent>>) {
         match action {
+            TunnelAction::InstallPreTunnelFirewall => {
+                spawn_install_pre_tunnel_firewall(
+                    self.runner.clone(),
+                    self.config.clone(),
+                    event_tx.clone(),
+                );
+            }
             TunnelAction::ConfigureInterface => {
                 spawn_configure_interface(
                     self.runner.clone(),
@@ -413,6 +420,41 @@ fn allowed_ips_for_args(peer: &PeerConfig) -> String {
         .join(",")
 }
 
+fn spawn_install_pre_tunnel_firewall(
+    runner: Arc<dyn Runner>,
+    config: Arc<TunnelShellConfig>,
+    tx: UnboundedSender<Timed<TunnelEvent>>,
+) {
+    windlass_machine::causal::spawn(async move {
+        // Pre-tunnel kill switch: drops everything except `lo` and the
+        // UDP underlay packets to the configured peer endpoint(s).
+        // The tunnel interface (`wg0`) doesn't exist yet, so the
+        // ruleset MUST NOT name it.  When the interface is configured
+        // and `InstallFirewall` runs, we'll replace this table with
+        // the full one that also accepts egress via `wg0`.
+        let ruleset = build_nft_pre_tunnel_ruleset(&config);
+        match runner.run_with_stdin("nft", &["-f", "-"], &ruleset).await {
+            Ok(_) => send_event(&tx, TunnelEvent::PreTunnelFirewallInstalled),
+            Err(e) => {
+                let reason = firewall_failure_from(&e);
+                send_event(&tx, TunnelEvent::PreTunnelFirewallInstallFailed { reason });
+            }
+        }
+    });
+}
+
+fn firewall_failure_from(e: &crate::command::CommandError) -> FirewallInstallFailure {
+    match e {
+        crate::command::CommandError::Spawn { .. } => {
+            FirewallInstallFailure::NftMissing(e.to_string())
+        }
+        crate::command::CommandError::NonZeroExit { .. } => {
+            FirewallInstallFailure::RulesetRejected(e.to_string())
+        }
+        crate::command::CommandError::Signal { .. } => FirewallInstallFailure::Other(e.to_string()),
+    }
+}
+
 fn spawn_install_firewall(
     runner: Arc<dyn Runner>,
     config: Arc<TunnelShellConfig>,
@@ -423,51 +465,31 @@ fn spawn_install_firewall(
         match runner.run_with_stdin("nft", &["-f", "-"], &ruleset).await {
             Ok(_) => send_event(&tx, TunnelEvent::FirewallInstalled),
             Err(e) => {
-                let reason = match e {
-                    crate::command::CommandError::Spawn { .. } => {
-                        FirewallInstallFailure::NftMissing(e.to_string())
-                    }
-                    crate::command::CommandError::NonZeroExit { .. } => {
-                        FirewallInstallFailure::RulesetRejected(e.to_string())
-                    }
-                    crate::command::CommandError::Signal { .. } => {
-                        FirewallInstallFailure::Other(e.to_string())
-                    }
-                };
+                let reason = firewall_failure_from(&e);
                 send_event(&tx, TunnelEvent::FirewallInstallFailed { reason });
             }
         }
     });
 }
 
-/// Builds the nftables ruleset that fences egress to the tunnel
-/// interface (+ the underlay path to the configured peer) and `lo`.
-/// IPv6 is dropped entirely unless the configured peer endpoint is
-/// IPv6.
-#[must_use]
-pub fn build_nft_ruleset(config: &TunnelShellConfig) -> String {
-    let iface = &config.interface_name;
-    let peer_endpoints: Vec<(IpAddr, u16)> = config
+/// Returns the parsed peer endpoints as `(IpAddr, port)` pairs.
+/// Hostname endpoints are skipped — the parser rejects them under
+/// the default `RequireIpLiteral` policy, so we don't expect them.
+fn peer_endpoints_for_ruleset(config: &TunnelShellConfig) -> Vec<(IpAddr, u16)> {
+    config
         .wg
         .peers
         .iter()
         .filter_map(|p| match &p.endpoint {
             Endpoint::Ip(addr) => Some((addr.ip(), addr.port())),
-            // Hostname endpoints are rejected at configure time; not
-            // expected here.  Skip if encountered.
             Endpoint::Hostname { .. } => None,
         })
-        .collect();
-    let mut rules = String::new();
-    rules.push_str("table inet windlass_killswitch\n");
-    rules.push_str("delete table inet windlass_killswitch\n");
-    rules.push_str("table inet windlass_killswitch {\n");
-    rules.push_str("  chain output {\n");
-    rules.push_str("    type filter hook output priority filter; policy drop;\n");
-    rules.push_str("    oifname \"lo\" accept\n");
-    let _ = writeln!(rules, "    oifname \"{iface}\" accept");
-    rules.push_str("    ct state established,related accept\n");
-    for (ip, port) in &peer_endpoints {
+        .collect()
+}
+
+/// Appends underlay carve-out rules for each configured peer endpoint.
+fn append_peer_underlay_rules(rules: &mut String, peer_endpoints: &[(IpAddr, u16)]) {
+    for (ip, port) in peer_endpoints {
         match ip {
             IpAddr::V4(v4) => {
                 let _ = writeln!(rules, "    ip daddr {v4} udp dport {port} accept");
@@ -477,6 +499,51 @@ pub fn build_nft_ruleset(config: &TunnelShellConfig) -> String {
             }
         }
     }
+}
+
+/// Pre-tunnel kill switch — runs BEFORE `ip link add wg0`.
+///
+/// Allows only loopback and the UDP underlay packets that establish
+/// the `WireGuard` session.  No `wg0` rule because the interface
+/// doesn't exist yet.  Replaced by [`build_nft_ruleset`] after the
+/// interface is up.  (`docs/vpn-ownership.md` acceptance criterion.)
+#[must_use]
+pub fn build_nft_pre_tunnel_ruleset(config: &TunnelShellConfig) -> String {
+    let peer_endpoints = peer_endpoints_for_ruleset(config);
+    let mut rules = String::new();
+    rules.push_str("table inet windlass_killswitch\n");
+    rules.push_str("delete table inet windlass_killswitch\n");
+    rules.push_str("table inet windlass_killswitch {\n");
+    rules.push_str("  chain output {\n");
+    rules.push_str("    type filter hook output priority filter; policy drop;\n");
+    rules.push_str("    oifname \"lo\" accept\n");
+    rules.push_str("    ct state established,related accept\n");
+    append_peer_underlay_rules(&mut rules, &peer_endpoints);
+    rules.push_str("  }\n");
+    rules.push_str("}\n");
+    rules
+}
+
+/// Post-tunnel kill switch — runs after the interface is up.
+///
+/// Fences egress to the tunnel interface (+ the underlay path to the
+/// configured peer) and `lo`.  IPv6 is dropped entirely unless the
+/// configured peer endpoint is IPv6.  Replaces the pre-tunnel
+/// ruleset by name.
+#[must_use]
+pub fn build_nft_ruleset(config: &TunnelShellConfig) -> String {
+    let iface = &config.interface_name;
+    let peer_endpoints = peer_endpoints_for_ruleset(config);
+    let mut rules = String::new();
+    rules.push_str("table inet windlass_killswitch\n");
+    rules.push_str("delete table inet windlass_killswitch\n");
+    rules.push_str("table inet windlass_killswitch {\n");
+    rules.push_str("  chain output {\n");
+    rules.push_str("    type filter hook output priority filter; policy drop;\n");
+    rules.push_str("    oifname \"lo\" accept\n");
+    let _ = writeln!(rules, "    oifname \"{iface}\" accept");
+    rules.push_str("    ct state established,related accept\n");
+    append_peer_underlay_rules(&mut rules, &peer_endpoints);
     rules.push_str("  }\n");
     rules.push_str("}\n");
     rules

@@ -99,6 +99,10 @@ pub struct TunnelConfig {
     /// Consecutive NAT-PMP failures before we publish that port
     /// forwarding is degraded.  Default 3.
     pub natpmp_failure_threshold: NatPmpFailureThreshold,
+    /// Consecutive exit-IP query failures before we publish that
+    /// the verification is degraded.  Default 3 — under exponential
+    /// backoff that's the first 7s, the next ~14s, then ~28s.
+    pub exit_ip_failure_threshold: NatPmpFailureThreshold,
     /// How often we re-query the public exit IP through the tunnel.
     /// Default 6 h.  This is what `TunnelPublish::ExitIpObserved`
     /// surfaces — the IP MAM sees us as.
@@ -123,6 +127,7 @@ impl Default for TunnelConfig {
             port_renewal_basis_points: PortRenewalBasisPoints::try_new(5_000).expect("default"),
             leak_probe_interval: Duration::from_hours(6),
             natpmp_failure_threshold: NatPmpFailureThreshold::try_new(3).expect("default"),
+            exit_ip_failure_threshold: NatPmpFailureThreshold::try_new(3).expect("default"),
             exit_ip_query_interval: Duration::from_hours(6),
             natpmp_protocol: crate::natpmp::Protocol::Tcp,
             natpmp_lifetime_seconds: 60,
@@ -137,6 +142,15 @@ impl Default for TunnelConfig {
 pub enum TunnelEvent {
     /// Boot — the runtime is asking us to start.
     Init,
+    /// The shell installed the *pre-tunnel* firewall — a minimal
+    /// kill switch that allows only loopback and the `WireGuard`
+    /// underlay path to the configured peer endpoint.  This MUST
+    /// land before the interface comes up so the boot path can
+    /// never leak.  (`docs/vpn-ownership.md` acceptance criterion.)
+    PreTunnelFirewallInstalled,
+    /// The shell failed to install the pre-tunnel firewall.  Fail-
+    /// closed: no tunnel comes up without it.
+    PreTunnelFirewallInstallFailed { reason: FirewallInstallFailure },
     /// The shell finished bringing the interface up (`ip link add`,
     /// `wg set`, address + route).
     InterfaceConfigured,
@@ -144,7 +158,8 @@ pub enum TunnelEvent {
     /// variant lets the core distinguish wg-set failures from
     /// routing failures without substring matching.
     InterfaceConfigureFailed { reason: InterfaceConfigureFailure },
-    /// The shell installed the firewall kill switch.
+    /// The shell installed the post-tunnel firewall — the
+    /// full kill switch that now also allows egress via `wg0`.
     FirewallInstalled,
     /// The shell failed to install the firewall kill switch.  We
     /// treat this as fail-closed — no tunnel can come up without it.
@@ -349,11 +364,18 @@ impl TunnelTimer {
 /// Side effects the shell should execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TunnelAction {
+    /// Install the *pre-tunnel* kill switch (allow only `lo` plus the
+    /// `WireGuard` underlay path to the configured peer endpoint).
+    /// One-shot at boot, BEFORE the interface comes up so the boot
+    /// path cannot leak (acceptance criterion in
+    /// `docs/vpn-ownership.md`).
+    InstallPreTunnelFirewall,
     /// Bring up the `WireGuard` interface using the held config.  One-shot
     /// at boot.
     ConfigureInterface,
-    /// Install the nftables kill switch.  One-shot at boot, after the
-    /// interface is up.
+    /// Install the full nftables kill switch (additionally allowing
+    /// egress via `wg0`).  One-shot at boot, after the interface
+    /// is up.
     InstallFirewall,
     /// Read the kernel's `latest_handshake` for the named peer.  The
     /// `peer_index` identifies which peer in the operator's `wg.conf`
@@ -428,6 +450,15 @@ pub enum TunnelPublish {
     /// Replaces the inside-address placeholder the tunnel bridge
     /// used before — domain admission keys on this for MAM dedup.
     ExitIpObserved { ip: windlass_types::VpnIp },
+    /// The shell's exit-IP query has failed
+    /// `exit_ip_failure_threshold` times in a row.  Surfaces as a
+    /// `Warning` alert without taking the tunnel down — the
+    /// admission path falls back to the inside-address placeholder.
+    /// Rising-edge gated; resets on the first successful query.
+    ExitIpVerificationDegraded {
+        consecutive_failures: u32,
+        last_reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,7 +481,9 @@ impl HasTopic<TunnelTopic> for TunnelPublish {
             | Self::PortUnavailable
             | Self::PortForwardingDegraded { .. } => TunnelTopic::Port,
             Self::LeakDetected { .. } => TunnelTopic::Leak,
-            Self::ExitIpObserved { .. } => TunnelTopic::PublicIp,
+            Self::ExitIpObserved { .. } | Self::ExitIpVerificationDegraded { .. } => {
+                TunnelTopic::PublicIp
+            }
         }
     }
 }
@@ -518,6 +551,10 @@ pub struct TunnelMachine {
     health: TunnelHealth,
     interface_configured: bool,
     firewall_installed: bool,
+    /// The pre-tunnel kill switch is up.  Required precondition
+    /// for `ConfigureInterface` — without it, the boot path could
+    /// leak through the host stack.
+    pre_tunnel_firewall_installed: bool,
     /// Last handshake age in seconds, as reported by the shell.
     /// `None` means "never observed" or "stale and cleared".
     last_handshake_age_seconds: Option<u64>,
@@ -554,6 +591,13 @@ pub struct TunnelMachine {
     /// is running.  Armed on the firewall-installed transition so a
     /// dropped event cannot kill the chain.
     exit_ip_chain_scheduled: bool,
+    /// Consecutive `ExitIpQueryFailed` events since the last success.
+    /// Drives both the fast-retry backoff and the rising-edge
+    /// `ExitIpVerificationDegraded` publish.
+    consecutive_exit_ip_failures: u32,
+    /// Whether `ExitIpVerificationDegraded` has already fired for
+    /// the current failure streak (rising-edge gate).
+    exit_ip_degraded_published: bool,
 }
 
 impl TunnelMachine {
@@ -685,6 +729,7 @@ impl Machine for TunnelMachine {
             health: TunnelHealth::Initializing,
             interface_configured: false,
             firewall_installed: false,
+            pre_tunnel_firewall_installed: false,
             last_handshake_age_seconds: None,
             consecutive_stalls: 0,
             rotation_count: 0,
@@ -695,6 +740,8 @@ impl Machine for TunnelMachine {
             port_degraded_published: false,
             last_exit_ip: None,
             exit_ip_chain_scheduled: false,
+            consecutive_exit_ip_failures: 0,
+            exit_ip_degraded_published: false,
         }
     }
 
@@ -709,9 +756,31 @@ impl Machine for TunnelMachine {
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
             TunnelEvent::Init => Outcome {
-                actions: vec![TunnelAction::ConfigureInterface],
+                // Pre-tunnel firewall FIRST, then interface, then
+                // the post-tunnel firewall.  This ordering enforces
+                // the acceptance criterion that the boot path is
+                // fenced before any privileged interface work runs.
+                actions: vec![TunnelAction::InstallPreTunnelFirewall],
                 publishes: Vec::new(),
             },
+
+            TunnelEvent::PreTunnelFirewallInstalled => {
+                self.pre_tunnel_firewall_installed = true;
+                Outcome {
+                    actions: vec![TunnelAction::ConfigureInterface],
+                    publishes: Vec::new(),
+                }
+            }
+            TunnelEvent::PreTunnelFirewallInstallFailed { reason } => {
+                self.health = TunnelHealth::Down;
+                Outcome {
+                    actions: Vec::new(),
+                    publishes: vec![TunnelPublish::Down {
+                        reason: format!("pre-tunnel firewall install failed: {reason}"),
+                        since: wall_now,
+                    }],
+                }
+            }
 
             TunnelEvent::InterfaceConfigured => {
                 self.interface_configured = true;
@@ -975,9 +1044,13 @@ impl Machine for TunnelMachine {
             },
             // Shell got a usable answer from the public-IP query.
             // Rising-edge publish on first observation or change.
+            // Resets the failure counter and degraded gate so a
+            // subsequent failure streak can fire `Degraded` again.
             TunnelEvent::ExitIpObserved { ip } => {
                 let changed = self.last_exit_ip != Some(ip);
                 self.last_exit_ip = Some(ip);
+                self.consecutive_exit_ip_failures = 0;
+                self.exit_ip_degraded_published = false;
                 let publishes = if changed {
                     vec![TunnelPublish::ExitIpObserved { ip }]
                 } else {
@@ -988,11 +1061,37 @@ impl Machine for TunnelMachine {
                     publishes,
                 }
             }
-            // Shell could not run the query.  Bounded retry happens
-            // via the existing ExitIpQuery timer; we just log via the
-            // state snapshot.  No publish yet — we wait for sustained
-            // failure rather than transient noise.
-            TunnelEvent::ExitIpQueryFailed { reason: _ } => Outcome::none(),
+            // Shell could not run the query.  Schedule a fast-retry
+            // (exponential backoff capped at the configured cadence)
+            // so the operator-visible exit IP doesn't go stale for 6h
+            // when the first attempt happens to fail.  After the
+            // failure threshold, publish `Degraded` once.
+            TunnelEvent::ExitIpQueryFailed { reason } => {
+                self.consecutive_exit_ip_failures =
+                    self.consecutive_exit_ip_failures.saturating_add(1);
+                let mut publishes = Vec::new();
+                let crossed = !self.exit_ip_degraded_published
+                    && self.consecutive_exit_ip_failures
+                        >= self.config.exit_ip_failure_threshold.into_inner();
+                if crossed {
+                    publishes.push(TunnelPublish::ExitIpVerificationDegraded {
+                        consecutive_failures: self.consecutive_exit_ip_failures,
+                        last_reason: reason.to_string(),
+                    });
+                    self.exit_ip_degraded_published = true;
+                }
+                let backoff = exit_ip_retry_delay(
+                    self.consecutive_exit_ip_failures,
+                    self.config.exit_ip_query_interval,
+                );
+                Outcome {
+                    actions: vec![TunnelAction::ScheduleTimer {
+                        timer: TunnelTimer::ExitIpQuery,
+                        after: backoff,
+                    }],
+                    publishes,
+                }
+            }
         }
     }
 
@@ -1076,6 +1175,13 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
     candidate.min(cap)
 }
 
+/// Backoff for exit-IP query retries.  Caps at the configured query
+/// interval so a sustained outage settles back to the normal 6h
+/// cadence rather than hammering ifconfig.co.
+fn exit_ip_retry_delay(attempt: u32, normal_cadence: Duration) -> Duration {
+    backoff_for_attempt(attempt).min(normal_cadence)
+}
+
 // Internal helper so `handle_command` can keep the `now`/`wall_now`
 // parameters live without unused-variable warnings.  This avoids
 // peppering `#[allow]` attributes.
@@ -1107,6 +1213,7 @@ mod tests {
                 port_renewal_basis_points: PortRenewalBasisPoints::try_new(5_000).unwrap(),
                 leak_probe_interval: Duration::from_hours(6),
                 natpmp_failure_threshold: NatPmpFailureThreshold::try_new(3).unwrap(),
+                exit_ip_failure_threshold: NatPmpFailureThreshold::try_new(3).unwrap(),
                 exit_ip_query_interval: Duration::from_hours(6),
                 natpmp_protocol: crate::natpmp::Protocol::Tcp,
                 natpmp_lifetime_seconds: 60,
@@ -1129,23 +1236,41 @@ mod tests {
     /// (`interface_configured && firewall_installed`).
     fn boot(m: &mut TunnelMachine) {
         handle(m, TunnelEvent::Init);
+        handle(m, TunnelEvent::PreTunnelFirewallInstalled);
         handle(m, TunnelEvent::InterfaceConfigured);
         handle(m, TunnelEvent::FirewallInstalled);
     }
 
     #[test]
-    fn init_asks_shell_to_configure_interface() {
+    fn init_asks_shell_to_install_pre_tunnel_firewall_first() {
+        // Boot ordering: pre-tunnel killswitch → interface → final
+        // firewall.  Init must NOT issue ConfigureInterface directly
+        // — the boot path would have a leak window before the
+        // killswitch lands.
         let mut m = machine();
         let out = handle(&mut m, TunnelEvent::Init);
         assert_eq!(out.actions.len(), 1);
-        assert!(matches!(out.actions[0], TunnelAction::ConfigureInterface));
+        assert!(matches!(
+            out.actions[0],
+            TunnelAction::InstallPreTunnelFirewall
+        ));
         assert!(out.publishes.is_empty());
+    }
+
+    #[test]
+    fn pre_tunnel_firewall_installed_then_configure_interface() {
+        let mut m = machine();
+        handle(&mut m, TunnelEvent::Init);
+        let out = handle(&mut m, TunnelEvent::PreTunnelFirewallInstalled);
+        assert_eq!(out.actions.len(), 1);
+        assert!(matches!(out.actions[0], TunnelAction::ConfigureInterface));
     }
 
     #[test]
     fn interface_configured_then_firewall_install() {
         let mut m = machine();
         handle(&mut m, TunnelEvent::Init);
+        handle(&mut m, TunnelEvent::PreTunnelFirewallInstalled);
         let out = handle(&mut m, TunnelEvent::InterfaceConfigured);
         assert_eq!(out.actions.len(), 1);
         assert!(matches!(out.actions[0], TunnelAction::InstallFirewall));
@@ -1155,6 +1280,7 @@ mod tests {
     fn firewall_installed_drives_boot_actions_and_timers() {
         let mut m = machine();
         handle(&mut m, TunnelEvent::Init);
+        handle(&mut m, TunnelEvent::PreTunnelFirewallInstalled);
         handle(&mut m, TunnelEvent::InterfaceConfigured);
         let out = handle(&mut m, TunnelEvent::FirewallInstalled);
         // The shell should now poll handshake, request NAT-PMP, run
@@ -1703,6 +1829,10 @@ mod prop_tests {
     fn any_event() -> impl Strategy<Value = TunnelEvent> {
         prop_oneof![
             Just(TunnelEvent::Init),
+            Just(TunnelEvent::PreTunnelFirewallInstalled),
+            any::<String>().prop_map(|r| TunnelEvent::PreTunnelFirewallInstallFailed {
+                reason: FirewallInstallFailure::Other(r),
+            }),
             Just(TunnelEvent::InterfaceConfigured),
             any::<String>().prop_map(|r| TunnelEvent::InterfaceConfigureFailed {
                 reason: InterfaceConfigureFailure::Other(r),

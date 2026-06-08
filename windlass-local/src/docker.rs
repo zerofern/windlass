@@ -165,14 +165,19 @@ impl DockerClient {
         }
     }
 
-    pub async fn restart_gluetun(&self) {
+    /// Restarts the configured anchor container.  Used by the
+    /// legacy Gluetun-mode crash-recovery path
+    /// (`WindlassConfig::restart_anchor_on_crash`); in tunnel
+    /// mode the domain skips the call entirely because the anchor
+    /// would be Windlass itself.
+    pub async fn restart_anchor(&self) {
         let options = RestartContainerOptions { t: 0 };
         if let Err(e) = self
             .inner
             .restart_container(&self.gluetun_anchor, Some(options))
             .await
         {
-            error!("Failed to restart gluetun: {e}");
+            error!("Failed to restart anchor `{}`: {e}", self.gluetun_anchor);
         }
     }
 
