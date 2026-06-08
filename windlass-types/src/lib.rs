@@ -140,6 +140,20 @@ impl NullHttpTap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnIp(pub Ipv4Addr);
 
+impl VpnIp {
+    /// Builds from any `IpAddr`, returning `None` for IPv6 inputs.
+    /// IPv6 exit IPs are surfaced via a dedicated path; this
+    /// constructor is a pragmatic narrowing site for callers that
+    /// only deal with IPv4.
+    #[must_use]
+    pub const fn from_ip(ip: std::net::IpAddr) -> Option<Self> {
+        match ip {
+            std::net::IpAddr::V4(v4) => Some(Self(v4)),
+            std::net::IpAddr::V6(_) => None,
+        }
+    }
+}
+
 // ── Ports ────────────────────────────────────────────────────────────────────
 
 #[nutype(

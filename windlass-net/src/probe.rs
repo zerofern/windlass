@@ -1,28 +1,24 @@
-//! Leak probe.
+//! Leak probe — two layers, both required by
+//! `docs/vpn-ownership.md`.
 //!
-//! Enumerates the kernel interfaces inside Windlass's network
-//! namespace and reports whether any interface other than `lo` and
-//! the configured tunnel interface carries an IPv4 or IPv6 address.
+//! ## Layer 1 — Interface enumeration
 //!
-//! The acceptance criterion in `docs/vpn-ownership.md` is:
+//! Parses `ip -j addr show` JSON output via the shared
+//! [`crate::command::Runner`] and reports whether any interface
+//! other than `lo` and the configured tunnel interface carries a
+//! non-link-local IPv4 or IPv6 address.  Anything beyond that — a
+//! leftover `eth0`, a stray bridge — implies a path the kill
+//! switch can't protect.  See [`leak_outcome_from_snapshot`].
 //!
-//! > The container's network namespace exposes `wg0` and `lo` as the
-//! > only interfaces with internet routing after the tunnel is
-//! > established.
+//! ## Layer 2 — Active connect-bind
 //!
-//! Anything beyond that — a leftover `eth0` from a misconfigured
-//! `network_mode`, a stray bridge interface — would imply a path
-//! the kill switch is not protecting.  Probe returns
-//! [`windlass_tunnel_core::LeakProbeOutcome::LeakDetected`] in that
-//! case; the tunnel core takes the health gate down on the
-//! resulting event.
-//!
-//! ## Implementation
-//!
-//! Today the probe parses `ip -j addr show` JSON output via the
-//! shared [`crate::command::Runner`].  Migration to in-process
-//! `rtnetlink` follows the same shape: produce an
-//! [`InterfaceSnapshot`], hand it to [`leak_outcome_from_snapshot`].
+//! Tries an outbound TCP connect bound to a non-tunnel source IP.
+//! Under a correctly configured namespace + nftables ruleset the
+//! connect must fail (no route or firewall drop); a successful
+//! connect proves we have an egress path the kill switch isn't
+//! enforcing.  Implemented with `SO_BINDTODEVICE` on Linux via
+//! [`active_connect_probe`].  Skipped on platforms without that
+//! socket option (only Linux for this project).
 
 use std::collections::BTreeSet;
 
@@ -125,6 +121,109 @@ pub fn leak_outcome_from_snapshot(
         // follow-up.  For now, name what we found.
         observed_remote: "non-tunnel interface present in namespace".to_string(),
     }
+}
+
+/// Strays we'll try an active TCP connect against.  Public IPs that
+/// stay routed reliably and don't host services we care about.
+const ACTIVE_PROBE_TARGETS: &[(&str, u16)] = &[
+    // Cloudflare DNS over HTTPS.  Reliable, public, harmless to ping.
+    ("1.1.1.1", 443),
+    ("1.0.0.1", 443),
+];
+
+/// Active leak probe — `SO_BINDTODEVICE` connects to each stray.
+///
+/// For each non-tunnel interface, try a connect to one of
+/// [`ACTIVE_PROBE_TARGETS`].  A successful connect proves there's a
+/// routable egress path that bypasses the kill switch.  Times out
+/// fast (300 ms per attempt).  Failure modes (no targets reachable,
+/// no non-tunnel interfaces, etc.) fold into `NoEgressDetected` —
+/// the layer-1 enumeration probe is the primary signal; the active
+/// probe is a verification.
+#[cfg(target_os = "linux")]
+pub fn active_connect_probe(
+    snapshot: &InterfaceSnapshot,
+    tunnel_interface: &str,
+) -> LeakProbeOutcome {
+    use std::time::Duration;
+
+    let stray: Vec<&str> = snapshot
+        .interfaces_with_global_addr
+        .iter()
+        .map(String::as_str)
+        .filter(|name| *name != "lo" && *name != tunnel_interface)
+        .collect();
+    if stray.is_empty() {
+        // Layer 1 already covers "no stray interface to probe".
+        return LeakProbeOutcome::NoEgressDetected;
+    }
+
+    for iface in &stray {
+        for (host, port) in ACTIVE_PROBE_TARGETS {
+            if try_bound_connect(iface, host, *port, Duration::from_millis(300)).is_ok() {
+                return LeakProbeOutcome::LeakDetected {
+                    interface: (*iface).to_string(),
+                    observed_remote: format!("{host}:{port}"),
+                };
+            }
+        }
+    }
+    LeakProbeOutcome::NoEgressDetected
+}
+
+#[cfg(target_os = "linux")]
+fn try_bound_connect(
+    iface: &str,
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let addr: std::net::IpAddr = host.parse().map_err(std::io::Error::other)?;
+    let domain = match addr {
+        std::net::IpAddr::V4(_) => socket2::Domain::IPV4,
+        std::net::IpAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    // SO_BINDTODEVICE binds outgoing traffic to the named interface,
+    // bypassing the routing table.  This forces the connect to use a
+    // non-tunnel path; under a correct ruleset the firewall drops it.
+    let iface_len = libc::socklen_t::try_from(iface.len())
+        .map_err(|_| std::io::Error::other("interface name too long"))?;
+    let bind_res = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            iface.as_ptr().cast(),
+            iface_len,
+        )
+    };
+    if bind_res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sock_addr = std::net::SocketAddr::new(addr, port).into();
+    let tcp_std: std::net::TcpStream = match socket.connect_timeout(&sock_addr, timeout) {
+        Ok(()) => socket.into(),
+        Err(e) => return Err(e),
+    };
+    tcp_std.set_nonblocking(false)?;
+    // We don't actually want to talk to the target — just confirm the
+    // socket opened.  Drop it to close the connection.
+    drop(tcp_std);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn active_connect_probe(
+    _snapshot: &InterfaceSnapshot,
+    _tunnel_interface: &str,
+) -> LeakProbeOutcome {
+    // Non-Linux targets (currently only tests in CI) don't have
+    // SO_BINDTODEVICE.  Fall back to the layer-1 outcome.
+    LeakProbeOutcome::NoEgressDetected
 }
 
 #[cfg(test)]

@@ -702,14 +702,27 @@ fn spawn_query_exit_ip(
                         },
                         Ok(body) => {
                             let raw = body.lines().next().unwrap_or("").trim();
-                            match raw.parse::<std::net::Ipv4Addr>() {
-                                Err(e) => TunnelEvent::ExitIpQueryFailed {
+                            // Accept either IPv4 or IPv6 — operators
+                            // routing v6 through the tunnel would
+                            // otherwise be stuck with the placeholder
+                            // forever.  v6 still goes through the same
+                            // VpnIp-narrowing path because the
+                            // downstream domain types are v4 today.
+                            raw.parse::<std::net::IpAddr>().map_or_else(
+                                |e| TunnelEvent::ExitIpQueryFailed {
                                     reason: ExitIpFailure::Parse(format!("`{raw}`: {e}")),
                                 },
-                                Ok(v4) => TunnelEvent::ExitIpObserved {
-                                    ip: windlass_types::VpnIp(v4),
+                                |ip| {
+                                    windlass_types::VpnIp::from_ip(ip).map_or_else(
+                                        || TunnelEvent::ExitIpQueryFailed {
+                                            reason: ExitIpFailure::Parse(format!(
+                                                "IPv6 exit IP `{ip}` not yet mapped to VpnIp"
+                                            )),
+                                        },
+                                        |vpn| TunnelEvent::ExitIpObserved { ip: vpn },
+                                    )
                                 },
-                            }
+                            )
                         }
                     }
                 } else {
@@ -729,16 +742,58 @@ fn spawn_run_leak_probe(
     tx: UnboundedSender<Timed<TunnelEvent>>,
 ) {
     windlass_machine::causal::spawn(async move {
-        let outcome = match runner.run("ip", &["-j", "addr", "show"]).await {
+        // Layer 1: interface enumeration.
+        let layer1 = match runner.run("ip", &["-j", "addr", "show"]).await {
             Ok(out) => match parse_ip_addr_show(&out.stdout) {
-                Ok(snapshot) => leak_outcome_from_snapshot(&snapshot, &config.interface_name),
-                Err(e) => windlass_tunnel_core::LeakProbeOutcome::Inconclusive {
-                    reason: format!("parse `ip -j addr show`: {e}"),
-                },
+                Ok(snapshot) => {
+                    let enum_outcome =
+                        leak_outcome_from_snapshot(&snapshot, &config.interface_name);
+                    // If layer 1 found a stray interface, we already
+                    // have a leak signal — escalate via the active
+                    // probe to get a real `observed_remote` rather
+                    // than the generic enumeration string.  If layer
+                    // 1 found nothing, the active probe is what
+                    // verifies the kill switch actually drops on
+                    // attempts.
+                    Some((snapshot, enum_outcome))
+                }
+                Err(e) => {
+                    send_event(
+                        &tx,
+                        TunnelEvent::LeakProbeCompleted {
+                            outcome: windlass_tunnel_core::LeakProbeOutcome::Inconclusive {
+                                reason: format!("parse `ip -j addr show`: {e}"),
+                            },
+                        },
+                    );
+                    return;
+                }
             },
-            Err(e) => windlass_tunnel_core::LeakProbeOutcome::Inconclusive {
-                reason: format!("spawn `ip`: {e}"),
-            },
+            Err(e) => {
+                send_event(
+                    &tx,
+                    TunnelEvent::LeakProbeCompleted {
+                        outcome: windlass_tunnel_core::LeakProbeOutcome::Inconclusive {
+                            reason: format!("spawn `ip`: {e}"),
+                        },
+                    },
+                );
+                return;
+            }
+        };
+        let (snapshot, enum_outcome) = layer1.expect("checked above");
+        let active = crate::probe::active_connect_probe(&snapshot, &config.interface_name);
+        // Either probe finding a leak is sufficient.  The active
+        // probe's `LeakDetected` carries the concrete remote we
+        // reached; if only enumeration detected something, we
+        // surface its more generic message.
+        let outcome = match (enum_outcome, active) {
+            (_, active @ windlass_tunnel_core::LeakProbeOutcome::LeakDetected { .. })
+            | (active @ windlass_tunnel_core::LeakProbeOutcome::LeakDetected { .. }, _) => active,
+            (windlass_tunnel_core::LeakProbeOutcome::NoEgressDetected, _) => {
+                windlass_tunnel_core::LeakProbeOutcome::NoEgressDetected
+            }
+            (other, _) => other,
         };
         send_event(&tx, TunnelEvent::LeakProbeCompleted { outcome });
     });

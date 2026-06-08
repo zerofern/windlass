@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 async-trait           = { workspace = true }
 chrono                = { workspace = true }
+libc                  = { workspace = true }
+socket2               = "0.5"
 reqwest               = { workspace = true }
 secrecy               = { workspace = true }
 serde                 = { workspace = true }

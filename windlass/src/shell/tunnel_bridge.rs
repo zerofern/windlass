@@ -71,13 +71,28 @@ pub(super) fn bridge_tunnel_publish(
             // also gone, so clear the cached port.
             clear_forwarded_port: true,
         },
-        TunnelPublish::LeakDetected { .. } => {
+        TunnelPublish::LeakDetected {
+            observed_remote, ..
+        } => {
+            // file_ip = what we believe our tunnel IP is.
+            // verified_ip = what we actually reached the leak target as,
+            // parsed from `observed_remote` if it's an IPv4 literal —
+            // otherwise UNSPECIFIED so the typed publish still flips
+            // the admission gate.  The tunnel-core `LeakDetected`
+            // publish carries the full `interface`/`observed_remote`
+            // strings; the operator-facing alert log shows both via
+            // `/observability`.
             let zero = VpnIp(std::net::Ipv4Addr::UNSPECIFIED);
+            let verified_ip = observed_remote
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .and_then(VpnIp::from_ip)
+                .unwrap_or(zero);
             TunnelBridgeOutput {
                 vpn_events: vec![VpnEvent::ContainerUnhealthy],
                 vpn_publishes: vec![VpnPublish::PublicIpMismatch {
                     file_ip: observed_ip.unwrap_or(zero),
-                    verified_ip: zero,
+                    verified_ip,
                     source: VerificationSource::IfConfigCo,
                 }],
                 clear_forwarded_port: true,

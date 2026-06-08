@@ -237,46 +237,53 @@ pub(super) async fn init_shell(
     // into the existing VpnMachine event channel so PortReady/
     // Disconnected/etc. drive the same downstream paths Gluetun-
     // sourced events do today.
-    let (tunnel_handles, _tunnel_join) = {
-        let wg_path = config.wg_config_path.as_str();
-        let wg_content = tokio::fs::read_to_string(wg_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
-        let wg = WgConfig::parse(&wg_content, EndpointResolutionPolicy::RequireIpLiteral)
-            .map_err(|e| anyhow::anyhow!("parse {wg_path}: {e}"))?;
-        let peer_count_raw = wg.peers.len();
-        let peer_count = windlass_tunnel_core::PeerCount::try_new(peer_count_raw)
-            .map_err(|e| anyhow::anyhow!("wg.conf must have at least one [Peer] section: {e}"))?;
-        let natpmp_gateway = config
-            .natpmp_gateway
-            .parse()
-            .map_err(|e| anyhow::anyhow!("NATPMP_GATEWAY: {e}"))?;
-        let handles = windlass_machine::spawn::<TunnelMachine, TunnelShell>(
-            windlass_machine::CoreId::Tunnel,
-            runtime_tap.clone(),
-            TunnelConfig {
-                peer_count,
-                ..TunnelConfig::default()
-            },
-            TunnelShellConfig {
-                wg,
-                interface_name: config.wg_interface_name.clone(),
-                natpmp_gateway,
-                natpmp_timeout: Duration::from_secs(2),
-                natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
-                natpmp_lifetime_seconds: 60,
-                exit_ip_url: "https://ifconfig.co/ip".to_string(),
-                tap: http_tap.clone(),
-            },
-        )
-        .await;
-        info!(
-            wg_path,
-            peer_count = peer_count_raw,
-            "tunnel mode active — TunnelMachine spawned"
-        );
-        handles
-    };
+    // Read + parse wg.conf exactly once.  We compute
+    // `tunnel_inside_ip` (the IPv4 placeholder forwarded to MAM as
+    // PublicIpObserved before the real exit-IP query lands) from the
+    // parsed config in the same pass, then move ownership of the
+    // parsed config into TunnelShellConfig.
+    let wg_path = config.wg_config_path.clone();
+    let wg_content = tokio::fs::read_to_string(&wg_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
+    let wg = WgConfig::parse(&wg_content, EndpointResolutionPolicy::RequireIpLiteral)
+        .map_err(|e| anyhow::anyhow!("parse {wg_path}: {e}"))?;
+    let peer_count_raw = wg.peers.len();
+    let peer_count = windlass_tunnel_core::PeerCount::try_new(peer_count_raw)
+        .map_err(|e| anyhow::anyhow!("wg.conf must have at least one [Peer] section: {e}"))?;
+    let tunnel_inside_ip: Option<windlass_types::VpnIp> =
+        wg.interface.addresses.iter().find_map(|a| match a.ip {
+            std::net::IpAddr::V4(v4) => Some(windlass_types::VpnIp(v4)),
+            std::net::IpAddr::V6(_) => None,
+        });
+    let natpmp_gateway = config
+        .natpmp_gateway
+        .parse()
+        .map_err(|e| anyhow::anyhow!("NATPMP_GATEWAY: {e}"))?;
+    let (tunnel_handles, _tunnel_join) = windlass_machine::spawn::<TunnelMachine, TunnelShell>(
+        windlass_machine::CoreId::Tunnel,
+        runtime_tap.clone(),
+        TunnelConfig {
+            peer_count,
+            ..TunnelConfig::default()
+        },
+        TunnelShellConfig {
+            wg,
+            interface_name: config.wg_interface_name.clone(),
+            natpmp_gateway,
+            natpmp_timeout: Duration::from_secs(2),
+            natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
+            natpmp_lifetime_seconds: 60,
+            exit_ip_url: "https://ifconfig.co/ip".to_string(),
+            tap: http_tap.clone(),
+        },
+    )
+    .await;
+    info!(
+        wg_path,
+        peer_count = peer_count_raw,
+        "tunnel mode active — TunnelMachine spawned"
+    );
     let (tunnel_pub_tx, mut tunnel_pub_rx) =
         mpsc::channel::<windlass_machine::PublishEnvelope<TunnelPublish>>(128);
     tunnel_handles
@@ -291,29 +298,6 @@ pub(super) async fn init_shell(
             tunnel_pub_tx,
         ))
         .expect("tunnel pub subscription");
-
-    // Tunnel address used as the "observed IP" placeholder forwarded
-    // to MAM when the tunnel comes up.  This is the tunnel's INSIDE
-    // address (e.g. 10.2.0.2 for Proton), not the public exit IP —
-    // but it serves the dedup purpose correctly: the MAM core treats
-    // it as an opaque "is this a new tunnel state" identifier, and
-    // MAM's dynamic-seedbox endpoint uses the connection source
-    // address anyway (not what we send).  See
-    // `docs/vpn-ownership.md`.
-    let tunnel_inside_ip: Option<windlass_types::VpnIp> = {
-        let path = config.wg_config_path.as_str();
-        let raw = tokio::fs::read_to_string(path).await.ok();
-        raw.and_then(|c| WgConfig::parse(&c, EndpointResolutionPolicy::RequireIpLiteral).ok())
-            .and_then(|cfg| {
-                cfg.interface
-                    .addresses
-                    .into_iter()
-                    .find_map(|a| match a.ip {
-                        std::net::IpAddr::V4(v4) => Some(windlass_types::VpnIp(v4)),
-                        std::net::IpAddr::V6(_) => None,
-                    })
-            })
-    };
 
     // The actual bridge forwarder is spawned later, once
     // `domain_handles` exists — it needs both `vpn_handles.events`
