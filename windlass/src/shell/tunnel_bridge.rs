@@ -263,6 +263,97 @@ mod tests {
         assert!(out.clear_forwarded_port);
     }
 
+    /// Exit-IP `Degraded` should route to
+    /// `PublicIpVerificationDegraded` so the domain alert log
+    /// surfaces it as a Warning, but admission must stay open
+    /// (the tunnel itself is still up; we just can't confirm the
+    /// IP yet).
+    #[test]
+    fn exit_ip_degraded_routes_to_public_ip_verification_degraded_warning() {
+        let out = bridge_tunnel_publish(
+            &TunnelPublish::ExitIpVerificationDegraded {
+                consecutive_failures: 5,
+                last_reason: "ifconfig.co 503".into(),
+            },
+            None,
+            None,
+        );
+        assert!(out.vpn_events.is_empty());
+        assert_eq!(out.vpn_publishes.len(), 1);
+        match &out.vpn_publishes[0] {
+            VpnPublish::PublicIpVerificationDegraded {
+                consecutive_failures,
+                last_reason,
+            } => {
+                assert_eq!(*consecutive_failures, 5);
+                assert_eq!(last_reason, "ifconfig.co 503");
+            }
+            other => panic!("expected PublicIpVerificationDegraded, got {other:?}"),
+        }
+        assert!(!out.clear_forwarded_port);
+    }
+
+    /// Real exit IP from the query should reach the domain as
+    /// `PublicIpObserved` so MAM dedups against the actual Proton
+    /// egress IP rather than the inside-address placeholder.
+    #[test]
+    fn exit_ip_observed_routes_to_public_ip_observed() {
+        let exit = ip("203.0.113.5");
+        let out = bridge_tunnel_publish(
+            &TunnelPublish::ExitIpObserved { ip: exit },
+            Some(ip("10.2.0.2")),
+            Some(exit),
+        );
+        assert_eq!(
+            out.vpn_publishes,
+            vec![VpnPublish::PublicIpObserved { ip: exit }]
+        );
+    }
+
+    /// `LeakDetected` with a parseable IPv4 in `observed_remote`
+    /// should thread through as the `verified_ip` on the
+    /// `PublicIpMismatch` (M4 review fix).
+    #[test]
+    fn leak_detected_threads_observed_remote_into_verified_ip() {
+        let out = bridge_tunnel_publish(
+            &TunnelPublish::LeakDetected {
+                interface: "eth0".into(),
+                observed_remote: "203.0.113.1:443".into(),
+            },
+            Some(ip("10.2.0.2")),
+            None,
+        );
+        // "host:port" doesn't parse as a bare IpAddr — should fall
+        // back to UNSPECIFIED (no leak parsing this time).
+        let unspec = VpnIp(std::net::Ipv4Addr::UNSPECIFIED);
+        match &out.vpn_publishes[0] {
+            VpnPublish::PublicIpMismatch { verified_ip, .. } => {
+                assert_eq!(*verified_ip, unspec);
+            }
+            other => panic!("expected PublicIpMismatch, got {other:?}"),
+        }
+    }
+
+    /// When `observed_remote` is a bare IP literal, the bridge
+    /// should narrow it through `VpnIp::from_ip` and surface it.
+    #[test]
+    fn leak_detected_with_bare_ip_surfaces_concrete_verified_ip() {
+        let out = bridge_tunnel_publish(
+            &TunnelPublish::LeakDetected {
+                interface: "eth0".into(),
+                observed_remote: "203.0.113.1".into(),
+            },
+            Some(ip("10.2.0.2")),
+            None,
+        );
+        match &out.vpn_publishes[0] {
+            VpnPublish::PublicIpMismatch { verified_ip, .. } => {
+                assert_eq!(*verified_ip, ip("203.0.113.1"));
+            }
+            other => panic!("expected PublicIpMismatch, got {other:?}"),
+        }
+    }
+
     /// Same regression: `PortForwardingDegraded` past the NAT-PMP
     /// failure threshold must clear the cached forwarded port.
     #[test]

@@ -274,7 +274,10 @@ pub(super) async fn init_shell(
             natpmp_timeout: Duration::from_secs(2),
             natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
             natpmp_lifetime_seconds: 60,
-            exit_ip_url: "https://ifconfig.co/ip".to_string(),
+            exit_ip_urls: vec![
+                "https://ifconfig.co/ip".to_string(),
+                "https://icanhazip.com".to_string(),
+            ],
             tap: http_tap.clone(),
         },
     )

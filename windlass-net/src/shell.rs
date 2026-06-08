@@ -29,10 +29,9 @@ use crate::handshake::{HandshakeAge, latest_handshake_age};
 use crate::natpmp::NatPmpClient;
 use crate::probe::{leak_outcome_from_snapshot, parse_ip_addr_show};
 
-/// Default URL the exit-IP query hits.  ifconfig.co's `/ip` endpoint
-/// returns a single line containing the connection's source IP —
-/// which through the tunnel is Proton's exit IP.
-const DEFAULT_EXIT_IP_URL: &str = "https://ifconfig.co/ip";
+/// Default URLs the exit-IP query hits.  Each returns the source
+/// IP on the first line.  Tried in order until one succeeds.
+const DEFAULT_EXIT_IP_URLS: &[&str] = &["https://ifconfig.co/ip", "https://icanhazip.com"];
 
 /// Operator-supplied configuration for the shell.
 ///
@@ -56,10 +55,13 @@ pub struct TunnelShellConfig {
     /// Lifetime requested from the NAT-PMP gateway, in seconds.
     /// Defaults to 60 (`ProtonVPN` caps at 60 regardless).
     pub natpmp_lifetime_seconds: u32,
-    /// URL the shell GETs for `TunnelAction::QueryExitIp`.  Must
-    /// return the connection's source IP as plain text on its first
-    /// line.  Defaults to `https://ifconfig.co/ip`.
-    pub exit_ip_url: String,
+    /// URLs the shell GETs for `TunnelAction::QueryExitIp`.  Each
+    /// must return the connection's source IP as plain text on its
+    /// first line.  Tried in order; the first successful response
+    /// wins.  Defaults to `[ifconfig.co/ip, icanhazip.com]` — two
+    /// independent public reflectors so a single outage doesn't
+    /// blind the exit-IP signal.
+    pub exit_ip_urls: Vec<String>,
     /// Observability tap.  Every subprocess invocation and NAT-PMP
     /// exchange is captured here so the `/observability` ring sees
     /// tunnel ops alongside MAM/qBit HTTP.
@@ -85,7 +87,10 @@ impl TunnelShellConfig {
             natpmp_timeout: Duration::from_secs(2),
             natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
             natpmp_lifetime_seconds: 60,
-            exit_ip_url: DEFAULT_EXIT_IP_URL.to_string(),
+            exit_ip_urls: DEFAULT_EXIT_IP_URLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             tap: NullHttpTap::arc(),
         }
     }
@@ -687,53 +692,60 @@ fn spawn_query_exit_ip(
     config: &Arc<TunnelShellConfig>,
     tx: UnboundedSender<Timed<TunnelEvent>>,
 ) {
-    let url = config.exit_ip_url.clone();
+    let urls = config.exit_ip_urls.clone();
     windlass_machine::causal::spawn(async move {
-        let event = match http.get(&url).send().await {
-            Err(e) => TunnelEvent::ExitIpQueryFailed {
-                reason: ExitIpFailure::Transport(e.to_string()),
-            },
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    match resp.text().await {
-                        Err(e) => TunnelEvent::ExitIpQueryFailed {
-                            reason: ExitIpFailure::Transport(e.to_string()),
-                        },
-                        Ok(body) => {
-                            let raw = body.lines().next().unwrap_or("").trim();
-                            // Accept either IPv4 or IPv6 — operators
-                            // routing v6 through the tunnel would
-                            // otherwise be stuck with the placeholder
-                            // forever.  v6 still goes through the same
-                            // VpnIp-narrowing path because the
-                            // downstream domain types are v4 today.
-                            raw.parse::<std::net::IpAddr>().map_or_else(
-                                |e| TunnelEvent::ExitIpQueryFailed {
-                                    reason: ExitIpFailure::Parse(format!("`{raw}`: {e}")),
-                                },
-                                |ip| {
-                                    windlass_types::VpnIp::from_ip(ip).map_or_else(
-                                        || TunnelEvent::ExitIpQueryFailed {
-                                            reason: ExitIpFailure::Parse(format!(
-                                                "IPv6 exit IP `{ip}` not yet mapped to VpnIp"
-                                            )),
-                                        },
-                                        |vpn| TunnelEvent::ExitIpObserved { ip: vpn },
-                                    )
-                                },
-                            )
-                        }
-                    }
-                } else {
-                    TunnelEvent::ExitIpQueryFailed {
-                        reason: ExitIpFailure::HttpStatus(status.as_u16()),
-                    }
+        let mut last_failure = None;
+        for url in &urls {
+            match query_exit_ip_once(&http, url).await {
+                Ok(event) => {
+                    send_event(&tx, event);
+                    return;
+                }
+                Err(failure) => {
+                    last_failure = Some(failure);
                 }
             }
-        };
+        }
+        // Every URL failed.  Surface the last failure so the
+        // operator at least sees one concrete reason.
+        let event = last_failure.map_or_else(
+            || TunnelEvent::ExitIpQueryFailed {
+                reason: ExitIpFailure::Transport("no exit_ip_urls configured".into()),
+            },
+            |reason| TunnelEvent::ExitIpQueryFailed { reason },
+        );
         send_event(&tx, event);
     });
+}
+
+/// Tries one exit-IP source.  Returns `Ok(ExitIpObserved)` on a
+/// usable response, or `Err(typed failure)` so the caller can fall
+/// through to the next URL.
+async fn query_exit_ip_once(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<TunnelEvent, ExitIpFailure> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ExitIpFailure::Transport(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(ExitIpFailure::HttpStatus(status.as_u16()));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ExitIpFailure::Transport(e.to_string()))?;
+    let raw = body.lines().next().unwrap_or("").trim();
+    let ip = raw
+        .parse::<std::net::IpAddr>()
+        .map_err(|e| ExitIpFailure::Parse(format!("`{raw}`: {e}")))?;
+    let vpn = windlass_types::VpnIp::from_ip(ip).ok_or_else(|| {
+        ExitIpFailure::Parse(format!("IPv6 exit IP `{ip}` not yet mapped to VpnIp"))
+    })?;
+    Ok(TunnelEvent::ExitIpObserved { ip: vpn })
 }
 
 fn spawn_run_leak_probe(

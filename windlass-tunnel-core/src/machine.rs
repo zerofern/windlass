@@ -1681,6 +1681,114 @@ mod tests {
         assert!(matches!(m.health(), TunnelHealth::Down));
     }
 
+    // ── Exit-IP query: degraded + retry coverage ──────────────────────────
+
+    #[test]
+    fn exit_ip_failures_publish_degraded_once_at_threshold_and_schedule_retry() {
+        // H3/M5 fix: a sustained ExitIpQuery failure must (a) fire
+        // ExitIpVerificationDegraded exactly once at the threshold,
+        // and (b) reschedule a fast-retry timer so we don't have to
+        // wait 6h for the next attempt.
+        let mut m = machine();
+        boot(&mut m);
+        for _ in 0..2 {
+            let out = handle(
+                &mut m,
+                TunnelEvent::ExitIpQueryFailed {
+                    reason: ExitIpFailure::Transport("timeout".into()),
+                },
+            );
+            assert!(out.publishes.is_empty(), "below threshold should be silent");
+            assert!(out.actions.iter().any(|a| matches!(
+                a,
+                TunnelAction::ScheduleTimer {
+                    timer: TunnelTimer::ExitIpQuery,
+                    ..
+                }
+            )));
+        }
+        // Third failure crosses the default threshold (3).
+        let out = handle(
+            &mut m,
+            TunnelEvent::ExitIpQueryFailed {
+                reason: ExitIpFailure::HttpStatus(503),
+            },
+        );
+        assert!(
+            out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::ExitIpVerificationDegraded { .. }))
+        );
+        // Fourth failure stays silent — rising-edge gate held.
+        let out = handle(
+            &mut m,
+            TunnelEvent::ExitIpQueryFailed {
+                reason: ExitIpFailure::Transport("still timing out".into()),
+            },
+        );
+        assert!(
+            !out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::ExitIpVerificationDegraded { .. }))
+        );
+    }
+
+    #[test]
+    fn exit_ip_success_resets_failure_streak_so_degraded_can_fire_again() {
+        let mut m = machine();
+        boot(&mut m);
+        // Cross the threshold.
+        for _ in 0..3 {
+            handle(
+                &mut m,
+                TunnelEvent::ExitIpQueryFailed {
+                    reason: ExitIpFailure::Transport("x".into()),
+                },
+            );
+        }
+        // Recovery resets the gate.
+        let ip = windlass_types::VpnIp(std::net::Ipv4Addr::new(203, 0, 113, 5));
+        let _ = handle(&mut m, TunnelEvent::ExitIpObserved { ip });
+        // Re-cross the threshold; Degraded fires again.
+        for _ in 0..2 {
+            handle(
+                &mut m,
+                TunnelEvent::ExitIpQueryFailed {
+                    reason: ExitIpFailure::Transport("y".into()),
+                },
+            );
+        }
+        let out = handle(
+            &mut m,
+            TunnelEvent::ExitIpQueryFailed {
+                reason: ExitIpFailure::Transport("y".into()),
+            },
+        );
+        assert!(
+            out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::ExitIpVerificationDegraded { .. }))
+        );
+    }
+
+    #[test]
+    fn pre_tunnel_firewall_failure_takes_health_down() {
+        let mut m = machine();
+        handle(&mut m, TunnelEvent::Init);
+        let out = handle(
+            &mut m,
+            TunnelEvent::PreTunnelFirewallInstallFailed {
+                reason: FirewallInstallFailure::RulesetRejected("nft failed".into()),
+            },
+        );
+        assert!(matches!(m.health(), TunnelHealth::Down));
+        assert!(
+            out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::Down { .. }))
+        );
+    }
+
     #[test]
     fn leak_no_egress_just_reschedules() {
         let mut m = machine();
