@@ -42,8 +42,18 @@ RUN apt-get update \
         iproute2 \
         wireguard-tools \
         nftables \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/windlass /usr/local/bin/windlass
+
+# Healthcheck so `depends_on: service_healthy` works for any
+# container that shares Windlass's namespace (qBittorrent in
+# tunnel mode).  The web server exposes /api/v1/health; we use
+# wget because we already pull in the standard Debian image
+# which includes it.  --quiet --tries=1 --spider keeps the
+# probe lightweight.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://127.0.0.1:5010/api/v1/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/windlass"]

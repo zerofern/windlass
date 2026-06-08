@@ -3370,6 +3370,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
@@ -3432,6 +3433,7 @@ name = "windlass-tunnel-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "nutype",
  "proptest",
  "secrecy",
  "serde",

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 chrono           = { workspace = true }
+nutype           = { workspace = true }
 secrecy          = { workspace = true }
 serde            = { workspace = true }
 thiserror        = { workspace = true }

@@ -16,10 +16,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 use windlass_machine::{ExternalCause, Shell, Timed};
 use windlass_tunnel_core::config::{Endpoint, PeerConfig, WgConfig};
-use windlass_tunnel_core::natpmp::Protocol;
 use windlass_tunnel_core::{
-    FirewallInstallFailure, InterfaceConfigureFailure, NatPmpFailure, NatPmpRequest, TunnelAction,
-    TunnelEvent,
+    ExitIpFailure, FirewallInstallFailure, InterfaceConfigureFailure, NatPmpFailure, NatPmpRequest,
+    TunnelAction, TunnelEvent,
 };
 
 use crate::natpmp::NatPmpClientError;
@@ -29,6 +28,11 @@ use crate::command::{Runner, SystemRunner};
 use crate::handshake::{HandshakeAge, latest_handshake_age};
 use crate::natpmp::NatPmpClient;
 use crate::probe::{leak_outcome_from_snapshot, parse_ip_addr_show};
+
+/// Default URL the exit-IP query hits.  ifconfig.co's `/ip` endpoint
+/// returns a single line containing the connection's source IP —
+/// which through the tunnel is Proton's exit IP.
+const DEFAULT_EXIT_IP_URL: &str = "https://ifconfig.co/ip";
 
 /// Operator-supplied configuration for the shell.
 ///
@@ -45,6 +49,17 @@ pub struct TunnelShellConfig {
     pub natpmp_gateway: SocketAddr,
     /// Per-request NAT-PMP timeout.  Default 2 s.
     pub natpmp_timeout: Duration,
+    /// NAT-PMP transport (UDP vs TCP).  `ProtonVPN` uses TCP; some
+    /// providers prefer UDP.  Defaults to TCP.  Previously hard-
+    /// coded in `spawn_request_natpmp`.
+    pub natpmp_protocol: windlass_tunnel_core::natpmp::Protocol,
+    /// Lifetime requested from the NAT-PMP gateway, in seconds.
+    /// Defaults to 60 (`ProtonVPN` caps at 60 regardless).
+    pub natpmp_lifetime_seconds: u32,
+    /// URL the shell GETs for `TunnelAction::QueryExitIp`.  Must
+    /// return the connection's source IP as plain text on its first
+    /// line.  Defaults to `https://ifconfig.co/ip`.
+    pub exit_ip_url: String,
     /// Observability tap.  Every subprocess invocation and NAT-PMP
     /// exchange is captured here so the `/observability` ring sees
     /// tunnel ops alongside MAM/qBit HTTP.
@@ -68,6 +83,9 @@ impl TunnelShellConfig {
             interface_name: "wg0".to_string(),
             natpmp_gateway: "10.2.0.1:5351".parse().expect("static literal"),
             natpmp_timeout: Duration::from_secs(2),
+            natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
+            natpmp_lifetime_seconds: 60,
+            exit_ip_url: DEFAULT_EXIT_IP_URL.to_string(),
             tap: NullHttpTap::arc(),
         }
     }
@@ -82,7 +100,17 @@ impl TunnelShellConfig {
 pub struct TunnelShell {
     config: Arc<TunnelShellConfig>,
     runner: Arc<dyn Runner>,
-    natpmp: Option<Arc<NatPmpClient>>,
+    /// Lazily-initialized NAT-PMP client.  The tunnel interface is
+    /// not yet up at shell construction time, so we defer the UDP
+    /// bind until the first request and persist the client through
+    /// a `tokio::sync::OnceCell` so subsequent dispatches reuse the
+    /// same socket.  Previous version cloned `Option<Arc<...>>`
+    /// into the spawned task and never wrote back; every dispatch
+    /// re-bound a fresh socket.
+    natpmp: Arc<tokio::sync::OnceCell<Arc<NatPmpClient>>>,
+    /// Shared HTTP client for the exit-IP query.  Built once at
+    /// shell-construction so we don't re-handshake TLS every 6h.
+    http: reqwest::Client,
 }
 
 impl Shell for TunnelShell {
@@ -92,14 +120,15 @@ impl Shell for TunnelShell {
 
     async fn new(config: Self::Config, _event_tx: UnboundedSender<Timed<Self::Event>>) -> Self {
         let runner: Arc<dyn Runner> = Arc::new(SystemRunner::new(CoreId::Tunnel, config.tap()));
-        // The NAT-PMP client binds a UDP socket; we defer the bind
-        // until the first request because the tunnel interface is
-        // not yet up at shell-construction time.  `Option<Arc<...>>`
-        // lazily initializes on first use.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest client for exit-IP query");
         Self {
             config: Arc::new(config),
             runner,
-            natpmp: None,
+            natpmp: Arc::new(tokio::sync::OnceCell::new()),
+            http,
         }
     }
 
@@ -124,52 +153,10 @@ impl Shell for TunnelShell {
                 );
             }
             TunnelAction::RequestNatPmp => {
-                let gateway = self.config.natpmp_gateway;
-                let timeout = self.config.natpmp_timeout;
-                let existing = self.natpmp.clone();
-                let tap = self.config.tap();
-                let tx = event_tx.clone();
-                windlass_machine::causal::spawn(async move {
-                    let client = match existing {
-                        Some(c) => c,
-                        None => {
-                            match NatPmpClient::new(gateway, timeout, CoreId::Tunnel, tap).await {
-                                Ok(c) => Arc::new(c),
-                                Err(e) => {
-                                    send_event(
-                                        &tx,
-                                        TunnelEvent::NatPmpFailed {
-                                            reason: natpmp_failure(&e),
-                                        },
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                    };
-                    let req = NatPmpRequest {
-                        protocol: Protocol::Tcp,
-                        internal_port: 0,
-                        external_port_hint: 0,
-                        lifetime_seconds: 60,
-                    };
-                    match client.request(req).await {
-                        Ok(lease) => send_event(
-                            &tx,
-                            TunnelEvent::NatPmpLeaseGranted {
-                                external_port: lease.external_port,
-                                lifetime_seconds: lease.lifetime_seconds,
-                                epoch_seconds: lease.epoch_seconds,
-                            },
-                        ),
-                        Err(e) => send_event(
-                            &tx,
-                            TunnelEvent::NatPmpFailed {
-                                reason: natpmp_failure(&e),
-                            },
-                        ),
-                    }
-                });
+                spawn_request_natpmp(&self.config, self.natpmp.clone(), event_tx.clone());
+            }
+            TunnelAction::QueryExitIp => {
+                spawn_query_exit_ip(self.http.clone(), &self.config, event_tx.clone());
             }
             TunnelAction::RotateEndpoint { peer_index } => {
                 spawn_rotate_endpoint(
@@ -567,6 +554,105 @@ fn spawn_rotate_endpoint(
                 );
             }
         }
+    });
+}
+
+fn spawn_request_natpmp(
+    config: &Arc<TunnelShellConfig>,
+    cell: Arc<tokio::sync::OnceCell<Arc<NatPmpClient>>>,
+    tx: UnboundedSender<Timed<TunnelEvent>>,
+) {
+    let gateway = config.natpmp_gateway;
+    let timeout = config.natpmp_timeout;
+    let tap = config.tap();
+    let protocol = config.natpmp_protocol;
+    let lifetime = config.natpmp_lifetime_seconds;
+    windlass_machine::causal::spawn(async move {
+        // OnceCell::get_or_try_init persists the NAT-PMP client across
+        // dispatches so we don't re-bind the local UDP socket every
+        // request.  Returns the typed NatPmpFailure on bind failure.
+        let client = match cell
+            .get_or_try_init(|| async {
+                NatPmpClient::new(gateway, timeout, CoreId::Tunnel, tap)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+        {
+            Ok(c) => Arc::clone(c),
+            Err(e) => {
+                send_event(
+                    &tx,
+                    TunnelEvent::NatPmpFailed {
+                        reason: natpmp_failure(&e),
+                    },
+                );
+                return;
+            }
+        };
+        let req = NatPmpRequest {
+            protocol,
+            internal_port: 0,
+            external_port_hint: 0,
+            lifetime_seconds: lifetime,
+        };
+        match client.request(req).await {
+            Ok(lease) => send_event(
+                &tx,
+                TunnelEvent::NatPmpLeaseGranted {
+                    external_port: lease.external_port,
+                    lifetime_seconds: lease.lifetime_seconds,
+                    epoch_seconds: lease.epoch_seconds,
+                },
+            ),
+            Err(e) => send_event(
+                &tx,
+                TunnelEvent::NatPmpFailed {
+                    reason: natpmp_failure(&e),
+                },
+            ),
+        }
+    });
+}
+
+fn spawn_query_exit_ip(
+    http: reqwest::Client,
+    config: &Arc<TunnelShellConfig>,
+    tx: UnboundedSender<Timed<TunnelEvent>>,
+) {
+    let url = config.exit_ip_url.clone();
+    windlass_machine::causal::spawn(async move {
+        let event = match http.get(&url).send().await {
+            Err(e) => TunnelEvent::ExitIpQueryFailed {
+                reason: ExitIpFailure::Transport(e.to_string()),
+            },
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.text().await {
+                        Err(e) => TunnelEvent::ExitIpQueryFailed {
+                            reason: ExitIpFailure::Transport(e.to_string()),
+                        },
+                        Ok(body) => {
+                            let raw = body.lines().next().unwrap_or("").trim();
+                            match raw.parse::<std::net::Ipv4Addr>() {
+                                Err(e) => TunnelEvent::ExitIpQueryFailed {
+                                    reason: ExitIpFailure::Parse(format!("`{raw}`: {e}")),
+                                },
+                                Ok(v4) => TunnelEvent::ExitIpObserved {
+                                    ip: windlass_types::VpnIp(v4),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    TunnelEvent::ExitIpQueryFailed {
+                        reason: ExitIpFailure::HttpStatus(status.as_u16()),
+                    }
+                }
+            }
+        };
+        send_event(&tx, event);
     });
 }
 

@@ -13,9 +13,49 @@
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use nutype::nutype;
 use serde::{Deserialize, Serialize};
 use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_types::VpnPort;
+
+// ── Typed config primitives ──────────────────────────────────────────────────
+//
+// Project type rule: prefer deep domain-specific types over raw
+// primitives.  These newtypes carry the validation rules the
+// state machine relies on so a wrong literal in TunnelConfig is
+// rejected at construction, not at runtime.
+
+/// Number of `[Peer]` sections in the parsed wg.conf.  Must be at
+/// least 1 — a tunnel without peers cannot establish.
+#[nutype(
+    validate(greater_or_equal = 1),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)
+)]
+pub struct PeerCount(usize);
+
+/// Consecutive `HandshakeStalled` events before the state machine
+/// rotates the endpoint.  Must be at least 1.
+#[nutype(
+    validate(greater_or_equal = 1),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)
+)]
+pub struct StallCountBeforeRotate(u32);
+
+/// Consecutive `NatPmpFailed` events before the state machine
+/// publishes `PortForwardingDegraded`.  Must be at least 1.
+#[nutype(
+    validate(greater_or_equal = 1),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)
+)]
+pub struct NatPmpFailureThreshold(u32);
+
+/// Lease-renewal cadence as basis points (`1/10_000`) of the granted
+/// lifetime.  Must be in `(0, 10_000]`.
+#[nutype(
+    validate(greater = 0, less_or_equal = 10_000),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)
+)]
+pub struct PortRenewalBasisPoints(u16);
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -28,7 +68,7 @@ pub struct TunnelConfig {
     /// machine to know whether endpoint rotation is possible.  The
     /// peer details themselves are held by the shell; the core only
     /// needs the count to make decisions.
-    pub peer_count: usize,
+    pub peer_count: PeerCount,
     /// How often the shell polls the kernel for the latest handshake
     /// timestamp.  Defaults to 30 s.
     pub handshake_poll_interval: Duration,
@@ -38,7 +78,7 @@ pub struct TunnelConfig {
     pub handshake_stall_after: Duration,
     /// How many consecutive stall observations before we try
     /// endpoint rotation.  Default 3.
-    pub stall_count_before_rotate: u32,
+    pub stall_count_before_rotate: StallCountBeforeRotate,
     /// How many consecutive rotations before we enter `Stuck`.
     /// `None` means "try every peer once" — [`TunnelMachine::new`]
     /// resolves it to `peer_count`.  An explicit `Some(n)` higher
@@ -51,29 +91,41 @@ pub struct TunnelConfig {
     /// config type can derive `Eq` and round-trip through the
     /// observability snapshot deterministically.  `10_000` = 1.0;
     /// 5000 = 0.5.  Default 5000.
-    pub port_renewal_basis_points: u16,
+    pub port_renewal_basis_points: PortRenewalBasisPoints,
     /// How often we run the leak probe (try a non-tunnel egress and
     /// expect it to fail).  Default 6 h, same as the §31 verify
     /// cadence we are replacing.
     pub leak_probe_interval: Duration,
     /// Consecutive NAT-PMP failures before we publish that port
     /// forwarding is degraded.  Default 3.
-    pub natpmp_failure_threshold: u32,
+    pub natpmp_failure_threshold: NatPmpFailureThreshold,
+    /// How often we re-query the public exit IP through the tunnel.
+    /// Default 6 h.  This is what `TunnelPublish::ExitIpObserved`
+    /// surfaces — the IP MAM sees us as.
+    pub exit_ip_query_interval: Duration,
+    /// NAT-PMP protocol (UDP vs TCP) for the periodic port-map
+    /// request.  `ProtonVPN` expects TCP; some providers prefer UDP.
+    pub natpmp_protocol: crate::natpmp::Protocol,
+    /// Lifetime in seconds requested from the NAT-PMP gateway.
+    /// `ProtonVPN` caps at 60 s regardless; making this configurable
+    /// lets non-Proton providers tune it.
+    pub natpmp_lifetime_seconds: u32,
 }
 
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
-            peer_count: 1,
+            peer_count: PeerCount::try_new(1).expect("default"),
             handshake_poll_interval: Duration::from_secs(30),
             handshake_stall_after: Duration::from_mins(3),
-            stall_count_before_rotate: 3,
-            // `None` = "try every peer once".  TunnelMachine::new
-            // resolves it against `peer_count`.
+            stall_count_before_rotate: StallCountBeforeRotate::try_new(3).expect("default"),
             rotations_before_stuck: None,
-            port_renewal_basis_points: 5_000,
+            port_renewal_basis_points: PortRenewalBasisPoints::try_new(5_000).expect("default"),
             leak_probe_interval: Duration::from_hours(6),
-            natpmp_failure_threshold: 3,
+            natpmp_failure_threshold: NatPmpFailureThreshold::try_new(3).expect("default"),
+            exit_ip_query_interval: Duration::from_hours(6),
+            natpmp_protocol: crate::natpmp::Protocol::Tcp,
+            natpmp_lifetime_seconds: 60,
         }
     }
 }
@@ -116,8 +168,39 @@ pub enum TunnelEvent {
     /// non-tunnel egress (good — no leak path), or it did reach
     /// something (bad — leak detected).
     LeakProbeCompleted { outcome: LeakProbeOutcome },
+    /// The shell queried an external IP-reflection service through
+    /// the tunnel and got a usable answer.  This is the *exit IP*
+    /// — what `ProtonVPN`'s server NATs us to, which is what MAM
+    /// sees when we connect.  Replaces the inside-address
+    /// placeholder the tunnel bridge used before.
+    ExitIpObserved { ip: windlass_types::VpnIp },
+    /// The exit-IP query failed.  Carried `reason` is for logs;
+    /// failures are bounded-retried via the existing exit-IP timer
+    /// and surface to the operator only after the threshold.
+    ExitIpQueryFailed { reason: ExitIpFailure },
     /// A scheduled timer fired.
     TimerFired(TunnelTimer),
+}
+
+/// Typed reasons the shell reports for `ExitIpQueryFailed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExitIpFailure {
+    /// Network-level failure (DNS, TCP, TLS).
+    Transport(String),
+    /// Service returned non-success HTTP.
+    HttpStatus(u16),
+    /// Body was unparseable / not an IP address.
+    Parse(String),
+}
+
+impl std::fmt::Display for ExitIpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(s) => write!(f, "transport: {s}"),
+            Self::HttpStatus(c) => write!(f, "HTTP {c}"),
+            Self::Parse(s) => write!(f, "parse: {s}"),
+        }
+    }
 }
 
 /// Typed reasons the shell reports for `InterfaceConfigureFailed`.
@@ -243,6 +326,8 @@ pub enum TunnelTimer {
     PortRenewal,
     /// Run the periodic leak probe.
     LeakProbe,
+    /// Re-query the public exit IP through the tunnel.
+    ExitIpQuery,
 }
 
 impl TunnelTimer {
@@ -254,6 +339,7 @@ impl TunnelTimer {
             Self::HandshakeWatchdog => "TunnelTimer::HandshakeWatchdog",
             Self::PortRenewal => "TunnelTimer::PortRenewal",
             Self::LeakProbe => "TunnelTimer::LeakProbe",
+            Self::ExitIpQuery => "TunnelTimer::ExitIpQuery",
         }
     }
 }
@@ -286,6 +372,11 @@ pub enum TunnelAction {
     /// Try to reach a non-tunnel egress.  Result arrives as
     /// [`TunnelEvent::LeakProbeCompleted`].
     RunLeakProbe,
+    /// Query an external IP-reflection service through the tunnel
+    /// to learn the public exit IP.  Result arrives as
+    /// [`TunnelEvent::ExitIpObserved`] or
+    /// [`TunnelEvent::ExitIpQueryFailed`].
+    QueryExitIp,
     /// Schedule a timer to fire after the given duration.
     ScheduleTimer { timer: TunnelTimer, after: Duration },
 }
@@ -332,6 +423,11 @@ pub enum TunnelPublish {
         consecutive_failures: u32,
         last_reason: String,
     },
+    /// The shell's exit-IP query returned a usable answer.  Fires
+    /// on rising edge (first observation, or when the IP changes).
+    /// Replaces the inside-address placeholder the tunnel bridge
+    /// used before — domain admission keys on this for MAM dedup.
+    ExitIpObserved { ip: windlass_types::VpnIp },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +435,9 @@ pub enum TunnelTopic {
     Health,
     Port,
     Leak,
+    /// Public exit IP observed through the tunnel (see
+    /// [`TunnelPublish::ExitIpObserved`]).
+    PublicIp,
 }
 
 impl HasTopic<TunnelTopic> for TunnelPublish {
@@ -351,6 +450,7 @@ impl HasTopic<TunnelTopic> for TunnelPublish {
             | Self::PortUnavailable
             | Self::PortForwardingDegraded { .. } => TunnelTopic::Port,
             Self::LeakDetected { .. } => TunnelTopic::Leak,
+            Self::ExitIpObserved { .. } => TunnelTopic::PublicIp,
         }
     }
 }
@@ -445,6 +545,15 @@ pub struct TunnelMachine {
     /// Whether a `PortForwardingDegraded` publish has already fired
     /// for the current failure streak (rising-edge gate).
     port_degraded_published: bool,
+    /// Last public exit IP the shell reported via
+    /// `TunnelEvent::ExitIpObserved`.  `None` until the first
+    /// successful query.  Used for rising-edge dedup of
+    /// `TunnelPublish::ExitIpObserved`.
+    last_exit_ip: Option<windlass_types::VpnIp>,
+    /// Once true, the self-perpetuating `ExitIpQuery` timer chain
+    /// is running.  Armed on the firewall-installed transition so a
+    /// dropped event cannot kill the chain.
+    exit_ip_chain_scheduled: bool,
 }
 
 impl TunnelMachine {
@@ -465,13 +574,11 @@ impl TunnelMachine {
 
     /// Picks the next peer index when rotating endpoints.  Wraps
     /// around at the end of the list.
-    const fn next_peer_index(&self) -> usize {
-        let n = self.config.peer_count;
-        if n == 0 {
-            0
-        } else {
-            (self.active_peer_index + 1) % n
-        }
+    fn next_peer_index(&self) -> usize {
+        // PeerCount enforces >= 1 at construction so `n` is always
+        // safe as the divisor.
+        let n = self.config.peer_count.into_inner();
+        (self.active_peer_index + 1) % n
     }
 
     /// If a forwarded port is held but has not yet been published,
@@ -502,13 +609,13 @@ impl TunnelMachine {
         let mut publishes = Vec::new();
         let was_up = matches!(self.health, TunnelHealth::Up);
 
-        if self.consecutive_stalls < self.config.stall_count_before_rotate {
+        if self.consecutive_stalls < self.config.stall_count_before_rotate.into_inner() {
             // Stay in current health; just wait for the next poll.
         } else if self
             .config
             .rotations_before_stuck
             .is_some_and(|max| self.rotation_count < max)
-            && self.config.peer_count > 1
+            && self.config.peer_count.into_inner() > 1
         {
             self.active_peer_index = self.next_peer_index();
             self.rotation_count = self.rotation_count.saturating_add(1);
@@ -560,9 +667,9 @@ impl Machine for TunnelMachine {
         // Normalize `rotations_before_stuck`:
         // - `None`  → "try every peer once" (= peer_count).
         // - `Some(n)` capped at peer_count because rotation wraps.
-        let peers = config.peer_count.max(1);
+        // PeerCount enforces >= 1; no max() needed.
         #[allow(clippy::cast_possible_truncation)]
-        let peers_u32 = peers as u32;
+        let peers_u32 = config.peer_count.into_inner() as u32;
         let normalized_rotations = Some(
             config
                 .rotations_before_stuck
@@ -586,6 +693,8 @@ impl Machine for TunnelMachine {
             port_published: false,
             last_natpmp_epoch: None,
             port_degraded_published: false,
+            last_exit_ip: None,
+            exit_ip_chain_scheduled: false,
         }
     }
 
@@ -637,6 +746,7 @@ impl Machine for TunnelMachine {
                     publishes.push(p);
                     self.port_published = true;
                 }
+                self.exit_ip_chain_scheduled = true;
                 Outcome {
                     actions: vec![
                         TunnelAction::PollHandshake {
@@ -644,6 +754,7 @@ impl Machine for TunnelMachine {
                         },
                         TunnelAction::RequestNatPmp,
                         TunnelAction::RunLeakProbe,
+                        TunnelAction::QueryExitIp,
                         TunnelAction::ScheduleTimer {
                             timer: TunnelTimer::HandshakeWatchdog,
                             after: self.config.handshake_poll_interval,
@@ -651,6 +762,10 @@ impl Machine for TunnelMachine {
                         TunnelAction::ScheduleTimer {
                             timer: TunnelTimer::LeakProbe,
                             after: self.config.leak_probe_interval,
+                        },
+                        TunnelAction::ScheduleTimer {
+                            timer: TunnelTimer::ExitIpQuery,
+                            after: self.config.exit_ip_query_interval,
                         },
                     ],
                     publishes,
@@ -759,7 +874,7 @@ impl Machine for TunnelMachine {
                     timer: TunnelTimer::PortRenewal,
                     after: lease_renewal_delay(
                         Duration::from_secs(u64::from(lifetime_seconds)),
-                        self.config.port_renewal_basis_points,
+                        self.config.port_renewal_basis_points.into_inner(),
                     ),
                 }];
                 Outcome { actions, publishes }
@@ -769,7 +884,8 @@ impl Machine for TunnelMachine {
                     self.consecutive_natpmp_failures.saturating_add(1);
                 let mut publishes = Vec::new();
                 let crossed = !self.port_degraded_published
-                    && self.consecutive_natpmp_failures >= self.config.natpmp_failure_threshold;
+                    && self.consecutive_natpmp_failures
+                        >= self.config.natpmp_failure_threshold.into_inner();
                 if crossed {
                     publishes.push(TunnelPublish::PortForwardingDegraded {
                         consecutive_failures: self.consecutive_natpmp_failures,
@@ -845,6 +961,38 @@ impl Machine for TunnelMachine {
                 actions: vec![TunnelAction::RunLeakProbe],
                 publishes: Vec::new(),
             },
+            // Self-perpetuating exit-IP query heartbeat.  Always
+            // reschedules so a dropped event cannot kill the chain.
+            TunnelEvent::TimerFired(TunnelTimer::ExitIpQuery) => Outcome {
+                actions: vec![
+                    TunnelAction::QueryExitIp,
+                    TunnelAction::ScheduleTimer {
+                        timer: TunnelTimer::ExitIpQuery,
+                        after: self.config.exit_ip_query_interval,
+                    },
+                ],
+                publishes: Vec::new(),
+            },
+            // Shell got a usable answer from the public-IP query.
+            // Rising-edge publish on first observation or change.
+            TunnelEvent::ExitIpObserved { ip } => {
+                let changed = self.last_exit_ip != Some(ip);
+                self.last_exit_ip = Some(ip);
+                let publishes = if changed {
+                    vec![TunnelPublish::ExitIpObserved { ip }]
+                } else {
+                    Vec::new()
+                };
+                Outcome {
+                    actions: Vec::new(),
+                    publishes,
+                }
+            }
+            // Shell could not run the query.  Bounded retry happens
+            // via the existing ExitIpQuery timer; we just log via the
+            // state snapshot.  No publish yet — we wait for sustained
+            // failure rather than transient noise.
+            TunnelEvent::ExitIpQueryFailed { reason: _ } => Outcome::none(),
         }
     }
 
@@ -865,7 +1013,7 @@ impl Machine for TunnelMachine {
                 Self::outcome(vec![TunnelAction::RequestNatPmp], TunnelResponse::Accepted)
             }
             TunnelCommand::RotateEndpointNow => {
-                if self.config.peer_count <= 1 {
+                if self.config.peer_count.into_inner() <= 1 {
                     return Self::outcome(
                         Vec::new(),
                         TunnelResponse::Rejected {
@@ -951,14 +1099,17 @@ mod tests {
     fn machine() -> TunnelMachine {
         TunnelMachine::new(
             TunnelConfig {
-                peer_count: 2,
+                peer_count: PeerCount::try_new(2).unwrap(),
                 handshake_poll_interval: Duration::from_secs(30),
                 handshake_stall_after: Duration::from_mins(3),
-                stall_count_before_rotate: 2,
+                stall_count_before_rotate: StallCountBeforeRotate::try_new(2).unwrap(),
                 rotations_before_stuck: Some(1),
-                port_renewal_basis_points: 5_000,
+                port_renewal_basis_points: PortRenewalBasisPoints::try_new(5_000).unwrap(),
                 leak_probe_interval: Duration::from_hours(6),
-                natpmp_failure_threshold: 3,
+                natpmp_failure_threshold: NatPmpFailureThreshold::try_new(3).unwrap(),
+                exit_ip_query_interval: Duration::from_hours(6),
+                natpmp_protocol: crate::natpmp::Protocol::Tcp,
+                natpmp_lifetime_seconds: 60,
             },
             Instant::now(),
         )
@@ -1455,7 +1606,7 @@ mod tests {
     fn rotate_endpoint_now_rejected_when_one_peer() {
         let mut m = TunnelMachine::new(
             TunnelConfig {
-                peer_count: 1,
+                peer_count: PeerCount::try_new(1).unwrap(),
                 ..TunnelConfig::default()
             },
             Instant::now(),
@@ -1504,7 +1655,7 @@ mod tests {
         // resolves it against the supplied peer_count.
         let m = TunnelMachine::new(
             TunnelConfig {
-                peer_count: 3,
+                peer_count: PeerCount::try_new(3).unwrap(),
                 rotations_before_stuck: None,
                 ..TunnelConfig::default()
             },
@@ -1519,7 +1670,7 @@ mod tests {
         // wraps anyway.
         let m = TunnelMachine::new(
             TunnelConfig {
-                peer_count: 2,
+                peer_count: PeerCount::try_new(2).unwrap(),
                 rotations_before_stuck: Some(99),
                 ..TunnelConfig::default()
             },

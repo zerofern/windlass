@@ -35,6 +35,7 @@
 //! Op for a successful port-map response is the request's Op | 0x80.
 //! Code 0 is success; non-zero is a typed error.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// NAT-PMP protocol version.  RFC 6886 specifies 0.
@@ -60,7 +61,7 @@ pub struct NatPmpRequest {
     pub lifetime_seconds: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Udp,
     Tcp,

@@ -24,7 +24,7 @@ use windlass_net::{TunnelShell, TunnelShellConfig};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_tunnel_core::config::{EndpointResolutionPolicy, WgConfig};
 use windlass_tunnel_core::{TunnelConfig, TunnelMachine, TunnelPublish, TunnelTopic};
-use windlass_vpn_core::{VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTopic};
+use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
 use super::db_shell::DbShell;
@@ -34,6 +34,7 @@ use super::domain_shell::{DomainShell, DomainShellConfig};
 use super::mam_shell::MamShell;
 use super::qbit_shell::QbitShell;
 use super::service::ServiceCores;
+use super::tunnel_bridge::{bridge_tunnel_publish, wrap_publish_for_domain};
 use super::vpn_shell::{VpnShell, VpnShellConfig};
 
 /// Owns everything constructed by `init_shell` that needs to outlive
@@ -243,7 +244,9 @@ pub(super) async fn init_shell(
             .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
         let wg = WgConfig::parse(&wg_content, EndpointResolutionPolicy::RequireIpLiteral)
             .map_err(|e| anyhow::anyhow!("parse {wg_path}: {e}"))?;
-        let peer_count = wg.peers.len();
+        let peer_count_raw = wg.peers.len();
+        let peer_count = windlass_tunnel_core::PeerCount::try_new(peer_count_raw)
+            .map_err(|e| anyhow::anyhow!("wg.conf must have at least one [Peer] section: {e}"))?;
         let natpmp_gateway = config
             .natpmp_gateway
             .parse()
@@ -260,13 +263,17 @@ pub(super) async fn init_shell(
                 interface_name: config.wg_interface_name.clone(),
                 natpmp_gateway,
                 natpmp_timeout: Duration::from_secs(2),
+                natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
+                natpmp_lifetime_seconds: 60,
+                exit_ip_url: "https://ifconfig.co/ip".to_string(),
                 tap: http_tap.clone(),
             },
         )
         .await;
         info!(
             wg_path,
-            peer_count, "tunnel mode active — TunnelMachine spawned"
+            peer_count = peer_count_raw,
+            "tunnel mode active — TunnelMachine spawned"
         );
         handles
     };
@@ -275,7 +282,12 @@ pub(super) async fn init_shell(
     tunnel_handles
         .subscribe
         .send((
-            vec![TunnelTopic::Health, TunnelTopic::Port, TunnelTopic::Leak],
+            vec![
+                TunnelTopic::Health,
+                TunnelTopic::Port,
+                TunnelTopic::Leak,
+                TunnelTopic::PublicIp,
+            ],
             tunnel_pub_tx,
         ))
         .expect("tunnel pub subscription");
@@ -469,60 +481,50 @@ pub(super) async fn init_shell(
     }
 
     // ── Tunnel forwarder task ─────────────────────────────────────────────────
-    // Drains TunnelPublish, emits VpnEvent into the VpnMachine
-    // (which still produces VpnPublish that the VPN forwarder above
-    // routes to the domain), AND synthesizes WindlassEvent::Vpn
-    // directly into the domain channel for the compliance signals
-    // the domain still tracks: PublicIpObserved, PublicIpUnavailable,
-    // PublicIpMismatch.  This is what hooks the tunnel-core
-    // LeakDetected publish into the §29 admission gate.
+    // Drains TunnelPublish and dispatches via the pure
+    // `bridge_tunnel_publish` mapping (see
+    // `windlass/src/shell/tunnel_bridge.rs`).  The bridge yields three
+    // outputs per publish: VpnEvents fed into VpnMachine, VpnPublishes
+    // injected directly into the domain channel for the compliance
+    // signals the domain consumes (PublicIpObserved/Unavailable/
+    // Mismatch — including the LeakDetected → admission-gate flip),
+    // and a clear-port hint that the runtime applies to the shared
+    // forwarded_port arc so qBit stops trusting a port the tunnel no
+    // longer holds.
     {
         let vpn_event_tx_bridge = vpn_handles.events.clone();
         let domain_ev_tx_bridge = domain_handles.events.clone();
+        let fp_for_bridge = Arc::clone(&forwarded_port);
         tokio::spawn(async move {
+            // Track the latest exit IP the tunnel core has reported.
+            // We thread it into every subsequent bridge call so a
+            // later TunnelPublish::Up uses the real exit IP for
+            // PublicIpObserved (and the LeakDetected file_ip
+            // synthesis), not the inside-address placeholder.
+            let mut last_exit_ip: Option<windlass_types::VpnIp> = None;
             while let Some(envelope) = tunnel_pub_rx.recv().await {
-                let (vpn_events, vpn_publishes): (Vec<VpnEvent>, Vec<VpnPublish>) =
-                    match &envelope.payload {
-                        TunnelPublish::Up | TunnelPublish::Recovered => {
-                            let publishes = tunnel_inside_ip
-                                .map(|ip| vec![VpnPublish::PublicIpObserved { ip }])
-                                .unwrap_or_default();
-                            (vec![VpnEvent::ContainerHealthy], publishes)
-                        }
-                        TunnelPublish::Down { .. } | TunnelPublish::Stuck { .. } => (
-                            vec![VpnEvent::ContainerUnhealthy],
-                            vec![VpnPublish::PublicIpUnavailable],
-                        ),
-                        TunnelPublish::LeakDetected { .. } => {
-                            let zero = windlass_types::VpnIp(std::net::Ipv4Addr::UNSPECIFIED);
-                            (
-                                vec![VpnEvent::ContainerUnhealthy],
-                                vec![VpnPublish::PublicIpMismatch {
-                                    file_ip: tunnel_inside_ip.unwrap_or(zero),
-                                    verified_ip: zero,
-                                    source: windlass_vpn_core::VerificationSource::IfConfigCo,
-                                }],
-                            )
-                        }
-                        TunnelPublish::PortReady { port } => {
-                            (vec![VpnEvent::PortFileChanged { port: *port }], vec![])
-                        }
-                        TunnelPublish::PortUnavailable
-                        | TunnelPublish::PortForwardingDegraded { .. } => (vec![], vec![]),
-                    };
-                for ev in vpn_events {
+                if let TunnelPublish::ExitIpObserved { ip } = envelope.payload {
+                    last_exit_ip = Some(ip);
+                }
+                let out = bridge_tunnel_publish(&envelope.payload, tunnel_inside_ip, last_exit_ip);
+                for ev in out.vpn_events {
                     let _ = vpn_event_tx_bridge.send(Timed::from_publish(
                         std::time::Instant::now(),
                         envelope.id,
                         ev,
                     ));
                 }
-                for pub_ in vpn_publishes {
+                for pub_ in out.vpn_publishes {
                     let _ = domain_ev_tx_bridge.send(Timed::from_publish(
                         std::time::Instant::now(),
                         envelope.id,
-                        WindlassEvent::Vpn(pub_),
+                        wrap_publish_for_domain(pub_),
                     ));
+                }
+                if out.clear_forwarded_port
+                    && let Ok(mut g) = fp_for_bridge.lock()
+                {
+                    *g = None;
                 }
             }
         });
