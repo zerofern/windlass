@@ -480,6 +480,7 @@ pub enum MamStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
     #[test]
@@ -630,6 +631,26 @@ mod tests {
             !logged.contains("pw-cleartext-xyz"),
             "QbitPassword cleartext leaked: {logged}"
         );
+    }
+
+    #[test]
+    fn core_id_display_names_are_stable() {
+        let names: Vec<String> = CoreId::all().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            names,
+            vec![
+                "vpn", "qbit", "mam", "db", "disk", "docker", "domain", "tunnel"
+            ]
+        );
+    }
+
+    #[test]
+    fn vpn_ip_from_ip_accepts_ipv4_and_rejects_ipv6() {
+        assert_eq!(
+            VpnIp::from_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            Some(VpnIp(Ipv4Addr::new(203, 0, 113, 7)))
+        );
+        assert_eq!(VpnIp::from_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)), None);
     }
 
     #[test]

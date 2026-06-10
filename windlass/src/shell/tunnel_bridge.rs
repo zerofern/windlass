@@ -43,23 +43,20 @@ pub(super) const fn wrap_publish_for_domain(publish: VpnPublish) -> WindlassEven
 }
 
 /// Map one [`TunnelPublish`] to the downstream signals the runtime
-/// should produce.  `tunnel_inside_ip` is the tunnel's interface
-/// address from `wg.conf` — used as a dedup placeholder until a
-/// real exit-IP query lands.  `exit_ip` is the latest exit IP the
-/// tunnel core knows (from `TunnelPublish::ExitIpObserved` after
-/// the shell's HTTP query); if present, the bridge uses it in
-/// preference to the inside address.
+/// should produce. `exit_ip` is the latest public exit IP the tunnel
+/// core knows (from `TunnelPublish::ExitIpObserved` after the shell's
+/// HTTP query). The tunnel interface address from `wg.conf` is never a
+/// valid substitute for the public IP MAM/domain care about.
 #[must_use]
 pub(super) fn bridge_tunnel_publish(
     publish: &TunnelPublish,
-    tunnel_inside_ip: Option<VpnIp>,
+    _tunnel_inside_ip: Option<VpnIp>,
     exit_ip: Option<VpnIp>,
 ) -> TunnelBridgeOutput {
-    let observed_ip = exit_ip.or(tunnel_inside_ip);
     match publish {
         TunnelPublish::Up | TunnelPublish::Recovered => TunnelBridgeOutput {
             vpn_events: vec![VpnEvent::ContainerHealthy],
-            vpn_publishes: observed_ip
+            vpn_publishes: exit_ip
                 .map(|ip| vec![VpnPublish::PublicIpObserved { ip }])
                 .unwrap_or_default(),
             clear_forwarded_port: false,
@@ -74,7 +71,7 @@ pub(super) fn bridge_tunnel_publish(
         TunnelPublish::LeakDetected {
             observed_remote, ..
         } => {
-            // file_ip = what we believe our tunnel IP is.
+            // file_ip = the last public exit IP we trusted.
             // verified_ip = what we actually reached the leak target as,
             // parsed from `observed_remote` if it's an IPv4 literal —
             // otherwise UNSPECIFIED so the typed publish still flips
@@ -91,7 +88,7 @@ pub(super) fn bridge_tunnel_publish(
             TunnelBridgeOutput {
                 vpn_events: vec![VpnEvent::ContainerUnhealthy],
                 vpn_publishes: vec![VpnPublish::PublicIpMismatch {
-                    file_ip: observed_ip.unwrap_or(zero),
+                    file_ip: exit_ip.unwrap_or(zero),
                     verified_ip,
                     source: VerificationSource::IfConfigCo,
                 }],
@@ -157,13 +154,10 @@ mod tests {
     }
 
     #[test]
-    fn up_with_known_inside_ip_publishes_observed() {
+    fn up_with_only_inside_ip_does_not_publish_observed() {
         let out = bridge_tunnel_publish(&TunnelPublish::Up, Some(ip("10.2.0.2")), None);
         assert_eq!(out.vpn_events, vec![VpnEvent::ContainerHealthy]);
-        assert_eq!(
-            out.vpn_publishes,
-            vec![VpnPublish::PublicIpObserved { ip: ip("10.2.0.2") }]
-        );
+        assert!(out.vpn_publishes.is_empty());
         assert!(!out.clear_forwarded_port);
     }
 
@@ -184,10 +178,14 @@ mod tests {
 
     #[test]
     fn recovered_publishes_observed_same_as_up() {
-        let out = bridge_tunnel_publish(&TunnelPublish::Recovered, Some(ip("10.2.0.2")), None);
+        let out = bridge_tunnel_publish(
+            &TunnelPublish::Recovered,
+            Some(ip("10.2.0.2")),
+            Some(ip("203.0.113.10")),
+        );
         assert!(out.vpn_publishes.iter().any(|p| matches!(
             p,
-            VpnPublish::PublicIpObserved { ip } if *ip == self::ip("10.2.0.2")
+            VpnPublish::PublicIpObserved { ip } if *ip == self::ip("203.0.113.10")
         )));
     }
 

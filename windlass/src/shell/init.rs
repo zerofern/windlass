@@ -199,6 +199,16 @@ pub(super) async fn init_shell(
         .send((vec![DiskTopic::Pressure], disk_pub_tx))
         .expect("disk pub subscription");
 
+    let tunnel_mode_active = config.wg_config_path.is_some();
+    let vpn_shell_config = if tunnel_mode_active {
+        VpnShellConfig::TunnelMode
+    } else {
+        VpnShellConfig::LegacyGluetun {
+            docker: docker.clone(),
+            vpn_ip_file: config.vpn_ip_file.clone(),
+            vpn_port_file: config.vpn_port_file.clone(),
+        }
+    };
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         windlass_machine::CoreId::Vpn,
         runtime_tap.clone(),
@@ -210,7 +220,7 @@ pub(super) async fn init_shell(
             public_ip_verify_interval: Duration::from_hours(6),
             public_ip_verify_failure_threshold: 3,
         },
-        VpnShellConfig,
+        vpn_shell_config,
     )
     .await;
     let (vpn_pub_tx, mut vpn_pub_rx) =
@@ -237,70 +247,80 @@ pub(super) async fn init_shell(
     // into the existing VpnMachine event channel so PortReady/
     // Disconnected/etc. drive the same downstream paths Gluetun-
     // sourced events do today.
-    // Read + parse wg.conf exactly once.  We compute
-    // `tunnel_inside_ip` (the IPv4 placeholder forwarded to MAM as
-    // PublicIpObserved before the real exit-IP query lands) from the
-    // parsed config in the same pass, then move ownership of the
-    // parsed config into TunnelShellConfig.
-    let wg_path = config.wg_config_path.clone();
-    let wg_content = tokio::fs::read_to_string(&wg_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
-    let wg = WgConfig::parse(&wg_content, EndpointResolutionPolicy::RequireIpLiteral)
-        .map_err(|e| anyhow::anyhow!("parse {wg_path}: {e}"))?;
-    let peer_count_raw = wg.peers.len();
-    let peer_count = windlass_tunnel_core::PeerCount::try_new(peer_count_raw)
-        .map_err(|e| anyhow::anyhow!("wg.conf must have at least one [Peer] section: {e}"))?;
-    let tunnel_inside_ip: Option<windlass_types::VpnIp> =
-        wg.interface.addresses.iter().find_map(|a| match a.ip {
-            std::net::IpAddr::V4(v4) => Some(windlass_types::VpnIp(v4)),
-            std::net::IpAddr::V6(_) => None,
-        });
-    let natpmp_gateway = config
-        .natpmp_gateway
-        .parse()
-        .map_err(|e| anyhow::anyhow!("NATPMP_GATEWAY: {e}"))?;
-    let (tunnel_handles, _tunnel_join) = windlass_machine::spawn::<TunnelMachine, TunnelShell>(
-        windlass_machine::CoreId::Tunnel,
-        runtime_tap.clone(),
-        TunnelConfig {
-            peer_count,
-            ..TunnelConfig::default()
-        },
-        TunnelShellConfig {
-            wg,
-            interface_name: config.wg_interface_name.clone(),
-            natpmp_gateway,
-            natpmp_timeout: Duration::from_secs(2),
-            natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
-            natpmp_lifetime_seconds: 60,
-            exit_ip_urls: vec![
-                "https://ifconfig.co/ip".to_string(),
-                "https://icanhazip.com".to_string(),
-            ],
-            tap: http_tap.clone(),
-        },
-    )
-    .await;
-    info!(
-        wg_path,
-        peer_count = peer_count_raw,
-        "tunnel mode active — TunnelMachine spawned"
-    );
-    let (tunnel_pub_tx, mut tunnel_pub_rx) =
-        mpsc::channel::<windlass_machine::PublishEnvelope<TunnelPublish>>(128);
-    tunnel_handles
-        .subscribe
-        .send((
-            vec![
-                TunnelTopic::Health,
-                TunnelTopic::Port,
-                TunnelTopic::Leak,
-                TunnelTopic::PublicIp,
-            ],
-            tunnel_pub_tx,
-        ))
-        .expect("tunnel pub subscription");
+    // Read + parse wg.conf exactly once when tunnel mode is enabled.
+    // We keep the tunnel interface address only for diagnostics/legacy
+    // bridge shape; compliance publishes must come from the real
+    // exit-IP query.
+    let (tunnel_handles_opt, tunnel_bridge_rx) = if let Some(wg_path) =
+        config.wg_config_path.clone()
+    {
+        let wg_content = tokio::fs::read_to_string(&wg_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
+        let wg = WgConfig::parse(&wg_content, EndpointResolutionPolicy::RequireIpLiteral)
+            .map_err(|e| anyhow::anyhow!("parse {wg_path}: {e}"))?;
+        let peer_count_raw = wg.peers.len();
+        let peer_count = windlass_tunnel_core::PeerCount::try_new(peer_count_raw)
+            .map_err(|e| anyhow::anyhow!("wg.conf must have at least one [Peer] section: {e}"))?;
+        let tunnel_inside_ip: Option<windlass_types::VpnIp> =
+            wg.interface.addresses.iter().find_map(|a| match a.ip {
+                std::net::IpAddr::V4(v4) => Some(windlass_types::VpnIp(v4)),
+                std::net::IpAddr::V6(_) => None,
+            });
+        let natpmp_gateway = config
+            .natpmp_gateway
+            .parse()
+            .map_err(|e| anyhow::anyhow!("NATPMP_GATEWAY: {e}"))?;
+        let (tunnel_handles, _tunnel_join) = windlass_machine::spawn::<TunnelMachine, TunnelShell>(
+            windlass_machine::CoreId::Tunnel,
+            runtime_tap.clone(),
+            TunnelConfig {
+                peer_count,
+                ..TunnelConfig::default()
+            },
+            TunnelShellConfig {
+                wg,
+                interface_name: config.wg_interface_name.clone(),
+                natpmp_gateway,
+                natpmp_timeout: Duration::from_secs(2),
+                natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
+                natpmp_lifetime_seconds: 60,
+                exit_ip_urls: vec![
+                    "https://api.ipify.org".to_string(),
+                    "https://ipv4.icanhazip.com".to_string(),
+                ],
+                allowed_tcp_endpoints: config.tunnel_firewall_allow_tcp.clone(),
+                tap: http_tap.clone(),
+            },
+        )
+        .await;
+        info!(
+            wg_path,
+            peer_count = peer_count_raw,
+            "tunnel mode active - TunnelMachine spawned"
+        );
+        let (tunnel_pub_tx, tunnel_pub_rx) =
+            mpsc::channel::<windlass_machine::PublishEnvelope<TunnelPublish>>(128);
+        tunnel_handles
+            .subscribe
+            .send((
+                vec![
+                    TunnelTopic::Health,
+                    TunnelTopic::Port,
+                    TunnelTopic::Leak,
+                    TunnelTopic::PublicIp,
+                ],
+                tunnel_pub_tx,
+            ))
+            .expect("tunnel pub subscription");
+        (
+            Some(tunnel_handles),
+            Some((tunnel_pub_rx, tunnel_inside_ip)),
+        )
+    } else {
+        info!("WG_CONFIG_PATH not set; tunnel mode disabled");
+        (None, None)
+    };
 
     // The actual bridge forwarder is spawned later, once
     // `domain_handles` exists — it needs both `vpn_handles.events`
@@ -393,7 +413,7 @@ pub(super) async fn init_shell(
             // so the domain must NOT issue
             // `Docker(RestartContainer { name = windlass })` on
             // Crashed.  Legacy Gluetun deploys would set this true.
-            restart_anchor_on_crash: false,
+            restart_anchor_on_crash: !tunnel_mode_active,
             initial_blacklist,
         },
         DomainShellConfig {
@@ -483,7 +503,7 @@ pub(super) async fn init_shell(
     // and a clear-port hint that the runtime applies to the shared
     // forwarded_port arc so qBit stops trusting a port the tunnel no
     // longer holds.
-    {
+    if let Some((mut tunnel_pub_rx, tunnel_inside_ip)) = tunnel_bridge_rx {
         let vpn_event_tx_bridge = vpn_handles.events.clone();
         let domain_ev_tx_bridge = domain_handles.events.clone();
         let fp_for_bridge = Arc::clone(&forwarded_port);
@@ -491,8 +511,7 @@ pub(super) async fn init_shell(
             // Track the latest exit IP the tunnel core has reported.
             // We thread it into every subsequent bridge call so a
             // later TunnelPublish::Up uses the real exit IP for
-            // PublicIpObserved (and the LeakDetected file_ip
-            // synthesis), not the inside-address placeholder.
+            // PublicIpObserved and LeakDetected file_ip synthesis.
             let mut last_exit_ip: Option<windlass_types::VpnIp> = None;
             while let Some(envelope) = tunnel_pub_rx.recv().await {
                 if let TunnelPublish::ExitIpObserved { ip } = envelope.payload {
@@ -684,7 +703,7 @@ pub(super) async fn init_shell(
         qbit_handles,
         mam_handles,
         disk_handles,
-        tunnel_handles,
+        tunnel_handles_opt,
         forwarded_port,
     );
     let execute_service_actions = config.execute_service_actions;

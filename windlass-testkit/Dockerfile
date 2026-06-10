@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:bookworm AS builder
 WORKDIR /app
 
 ENV SQLX_OFFLINE=true
@@ -13,10 +13,12 @@ COPY windlass-disk-core/ windlass-disk-core/
 COPY windlass-docker-core/ windlass-docker-core/
 COPY windlass-mam-core/ windlass-mam-core/
 COPY windlass-qbit-core/ windlass-qbit-core/
+COPY windlass-tunnel-core/ windlass-tunnel-core/
 COPY windlass-vpn-core/ windlass-vpn-core/
 COPY windlass-domain-core/ windlass-domain-core/
 COPY windlass-local/   windlass-local/
 COPY windlass-clients/ windlass-clients/
+COPY windlass-net/     windlass-net/
 COPY windlass-db/      windlass-db/
 COPY windlass-web/     windlass-web/
 COPY windlass/         windlass/

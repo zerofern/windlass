@@ -1,45 +1,213 @@
-//! Stub [`windlass_machine::Shell`] for [`windlass_vpn_core::VpnMachine`].
+//! [`windlass_machine::Shell`] for [`windlass_vpn_core::VpnMachine`].
 //!
-//! Phase 5 of the vpn branch (`docs/vpn-ownership.md`) retired the
-//! Gluetun-aware implementation that used to live here:
-//! file watching, `ifconfig.co` + MAM `/json/jsonIp.php` cross-checks,
-//! and the Gluetun HTTP proxy.  Those concerns are now owned by
-//! [`windlass_tunnel_core`] + [`windlass_net`] which talk to the
-//! kernel `WireGuard` interface directly.
-//!
-//! [`VpnMachine`] still runs in tunnel mode as a thin state
-//! translator: the bridge in `init.rs` synthesizes [`VpnEvent`]s from
-//! [`windlass_tunnel_core::TunnelPublish`]es so the domain core's
-//! existing [`windlass_vpn_core::VpnPublish`] consumers keep
-//! working unchanged.  This stub shell satisfies the runtime's
-//! requirement that every machine has a paired shell; every
-//! [`VpnAction`] it receives is now a no-op because the actual I/O
-//! lives in [`windlass_net::TunnelShell`].
+//! In tunnel mode, [`windlass_tunnel_core`] + [`windlass_net`] own the
+//! privileged `WireGuard` I/O and this shell is intentionally inert.
+//! In legacy Gluetun-compatible mode, this shell only translates Docker
+//! health and Gluetun file observations into `VpnEvent`s; `VpnMachine`
+//! still owns every state transition and policy decision.
+
+use std::net::IpAddr;
+use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
-use windlass_machine::{Shell, Timed};
-use windlass_vpn_core::{VpnAction, VpnEvent};
+use windlass_local::docker::DockerClient;
+use windlass_machine::{ExternalCause, Shell, Timed};
+use windlass_types::{VpnIp, VpnPort};
+use windlass_vpn_core::{VpnAction, VpnEvent, VpnTimer};
 
-pub struct VpnShellConfig;
+pub enum VpnShellConfig {
+    TunnelMode,
+    LegacyGluetun {
+        docker: DockerClient,
+        vpn_ip_file: String,
+        vpn_port_file: String,
+    },
+}
 
-pub struct VpnShell;
+pub enum VpnShell {
+    TunnelMode,
+    LegacyGluetun {
+        docker: DockerClient,
+        vpn_ip_file: String,
+        vpn_port_file: String,
+    },
+}
 
 impl Shell for VpnShell {
     type Config = VpnShellConfig;
     type Event = VpnEvent;
     type Action = VpnAction;
 
-    async fn new(_config: Self::Config, _event_tx: UnboundedSender<Timed<Self::Event>>) -> Self {
-        Self
+    async fn new(config: Self::Config, _event_tx: UnboundedSender<Timed<Self::Event>>) -> Self {
+        match config {
+            VpnShellConfig::TunnelMode => Self::TunnelMode,
+            VpnShellConfig::LegacyGluetun {
+                docker,
+                vpn_ip_file,
+                vpn_port_file,
+            } => Self::LegacyGluetun {
+                docker,
+                vpn_ip_file,
+                vpn_port_file,
+            },
+        }
     }
 
-    fn dispatch(&mut self, _action: VpnAction, _event_tx: &UnboundedSender<Timed<VpnEvent>>) {
-        // All VpnActions (InspectContainer, ReadPortFiles, VerifyPublicIp,
-        // VerifyMamIp, StartMonitoring, ScheduleTimer) are dead in tunnel
-        // mode: the tunnel core owns interface state, port forwarding,
-        // and leak detection.  Receiving an action here just means the
-        // VpnMachine produced one — we drop it because nothing privileged
-        // needs to run.  Future cleanup will trim these variants out of
-        // VpnAction entirely.
+    fn dispatch(&mut self, action: VpnAction, event_tx: &UnboundedSender<Timed<VpnEvent>>) {
+        match self {
+            Self::TunnelMode => {}
+            Self::LegacyGluetun {
+                docker,
+                vpn_ip_file,
+                vpn_port_file,
+            } => dispatch_legacy(
+                &action,
+                docker.clone(),
+                vpn_ip_file.clone(),
+                vpn_port_file.clone(),
+                event_tx.clone(),
+            ),
+        }
     }
+}
+
+fn dispatch_legacy(
+    action: &VpnAction,
+    docker: DockerClient,
+    vpn_ip_file: String,
+    vpn_port_file: String,
+    tx: UnboundedSender<Timed<VpnEvent>>,
+) {
+    match action {
+        VpnAction::InspectContainer => {
+            windlass_machine::causal::spawn(async move {
+                let event = if docker.is_gluetun_healthy().await {
+                    VpnEvent::ContainerHealthy
+                } else {
+                    VpnEvent::ContainerUnhealthy
+                };
+                send_event(&tx, event);
+            });
+        }
+        VpnAction::ReadPortFiles => {
+            windlass_machine::causal::spawn(async move {
+                read_legacy_files(&vpn_ip_file, &vpn_port_file, &tx).await;
+            });
+        }
+        VpnAction::StartMonitoring => {
+            windlass_machine::causal::spawn(async move {
+                poll_legacy_files(vpn_ip_file, vpn_port_file, tx).await;
+            });
+        }
+        VpnAction::VerifyPublicIp => {
+            send_event(
+                &tx,
+                VpnEvent::PublicIpVerifyFailed {
+                    reason: "legacy verification disabled in shell".to_string(),
+                },
+            );
+        }
+        VpnAction::VerifyMamIp => {
+            send_event(
+                &tx,
+                VpnEvent::MamIpVerifyFailed {
+                    reason: "legacy verification disabled in shell".to_string(),
+                },
+            );
+        }
+        VpnAction::ScheduleTimer { timer, after } => schedule_timer(*timer, *after, tx),
+    }
+}
+
+async fn read_legacy_files(
+    vpn_ip_file: &str,
+    vpn_port_file: &str,
+    tx: &UnboundedSender<Timed<VpnEvent>>,
+) {
+    match read_legacy_ip(vpn_ip_file).await {
+        Some(ip) => send_event(tx, VpnEvent::PublicIpFromFile { ip }),
+        None => send_event(tx, VpnEvent::PublicIpFileUnavailable),
+    }
+
+    match read_legacy_port(vpn_port_file).await {
+        Ok(port) => match port {
+            Some(port) => send_event(tx, VpnEvent::PortFileChanged { port }),
+            None => send_event(
+                tx,
+                VpnEvent::StateReadFailed {
+                    reason: format!("invalid VPN port file `{vpn_port_file}`"),
+                },
+            ),
+        },
+        Err(reason) => send_event(tx, VpnEvent::StateReadFailed { reason }),
+    }
+}
+
+async fn poll_legacy_files(
+    vpn_ip_file: String,
+    vpn_port_file: String,
+    tx: UnboundedSender<Timed<VpnEvent>>,
+) {
+    let mut last_ip: Option<Option<VpnIp>> = None;
+    let mut last_port: Option<Option<VpnPort>> = None;
+
+    loop {
+        let ip = read_legacy_ip(&vpn_ip_file).await;
+        if last_ip != Some(ip) {
+            match ip {
+                Some(ip) => send_event(&tx, VpnEvent::PublicIpFromFile { ip }),
+                None => send_event(&tx, VpnEvent::PublicIpFileUnavailable),
+            }
+            last_ip = Some(ip);
+        }
+
+        let port = read_legacy_port(&vpn_port_file).await.ok().flatten();
+        if last_port != Some(port) {
+            if let Some(port) = port {
+                send_event(&tx, VpnEvent::PortFileChanged { port });
+            }
+            last_port = Some(port);
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn read_legacy_ip(vpn_ip_file: &str) -> Option<VpnIp> {
+    tokio::fs::read_to_string(vpn_ip_file)
+        .await
+        .ok()
+        .and_then(|raw| raw.trim().parse::<IpAddr>().ok())
+        .and_then(VpnIp::from_ip)
+}
+
+async fn read_legacy_port(vpn_port_file: &str) -> Result<Option<VpnPort>, String> {
+    let raw = tokio::fs::read_to_string(vpn_port_file)
+        .await
+        .map_err(|e| format!("read VPN port file `{vpn_port_file}`: {e}"))?;
+    Ok(raw
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .and_then(|port| VpnPort::try_new(port).ok()))
+}
+
+fn schedule_timer(timer: VpnTimer, after: Duration, tx: UnboundedSender<Timed<VpnEvent>>) {
+    windlass_machine::causal::spawn(async move {
+        let scheduled_at = std::time::Instant::now() + after;
+        tokio::time::sleep(after).await;
+        let _ = tx.send(Timed::external(
+            scheduled_at,
+            ExternalCause::Timer { name: timer.name() },
+            VpnEvent::TimerFired(timer),
+        ));
+    });
+}
+
+fn send_event(tx: &UnboundedSender<Timed<VpnEvent>>, event: VpnEvent) {
+    let _ = tx.send(Timed::external(
+        std::time::Instant::now(),
+        ExternalCause::Unknown,
+        event,
+    ));
 }

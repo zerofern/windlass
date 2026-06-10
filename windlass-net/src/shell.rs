@@ -22,7 +22,7 @@ use windlass_tunnel_core::{
 };
 
 use crate::natpmp::NatPmpClientError;
-use windlass_types::{CoreId, HttpTap, NullHttpTap};
+use windlass_types::{CoreId, HttpExchange, HttpRequestView, HttpTap, NullHttpTap};
 
 use crate::command::{Runner, SystemRunner};
 use crate::handshake::{HandshakeAge, latest_handshake_age};
@@ -31,7 +31,7 @@ use crate::probe::{leak_outcome_from_snapshot, parse_ip_addr_show};
 
 /// Default URLs the exit-IP query hits.  Each returns the source
 /// IP on the first line.  Tried in order until one succeeds.
-const DEFAULT_EXIT_IP_URLS: &[&str] = &["https://ifconfig.co/ip", "https://icanhazip.com"];
+const DEFAULT_EXIT_IP_URLS: &[&str] = &["https://api.ipify.org", "https://ipv4.icanhazip.com"];
 
 /// Operator-supplied configuration for the shell.
 ///
@@ -62,6 +62,12 @@ pub struct TunnelShellConfig {
     /// independent public reflectors so a single outage doesn't
     /// blind the exit-IP signal.
     pub exit_ip_urls: Vec<String>,
+    /// Explicit non-tunnel TCP destinations the kill switch permits.
+    ///
+    /// This is intentionally narrow. The shipped tunnel compose uses it
+    /// for the Postgres service's fixed private address; general internet
+    /// egress must go through the tunnel interface.
+    pub allowed_tcp_endpoints: Vec<SocketAddr>,
     /// Observability tap.  Every subprocess invocation and NAT-PMP
     /// exchange is captured here so the `/observability` ring sees
     /// tunnel ops alongside MAM/qBit HTTP.
@@ -91,6 +97,7 @@ impl TunnelShellConfig {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            allowed_tcp_endpoints: Vec::new(),
             tap: NullHttpTap::arc(),
         }
     }
@@ -506,6 +513,29 @@ fn append_peer_underlay_rules(rules: &mut String, peer_endpoints: &[(IpAddr, u16
     }
 }
 
+fn append_allowed_tcp_rules(rules: &mut String, endpoints: &[SocketAddr]) {
+    for endpoint in endpoints {
+        match endpoint {
+            SocketAddr::V4(v4) => {
+                let _ = writeln!(
+                    rules,
+                    "    ip daddr {} tcp dport {} accept",
+                    v4.ip(),
+                    v4.port()
+                );
+            }
+            SocketAddr::V6(v6) => {
+                let _ = writeln!(
+                    rules,
+                    "    ip6 daddr {} tcp dport {} accept",
+                    v6.ip(),
+                    v6.port()
+                );
+            }
+        }
+    }
+}
+
 /// Pre-tunnel kill switch — runs BEFORE `ip link add wg0`.
 ///
 /// Allows only loopback and the UDP underlay packets that establish
@@ -524,6 +554,7 @@ pub fn build_nft_pre_tunnel_ruleset(config: &TunnelShellConfig) -> String {
     rules.push_str("    oifname \"lo\" accept\n");
     rules.push_str("    ct state established,related accept\n");
     append_peer_underlay_rules(&mut rules, &peer_endpoints);
+    append_allowed_tcp_rules(&mut rules, &config.allowed_tcp_endpoints);
     rules.push_str("  }\n");
     rules.push_str("}\n");
     rules
@@ -549,6 +580,7 @@ pub fn build_nft_ruleset(config: &TunnelShellConfig) -> String {
     let _ = writeln!(rules, "    oifname \"{iface}\" accept");
     rules.push_str("    ct state established,related accept\n");
     append_peer_underlay_rules(&mut rules, &peer_endpoints);
+    append_allowed_tcp_rules(&mut rules, &config.allowed_tcp_endpoints);
     rules.push_str("  }\n");
     rules.push_str("}\n");
     rules
@@ -693,10 +725,11 @@ fn spawn_query_exit_ip(
     tx: UnboundedSender<Timed<TunnelEvent>>,
 ) {
     let urls = config.exit_ip_urls.clone();
+    let tap = config.tap();
     windlass_machine::causal::spawn(async move {
         let mut last_failure = None;
         for url in &urls {
-            match query_exit_ip_once(&http, url).await {
+            match query_exit_ip_once(&http, &tap, url).await {
                 Ok(event) => {
                     send_event(&tx, event);
                     return;
@@ -723,21 +756,45 @@ fn spawn_query_exit_ip(
 /// through to the next URL.
 async fn query_exit_ip_once(
     http: &reqwest::Client,
+    tap: &Arc<dyn HttpTap>,
     url: &str,
 ) -> Result<TunnelEvent, ExitIpFailure> {
-    let resp = http
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| ExitIpFailure::Transport(e.to_string()))?;
+    tap.gate_request(
+        CoreId::Tunnel,
+        &HttpRequestView {
+            method: "GET",
+            url,
+            body: None,
+        },
+    )
+    .await;
+    let resp = http.get(url).send().await.map_err(|e| {
+        tap.observed_exchange(
+            CoreId::Tunnel,
+            &exit_ip_exchange(url, 0, "", &e.to_string()),
+        );
+        ExitIpFailure::Transport(e.to_string())
+    })?;
     let status = resp.status();
+    let response_status = status.as_u16();
     if !status.is_success() {
-        return Err(ExitIpFailure::HttpStatus(status.as_u16()));
+        tap.observed_exchange(
+            CoreId::Tunnel,
+            &exit_ip_exchange(url, response_status, "", ""),
+        );
+        return Err(ExitIpFailure::HttpStatus(response_status));
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| ExitIpFailure::Transport(e.to_string()))?;
+    let body = resp.text().await.map_err(|e| {
+        tap.observed_exchange(
+            CoreId::Tunnel,
+            &exit_ip_exchange(url, response_status, "", &e.to_string()),
+        );
+        ExitIpFailure::Transport(e.to_string())
+    })?;
+    tap.observed_exchange(
+        CoreId::Tunnel,
+        &exit_ip_exchange(url, response_status, &body, ""),
+    );
     let raw = body.lines().next().unwrap_or("").trim();
     let ip = raw
         .parse::<std::net::IpAddr>()
@@ -746,6 +803,24 @@ async fn query_exit_ip_once(
         ExitIpFailure::Parse(format!("IPv6 exit IP `{ip}` not yet mapped to VpnIp"))
     })?;
     Ok(TunnelEvent::ExitIpObserved { ip: vpn })
+}
+
+fn exit_ip_exchange(url: &str, status: u16, body: &str, error: &str) -> HttpExchange {
+    let response_headers = if error.is_empty() {
+        Vec::new()
+    } else {
+        vec![("error".to_string(), error.to_string())]
+    };
+    HttpExchange {
+        module: "tunnel-exit-ip".to_string(),
+        method: "GET".to_string(),
+        url: url.to_string(),
+        request_headers: Vec::new(),
+        request_body: None,
+        response_status: status,
+        response_headers,
+        response_body: body.to_string(),
+    }
 }
 
 fn spawn_run_leak_probe(
@@ -859,6 +934,18 @@ Endpoint = 198.51.100.7:51820
             ruleset.contains("ip daddr 198.51.100.7 udp dport 51820 accept"),
             "ruleset missing peer underlay rule: {ruleset}"
         );
+    }
+
+    #[test]
+    fn nft_rulesets_include_explicit_allowed_tcp_endpoints() {
+        let mut cfg = shell_config();
+        cfg.allowed_tcp_endpoints = vec!["172.30.0.10:5432".parse().unwrap()];
+
+        let pre = build_nft_pre_tunnel_ruleset(&cfg);
+        let post = build_nft_ruleset(&cfg);
+
+        assert!(pre.contains("ip daddr 172.30.0.10 tcp dport 5432 accept"));
+        assert!(post.contains("ip daddr 172.30.0.10 tcp dport 5432 accept"));
     }
 
     #[test]

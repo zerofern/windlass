@@ -8,6 +8,10 @@ fn test_client() -> DockerClient {
     DockerClient::connect("/tmp".into(), "gluetun".into()).expect("Docker socket unavailable")
 }
 
+fn test_client_with_anchor(anchor: &str) -> DockerClient {
+    DockerClient::connect("/tmp".into(), anchor.to_string()).expect("Docker socket unavailable")
+}
+
 async fn ensure_test_image(docker: &bollard::Docker) {
     use bollard::image::CreateImageOptions;
     use futures_util::StreamExt;
@@ -41,10 +45,10 @@ async fn docker_discover_dependents_finds_containers_in_network_mode() {
     };
     use bollard::models::HostConfig;
 
-    let mut client = test_client();
-    let docker = &client.inner.clone();
     let anchor = "windlass_test_anchor";
     let dependent = "windlass_test_dep";
+    let client = test_client_with_anchor(anchor);
+    let docker = &client.inner.clone();
 
     ensure_test_image(docker).await;
 

@@ -26,8 +26,9 @@ services:
       - NET_ADMIN
     # Tunnel mode requires Windlass to have its own network namespace
     # so it can create `wg0` and install the nftables kill switch.
-    # Default Docker bridge gives the container a private namespace.
-    network_mode: "bridge"
+    networks:
+      windlass-control:
+        ipv4_address: 172.30.0.2
     environment:
       WG_CONFIG_PATH: /config/wg.conf
       # qBit is reachable on localhost inside the shared namespace.
@@ -35,7 +36,9 @@ services:
       QBITTORRENT_USER: ${QBITTORRENT_USER:-admin}
       QBITTORRENT_PASS: ${QBITTORRENT_PASS:?QBITTORRENT_PASS missing}
       MAM_SESSION: ${MAM_SESSION:?MAM_SESSION missing}
-      DATABASE_URL: ${DATABASE_URL:-postgres://windlass:windlass@postgres:5432/windlass}
+      DATABASE_URL: ${DATABASE_URL:-postgres://windlass:windlass@172.30.0.10:5432/windlass}
+      # Only this non-tunnel TCP endpoint is allowed by the nftables kill switch.
+      TUNNEL_FIREWALL_ALLOW_TCP: 172.30.0.10:5432
     volumes:
       - ./wg.conf:/config/wg.conf:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -83,6 +86,9 @@ services:
       POSTGRES_DB: windlass
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks:
+      windlass-control:
+        ipv4_address: 172.30.0.10
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "windlass"]
       interval: 5s
@@ -92,3 +98,9 @@ services:
 
 volumes:
   postgres-data:
+
+networks:
+  windlass-control:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

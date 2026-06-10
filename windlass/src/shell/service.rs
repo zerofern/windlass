@@ -31,7 +31,7 @@ pub(super) struct ServiceCores {
     /// way to deliver `TunnelEvent::Init` to the tunnel core, so the
     /// runtime would spawn the machine but never tell it to bring
     /// the interface up.
-    tunnel: ServiceHandles<TunnelMachine>,
+    tunnel: Option<ServiceHandles<TunnelMachine>>,
     /// Cached forwarded port, shared with the VPN forwarder task.
     /// Updated by the VPN forwarder on PortReady/PortUnavailable/Disconnected.
     forwarded_port: Arc<Mutex<Option<VpnPort>>>,
@@ -47,7 +47,7 @@ impl ServiceCores {
         qbit: ServiceHandles<QbitMachine>,
         mam: ServiceHandles<MamMachine>,
         disk: ServiceHandles<DiskMachine>,
-        tunnel: ServiceHandles<TunnelMachine>,
+        tunnel: Option<ServiceHandles<TunnelMachine>>,
         forwarded_port: Arc<Mutex<Option<VpnPort>>>,
     ) -> Self {
         Self {
@@ -103,10 +103,12 @@ impl ServiceCores {
             .mam
             .events
             .send(Timed::external(now, ExternalCause::Init, MamEvent::Init));
-        let _ =
-            self.tunnel
-                .events
-                .send(Timed::external(now, ExternalCause::Init, TunnelEvent::Init));
+        if let Some(tunnel) = &self.tunnel {
+            let _ =
+                tunnel
+                    .events
+                    .send(Timed::external(now, ExternalCause::Init, TunnelEvent::Init));
+        }
     }
 }
 
@@ -268,7 +270,7 @@ mod tests {
             qbit_handles,
             mam_handles,
             disk_handles,
-            tunnel_handles,
+            Some(tunnel_handles),
             Arc::clone(&forwarded_port),
         );
         (cores, domain_ev_rx, forwarded_port)
