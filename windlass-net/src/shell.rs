@@ -14,7 +14,7 @@ use std::time::Duration;
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
-use windlass_machine::{ExternalCause, Shell, Timed};
+use windlass_machine::{Shell, Timed};
 use windlass_tunnel_core::config::{Endpoint, PeerConfig, WgConfig};
 use windlass_tunnel_core::{
     ExitIpFailure, FirewallInstallFailure, InterfaceConfigureFailure, NatPmpFailure, NatPmpRequest,
@@ -1031,11 +1031,7 @@ fn send_event(tx: &UnboundedSender<Timed<TunnelEvent>>, event: TunnelEvent) {
     // upstream action/publish id.  Once the runtime causal-tx
     // plumbing is wired in Phase 4, this will carry the
     // originating action id.
-    let _ = tx.send(Timed::external(
-        std::time::Instant::now(),
-        ExternalCause::Unknown,
-        event,
-    ));
+    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
 }
 
 #[cfg(test)]
@@ -1254,6 +1250,47 @@ Endpoint = 198.51.100.8:51821
             .iter()
             .map(|(p, a, _)| format!("{p} {}", a.join(" ")))
             .collect()
+    }
+
+    /// Regression: the leak probe used to treat ANY non-tunnel
+    /// interface with a global address as `LeakDetected` — but the
+    /// shipped topology deliberately attaches a control-network
+    /// interface, so the tunnel went Down on the first probe after
+    /// every boot.  A stray that the kill switch fences (the active
+    /// connect probe cannot reach out through it) must resolve to
+    /// `NoEgressDetected`.
+    #[tokio::test]
+    async fn leak_probe_treats_fenced_stray_interface_as_no_egress() {
+        let cfg = shell_config();
+        let runner = RecordingRunner::default();
+        runner.responses.lock().unwrap().push(Ok(CommandOutcome {
+            stdout: r#"[
+                {"ifname":"lo","addr_info":[{"family":"inet","scope":"host"}]},
+                {"ifname":"wg0","addr_info":[{"family":"inet","scope":"global"}]},
+                {"ifname":"straytest0","addr_info":[{"family":"inet","scope":"global"}]}
+            ]"#
+            .to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_run_leak_probe(Arc::new(runner), Arc::new(cfg), tx);
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("probe completes")
+            .expect("channel open");
+        match event.inner {
+            TunnelEvent::LeakProbeCompleted { outcome } => {
+                assert!(
+                    matches!(
+                        outcome,
+                        windlass_tunnel_core::LeakProbeOutcome::NoEgressDetected
+                    ),
+                    "fenced stray must not flag a leak: {outcome:?}"
+                );
+            }
+            other => panic!("expected LeakProbeCompleted, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -167,6 +167,24 @@ impl<E> Timed<E> {
             inner,
         }
     }
+
+    /// Event is the completion of I/O work the shell spawned for an
+    /// action: reads the task-local action id that
+    /// [`crate::causal::spawn`] propagated into the worker and ties
+    /// the event back to its originating action — the same id the
+    /// HTTP tap stamps on captured exchanges.  Falls back to
+    /// `External(Unknown)` when no dispatch is in flight.
+    ///
+    /// This is the constructor shells should use for action results;
+    /// `Timed::external(.., Unknown, ..)` at a completion site breaks
+    /// the causal chain the observability page walks.
+    #[must_use]
+    pub fn from_dispatch(at: Instant, inner: E) -> Self {
+        match crate::causal::current() {
+            Some(id) => Self::from_action(at, id, inner),
+            None => Self::external(at, ExternalCause::Unknown, inner),
+        }
+    }
 }
 
 /// An action paired with a runtime-minted id.
@@ -253,7 +271,10 @@ pub trait Machine: Sized {
     /// each publish was emitted on into the captured `StoredPublish`
     /// (`docs/observability-redesign.md` Stored records, line 419).
     type Topic: Serialize + DeserializeOwned + PartialEq + Clone + Send + 'static;
-    type Command: DeserializeOwned + Send + 'static;
+    /// `Serialize` is required so the runtime can record the command
+    /// payload + variant into the command step's `StoredStepRecord` —
+    /// without it the observability page shows an opaque "Command".
+    type Command: Serialize + DeserializeOwned + Send + 'static;
     type Response: Serialize + Send + 'static;
 
     /// An owned, serializable snapshot of the machine's internal state.
@@ -334,6 +355,42 @@ mod tests {
         let t = Timed::from_publish(Instant::now(), id, "hello");
         assert_eq!(t.cause, EventCause::Publish(id));
         assert_eq!(t.inner, "hello");
+    }
+
+    /// Inside a dispatch scope (how `causal::spawn`ed shell work runs),
+    /// `from_dispatch` ties the event to the originating action — the
+    /// same id the HTTP tap stamps on captured exchanges.  Outside any
+    /// scope it falls back to `Unknown` instead of inventing a cause.
+    #[tokio::test]
+    async fn from_dispatch_reads_the_task_local_action_id() {
+        let id = Uuid::new_v4();
+        let inside =
+            crate::causal::scope(id, async { Timed::from_dispatch(Instant::now(), 1_u8) }).await;
+        assert_eq!(inside.cause, EventCause::Action(id));
+
+        let outside = Timed::from_dispatch(Instant::now(), 1_u8);
+        assert_eq!(outside.cause, EventCause::External(ExternalCause::Unknown));
+    }
+
+    /// Regression: `StoredEventCause` is internally tagged with `kind`,
+    /// and serde flattens the external cause's fields into the same
+    /// JSON object.  `DockerEvent`'s field must therefore serialize as
+    /// `event` — a field literally named `kind` emitted a duplicate
+    /// key, and `JSON.parse` (last-key-wins) clobbered the
+    /// discriminator the frontend switches on.
+    #[test]
+    fn docker_event_cause_keeps_its_wire_discriminator() {
+        let cause = StoredEventCause::External(StoredExternalCause::DockerEvent {
+            kind: "container.start".to_string(),
+        });
+        let json = serde_json::to_string(&cause).expect("serializes");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        assert_eq!(v["kind"], "external");
+        assert_eq!(v["source"], "docker_event");
+        assert_eq!(v["event"], "container.start");
+        // And it round-trips.
+        let back: StoredEventCause = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, cause);
     }
 
     #[test]

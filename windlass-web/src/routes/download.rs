@@ -38,7 +38,11 @@ async fn post_add_download(
     let (reply_tx, _reply_rx) = oneshot::channel::<WindlassResponse>();
     if app
         .domain_command_tx
-        .send((WindlassCommand::ManualDownload { mam_id }, reply_tx))
+        .send((
+            WindlassCommand::ManualDownload { mam_id },
+            windlass_machine::EventCause::External(windlass_machine::ExternalCause::ManualCommand),
+            reply_tx,
+        ))
         .is_err()
     {
         tracing::warn!("Domain command channel closed — could not queue ManualDownload");

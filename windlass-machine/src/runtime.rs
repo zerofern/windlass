@@ -14,9 +14,18 @@ use crate::tap::{
     StepRecordView,
 };
 
-/// A command paired with the channel its typed response is returned on.
+/// A command paired with its upstream cause and the channel its typed
+/// response is returned on.
+///
+/// The cause is supplied by the sender: the domain shell passes
+/// `EventCause::Action(id)` of the domain action that routed the
+/// command (read from the task-local dispatch scope), web handlers
+/// pass `External(ManualCommand)`.  The runtime records it on the
+/// command step so the observability page can answer "which core —
+/// and which step — sent this command".
 pub type Command<M> = (
     <M as Machine>::Command,
+    crate::machine::EventCause,
     oneshot::Sender<<M as Machine>::Response>,
 );
 
@@ -193,7 +202,13 @@ where
                     });
                 }
                 command = self.command_rx.recv() => {
-                    let Some((cmd, reply)) = command else { break };
+                    let Some((cmd, cause, reply)) = command else { break };
+                    // Serialize before `handle_command` consumes the value;
+                    // the JSON doubles as the step's event payload and the
+                    // source of the variant name.
+                    let cmd_json = serde_json::to_value(&cmd)
+                        .unwrap_or(serde_json::Value::Null);
+                    let cmd_variant = crate::machine::variant_name(&cmd_json).to_owned();
                     let t0 = Instant::now();
                     let wall_now = Utc::now();
                     let outcome = self.machine.handle_command(t0, wall_now, cmd);
@@ -265,21 +280,14 @@ where
                     let snapshot = self.machine.state_snapshot();
                     let state_json = serde_json::to_value(snapshot)
                         .unwrap_or(serde_json::Value::Null);
-                    // Commands don't carry an upstream Timed::cause; tag as
-                    // External(ManualCommand) since commands originate from
-                    // outside the per-core event loop (web handlers, the
-                    // legacy bridge, etc.).
-                    let cause = crate::machine::EventCause::External(
-                        crate::machine::ExternalCause::ManualCommand,
-                    );
                     self.tap.observed_step(self.core_id, &StepRecordView {
                         step_id,
                         core: self.core_id,
                         recorded_at: Utc::now(),
                         duration,
                         kind: StepKind::Command { response: response_status },
-                        event_variant: "Command",
-                        event: &serde_json::Value::Null,
+                        event_variant: &cmd_variant,
+                        event: &cmd_json,
                         event_cause: &cause,
                         state_after: &state_json,
                         action_ids: &action_ids,
@@ -353,10 +361,13 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::spawn;
-    use crate::machine::{CommandOutcome, ExternalCause, Machine, Outcome, Timed};
+    use crate::machine::{CommandOutcome, EventCause, ExternalCause, Machine, Outcome, Timed};
     use crate::pubsub::HasTopic;
     use crate::shell::Shell;
-    use crate::tap::{CoreId, NullRuntimeTap};
+    use crate::tap::{
+        CoreId, EventGateView, NullRuntimeTap, OutcomeGateView, RuntimeTap, StepKind,
+        StepRecordView,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     enum Event {
@@ -378,6 +389,11 @@ mod tests {
         Beep,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum Cmd {
+        Ask { nonce: u32 },
+    }
+
     impl HasTopic<Topic> for Publish {
         fn topic(&self) -> Topic {
             Topic::Beeps
@@ -397,7 +413,7 @@ mod tests {
         type Action = Action;
         type Publish = Publish;
         type Topic = Topic;
-        type Command = (); // "Ask"
+        type Command = Cmd;
         type Response = u32;
         type StateSnapshot = Self;
 
@@ -423,7 +439,7 @@ mod tests {
             &mut self,
             _now: Instant,
             _wall_now: chrono::DateTime<chrono::Utc>,
-            (): Self::Command,
+            _cmd: Self::Command,
         ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
             self.asks += 1;
             Self::outcome(vec![Action::Pong], self.asks)
@@ -498,7 +514,11 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         handles
             .commands
-            .send(((), reply_tx))
+            .send((
+                Cmd::Ask { nonce: 7 },
+                EventCause::External(ExternalCause::ManualCommand),
+                reply_tx,
+            ))
             .expect("command channel should be open");
 
         assert_eq!(reply_rx.await, Ok(1));
@@ -511,10 +531,84 @@ mod tests {
         // snapshot. The FakeMachine's snapshot is itself; after one Ask
         // command the asks counter is visible in the JSON.
         let mut machine = FakeMachine::new((), Instant::now());
-        let _ = machine.handle_command(Instant::now(), chrono::Utc::now(), ());
+        let _ = machine.handle_command(Instant::now(), chrono::Utc::now(), Cmd::Ask { nonce: 0 });
         let value = serde_json::to_value(machine.state_snapshot())
             .expect("state snapshot should serialize");
         assert_eq!(value["asks"], 1);
+    }
+
+    /// Captures every `observed_step` so tests can assert what the
+    /// runtime records for the observability layer.
+    #[derive(Default)]
+    struct RecordingTap {
+        steps: std::sync::Mutex<
+            Vec<(
+                String,
+                serde_json::Value,
+                crate::machine::StoredEventCause,
+                bool,
+            )>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeTap for RecordingTap {
+        async fn gate_event(&self, _core: CoreId, _view: &EventGateView<'_>) {}
+        async fn gate_outcome(&self, _core: CoreId, _view: &OutcomeGateView<'_>) {}
+        fn reserve_step_ids(
+            &self,
+            _core: CoreId,
+            _step_id: uuid::Uuid,
+            _action_ids: &[uuid::Uuid],
+            _publish_ids: &[uuid::Uuid],
+        ) {
+        }
+        fn observed_step(&self, _core: CoreId, view: &StepRecordView<'_>) {
+            self.steps.lock().unwrap().push((
+                view.event_variant.to_owned(),
+                view.event.clone(),
+                view.event_cause.into(),
+                matches!(view.kind, StepKind::Command { .. }),
+            ));
+        }
+    }
+
+    /// The command step must record the real command variant, its
+    /// payload, and the sender-supplied cause — not the opaque
+    /// `"Command"` / `null` / `manual_command` triple it recorded
+    /// before, which made command rows unreadable on the
+    /// observability page.
+    #[tokio::test]
+    async fn command_step_records_variant_payload_and_cause() {
+        let tap = std::sync::Arc::new(RecordingTap::default());
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let (handles, _join) =
+            spawn::<FakeMachine, FakeShell>(CoreId::Mam, tap.clone(), (), action_tx).await;
+
+        let origin_action = uuid::Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handles
+            .commands
+            .send((
+                Cmd::Ask { nonce: 42 },
+                EventCause::Action(origin_action),
+                reply_tx,
+            ))
+            .expect("command channel should be open");
+        assert_eq!(reply_rx.await, Ok(1));
+        // The dispatched action proves the step completed before we
+        // inspect the tap.
+        assert_eq!(action_rx.recv().await, Some(Action::Pong));
+
+        let steps = tap.steps.lock().unwrap();
+        let (variant, payload, cause, is_command) = steps.last().expect("command step recorded");
+        assert_eq!(variant, "Ask");
+        assert_eq!(payload["Ask"]["nonce"], 42);
+        assert_eq!(
+            *cause,
+            crate::machine::StoredEventCause::Action { id: origin_action }
+        );
+        assert!(is_command);
     }
 
     #[tokio::test]

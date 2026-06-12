@@ -354,7 +354,7 @@ impl StoredStepRecord {
 
 #[cfg(test)]
 mod secret_tests {
-    use super::{MaybeSecret, ServerSecretSlot};
+    use super::{BodyCapture, BodyKind, MaybeSecret, ServerSecretSlot};
 
     #[test]
     fn server_secret_slot_serializes_to_wire_redacted() {
@@ -390,5 +390,54 @@ mod secret_tests {
         let a = ServerSecretSlot::new("v");
         let b = ServerSecretSlot::new("v");
         assert_ne!(a.reveal_id, b.reveal_id, "each slot mints a fresh id");
+    }
+
+    /// Regression: serde's internal tagging cannot serialize a newtype
+    /// variant wrapping a non-map value at runtime.  When `Text` /
+    /// `Inline` / `Bytes` were newtypes, every SSE message containing
+    /// a captured body failed `to_string` — including the entire
+    /// `Hello` snapshot, which the route silently degraded to an empty
+    /// `data:` frame that browsers discard.  Every variant must
+    /// serialize, and the wire shape (`kind` + `value`) must match the
+    /// frontend's `BodyCapture` union.
+    #[test]
+    fn every_body_capture_variant_serializes_with_kind_and_value() {
+        let cases: Vec<(BodyCapture, serde_json::Value)> = vec![
+            (
+                BodyCapture::Text {
+                    value: "hello".to_string(),
+                },
+                serde_json::json!({"kind": "text", "value": "hello"}),
+            ),
+            (
+                BodyCapture::Inline {
+                    value: serde_json::json!({"a": 1}),
+                },
+                serde_json::json!({"kind": "inline", "value": {"a": 1}}),
+            ),
+            (
+                BodyCapture::Bytes { value: 512 },
+                serde_json::json!({"kind": "bytes", "value": 512}),
+            ),
+            (
+                BodyCapture::Truncated {
+                    body_kind: BodyKind::Text,
+                    captured: serde_json::Value::String("trunc".to_string()),
+                    original_len: 9000,
+                },
+                serde_json::json!({
+                    "kind": "truncated",
+                    "body_kind": "text",
+                    "captured": "trunc",
+                    "original_len": 9000
+                }),
+            ),
+            (BodyCapture::None, serde_json::json!({"kind": "none"})),
+        ];
+        for (capture, expected) in cases {
+            let got = serde_json::to_value(&capture)
+                .unwrap_or_else(|e| panic!("{capture:?} must serialize: {e}"));
+            assert_eq!(got, expected);
+        }
     }
 }

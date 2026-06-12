@@ -69,7 +69,14 @@ async fn stream_handler(
 }
 
 fn sse_event(msg: &SseMessage) -> SseEvent {
-    let json = serde_json::to_string(msg).unwrap_or_default();
+    let json = serde_json::to_string(msg).unwrap_or_else(|e| {
+        // An empty `data:` frame is silently discarded by browsers
+        // (SSE spec), which is exactly how the BodyCapture
+        // serialization bug hid the entire Hello snapshot — if this
+        // ever fires again it must at least be loud server-side.
+        tracing::error!(error = %e, "SSE message failed to serialize; emitting empty frame");
+        String::new()
+    });
     SseEvent::default().event("observability").data(json)
 }
 
@@ -266,6 +273,32 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         assert!(!observability.is_paused(CoreId::Mam));
+    }
+
+    /// Regression: `parse_core` shipped without the tunnel core when
+    /// `CoreId::Tunnel` landed, so the dashboard's pause/resume/step
+    /// controls 404'd for it.  Every core in `CoreId::all()` must be
+    /// addressable.
+    #[tokio::test]
+    async fn every_core_is_pausable_including_tunnel() {
+        let observability = ObservabilityController::new();
+        let state = crate::test_helpers::test_state_with_observability(observability.clone()).await;
+        let app = router(state);
+        for core in CoreId::all() {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/observability/pause/{core}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NO_CONTENT, "pause {core}");
+            assert!(observability.is_paused(core), "{core} paused");
+        }
     }
 
     #[tokio::test]

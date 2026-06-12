@@ -372,6 +372,9 @@ pub(super) async fn init_shell(
             // §31 stale-registration refresh — 24h cookie/registration
             // refresh, mirrors Mousehole's STALE_RESPONSE_SECONDS.
             stale_registration_interval: windlass_mam_core::DEFAULT_STALE_REGISTRATION_INTERVAL,
+            // §32 machine-side dynamicSeedbox spacing — keeps every
+            // update path off MAM's 1-hour limit by construction.
+            seedbox_update_min_interval: windlass_mam_core::DEFAULT_SEEDBOX_UPDATE_MIN_INTERVAL,
         },
         mam.clone(),
     )
@@ -654,7 +657,8 @@ pub(super) async fn init_shell(
         tokio::spawn(async move {
             while let Some(envelope) = domain_pub_rx.recv().await {
                 let windlass_machine::PublishEnvelope {
-                    payload: publish, ..
+                    id: publish_id,
+                    payload: publish,
                 } = envelope;
                 match publish {
                     WindlassPublish::SystemState(_) => {}
@@ -669,6 +673,9 @@ pub(super) async fn init_shell(
                                 detail: Some(message),
                                 metadata: serde_json::Value::Null,
                             }),
+                            // The DB command step links back to the domain
+                            // publish that carried the activity.
+                            windlass_machine::EventCause::Publish(publish_id),
                             reply_tx,
                         ));
                     }

@@ -2,7 +2,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use windlass_db::DbPool;
 use windlass_db::actor::PostgresDbActor;
 use windlass_db_core::{DbAction, DbEvent};
-use windlass_machine::{ExternalCause, Shell, Timed};
+use windlass_machine::{Shell, Timed};
 
 pub struct DbShell {
     actor: PostgresDbActor,
@@ -33,11 +33,7 @@ impl Shell for DbShell {
                         // mapping bug (fixed in actor::torrent_state_str).
                         tracing::warn!("DB operation {} failed: {}", f.operation, f.message);
                     }
-                    let _ = event_tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        result,
-                    ));
+                    let _ = event_tx.send(Timed::from_dispatch(std::time::Instant::now(), result));
                 });
             }
         }

@@ -24,6 +24,13 @@ pub const DEFAULT_KEEP_ALIVE_FAILURE_THRESHOLD: u32 = 3;
 /// `STALE_RESPONSE_SECONDS` (86 400 s = 1 day).
 pub const DEFAULT_STALE_REGISTRATION_INTERVAL: Duration = Duration::from_hours(24);
 
+/// §32: default machine-side spacing between `UpdateSeedbox` attempts.
+///
+/// One minute over MAM's documented 1-hour `dynamicSeedbox.php` limit
+/// (and the HTTP client's belt-and-braces guard) so a machine-side
+/// retry can never race the guard and produce a `RateLimited`.
+pub const DEFAULT_SEEDBOX_UPDATE_MIN_INTERVAL: Duration = Duration::from_mins(61);
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MamConfig {
     pub status_retry: Duration,
@@ -48,6 +55,14 @@ pub struct MamConfig {
     /// Default: 24 hours (`DEFAULT_STALE_REGISTRATION_INTERVAL`,
     /// mirrors Mousehole's `STALE_RESPONSE_SECONDS`).
     pub stale_registration_interval: Duration,
+    /// §32: minimum spacing between `UpdateSeedbox` attempts, enforced
+    /// in the machine so no command/timer path can storm
+    /// `dynamicSeedbox.php` (MAM documents a 1-hour rolling limit; the
+    /// HTTP client carries a belt-and-braces guard that should never
+    /// trip).  Callers inside the window get a deferral timer instead
+    /// of a doomed request.  Default: 61 minutes — one minute over the
+    /// client guard so a machine-side retry never races it.
+    pub seedbox_update_min_interval: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +373,18 @@ pub struct MamMachine {
     /// §32: AS organization name from the last successful dynamic-seedbox
     /// call.  Carried for logging.
     registered_as: Option<String>,
+    /// §32: wall-clock instant an `UpdateSeedbox` action was emitted
+    /// and not yet answered (single-flight gate).  Cleared by every
+    /// completion event (`SeedboxUpdated` / `SeedboxUpdateFailed` /
+    /// `AsnMismatch` / `Unreachable` / `RateLimited`); treated as
+    /// stale after 5 minutes so a lost completion can't wedge updates
+    /// forever.
+    seedbox_update_in_flight_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// §32: wall-clock instant of the last `UpdateSeedbox` emission,
+    /// driving the machine-side min-interval window.  Reset to `None`
+    /// on `RateLimited` — that attempt never reached MAM, and the
+    /// client's `retry_after` governs the next try instead.
+    last_seedbox_update_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl MamMachine {
@@ -462,24 +489,67 @@ impl MamMachine {
     /// `getUpdateReason`: skip the call when nothing changed).  A future
     /// story will add IP-change detection so we *do* update on a public IP
     /// change even when the port is unchanged.
-    fn refresh_or_update_seedbox(&self) -> Vec<MamAction> {
+    fn refresh_or_update_seedbox(
+        &mut self,
+        wall_now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<MamAction> {
         match self.desired_seedbox_port {
             Some(desired) if self.seedbox_port != Some(desired) => {
-                vec![MamAction::UpdateSeedbox]
+                self.request_seedbox_update(wall_now)
             }
             _ => vec![MamAction::FetchStatus],
         }
     }
 
-    fn converge_seedbox(&self) -> Vec<MamAction> {
+    fn converge_seedbox(&mut self, wall_now: chrono::DateTime<chrono::Utc>) -> Vec<MamAction> {
         let Some(desired) = self.desired_seedbox_port else {
             return Vec::new();
         };
         if self.seedbox_port == Some(desired) {
             Vec::new()
         } else {
-            vec![MamAction::UpdateSeedbox]
+            self.request_seedbox_update(wall_now)
         }
+    }
+
+    /// Single gateway for emitting `UpdateSeedbox`.
+    ///
+    /// Enforces single-flight and the machine-side min-interval window
+    /// here — in the pure machine, where it is observable and testable
+    /// — so no combination of commands, retries, and timer chains can
+    /// storm `dynamicSeedbox.php`.  A caller that wants an update
+    /// while one is in flight gets nothing (every completion handler
+    /// re-converges); a caller inside the window gets a deferral
+    /// timer for the window's remainder (`KeyedTimers` in the shell
+    /// collapses duplicates).
+    fn request_seedbox_update(
+        &mut self,
+        wall_now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<MamAction> {
+        // A lost completion must not wedge updates forever.
+        const IN_FLIGHT_STALE_SECONDS: i64 = 300;
+        if let Some(since) = self.seedbox_update_in_flight_since
+            && wall_now.signed_duration_since(since).num_seconds() < IN_FLIGHT_STALE_SECONDS
+        {
+            return Vec::new();
+        }
+        if let Some(last) = self.last_seedbox_update_attempt_at {
+            let window = chrono::Duration::from_std(self.config.seedbox_update_min_interval)
+                .unwrap_or_else(|_| chrono::Duration::hours(1));
+            let elapsed = wall_now.signed_duration_since(last);
+            if elapsed >= chrono::Duration::zero() && elapsed < window {
+                let remaining = (window - elapsed)
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1));
+                return vec![MamAction::ScheduleTimer {
+                    timer: MamTimer::RateLimitExpired,
+                    after: remaining,
+                }];
+            }
+        }
+        self.seedbox_update_in_flight_since = Some(wall_now);
+        self.last_seedbox_update_attempt_at = Some(wall_now);
+        vec![MamAction::UpdateSeedbox]
     }
 
     fn seedbox_publish(&self, seedbox_port: Option<VpnPort>) -> Vec<MamPublish> {
@@ -522,6 +592,8 @@ impl Machine for MamMachine {
             registered_ip: None,
             registered_asn: None,
             registered_as: None,
+            seedbox_update_in_flight_since: None,
+            last_seedbox_update_attempt_at: None,
         }
     }
 
@@ -531,7 +603,7 @@ impl Machine for MamMachine {
     fn handle(
         &mut self,
         _now: Instant,
-        _wall_now: chrono::DateTime<chrono::Utc>,
+        wall_now: chrono::DateTime<chrono::Utc>,
         event: Timed<Self::Event>,
     ) -> Outcome<Self::Action, Self::Publish> {
         match event.inner {
@@ -540,7 +612,7 @@ impl Machine for MamMachine {
                 publishes: Vec::new(),
             },
             MamEvent::TimerFired(MamTimer::StatusRetry | MamTimer::RateLimitExpired) => Outcome {
-                actions: self.refresh_or_update_seedbox(),
+                actions: self.refresh_or_update_seedbox(wall_now),
                 publishes: Vec::new(),
             },
             // §27: the keep-alive timer always re-schedules itself before
@@ -561,16 +633,17 @@ impl Machine for MamMachine {
             // once per `stale_registration_interval` even when the IP is
             // unchanged, so the MAM session cookie stays fresh.  Always
             // re-schedules itself.
-            MamEvent::TimerFired(MamTimer::StaleRegistrationRefresh) => Outcome {
-                actions: vec![
-                    MamAction::UpdateSeedbox,
-                    MamAction::ScheduleTimer {
-                        timer: MamTimer::StaleRegistrationRefresh,
-                        after: self.config.stale_registration_interval,
-                    },
-                ],
-                publishes: Vec::new(),
-            },
+            MamEvent::TimerFired(MamTimer::StaleRegistrationRefresh) => {
+                let mut actions = self.request_seedbox_update(wall_now);
+                actions.push(MamAction::ScheduleTimer {
+                    timer: MamTimer::StaleRegistrationRefresh,
+                    after: self.config.stale_registration_interval,
+                });
+                Outcome {
+                    actions,
+                    publishes: Vec::new(),
+                }
+            }
             MamEvent::AuthSucceeded => {
                 self.authenticated = true;
                 let mut actions = vec![MamAction::FetchStatus];
@@ -591,6 +664,7 @@ impl Machine for MamMachine {
             MamEvent::AuthFailed { reason }
             | MamEvent::StatusFailed { reason }
             | MamEvent::SeedboxUpdateFailed { reason } => {
+                self.seedbox_update_in_flight_since = None;
                 let mut publishes = vec![MamPublish::Unavailable {
                     reason: reason.clone(),
                 }];
@@ -620,6 +694,7 @@ impl Machine for MamMachine {
             // side").  Same StatusRetry + keep-alive-counter handling as the
             // other retryable failures.
             MamEvent::Unreachable { reason } => {
+                self.seedbox_update_in_flight_since = None;
                 let mut publishes = vec![MamPublish::Unreachable {
                     reason: reason.clone(),
                 }];
@@ -682,7 +757,7 @@ impl Machine for MamMachine {
                     });
                 }
                 Outcome {
-                    actions: self.converge_seedbox(),
+                    actions: self.converge_seedbox(wall_now),
                     publishes,
                 }
             }
@@ -691,6 +766,7 @@ impl Machine for MamMachine {
                 registered_asn,
                 registered_as,
             } => {
+                self.seedbox_update_in_flight_since = None;
                 let port = self.desired_seedbox_port;
                 if let Some(p) = port {
                     self.seedbox_port = Some(p);
@@ -720,7 +796,10 @@ impl Machine for MamMachine {
                     publishes.push(MamPublish::AsnAccepted);
                 }
                 Outcome {
-                    actions: Vec::new(),
+                    // Re-converge: desired state may have moved while
+                    // this update was in flight (the single-flight
+                    // gate swallowed those requests).
+                    actions: self.converge_seedbox(wall_now),
                     publishes,
                 }
             }
@@ -731,6 +810,7 @@ impl Machine for MamMachine {
             // bumps the §27 keep-alive failure counter — a persistent ASN
             // mismatch shows up as a degraded heartbeat too.
             MamEvent::AsnMismatch { ip } => {
+                self.seedbox_update_in_flight_since = None;
                 let mut publishes = Vec::new();
                 if self.asn_state != AsnState::Mismatched {
                     self.asn_state = AsnState::Mismatched;
@@ -751,13 +831,20 @@ impl Machine for MamMachine {
                     publishes,
                 }
             }
-            MamEvent::RateLimited { retry_after } => Outcome {
-                actions: vec![MamAction::ScheduleTimer {
-                    timer: MamTimer::RateLimitExpired,
-                    after: retry_after,
-                }],
-                publishes: vec![MamPublish::RateLimited { retry_after }],
-            },
+            MamEvent::RateLimited { retry_after } => {
+                // The attempt never reached MAM; the guard's honest
+                // retry_after governs the next try, so the machine
+                // window must not double-penalize it.
+                self.seedbox_update_in_flight_since = None;
+                self.last_seedbox_update_attempt_at = None;
+                Outcome {
+                    actions: vec![MamAction::ScheduleTimer {
+                        timer: MamTimer::RateLimitExpired,
+                        after: retry_after,
+                    }],
+                    publishes: vec![MamPublish::RateLimited { retry_after }],
+                }
+            }
             // §36 step 5: forward the fetched bytes to subscribers (domain
             // routes them to QbitCommand::AddTorrent).
             MamEvent::TorrentBytesFetched { mam_id, bytes } => Outcome {
@@ -774,7 +861,7 @@ impl Machine for MamMachine {
     fn handle_command(
         &mut self,
         _now: Instant,
-        _wall_now: chrono::DateTime<chrono::Utc>,
+        wall_now: chrono::DateTime<chrono::Utc>,
         cmd: Self::Command,
     ) -> CommandOutcome<Self::Action, Self::Publish, Self::Response> {
         let actions = match cmd {
@@ -790,7 +877,7 @@ impl Machine for MamMachine {
                         MamResponse::Accepted,
                     );
                 }
-                vec![MamAction::UpdateSeedbox]
+                self.request_seedbox_update(wall_now)
             }
             // §31 / MAM-16 + §32: Mousehole-style dedup.  Skip
             // `UpdateSeedbox` when MAM has already recorded this IP
@@ -806,7 +893,7 @@ impl Machine for MamMachine {
                 if already_registered || already_observed {
                     return Self::outcome(Vec::new(), MamResponse::Accepted);
                 }
-                let mut actions = vec![MamAction::UpdateSeedbox];
+                let mut actions = self.request_seedbox_update(wall_now);
                 if !self.stale_chain_scheduled {
                     self.stale_chain_scheduled = true;
                     actions.push(MamAction::ScheduleTimer {
@@ -850,6 +937,7 @@ mod tests {
                 keep_alive_interval: Duration::from_secs(300),
                 keep_alive_failure_threshold: 3,
                 stale_registration_interval: Duration::from_secs(86_400),
+                seedbox_update_min_interval: Duration::ZERO,
             },
             Instant::now(),
         )
@@ -966,12 +1054,16 @@ mod tests {
         let mut machine = machine();
         let desired = VpnPort::try_new(51_820).unwrap();
         let observed = VpnPort::try_new(42_000).unwrap();
-        let _ = machine.handle_command(
+        // EnsureSeedboxPort fires the first UpdateSeedbox…
+        let first = machine.handle_command(
             Instant::now(),
             chrono::Utc::now(),
             MamCommand::EnsureSeedboxPort { port: desired },
         );
-
+        assert_eq!(first.actions, vec![MamAction::UpdateSeedbox]);
+        // …which the single-flight gate holds open: a StatusFetched
+        // mismatch while it is in flight must NOT fire a second one
+        // (the in-flight update registers the desired port already).
         let out = handle(
             &mut machine,
             MamEvent::StatusFetched {
@@ -982,8 +1074,11 @@ mod tests {
                 upload_credit_bytes: 50 * 1024 * 1024 * 1024,
             },
         );
-
-        assert_eq!(out.actions, vec![MamAction::UpdateSeedbox]);
+        assert!(
+            out.actions.is_empty(),
+            "single-flight must hold: {:?}",
+            out.actions
+        );
         assert_eq!(
             out.publishes,
             vec![
@@ -997,6 +1092,269 @@ mod tests {
                     upload_credit_bytes: 50 * 1024 * 1024 * 1024,
                 },
             ]
+        );
+        // Once the in-flight attempt fails, the next status mismatch
+        // re-fires the update.
+        let _ = handle(
+            &mut machine,
+            MamEvent::SeedboxUpdateFailed {
+                reason: "boom".to_string(),
+            },
+        );
+        let retry = handle(
+            &mut machine,
+            MamEvent::StatusFetched {
+                connectable: true,
+                seedbox_port: Some(observed),
+                ratio: 3.0,
+                upload_credit_bytes: 50 * 1024 * 1024 * 1024,
+            },
+        );
+        assert_eq!(retry.actions, vec![MamAction::UpdateSeedbox]);
+    }
+
+    /// §32: the boot burst — port and IP arriving piecemeal within the
+    /// same second — must produce exactly ONE `UpdateSeedbox`, not one
+    /// per command.  This was the production alert storm: each extra
+    /// attempt hit the client's 1-hour guard and published a critical
+    /// `RateLimited` alert.
+    #[test]
+    fn piecemeal_boot_state_coalesces_into_one_update() {
+        let mut machine = machine();
+        let port = VpnPort::try_new(51_820).unwrap();
+        let ip = windlass_types::VpnIp(std::net::Ipv4Addr::new(203, 0, 113, 7));
+        let first = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::EnsureSeedboxPort { port },
+        );
+        let second = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::ObservedIpChanged { ip },
+        );
+        let updates = |a: &[MamAction]| {
+            a.iter()
+                .filter(|x| matches!(x, MamAction::UpdateSeedbox))
+                .count()
+        };
+        assert_eq!(updates(&first.actions), 1);
+        assert_eq!(
+            updates(&second.actions),
+            0,
+            "second desired-state change must coalesce into the in-flight update"
+        );
+        // The in-flight completion re-converges; nothing is lost.
+        let done = handle(
+            &mut machine,
+            MamEvent::SeedboxUpdated {
+                registered_ip: Some(ip),
+                registered_asn: Some(1),
+                registered_as: Some("AS".to_string()),
+            },
+        );
+        assert_eq!(
+            updates(&done.actions),
+            0,
+            "desired state is satisfied; no further update"
+        );
+    }
+
+    /// §32: a lost completion event must not wedge updates forever —
+    /// after the 5-minute staleness horizon the single-flight gate
+    /// yields and a new attempt goes out.
+    #[test]
+    fn stale_in_flight_update_does_not_wedge_the_gateway() {
+        let mut machine = machine();
+        let port_a = VpnPort::try_new(51_820).unwrap();
+        let port_b = VpnPort::try_new(42_000).unwrap();
+        let first = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::EnsureSeedboxPort { port: port_a },
+        );
+        assert_eq!(first.actions, vec![MamAction::UpdateSeedbox]);
+        // No completion ever arrives.  Pretend the attempt started
+        // 10 minutes ago by backdating the in-flight timestamp.
+        machine.seedbox_update_in_flight_since =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        machine.last_seedbox_update_attempt_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        let second = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::EnsureSeedboxPort { port: port_b },
+        );
+        assert_eq!(
+            second.actions,
+            vec![MamAction::UpdateSeedbox],
+            "a stale in-flight marker must not block updates forever"
+        );
+    }
+
+    /// §32: a `RateLimited` refusal never reached MAM, so it must not
+    /// consume the machine-side window — when the guard's honest
+    /// `retry_after` timer fires, the retry goes out immediately.
+    #[test]
+    fn rate_limited_does_not_consume_the_update_window() {
+        let mut machine = MamMachine::new(
+            MamConfig {
+                status_retry: Duration::from_secs(5),
+                min_global_ratio: 2.0,
+                min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
+                keep_alive_interval: Duration::from_secs(300),
+                keep_alive_failure_threshold: 3,
+                stale_registration_interval: Duration::from_secs(86_400),
+                seedbox_update_min_interval: Duration::from_secs(3600),
+            },
+            Instant::now(),
+        );
+        let port = VpnPort::try_new(51_820).unwrap();
+        let first = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::EnsureSeedboxPort { port },
+        );
+        assert_eq!(first.actions, vec![MamAction::UpdateSeedbox]);
+        // The client guard refuses the attempt.
+        let limited = handle(
+            &mut machine,
+            MamEvent::RateLimited {
+                retry_after: Duration::from_secs(120),
+            },
+        );
+        assert!(limited.actions.iter().any(|a| matches!(
+            a,
+            MamAction::ScheduleTimer {
+                timer: MamTimer::RateLimitExpired,
+                ..
+            }
+        )));
+        // When the retry timer fires, the update must go out — the
+        // refused attempt must not have armed the 1h machine window.
+        let retry = handle(
+            &mut machine,
+            MamEvent::TimerFired(MamTimer::RateLimitExpired),
+        );
+        assert_eq!(retry.actions, vec![MamAction::UpdateSeedbox]);
+    }
+
+    /// §31 + §32: the 24h stale-registration refresh goes through the
+    /// gateway too — inside the window it defers instead of firing,
+    /// but its self-perpetuating chain must survive the deferral.
+    #[test]
+    fn stale_refresh_defers_inside_window_but_keeps_its_chain() {
+        let mut machine = MamMachine::new(
+            MamConfig {
+                status_retry: Duration::from_secs(5),
+                min_global_ratio: 2.0,
+                min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
+                keep_alive_interval: Duration::from_secs(300),
+                keep_alive_failure_threshold: 3,
+                stale_registration_interval: Duration::from_secs(86_400),
+                seedbox_update_min_interval: Duration::from_secs(3600),
+            },
+            Instant::now(),
+        );
+        let port = VpnPort::try_new(51_820).unwrap();
+        let _ = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::EnsureSeedboxPort { port },
+        );
+        let _ = handle(
+            &mut machine,
+            MamEvent::SeedboxUpdated {
+                registered_ip: None,
+                registered_asn: None,
+                registered_as: None,
+            },
+        );
+        // Inside the window: no update, but the 24h chain re-arms and
+        // the window-expiry timer is scheduled.
+        let out = handle(
+            &mut machine,
+            MamEvent::TimerFired(MamTimer::StaleRegistrationRefresh),
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, MamAction::UpdateSeedbox)),
+            "stale refresh inside the window must defer: {:?}",
+            out.actions
+        );
+        assert!(out.actions.iter().any(|a| matches!(
+            a,
+            MamAction::ScheduleTimer {
+                timer: MamTimer::StaleRegistrationRefresh,
+                ..
+            }
+        )));
+        assert!(out.actions.iter().any(|a| matches!(
+            a,
+            MamAction::ScheduleTimer {
+                timer: MamTimer::RateLimitExpired,
+                ..
+            }
+        )));
+    }
+
+    /// §32: inside the machine-side min-interval window, an update
+    /// request defers (schedules the window-expiry timer) instead of
+    /// firing a doomed attempt into the client guard.
+    #[test]
+    fn update_inside_window_defers_instead_of_firing() {
+        let mut machine = MamMachine::new(
+            MamConfig {
+                status_retry: Duration::from_secs(5),
+                min_global_ratio: 2.0,
+                min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
+                keep_alive_interval: Duration::from_secs(300),
+                keep_alive_failure_threshold: 3,
+                stale_registration_interval: Duration::from_secs(86_400),
+                seedbox_update_min_interval: Duration::from_secs(3600),
+            },
+            Instant::now(),
+        );
+        let port_a = VpnPort::try_new(51_820).unwrap();
+        let port_b = VpnPort::try_new(42_000).unwrap();
+        let _ = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::EnsureSeedboxPort { port: port_a },
+        );
+        // Complete the first update successfully.
+        let _ = handle(
+            &mut machine,
+            MamEvent::SeedboxUpdated {
+                registered_ip: None,
+                registered_asn: None,
+                registered_as: None,
+            },
+        );
+        // A new desired port inside the window: deferral, not attempt.
+        let out = machine.handle_command(
+            Instant::now(),
+            chrono::Utc::now(),
+            MamCommand::EnsureSeedboxPort { port: port_b },
+        );
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, MamAction::UpdateSeedbox)),
+            "window must defer the attempt: {:?}",
+            out.actions
+        );
+        assert!(
+            out.actions.iter().any(|a| matches!(
+                a,
+                MamAction::ScheduleTimer {
+                    timer: MamTimer::RateLimitExpired,
+                    ..
+                }
+            )),
+            "deferral must schedule the window-expiry timer: {:?}",
+            out.actions
         );
     }
 
@@ -1467,6 +1825,7 @@ mod tests {
                 keep_alive_interval: Duration::from_secs(300),
                 keep_alive_failure_threshold: 0,
                 stale_registration_interval: Duration::from_secs(86_400),
+                seedbox_update_min_interval: Duration::ZERO,
             },
             Instant::now(),
         );
@@ -1538,6 +1897,7 @@ mod prop_tests {
                     keep_alive_interval: Duration::from_secs(keep_alive_secs),
                     keep_alive_failure_threshold,
                     stale_registration_interval: Duration::from_secs(stale_secs),
+                    seedbox_update_min_interval: Duration::ZERO,
                 },
             )
     }

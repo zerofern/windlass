@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 use windlass_local::docker::DockerClient;
-use windlass_machine::{ExternalCause, KeyedTimers, Shell, Timed};
+use windlass_machine::{KeyedTimers, Shell, Timed};
 use windlass_types::{VpnIp, VpnPort};
 use windlass_vpn_core::{VpnAction, VpnEvent, VpnTimer};
 
@@ -246,9 +246,5 @@ async fn read_legacy_port(vpn_port_file: &str) -> Result<Option<VpnPort>, String
 }
 
 fn send_event(tx: &UnboundedSender<Timed<VpnEvent>>, event: VpnEvent) {
-    let _ = tx.send(Timed::external(
-        std::time::Instant::now(),
-        ExternalCause::Unknown,
-        event,
-    ));
+    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
 }

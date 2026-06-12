@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use windlass_docker_core::{DockerAction, DockerEvent};
 use windlass_local::docker::DockerClient;
-use windlass_machine::{ExternalCause, Shell, Timed};
+use windlass_machine::{Shell, Timed};
 
 pub struct DockerShellConfig {
     pub docker: DockerClient,
@@ -86,9 +86,8 @@ impl Shell for DockerShell {
                     // VpnShell `is_gluetun_healthy()` poll.
                     let (started_at, healthy) = inspect_state(&docker, &name).await;
                     if let Some(started_at) = started_at {
-                        let _ = tx.send(Timed::external(
+                        let _ = tx.send(Timed::from_dispatch(
                             std::time::Instant::now(),
-                            ExternalCause::Unknown,
                             DockerEvent::ContainerStarted {
                                 name: name.clone(),
                                 started_at,
@@ -101,11 +100,7 @@ impl Shell for DockerShell {
                         } else {
                             DockerEvent::ContainerUnhealthy { name }
                         };
-                        let _ = tx.send(Timed::external(
-                            std::time::Instant::now(),
-                            ExternalCause::Unknown,
-                            event,
-                        ));
+                        let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                     }
                 });
             }
@@ -116,16 +111,14 @@ impl Shell for DockerShell {
                 windlass_machine::causal::spawn(async move {
                     match dump_one(&docker, &dump_dir, &name).await {
                         Ok(path) => {
-                            let _ = tx.send(Timed::external(
+                            let _ = tx.send(Timed::from_dispatch(
                                 std::time::Instant::now(),
-                                ExternalCause::Unknown,
                                 DockerEvent::LogsDumped { name, path },
                             ));
                         }
                         Err(reason) => {
-                            let _ = tx.send(Timed::external(
+                            let _ = tx.send(Timed::from_dispatch(
                                 std::time::Instant::now(),
-                                ExternalCause::Unknown,
                                 DockerEvent::LogsDumpFailed { name, reason },
                             ));
                         }
@@ -137,9 +130,8 @@ impl Shell for DockerShell {
                 let tx = event_tx.clone();
                 windlass_machine::causal::spawn(async move {
                     let names = docker.discover_dependents().await;
-                    let _ = tx.send(Timed::external(
+                    let _ = tx.send(Timed::from_dispatch(
                         std::time::Instant::now(),
-                        ExternalCause::Unknown,
                         DockerEvent::DependentsDiscovered { names },
                     ));
                 });
@@ -195,11 +187,7 @@ fn spawn_event_watcher(docker: Docker, event_tx: UnboundedSender<Timed<DockerEve
                 };
                 if let Some(event) = event
                     && event_tx
-                        .send(Timed::external(
-                            std::time::Instant::now(),
-                            ExternalCause::Unknown,
-                            event,
-                        ))
+                        .send(Timed::from_dispatch(std::time::Instant::now(), event))
                         .is_err()
                 {
                     return;

@@ -78,6 +78,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distinct_keys_do_not_replace_each_other() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        enum T {
+            A,
+            B,
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Timed<&'static str>>();
+        let mut timers = KeyedTimers::new();
+        timers.schedule(T::A, "a", Duration::from_millis(10), &tx, "a");
+        timers.schedule(T::B, "b", Duration::from_millis(20), &tx, "b");
+        let mut got = vec![
+            rx.recv().await.expect("first fires").inner,
+            rx.recv().await.expect("second fires").inner,
+        ];
+        got.sort_unstable();
+        assert_eq!(got, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
     async fn rescheduling_replaces_the_pending_sleep() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Timed<&'static str>>();
         let mut timers = KeyedTimers::new();

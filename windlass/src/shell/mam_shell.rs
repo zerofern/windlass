@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use windlass_clients::mam::{MamClient, MamFetchError, MamSeedboxResult};
-use windlass_machine::{ExternalCause, KeyedTimers, Shell, Timed};
+use windlass_machine::{KeyedTimers, Shell, Timed};
 use windlass_mam_core::{MamAction, MamEvent, MamTimer};
 
 pub struct MamShell {
@@ -50,11 +50,7 @@ impl Shell for MamShell {
                             MamEvent::StatusFailed { reason }
                         }
                     };
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
             MamAction::UpdateSeedbox => {
@@ -92,11 +88,7 @@ impl Shell for MamShell {
                             MamEvent::SeedboxUpdateFailed { reason }
                         }
                     };
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
             MamAction::ScheduleTimer { timer, after } => {
@@ -123,11 +115,7 @@ impl Shell for MamShell {
                         },
                         |bytes| MamEvent::TorrentBytesFetched { mam_id, bytes },
                     );
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
         }

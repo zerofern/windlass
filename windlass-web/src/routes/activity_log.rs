@@ -129,4 +129,26 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 5);
     }
+
+    /// Regression: a negative or absurd `limit` went straight into the
+    /// SQL `LIMIT` clause — Postgres rejected it and the client saw an
+    /// opaque 500.  Out-of-range values must clamp, not error.
+    #[tokio::test]
+    async fn get_events_out_of_range_limits_clamp_instead_of_500() {
+        let state = crate::test_helpers::test_state().await;
+        let app = router(state);
+        for query in ["limit=-5", "limit=0", "limit=999999999999"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/events?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "query {query}");
+        }
+    }
 }

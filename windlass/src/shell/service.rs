@@ -446,12 +446,12 @@ mod tests {
         let mut got_mam = false;
         for _ in 0..20 {
             tokio::task::yield_now().await;
-            while let Ok((cmd, _)) = qbit_cmd_rx.try_recv() {
+            while let Ok((cmd, _, _)) = qbit_cmd_rx.try_recv() {
                 if matches!(cmd, QbitCommand::EnsureListenPort { port: p } if p == port) {
                     got_qbit = true;
                 }
             }
-            while let Ok((cmd, _)) = mam_cmd_rx.try_recv() {
+            while let Ok((cmd, _, _)) = mam_cmd_rx.try_recv() {
                 if matches!(cmd, MamCommand::EnsureSeedboxPort { port: p } if p == port) {
                     got_mam = true;
                 }
@@ -609,6 +609,9 @@ mod tests {
                                 detail: Some(message),
                                 metadata: serde_json::Value::Null,
                             }),
+                            windlass_machine::EventCause::External(
+                                windlass_machine::ExternalCause::Unknown,
+                            ),
                             reply_tx,
                         ));
                     }
@@ -624,7 +627,7 @@ mod tests {
             .unwrap();
 
         // Wait for the DB command to arrive.
-        let (cmd, _) = tokio::time::timeout(Duration::from_secs(1), db_cmd_rx.recv())
+        let (cmd, _, _) = tokio::time::timeout(Duration::from_secs(1), db_cmd_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");

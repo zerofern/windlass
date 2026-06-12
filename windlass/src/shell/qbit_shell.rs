@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use windlass_clients::qbit::{QbitAuthResult, QbitClient, QbitPortSyncResult, QbitTorrentState};
-use windlass_machine::{ExternalCause, KeyedTimers, Shell, Timed};
+use windlass_machine::{KeyedTimers, Shell, Timed};
 use windlass_qbit_core::{QbitAction, QbitEvent, QbitTimer};
 use windlass_types::{TorrentRecord, TorrentState};
 
@@ -52,11 +52,7 @@ impl Shell for QbitShell {
                             reason: format!("qBittorrent API error (status {code})"),
                         },
                     };
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
             QbitAction::ReadPreferences { cookie } => {
@@ -75,11 +71,7 @@ impl Shell for QbitShell {
                             max_active_torrents: prefs.max_active_torrents,
                         },
                     );
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
             QbitAction::DisableBannedPrivacySettings { cookie } => {
@@ -93,11 +85,7 @@ impl Shell for QbitShell {
                             reason: "failed to set private tracker safe prefs".to_string(),
                         }
                     };
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
             QbitAction::SetListenPort { cookie, port } => {
@@ -111,11 +99,7 @@ impl Shell for QbitShell {
                             reason: format!("port sync failed (status {code})"),
                         },
                     };
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
             QbitAction::ListTorrents { cookie } => {
@@ -136,9 +120,8 @@ impl Shell for QbitShell {
                             seen_at: now,
                         })
                         .collect();
-                    let _ = tx.send(Timed::external(
+                    let _ = tx.send(Timed::from_dispatch(
                         std::time::Instant::now(),
-                        ExternalCause::Unknown,
                         QbitEvent::TorrentsListed { torrents },
                     ));
                 });
@@ -193,11 +176,7 @@ impl Shell for QbitShell {
                         },
                         |hash| QbitEvent::TorrentAdded { mam_id, hash },
                     );
-                    let _ = tx.send(Timed::external(
-                        std::time::Instant::now(),
-                        ExternalCause::Unknown,
-                        event,
-                    ));
+                    let _ = tx.send(Timed::from_dispatch(std::time::Instant::now(), event));
                 });
             }
             QbitAction::ScheduleTimer { timer, after } => {
