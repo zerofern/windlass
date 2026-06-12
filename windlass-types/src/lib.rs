@@ -137,6 +137,9 @@ impl NullHttpTap {
 
 // ── IPs ──────────────────────────────────────────────────────────────────────
 
+/// Deliberately IPv4-only: MAM does not support IPv6, so an IPv6 exit
+/// IP is never a valid value to observe, verify, or register anywhere
+/// this type flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnIp(pub Ipv4Addr);
 

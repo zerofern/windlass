@@ -248,9 +248,8 @@ pub(super) async fn init_shell(
     // Disconnected/etc. drive the same downstream paths Gluetun-
     // sourced events do today.
     // Read + parse wg.conf exactly once when tunnel mode is enabled.
-    // We keep the tunnel interface address only for diagnostics/legacy
-    // bridge shape; compliance publishes must come from the real
-    // exit-IP query.
+    // Compliance publishes must come from the real exit-IP query —
+    // never the tunnel interface address from wg.conf.
     let (tunnel_handles_opt, tunnel_bridge_rx) = if let Some(wg_path) =
         config.wg_config_path.clone()
     {
@@ -262,11 +261,6 @@ pub(super) async fn init_shell(
         let peer_count_raw = wg.peers.len();
         let peer_count = windlass_tunnel_core::PeerCount::try_new(peer_count_raw)
             .map_err(|e| anyhow::anyhow!("wg.conf must have at least one [Peer] section: {e}"))?;
-        let tunnel_inside_ip: Option<windlass_types::VpnIp> =
-            wg.interface.addresses.iter().find_map(|a| match a.ip {
-                std::net::IpAddr::V4(v4) => Some(windlass_types::VpnIp(v4)),
-                std::net::IpAddr::V6(_) => None,
-            });
         let natpmp_gateway = config
             .natpmp_gateway
             .parse()
@@ -283,7 +277,6 @@ pub(super) async fn init_shell(
                 interface_name: config.wg_interface_name.clone(),
                 natpmp_gateway,
                 natpmp_timeout: Duration::from_secs(2),
-                natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
                 natpmp_lifetime_seconds: 60,
                 exit_ip_urls: vec![
                     "https://api.ipify.org".to_string(),
@@ -313,10 +306,7 @@ pub(super) async fn init_shell(
                 tunnel_pub_tx,
             ))
             .expect("tunnel pub subscription");
-        (
-            Some(tunnel_handles),
-            Some((tunnel_pub_rx, tunnel_inside_ip)),
-        )
+        (Some(tunnel_handles), Some(tunnel_pub_rx))
     } else {
         info!("WG_CONFIG_PATH not set; tunnel mode disabled");
         (None, None)
@@ -503,21 +493,13 @@ pub(super) async fn init_shell(
     // and a clear-port hint that the runtime applies to the shared
     // forwarded_port arc so qBit stops trusting a port the tunnel no
     // longer holds.
-    if let Some((mut tunnel_pub_rx, tunnel_inside_ip)) = tunnel_bridge_rx {
+    if let Some(mut tunnel_pub_rx) = tunnel_bridge_rx {
         let vpn_event_tx_bridge = vpn_handles.events.clone();
         let domain_ev_tx_bridge = domain_handles.events.clone();
         let fp_for_bridge = Arc::clone(&forwarded_port);
         tokio::spawn(async move {
-            // Track the latest exit IP the tunnel core has reported.
-            // We thread it into every subsequent bridge call so a
-            // later TunnelPublish::Up uses the real exit IP for
-            // PublicIpObserved and LeakDetected file_ip synthesis.
-            let mut last_exit_ip: Option<windlass_types::VpnIp> = None;
             while let Some(envelope) = tunnel_pub_rx.recv().await {
-                if let TunnelPublish::ExitIpObserved { ip } = envelope.payload {
-                    last_exit_ip = Some(ip);
-                }
-                let out = bridge_tunnel_publish(&envelope.payload, tunnel_inside_ip, last_exit_ip);
+                let out = bridge_tunnel_publish(&envelope.payload);
                 for ev in out.vpn_events {
                     let _ = vpn_event_tx_bridge.send(Timed::from_publish(
                         std::time::Instant::now(),

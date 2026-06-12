@@ -77,6 +77,13 @@ impl NatPmpClient {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(NatPmpClientError::Bind)?;
+        // Connect so the kernel drops datagrams from any source
+        // other than the gateway — without this, anything that can
+        // reach our ephemeral port could forge a lease.
+        socket
+            .connect(gateway)
+            .await
+            .map_err(NatPmpClientError::Bind)?;
         Ok(Self {
             socket,
             gateway,
@@ -87,6 +94,13 @@ impl NatPmpClient {
     }
 
     /// Sends one NAT-PMP request and awaits the matching response.
+    ///
+    /// Datagrams that don't answer *this* request — malformed bytes,
+    /// or a well-formed response/error for the other protocol or a
+    /// different internal port (stale answers to an earlier request)
+    /// — are ignored and the wait continues until the deadline, per
+    /// RFC 6886 §3.2.  Adopting the first 16 bytes that arrived
+    /// (the previous behavior) could assign a wrong lease.
     ///
     /// # Errors
     ///
@@ -105,34 +119,55 @@ impl NatPmpClient {
                 },
             )
             .await;
-        self.socket
-            .send_to(&bytes, self.gateway)
-            .await
-            .map_err(|source| {
-                self.emit_exchange(&url, &bytes, &[], None);
-                NatPmpClientError::Send {
-                    gateway: self.gateway,
-                    source,
-                }
-            })?;
+        self.socket.send(&bytes).await.map_err(|source| {
+            self.emit_exchange(&url, &bytes, &[], None);
+            NatPmpClientError::Send {
+                gateway: self.gateway,
+                source,
+            }
+        })?;
 
-        let mut buf = [0u8; 16];
-        match tokio::time::timeout(self.request_timeout, self.socket.recv(&mut buf)).await {
-            Err(_) => {
-                self.emit_exchange(&url, &bytes, &[], Some("timeout"));
-                Err(NatPmpClientError::Timeout {
-                    gateway: self.gateway,
-                    timeout: self.request_timeout,
-                })
-            }
-            Ok(Err(e)) => {
-                self.emit_exchange(&url, &bytes, &[], Some("recv-error"));
-                Err(NatPmpClientError::Recv(e))
-            }
-            Ok(Ok(n)) => {
-                let response_bytes = &buf[..n];
-                self.emit_exchange(&url, &bytes, response_bytes, None);
-                Ok(NatPmpLease::decode(response_bytes)?)
+        // Oversized so a too-long datagram fails the codec's length
+        // check instead of being silently truncated to a valid 16.
+        let mut buf = [0u8; 64];
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, self.socket.recv(&mut buf)).await {
+                Err(_) => {
+                    self.emit_exchange(&url, &bytes, &[], Some("timeout"));
+                    return Err(NatPmpClientError::Timeout {
+                        gateway: self.gateway,
+                        timeout: self.request_timeout,
+                    });
+                }
+                Ok(Err(e)) => {
+                    self.emit_exchange(&url, &bytes, &[], Some("recv-error"));
+                    return Err(NatPmpClientError::Recv(e));
+                }
+                Ok(Ok(n)) => {
+                    let response_bytes = &buf[..n];
+                    match NatPmpLease::decode(response_bytes) {
+                        Ok(lease) if lease.matches_request(&req) => {
+                            self.emit_exchange(&url, &bytes, response_bytes, None);
+                            return Ok(lease);
+                        }
+                        // A gateway error for the protocol we asked
+                        // about is a real answer; surface it.
+                        Err(e @ NatPmpDecodeError::ErrorCode { protocol, .. })
+                            if protocol == req.protocol =>
+                        {
+                            self.emit_exchange(&url, &bytes, response_bytes, None);
+                            return Err(e.into());
+                        }
+                        // Anything else is noise on the socket:
+                        // stale answer for another request, or a
+                        // malformed datagram.  Log it to the tap and
+                        // keep waiting for the real response.
+                        Ok(_) | Err(_) => {
+                            self.emit_exchange(&url, &bytes, response_bytes, Some("ignored"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -182,7 +217,6 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
     use windlass_tunnel_core::natpmp::Protocol;
 
     /// Drives [`NatPmpClient`] against a local UDP fake that
@@ -236,11 +270,65 @@ mod tests {
         assert_eq!(lease.lifetime_seconds, 60);
     }
 
+    /// A wrong-protocol datagram (e.g. the duplicate answer to an
+    /// earlier UDP request arriving while we wait on the TCP one)
+    /// must be ignored, and the wait must continue until the real
+    /// response lands.
+    #[tokio::test]
+    async fn stale_response_for_other_protocol_is_ignored() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway = server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut req_buf = [0u8; 12];
+            let (_n, peer) = server.recv_from(&mut req_buf).await.unwrap();
+            let mut resp = [0u8; 16];
+            resp[0] = 0;
+            resp[2..4].copy_from_slice(&0u16.to_be_bytes());
+            resp[4..8].copy_from_slice(&7u32.to_be_bytes());
+            resp[8..10].copy_from_slice(&req_buf[4..6]);
+            resp[12..16].copy_from_slice(&60u32.to_be_bytes());
+            // First: a success response for the OTHER protocol with
+            // a tempting port the client must not adopt.
+            resp[1] = 0x80 | if req_buf[1] == 2 { 1 } else { 2 };
+            resp[10..12].copy_from_slice(&1111u16.to_be_bytes());
+            server.send_to(&resp, peer).await.unwrap();
+            // Then the real answer.
+            resp[1] = 0x80 | req_buf[1];
+            resp[10..12].copy_from_slice(&2222u16.to_be_bytes());
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let client = NatPmpClient::new(
+            gateway,
+            Duration::from_secs(2),
+            CoreId::Tunnel,
+            windlass_types::NullHttpTap::arc(),
+        )
+        .await
+        .expect("local bind succeeds");
+        let lease = client
+            .request(NatPmpRequest {
+                protocol: Protocol::Tcp,
+                internal_port: 0,
+                external_port_hint: 0,
+                lifetime_seconds: 60,
+            })
+            .await
+            .expect("matching response should win");
+        assert_eq!(lease.external_port, 2222);
+        assert_eq!(lease.protocol, Protocol::Tcp);
+    }
+
     #[tokio::test]
     async fn timeout_fires_when_gateway_silent() {
-        // Pick an address that won't respond.  We don't bind a fake
-        // server so the recv side will time out.
-        let gateway = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        // A bound-but-silent fake gateway: the request is consumed
+        // and never answered, so the deadline must fire.  (An
+        // unbound port no longer works for this test — the connected
+        // socket surfaces ICMP port-unreachable as a Recv error.)
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway = server.local_addr().unwrap();
+        let _hold = server; // keep the port bound, never respond
         let client = NatPmpClient::new(
             gateway,
             Duration::from_millis(50),

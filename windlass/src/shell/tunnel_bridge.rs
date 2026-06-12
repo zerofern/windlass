@@ -43,24 +43,24 @@ pub(super) const fn wrap_publish_for_domain(publish: VpnPublish) -> WindlassEven
 }
 
 /// Map one [`TunnelPublish`] to the downstream signals the runtime
-/// should produce. `exit_ip` is the latest public exit IP the tunnel
-/// core knows (from `TunnelPublish::ExitIpObserved` after the shell's
-/// HTTP query). The tunnel interface address from `wg.conf` is never a
-/// valid substitute for the public IP MAM/domain care about.
+/// should produce.  Stateless: the publishes that need the public
+/// exit IP (`Up` / `Recovered` / `LeakDetected`) carry it from the
+/// tunnel core, which owns that fact — the bridge holding its own
+/// copy was a second source of truth that could drift.  The tunnel
+/// interface address from `wg.conf` is never a valid substitute for
+/// the public IP MAM/domain care about.
 #[must_use]
-pub(super) fn bridge_tunnel_publish(
-    publish: &TunnelPublish,
-    _tunnel_inside_ip: Option<VpnIp>,
-    exit_ip: Option<VpnIp>,
-) -> TunnelBridgeOutput {
+pub(super) fn bridge_tunnel_publish(publish: &TunnelPublish) -> TunnelBridgeOutput {
     match publish {
-        TunnelPublish::Up | TunnelPublish::Recovered => TunnelBridgeOutput {
-            vpn_events: vec![VpnEvent::ContainerHealthy],
-            vpn_publishes: exit_ip
-                .map(|ip| vec![VpnPublish::PublicIpObserved { ip }])
-                .unwrap_or_default(),
-            clear_forwarded_port: false,
-        },
+        TunnelPublish::Up { exit_ip } | TunnelPublish::Recovered { exit_ip } => {
+            TunnelBridgeOutput {
+                vpn_events: vec![VpnEvent::ContainerHealthy],
+                vpn_publishes: exit_ip
+                    .map(|ip| vec![VpnPublish::PublicIpObserved { ip }])
+                    .unwrap_or_default(),
+                clear_forwarded_port: false,
+            }
+        }
         TunnelPublish::Down { .. } | TunnelPublish::Stuck { .. } => TunnelBridgeOutput {
             vpn_events: vec![VpnEvent::ContainerUnhealthy],
             vpn_publishes: vec![VpnPublish::PublicIpUnavailable],
@@ -69,7 +69,9 @@ pub(super) fn bridge_tunnel_publish(
             clear_forwarded_port: true,
         },
         TunnelPublish::LeakDetected {
-            observed_remote, ..
+            observed_remote,
+            exit_ip,
+            ..
         } => {
             // file_ip = the last public exit IP we trusted.
             // verified_ip = what we actually reached the leak target as,
@@ -154,20 +156,18 @@ mod tests {
     }
 
     #[test]
-    fn up_with_only_inside_ip_does_not_publish_observed() {
-        let out = bridge_tunnel_publish(&TunnelPublish::Up, Some(ip("10.2.0.2")), None);
+    fn up_without_exit_ip_does_not_publish_observed() {
+        let out = bridge_tunnel_publish(&TunnelPublish::Up { exit_ip: None });
         assert_eq!(out.vpn_events, vec![VpnEvent::ContainerHealthy]);
         assert!(out.vpn_publishes.is_empty());
         assert!(!out.clear_forwarded_port);
     }
 
     #[test]
-    fn up_with_exit_ip_prefers_exit_over_inside() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::Up,
-            Some(ip("10.2.0.2")),
-            Some(ip("203.0.113.10")),
-        );
+    fn up_with_exit_ip_publishes_observed() {
+        let out = bridge_tunnel_publish(&TunnelPublish::Up {
+            exit_ip: Some(ip("203.0.113.10")),
+        });
         assert_eq!(
             out.vpn_publishes,
             vec![VpnPublish::PublicIpObserved {
@@ -178,11 +178,9 @@ mod tests {
 
     #[test]
     fn recovered_publishes_observed_same_as_up() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::Recovered,
-            Some(ip("10.2.0.2")),
-            Some(ip("203.0.113.10")),
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::Recovered {
+            exit_ip: Some(ip("203.0.113.10")),
+        });
         assert!(out.vpn_publishes.iter().any(|p| matches!(
             p,
             VpnPublish::PublicIpObserved { ip } if *ip == self::ip("203.0.113.10")
@@ -191,14 +189,10 @@ mod tests {
 
     #[test]
     fn down_clears_forwarded_port_and_publishes_unavailable() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::Down {
-                reason: "test".into(),
-                since: chrono::Utc::now(),
-            },
-            Some(ip("10.2.0.2")),
-            None,
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::Down {
+            reason: "test".into(),
+            since: chrono::Utc::now(),
+        });
         assert_eq!(out.vpn_events, vec![VpnEvent::ContainerUnhealthy]);
         assert_eq!(out.vpn_publishes, vec![VpnPublish::PublicIpUnavailable]);
         assert!(out.clear_forwarded_port);
@@ -206,15 +200,11 @@ mod tests {
 
     #[test]
     fn stuck_publishes_unhealthy_and_unavailable() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::Stuck {
-                reason: "test".into(),
-                since: chrono::Utc::now(),
-                attempted_recoveries: 3,
-            },
-            Some(ip("10.2.0.2")),
-            None,
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::Stuck {
+            reason: "test".into(),
+            since: chrono::Utc::now(),
+            attempted_recoveries: 3,
+        });
         assert_eq!(out.vpn_events, vec![VpnEvent::ContainerUnhealthy]);
         assert_eq!(out.vpn_publishes, vec![VpnPublish::PublicIpUnavailable]);
         assert!(out.clear_forwarded_port);
@@ -222,14 +212,11 @@ mod tests {
 
     #[test]
     fn leak_detected_flips_admission_gate_and_clears_port() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::LeakDetected {
-                interface: "eth0".into(),
-                observed_remote: "203.0.113.1".into(),
-            },
-            Some(ip("10.2.0.2")),
-            None,
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::LeakDetected {
+            interface: "eth0".into(),
+            observed_remote: "203.0.113.1".into(),
+            exit_ip: None,
+        });
         assert_eq!(out.vpn_events, vec![VpnEvent::ContainerUnhealthy]);
         assert!(
             matches!(
@@ -244,7 +231,7 @@ mod tests {
     #[test]
     fn port_ready_feeds_vpn_event() {
         let port = VpnPort::try_new(51820).unwrap();
-        let out = bridge_tunnel_publish(&TunnelPublish::PortReady { port }, None, None);
+        let out = bridge_tunnel_publish(&TunnelPublish::PortReady { port });
         assert_eq!(out.vpn_events, vec![VpnEvent::PortFileChanged { port }]);
         assert!(out.vpn_publishes.is_empty());
         assert!(!out.clear_forwarded_port);
@@ -255,7 +242,7 @@ mod tests {
     /// against a port the tunnel no longer held.
     #[test]
     fn port_unavailable_clears_arc_and_publishes_unavailable() {
-        let out = bridge_tunnel_publish(&TunnelPublish::PortUnavailable, None, None);
+        let out = bridge_tunnel_publish(&TunnelPublish::PortUnavailable);
         assert!(out.vpn_events.is_empty());
         assert_eq!(out.vpn_publishes, vec![VpnPublish::PortUnavailable]);
         assert!(out.clear_forwarded_port);
@@ -268,14 +255,10 @@ mod tests {
     /// IP yet).
     #[test]
     fn exit_ip_degraded_routes_to_public_ip_verification_degraded_warning() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::ExitIpVerificationDegraded {
-                consecutive_failures: 5,
-                last_reason: "ifconfig.co 503".into(),
-            },
-            None,
-            None,
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::ExitIpVerificationDegraded {
+            consecutive_failures: 5,
+            last_reason: "ifconfig.co 503".into(),
+        });
         assert!(out.vpn_events.is_empty());
         assert_eq!(out.vpn_publishes.len(), 1);
         match &out.vpn_publishes[0] {
@@ -297,11 +280,7 @@ mod tests {
     #[test]
     fn exit_ip_observed_routes_to_public_ip_observed() {
         let exit = ip("203.0.113.5");
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::ExitIpObserved { ip: exit },
-            Some(ip("10.2.0.2")),
-            Some(exit),
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::ExitIpObserved { ip: exit });
         assert_eq!(
             out.vpn_publishes,
             vec![VpnPublish::PublicIpObserved { ip: exit }]
@@ -313,14 +292,11 @@ mod tests {
     /// `PublicIpMismatch` (M4 review fix).
     #[test]
     fn leak_detected_threads_observed_remote_into_verified_ip() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::LeakDetected {
-                interface: "eth0".into(),
-                observed_remote: "203.0.113.1:443".into(),
-            },
-            Some(ip("10.2.0.2")),
-            None,
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::LeakDetected {
+            interface: "eth0".into(),
+            observed_remote: "203.0.113.1:443".into(),
+            exit_ip: None,
+        });
         // "host:port" doesn't parse as a bare IpAddr — should fall
         // back to UNSPECIFIED (no leak parsing this time).
         let unspec = VpnIp(std::net::Ipv4Addr::UNSPECIFIED);
@@ -336,17 +312,31 @@ mod tests {
     /// should narrow it through `VpnIp::from_ip` and surface it.
     #[test]
     fn leak_detected_with_bare_ip_surfaces_concrete_verified_ip() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::LeakDetected {
-                interface: "eth0".into(),
-                observed_remote: "203.0.113.1".into(),
-            },
-            Some(ip("10.2.0.2")),
-            None,
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::LeakDetected {
+            interface: "eth0".into(),
+            observed_remote: "203.0.113.1".into(),
+            exit_ip: None,
+        });
         match &out.vpn_publishes[0] {
             VpnPublish::PublicIpMismatch { verified_ip, .. } => {
                 assert_eq!(*verified_ip, ip("203.0.113.1"));
+            }
+            other => panic!("expected PublicIpMismatch, got {other:?}"),
+        }
+    }
+
+    /// The exit IP carried on the publish (owned by the tunnel
+    /// core) must land as the mismatch's `file_ip`.
+    #[test]
+    fn leak_detected_uses_carried_exit_ip_as_file_ip() {
+        let out = bridge_tunnel_publish(&TunnelPublish::LeakDetected {
+            interface: "eth0".into(),
+            observed_remote: "203.0.113.1".into(),
+            exit_ip: Some(ip("198.51.100.20")),
+        });
+        match &out.vpn_publishes[0] {
+            VpnPublish::PublicIpMismatch { file_ip, .. } => {
+                assert_eq!(*file_ip, ip("198.51.100.20"));
             }
             other => panic!("expected PublicIpMismatch, got {other:?}"),
         }
@@ -356,14 +346,10 @@ mod tests {
     /// failure threshold must clear the cached forwarded port.
     #[test]
     fn port_forwarding_degraded_clears_arc_and_publishes_unavailable() {
-        let out = bridge_tunnel_publish(
-            &TunnelPublish::PortForwardingDegraded {
-                consecutive_failures: 3,
-                last_reason: "timeout".into(),
-            },
-            None,
-            None,
-        );
+        let out = bridge_tunnel_publish(&TunnelPublish::PortForwardingDegraded {
+            consecutive_failures: 3,
+            last_reason: "timeout".into(),
+        });
         assert!(out.vpn_events.is_empty());
         assert_eq!(out.vpn_publishes, vec![VpnPublish::PortUnavailable]);
         assert!(out.clear_forwarded_port);

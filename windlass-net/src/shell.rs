@@ -18,7 +18,7 @@ use windlass_machine::{ExternalCause, Shell, Timed};
 use windlass_tunnel_core::config::{Endpoint, PeerConfig, WgConfig};
 use windlass_tunnel_core::{
     ExitIpFailure, FirewallInstallFailure, InterfaceConfigureFailure, NatPmpFailure, NatPmpRequest,
-    TunnelAction, TunnelEvent,
+    TunnelAction, TunnelEvent, TunnelTimer,
 };
 
 use crate::natpmp::NatPmpClientError;
@@ -48,10 +48,6 @@ pub struct TunnelShellConfig {
     pub natpmp_gateway: SocketAddr,
     /// Per-request NAT-PMP timeout.  Default 2 s.
     pub natpmp_timeout: Duration,
-    /// NAT-PMP transport (UDP vs TCP).  `ProtonVPN` uses TCP; some
-    /// providers prefer UDP.  Defaults to TCP.  Previously hard-
-    /// coded in `spawn_request_natpmp`.
-    pub natpmp_protocol: windlass_tunnel_core::natpmp::Protocol,
     /// Lifetime requested from the NAT-PMP gateway, in seconds.
     /// Defaults to 60 (`ProtonVPN` caps at 60 regardless).
     pub natpmp_lifetime_seconds: u32,
@@ -91,7 +87,6 @@ impl TunnelShellConfig {
             interface_name: "wg0".to_string(),
             natpmp_gateway: "10.2.0.1:5351".parse().expect("static literal"),
             natpmp_timeout: Duration::from_secs(2),
-            natpmp_protocol: windlass_tunnel_core::natpmp::Protocol::Tcp,
             natpmp_lifetime_seconds: 60,
             exit_ip_urls: DEFAULT_EXIT_IP_URLS
                 .iter()
@@ -123,6 +118,12 @@ pub struct TunnelShell {
     /// Shared HTTP client for the exit-IP query.  Built once at
     /// shell-construction so we don't re-handshake TLS every 6h.
     http: reqwest::Client,
+    /// Pending sleep task per timer id.  `ScheduleTimer` has replace
+    /// semantics (see the action's doc): re-scheduling a pending
+    /// timer aborts the old sleep, so re-armed chains (duplicate
+    /// `FirewallInstalled`, operator commands racing the periodic
+    /// chains) can never stack a second self-perpetuating chain.
+    timers: std::collections::HashMap<TunnelTimer, tokio::task::AbortHandle>,
 }
 
 impl Shell for TunnelShell {
@@ -141,6 +142,7 @@ impl Shell for TunnelShell {
             runner,
             natpmp: Arc::new(tokio::sync::OnceCell::new()),
             http,
+            timers: std::collections::HashMap::new(),
         }
     }
 
@@ -194,7 +196,7 @@ impl Shell for TunnelShell {
                 // timer so the observability layer can render the
                 // timer as the external cause of the next step.
                 let tx = event_tx.clone();
-                windlass_machine::causal::spawn(async move {
+                let handle = windlass_machine::causal::spawn(async move {
                     let scheduled_at = std::time::Instant::now() + after;
                     tokio::time::sleep(after).await;
                     let _ = tx.send(Timed::external(
@@ -203,6 +205,13 @@ impl Shell for TunnelShell {
                         TunnelEvent::TimerFired(timer),
                     ));
                 });
+                // Replace semantics: at most one pending sleep per
+                // timer id.  Aborting a task that already fired is a
+                // no-op, so the race with an in-flight TimerFired is
+                // harmless.
+                if let Some(prev) = self.timers.insert(timer, handle.abort_handle()) {
+                    prev.abort();
+                }
             }
         }
     }
@@ -383,7 +392,7 @@ fn natpmp_failure(err: &NatPmpClientError) -> NatPmpFailure {
         NatPmpClientError::Timeout { .. } => NatPmpFailure::Timeout,
         NatPmpClientError::Recv(e) => NatPmpFailure::Recv(e.to_string()),
         NatPmpClientError::Decode(decode) => match decode {
-            windlass_tunnel_core::NatPmpDecodeError::ErrorCode(code) => {
+            windlass_tunnel_core::NatPmpDecodeError::ErrorCode { code, .. } => {
                 NatPmpFailure::GatewayError {
                     code: u16::from_be_bytes(code_to_be_u16(*code)),
                 }
@@ -669,7 +678,6 @@ fn spawn_request_natpmp(
     let gateway = config.natpmp_gateway;
     let timeout = config.natpmp_timeout;
     let tap = config.tap();
-    let protocol = config.natpmp_protocol;
     let lifetime = config.natpmp_lifetime_seconds;
     windlass_machine::causal::spawn(async move {
         // OnceCell::get_or_try_init persists the NAT-PMP client across
@@ -694,29 +702,75 @@ fn spawn_request_natpmp(
                 return;
             }
         };
-        let req = NatPmpRequest {
-            protocol,
-            internal_port: 0,
-            external_port_hint: 0,
-            lifetime_seconds: lifetime,
+        // `BitTorrent` needs the forwarded port reachable over both
+        // protocols (TCP for peer connections, UDP for DHT/uTP), so
+        // map both — the standard `ProtonVPN` natpmpc loop does the
+        // same.  Both must land on the same external port to be
+        // usable; the gateway grants that in practice because the
+        // requests share the wildcard internal port.
+        let request_for = |protocol| {
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .request(NatPmpRequest {
+                        protocol,
+                        internal_port: 0,
+                        external_port_hint: 0,
+                        lifetime_seconds: lifetime,
+                    })
+                    .await
+            }
         };
-        match client.request(req).await {
-            Ok(lease) => send_event(
-                &tx,
-                TunnelEvent::NatPmpLeaseGranted {
-                    external_port: lease.external_port,
-                    lifetime_seconds: lease.lifetime_seconds,
-                    epoch_seconds: lease.epoch_seconds,
-                },
-            ),
-            Err(e) => send_event(
-                &tx,
-                TunnelEvent::NatPmpFailed {
-                    reason: natpmp_failure(&e),
-                },
-            ),
-        }
+        let udp = match request_for(windlass_tunnel_core::natpmp::Protocol::Udp).await {
+            Ok(lease) => lease,
+            Err(e) => {
+                send_event(
+                    &tx,
+                    TunnelEvent::NatPmpFailed {
+                        reason: natpmp_failure(&e),
+                    },
+                );
+                return;
+            }
+        };
+        let tcp = match request_for(windlass_tunnel_core::natpmp::Protocol::Tcp).await {
+            Ok(lease) => lease,
+            Err(e) => {
+                send_event(
+                    &tx,
+                    TunnelEvent::NatPmpFailed {
+                        reason: natpmp_failure(&e),
+                    },
+                );
+                return;
+            }
+        };
+        send_event(&tx, merge_dual_lease(&udp, &tcp));
     });
+}
+
+/// Folds the UDP + TCP leases of one dual-mapping round into a
+/// single event.  A split grant (different external ports) is
+/// unusable for `BitTorrent`, so it surfaces as a failure and the
+/// normal retry/backoff path takes over.  The merged lease renews on
+/// the shorter lifetime and reports the newer epoch.
+fn merge_dual_lease(
+    udp: &windlass_tunnel_core::NatPmpLease,
+    tcp: &windlass_tunnel_core::NatPmpLease,
+) -> TunnelEvent {
+    if udp.external_port != tcp.external_port {
+        return TunnelEvent::NatPmpFailed {
+            reason: NatPmpFailure::PortMismatch {
+                udp_port: udp.external_port,
+                tcp_port: tcp.external_port,
+            },
+        };
+    }
+    TunnelEvent::NatPmpLeaseGranted {
+        external_port: tcp.external_port,
+        lifetime_seconds: udp.lifetime_seconds.min(tcp.lifetime_seconds),
+        epoch_seconds: udp.epoch_seconds.max(tcp.epoch_seconds),
+    }
 }
 
 fn spawn_query_exit_ip(
@@ -920,6 +974,54 @@ Endpoint = 198.51.100.7:51820
         let wg = WgConfig::parse(VALID_CONFIG, EndpointResolutionPolicy::RequireIpLiteral)
             .expect("test config parses");
         TunnelShellConfig::new(wg)
+    }
+
+    #[test]
+    fn dual_lease_merge_requires_matching_ports() {
+        use windlass_tunnel_core::NatPmpLease;
+        use windlass_tunnel_core::natpmp::Protocol;
+        let udp = NatPmpLease {
+            protocol: Protocol::Udp,
+            epoch_seconds: 100,
+            internal_port: 0,
+            external_port: 42000,
+            lifetime_seconds: 60,
+        };
+        let tcp = NatPmpLease {
+            protocol: Protocol::Tcp,
+            epoch_seconds: 105,
+            internal_port: 0,
+            external_port: 42000,
+            lifetime_seconds: 45,
+        };
+        // Same port: granted, renewing on the shorter lifetime and
+        // reporting the newer epoch.
+        match merge_dual_lease(&udp, &tcp) {
+            TunnelEvent::NatPmpLeaseGranted {
+                external_port,
+                lifetime_seconds,
+                epoch_seconds,
+            } => {
+                assert_eq!(external_port, 42000);
+                assert_eq!(lifetime_seconds, 45);
+                assert_eq!(epoch_seconds, 105);
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+        // Split grant: unusable for BitTorrent → typed failure.
+        let tcp_split = NatPmpLease {
+            external_port: 43000,
+            ..tcp
+        };
+        match merge_dual_lease(&udp, &tcp_split) {
+            TunnelEvent::NatPmpFailed {
+                reason: NatPmpFailure::PortMismatch { udp_port, tcp_port },
+            } => {
+                assert_eq!(udp_port, 42000);
+                assert_eq!(tcp_port, 43000);
+            }
+            other => panic!("expected PortMismatch, got {other:?}"),
+        }
     }
 
     #[test]

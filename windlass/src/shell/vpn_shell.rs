@@ -150,6 +150,11 @@ async fn poll_legacy_files(
 ) {
     let mut last_ip: Option<Option<VpnIp>> = None;
     let mut last_port: Option<Option<VpnPort>> = None;
+    // Rising-edge gate for port read errors: surface the first
+    // failure of a streak as `StateReadFailed` (so the machine
+    // reacts), then stay quiet until the file reads again — the
+    // 1 s cadence would otherwise storm the retry timer and logs.
+    let mut port_read_errored = false;
 
     loop {
         let ip = read_legacy_ip(&vpn_ip_file).await;
@@ -161,12 +166,35 @@ async fn poll_legacy_files(
             last_ip = Some(ip);
         }
 
-        let port = read_legacy_port(&vpn_port_file).await.ok().flatten();
-        if last_port != Some(port) {
-            if let Some(port) = port {
-                send_event(&tx, VpnEvent::PortFileChanged { port });
+        match read_legacy_port(&vpn_port_file).await {
+            Ok(port) => {
+                port_read_errored = false;
+                if last_port != Some(port) {
+                    match port {
+                        Some(port) => send_event(&tx, VpnEvent::PortFileChanged { port }),
+                        // Readable but unparseable content is an
+                        // error too — mirroring `read_legacy_files`
+                        // — not a silent no-op that leaves the
+                        // machine trusting a stale port.
+                        None => send_event(
+                            &tx,
+                            VpnEvent::StateReadFailed {
+                                reason: format!("invalid VPN port file `{vpn_port_file}`"),
+                            },
+                        ),
+                    }
+                    last_port = Some(port);
+                }
             }
-            last_port = Some(port);
+            Err(reason) => {
+                if !port_read_errored {
+                    send_event(&tx, VpnEvent::StateReadFailed { reason });
+                    port_read_errored = true;
+                }
+                // Forget the last good value so the file coming back
+                // with the same port still re-fires `PortFileChanged`.
+                last_port = None;
+            }
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;

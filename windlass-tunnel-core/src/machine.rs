@@ -107,13 +107,6 @@ pub struct TunnelConfig {
     /// Default 6 h.  This is what `TunnelPublish::ExitIpObserved`
     /// surfaces — the IP MAM sees us as.
     pub exit_ip_query_interval: Duration,
-    /// NAT-PMP protocol (UDP vs TCP) for the periodic port-map
-    /// request.  `ProtonVPN` expects TCP; some providers prefer UDP.
-    pub natpmp_protocol: crate::natpmp::Protocol,
-    /// Lifetime in seconds requested from the NAT-PMP gateway.
-    /// `ProtonVPN` caps at 60 s regardless; making this configurable
-    /// lets non-Proton providers tune it.
-    pub natpmp_lifetime_seconds: u32,
 }
 
 impl Default for TunnelConfig {
@@ -129,8 +122,6 @@ impl Default for TunnelConfig {
             natpmp_failure_threshold: NatPmpFailureThreshold::try_new(3).expect("default"),
             exit_ip_failure_threshold: NatPmpFailureThreshold::try_new(3).expect("default"),
             exit_ip_query_interval: Duration::from_hours(6),
-            natpmp_protocol: crate::natpmp::Protocol::Tcp,
-            natpmp_lifetime_seconds: 60,
         }
     }
 }
@@ -298,6 +289,10 @@ pub enum NatPmpFailure {
     GatewayError { code: u16 },
     /// Response was malformed (wrong length, version, op).
     MalformedResponse(String),
+    /// The gateway granted the UDP and TCP mappings on different
+    /// external ports.  `BitTorrent` needs both protocols forwarded
+    /// on the same port, so a split grant is unusable.
+    PortMismatch { udp_port: u16, tcp_port: u16 },
 }
 
 impl std::fmt::Display for NatPmpFailure {
@@ -309,6 +304,10 @@ impl std::fmt::Display for NatPmpFailure {
             Self::Recv(s) => write!(f, "NAT-PMP recv: {s}"),
             Self::GatewayError { code } => write!(f, "NAT-PMP gateway error code {code}"),
             Self::MalformedResponse(s) => write!(f, "NAT-PMP malformed response: {s}"),
+            Self::PortMismatch { udp_port, tcp_port } => write!(
+                f,
+                "NAT-PMP gateway granted UDP port {udp_port} but TCP port {tcp_port}"
+            ),
         }
     }
 }
@@ -333,7 +332,7 @@ pub enum LeakProbeOutcome {
     Inconclusive { reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TunnelTimer {
     /// Re-poll the kernel for the latest handshake.
     HandshakeWatchdog,
@@ -399,7 +398,11 @@ pub enum TunnelAction {
     /// [`TunnelEvent::ExitIpObserved`] or
     /// [`TunnelEvent::ExitIpQueryFailed`].
     QueryExitIp,
-    /// Schedule a timer to fire after the given duration.
+    /// Schedule a timer to fire after the given duration.  Replace
+    /// semantics: scheduling a timer whose id is already pending
+    /// cancels the pending one, so re-arming a chain (duplicate
+    /// `FirewallInstalled`, operator commands racing the periodic
+    /// chains) can never stack a second chain on top of the first.
     ScheduleTimer { timer: TunnelTimer, after: Duration },
 }
 
@@ -409,8 +412,12 @@ pub enum TunnelAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunnelPublish {
     /// Tunnel transitioned to healthy.  Rising-edge only — re-observing
-    /// a healthy handshake is a no-op for the publish.
-    Up,
+    /// a healthy handshake is a no-op for the publish.  Carries the
+    /// last exit IP the core knows (if any) so consumers can restore
+    /// the public-IP fact without holding their own copy of it.
+    Up {
+        exit_ip: Option<windlass_types::VpnIp>,
+    },
     /// Tunnel transitioned to unhealthy.  Rising-edge only.
     Down {
         reason: String,
@@ -424,8 +431,11 @@ pub enum TunnelPublish {
         attempted_recoveries: u32,
     },
     /// Tunnel recovered from `Stuck` (e.g. operator forced a re-handshake
-    /// and it took).  Rising-edge only.
-    Recovered,
+    /// and it took).  Rising-edge only.  Carries the last exit IP for
+    /// the same reason as [`TunnelPublish::Up`].
+    Recovered {
+        exit_ip: Option<windlass_types::VpnIp>,
+    },
     /// A forwarded port is available.  Fires on initial grant and on
     /// any port change.  qBit's listen port sync consumes this.
     PortReady { port: VpnPort },
@@ -434,9 +444,12 @@ pub enum TunnelPublish {
     PortUnavailable,
     /// The leak probe found a non-tunnel egress.  This is a `Critical`
     /// alert — the kill switch did not protect us as expected.
+    /// `exit_ip` is the last exit IP the core trusted before the leak,
+    /// so the bridge can synthesize the mismatch fact statelessly.
     LeakDetected {
         interface: String,
         observed_remote: String,
+        exit_ip: Option<windlass_types::VpnIp>,
     },
     /// Port forwarding has failed
     /// [`TunnelConfig::natpmp_failure_threshold`] times in a row.
@@ -474,7 +487,7 @@ pub enum TunnelTopic {
 impl HasTopic<TunnelTopic> for TunnelPublish {
     fn topic(&self) -> TunnelTopic {
         match self {
-            Self::Up | Self::Down { .. } | Self::Stuck { .. } | Self::Recovered => {
+            Self::Up { .. } | Self::Down { .. } | Self::Stuck { .. } | Self::Recovered { .. } => {
                 TunnelTopic::Health
             }
             Self::PortReady { .. }
@@ -585,12 +598,9 @@ pub struct TunnelMachine {
     /// Last public exit IP the shell reported via
     /// `TunnelEvent::ExitIpObserved`.  `None` until the first
     /// successful query.  Used for rising-edge dedup of
-    /// `TunnelPublish::ExitIpObserved`.
+    /// `TunnelPublish::ExitIpObserved` and threaded into the
+    /// health publishes so downstream bridges stay stateless.
     last_exit_ip: Option<windlass_types::VpnIp>,
-    /// Once true, the self-perpetuating `ExitIpQuery` timer chain
-    /// is running.  Armed on the firewall-installed transition so a
-    /// dropped event cannot kill the chain.
-    exit_ip_chain_scheduled: bool,
     /// Consecutive `ExitIpQueryFailed` events since the last success.
     /// Drives both the fast-retry backoff and the rising-edge
     /// `ExitIpVerificationDegraded` publish.
@@ -739,7 +749,6 @@ impl Machine for TunnelMachine {
             last_natpmp_epoch: None,
             port_degraded_published: false,
             last_exit_ip: None,
-            exit_ip_chain_scheduled: false,
             consecutive_exit_ip_failures: 0,
             exit_ip_degraded_published: false,
         }
@@ -815,7 +824,6 @@ impl Machine for TunnelMachine {
                     publishes.push(p);
                     self.port_published = true;
                 }
-                self.exit_ip_chain_scheduled = true;
                 Outcome {
                     actions: vec![
                         TunnelAction::PollHandshake {
@@ -872,16 +880,26 @@ impl Machine for TunnelMachine {
                 }
                 self.last_handshake_age_seconds = Some(age_seconds);
                 self.consecutive_stalls = 0;
+                // A healthy handshake ends the recovery episode: the
+                // full rotation budget is available again the next
+                // time the tunnel stalls.  Without this, rotations
+                // spent on long-resolved stalls (or manual commands)
+                // would eventually push a fresh stall straight to
+                // `Stuck`.
+                self.rotation_count = 0;
                 let was_up = matches!(self.health, TunnelHealth::Up);
                 let was_stuck = matches!(self.health, TunnelHealth::Stuck { .. });
                 self.health = TunnelHealth::Up;
                 let mut publishes = Vec::new();
                 if !was_up {
-                    publishes.push(TunnelPublish::Up);
+                    publishes.push(TunnelPublish::Up {
+                        exit_ip: self.last_exit_ip,
+                    });
                 }
                 if was_stuck {
-                    publishes.push(TunnelPublish::Recovered);
-                    self.rotation_count = 0;
+                    publishes.push(TunnelPublish::Recovered {
+                        exit_ip: self.last_exit_ip,
+                    });
                 }
                 // Publish a held-but-unpublished port now that
                 // preconditions are satisfied (this is the
@@ -952,15 +970,15 @@ impl Machine for TunnelMachine {
                 self.consecutive_natpmp_failures =
                     self.consecutive_natpmp_failures.saturating_add(1);
                 let mut publishes = Vec::new();
-                let crossed = !self.port_degraded_published
-                    && self.consecutive_natpmp_failures
-                        >= self.config.natpmp_failure_threshold.into_inner();
-                if crossed {
+                if degraded_edge_crossed(
+                    &mut self.port_degraded_published,
+                    self.consecutive_natpmp_failures,
+                    self.config.natpmp_failure_threshold.into_inner(),
+                ) {
                     publishes.push(TunnelPublish::PortForwardingDegraded {
                         consecutive_failures: self.consecutive_natpmp_failures,
                         last_reason: reason.to_string(),
                     });
-                    self.port_degraded_published = true;
                     if self.forwarded_port.take().is_some() {
                         // Only surface PortUnavailable to consumers
                         // if we had actually published the port to
@@ -994,6 +1012,7 @@ impl Machine for TunnelMachine {
                         publishes.push(TunnelPublish::LeakDetected {
                             interface: interface.clone(),
                             observed_remote: observed_remote.clone(),
+                            exit_ip: self.last_exit_ip,
                         });
                         // A leak is severe: take the health gate down
                         // immediately so admission falls closed.
@@ -1016,10 +1035,23 @@ impl Machine for TunnelMachine {
                 Outcome { actions, publishes }
             }
 
+            // Self-perpetuating: the watchdog reschedules itself on
+            // every fire.  Rescheduling on poll *results* instead
+            // (the previous design) killed the chain after the first
+            // healthy handshake, because the healthy path scheduled
+            // nothing.  The shell replaces a pending timer with the
+            // same id, so the stall path's reschedule cannot stack a
+            // second chain on top of this one.
             TunnelEvent::TimerFired(TunnelTimer::HandshakeWatchdog) => Outcome {
-                actions: vec![TunnelAction::PollHandshake {
-                    peer_index: self.active_peer_index,
-                }],
+                actions: vec![
+                    TunnelAction::PollHandshake {
+                        peer_index: self.active_peer_index,
+                    },
+                    TunnelAction::ScheduleTimer {
+                        timer: TunnelTimer::HandshakeWatchdog,
+                        after: self.config.handshake_poll_interval,
+                    },
+                ],
                 publishes: Vec::new(),
             },
             TunnelEvent::TimerFired(TunnelTimer::PortRenewal) => Outcome {
@@ -1070,15 +1102,15 @@ impl Machine for TunnelMachine {
                 self.consecutive_exit_ip_failures =
                     self.consecutive_exit_ip_failures.saturating_add(1);
                 let mut publishes = Vec::new();
-                let crossed = !self.exit_ip_degraded_published
-                    && self.consecutive_exit_ip_failures
-                        >= self.config.exit_ip_failure_threshold.into_inner();
-                if crossed {
+                if degraded_edge_crossed(
+                    &mut self.exit_ip_degraded_published,
+                    self.consecutive_exit_ip_failures,
+                    self.config.exit_ip_failure_threshold.into_inner(),
+                ) {
                     publishes.push(TunnelPublish::ExitIpVerificationDegraded {
                         consecutive_failures: self.consecutive_exit_ip_failures,
                         last_reason: reason.to_string(),
                     });
-                    self.exit_ip_degraded_published = true;
                 }
                 let backoff = exit_ip_retry_delay(
                     self.consecutive_exit_ip_failures,
@@ -1129,7 +1161,10 @@ impl Machine for TunnelMachine {
                     );
                 }
                 self.active_peer_index = self.next_peer_index();
-                self.rotation_count = self.rotation_count.saturating_add(1);
+                // Deliberately does NOT touch `rotation_count`: that
+                // budget bounds *automatic* stall recovery.  An
+                // operator-driven rotation must not spend it, or a
+                // later stall would hit `Stuck` early.
                 self.consecutive_stalls = 0;
                 Self::outcome(
                     vec![TunnelAction::RotateEndpoint {
@@ -1154,6 +1189,18 @@ impl Machine for TunnelMachine {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Rising-edge gate for the `*Degraded` publishes: returns true
+/// exactly once per failure streak — when `failures` first reaches
+/// `threshold` — and arms `flag` so the streak cannot re-fire.  The
+/// caller resets `flag` on the next success.
+const fn degraded_edge_crossed(flag: &mut bool, failures: u32, threshold: u32) -> bool {
+    let crossed = !*flag && failures >= threshold;
+    if crossed {
+        *flag = true;
+    }
+    crossed
+}
 
 /// Computes the renewal delay for a granted lease.  Scaled by the
 /// configured basis-points fraction (`10_000` = 1.0) and clamped to
@@ -1215,8 +1262,6 @@ mod tests {
                 natpmp_failure_threshold: NatPmpFailureThreshold::try_new(3).unwrap(),
                 exit_ip_failure_threshold: NatPmpFailureThreshold::try_new(3).unwrap(),
                 exit_ip_query_interval: Duration::from_hours(6),
-                natpmp_protocol: crate::natpmp::Protocol::Tcp,
-                natpmp_lifetime_seconds: 60,
             },
             Instant::now(),
         )
@@ -1338,9 +1383,18 @@ mod tests {
         let mut m = machine();
         boot(&mut m);
         let out = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 5 });
-        assert!(out.publishes.contains(&TunnelPublish::Up));
+        assert!(
+            out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::Up { .. }))
+        );
         let out2 = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
-        assert!(!out2.publishes.contains(&TunnelPublish::Up));
+        assert!(
+            !out2
+                .publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::Up { .. }))
+        );
     }
 
     #[test]
@@ -1389,7 +1443,11 @@ mod tests {
                 age_seconds: stale_age,
             },
         );
-        assert!(!out.publishes.contains(&TunnelPublish::Up));
+        assert!(
+            !out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::Up { .. }))
+        );
         assert!(out.actions.iter().any(|a| matches!(
             a,
             TunnelAction::ScheduleTimer {
@@ -1490,8 +1548,120 @@ mod tests {
         }
         assert!(matches!(m.health(), TunnelHealth::Stuck { .. }));
         let out = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
-        assert!(out.publishes.contains(&TunnelPublish::Recovered));
+        assert!(
+            out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::Recovered { .. }))
+        );
         assert!(matches!(m.health(), TunnelHealth::Up));
+    }
+
+    #[test]
+    fn manual_rotation_does_not_consume_stall_budget() {
+        // `rotations_before_stuck` bounds *automatic* recovery; the
+        // fixture allows exactly 1.  Two operator-driven rotations
+        // must leave that budget untouched, so the next stall streak
+        // still gets its automatic rotation instead of jumping
+        // straight to Stuck.
+        let mut m = machine();
+        boot(&mut m);
+        handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
+        for _ in 0..2 {
+            let out =
+                m.handle_command(Instant::now(), Utc::now(), TunnelCommand::RotateEndpointNow);
+            assert!(matches!(out.response, TunnelResponse::Accepted));
+        }
+        // stall_count_before_rotate = 2 → two stalls cross the
+        // rotation threshold.
+        handle(&mut m, TunnelEvent::HandshakeStalled);
+        let out = handle(&mut m, TunnelEvent::HandshakeStalled);
+        assert!(
+            out.actions
+                .iter()
+                .any(|a| matches!(a, TunnelAction::RotateEndpoint { .. })),
+            "automatic rotation budget must survive manual rotations"
+        );
+        assert!(!matches!(m.health(), TunnelHealth::Stuck { .. }));
+    }
+
+    #[test]
+    fn healthy_handshake_resets_rotation_budget() {
+        // A recovery episode ends at the next healthy handshake; the
+        // budget (1 in the fixture) must be fully available for the
+        // next episode rather than accumulating across the machine's
+        // lifetime.
+        let mut m = machine();
+        boot(&mut m);
+        handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
+        // Episode 1: two stalls → automatic rotation (budget spent).
+        handle(&mut m, TunnelEvent::HandshakeStalled);
+        let out = handle(&mut m, TunnelEvent::HandshakeStalled);
+        assert!(
+            out.actions
+                .iter()
+                .any(|a| matches!(a, TunnelAction::RotateEndpoint { .. }))
+        );
+        // Rotation worked; tunnel is healthy again.
+        handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
+        // Episode 2 must rotate again, not go Stuck.
+        handle(&mut m, TunnelEvent::HandshakeStalled);
+        let out = handle(&mut m, TunnelEvent::HandshakeStalled);
+        assert!(
+            out.actions
+                .iter()
+                .any(|a| matches!(a, TunnelAction::RotateEndpoint { .. })),
+            "budget must reset on recovery"
+        );
+        assert!(!matches!(m.health(), TunnelHealth::Stuck { .. }));
+    }
+
+    #[test]
+    fn handshake_watchdog_rechains_on_fire() {
+        // The watchdog chain must perpetuate on the timer itself: a
+        // healthy HandshakeReported schedules nothing, so without
+        // the self-reschedule the chain died after the first healthy
+        // handshake and stalls were never detected again.
+        let mut m = machine();
+        boot(&mut m);
+        let out = handle(
+            &mut m,
+            TunnelEvent::TimerFired(TunnelTimer::HandshakeWatchdog),
+        );
+        assert!(
+            out.actions
+                .iter()
+                .any(|a| matches!(a, TunnelAction::PollHandshake { .. }))
+        );
+        assert!(out.actions.iter().any(|a| matches!(
+            a,
+            TunnelAction::ScheduleTimer {
+                timer: TunnelTimer::HandshakeWatchdog,
+                ..
+            }
+        )));
+        // And the healthy poll result indeed schedules nothing.
+        let out = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
+        assert!(
+            !out.actions
+                .iter()
+                .any(|a| matches!(a, TunnelAction::ScheduleTimer { .. }))
+        );
+    }
+
+    #[test]
+    fn up_after_exit_ip_observation_carries_the_ip() {
+        // The core owns the last exit IP; health publishes carry it
+        // so the runtime bridge stays stateless.
+        let mut m = machine();
+        boot(&mut m);
+        let ip = windlass_types::VpnIp(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        handle(&mut m, TunnelEvent::ExitIpObserved { ip });
+        let out = handle(&mut m, TunnelEvent::HandshakeReported { age_seconds: 1 });
+        assert!(
+            out.publishes
+                .iter()
+                .any(|p| matches!(p, TunnelPublish::Up { exit_ip: Some(got) } if *got == ip))
+        );
     }
 
     #[test]
@@ -2019,7 +2189,7 @@ mod prop_tests {
                     TunnelEvent::HandshakeReported { age_seconds: age2 }),
             );
             let total_up = out1.publishes.iter().chain(out2.publishes.iter())
-                .filter(|p| matches!(p, TunnelPublish::Up)).count();
+                .filter(|p| matches!(p, TunnelPublish::Up { .. })).count();
             prop_assert_eq!(total_up, 1);
         }
 

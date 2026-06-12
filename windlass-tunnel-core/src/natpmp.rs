@@ -136,8 +136,15 @@ pub enum NatPmpDecodeError {
     WrongVersion(u8),
     #[error("response op {0:#04x} is not a known port-map response (0x81 / 0x82)")]
     UnknownOp(u8),
-    #[error("gateway returned error code {0:?}")]
-    ErrorCode(NatPmpResponseCode),
+    #[error("gateway returned error code {code:?} for {protocol:?} mapping")]
+    ErrorCode {
+        /// Which protocol's mapping the gateway rejected (from the
+        /// response op).  Lets the client distinguish an error for
+        /// *this* request from a stale error for the other protocol
+        /// of a dual-mapping flow.
+        protocol: Protocol,
+        code: NatPmpResponseCode,
+    },
 }
 
 /// Result codes a NAT-PMP gateway may return.  RFC 6886 §3.5 + the
@@ -207,7 +214,10 @@ impl NatPmpLease {
         let code = u16::from_be_bytes([bytes[2], bytes[3]]);
         let typed_code = NatPmpResponseCode::from_u16(code);
         if !matches!(typed_code, NatPmpResponseCode::Success) {
-            return Err(NatPmpDecodeError::ErrorCode(typed_code));
+            return Err(NatPmpDecodeError::ErrorCode {
+                protocol,
+                code: typed_code,
+            });
         }
         let epoch_seconds = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let internal_port = u16::from_be_bytes([bytes[8], bytes[9]]);
@@ -220,6 +230,23 @@ impl NatPmpLease {
             external_port,
             lifetime_seconds,
         })
+    }
+
+    /// Whether this lease answers the given request.  RFC 6886: the
+    /// response op must mirror the request's protocol, and the
+    /// internal port must echo the request's (unless the request
+    /// used the `0` wildcard, where the gateway picks).  A datagram
+    /// that decodes but fails this check is a stale or foreign
+    /// response — the client must keep waiting, not adopt it.
+    #[must_use]
+    pub const fn matches_request(&self, req: &NatPmpRequest) -> bool {
+        if !matches!(
+            (self.protocol, req.protocol),
+            (Protocol::Udp, Protocol::Udp) | (Protocol::Tcp, Protocol::Tcp)
+        ) {
+            return false;
+        }
+        req.internal_port == 0 || self.internal_port == req.internal_port
     }
 }
 
@@ -342,7 +369,10 @@ mod tests {
             let err = NatPmpLease::decode(&bytes).unwrap_err();
             assert_eq!(
                 err,
-                NatPmpDecodeError::ErrorCode(expected),
+                NatPmpDecodeError::ErrorCode {
+                    protocol: Protocol::Udp,
+                    code: expected
+                },
                 "code {code} should map to {expected:?}"
             );
         }
@@ -359,6 +389,43 @@ mod tests {
             NatPmpResponseCode::from_u16(12345),
             NatPmpResponseCode::Other(12345)
         );
+    }
+
+    #[test]
+    fn lease_matches_request_checks_protocol_and_internal_port() {
+        let lease = NatPmpLease {
+            protocol: Protocol::Tcp,
+            epoch_seconds: 7,
+            internal_port: 51820,
+            external_port: 42000,
+            lifetime_seconds: 60,
+        };
+        let tcp_req = NatPmpRequest {
+            protocol: Protocol::Tcp,
+            internal_port: 51820,
+            external_port_hint: 0,
+            lifetime_seconds: 60,
+        };
+        assert!(lease.matches_request(&tcp_req));
+        // Stale response for the other protocol must not satisfy
+        // this request.
+        let udp_req = NatPmpRequest {
+            protocol: Protocol::Udp,
+            ..tcp_req
+        };
+        assert!(!lease.matches_request(&udp_req));
+        // Internal port must echo the request's…
+        let other_port_req = NatPmpRequest {
+            internal_port: 8080,
+            ..tcp_req
+        };
+        assert!(!lease.matches_request(&other_port_req));
+        // …unless the request used the 0 wildcard.
+        let wildcard_req = NatPmpRequest {
+            internal_port: 0,
+            ..tcp_req
+        };
+        assert!(lease.matches_request(&wildcard_req));
     }
 
     #[test]
