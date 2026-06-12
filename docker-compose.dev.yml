@@ -133,6 +133,12 @@ services:
       DUMP_DIR: /tmp/windlass_dumps
       VPN_IP_FILE: /tmp/gluetun/ip
       VPN_PORT_FILE: /tmp/gluetun/forwarded_port
+      # Legacy Gluetun mode: the health-poll anchor is the fake
+      # Gluetun container.  The vpn-branch changed the default anchor
+      # to "windlass" (tunnel mode polls itself); without this
+      # override the VPN core inspects a nonexistent container and
+      # reports ContainerUnhealthy forever.
+      WINDLASS_ANCHOR_CONTAINER: gluetun
       WINDLASS_BIND: 0.0.0.0:5010
       DATABASE_URL: postgres://windlass:windlass@postgres:5432/windlass
       WINDLASS_EXECUTE_SERVICE_ACTIONS: ${WINDLASS_EXECUTE_SERVICE_ACTIONS:-${WINDLASS_EXECUTE_SHADOW_ACTIONS:-true}}
