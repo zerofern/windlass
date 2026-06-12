@@ -56,6 +56,30 @@ just stack-down
 The chaos controller and the WireMock-based mocks were retired in §34
 PR 2; control surfaces moved to each fake's own HTTP plane.
 
+## The WireGuard suite (`just integration-wg`)
+
+The owned-tunnel path (`docs/vpn-ownership.md`) gets its own suite
+because its external dependency is not an HTTP service but the
+kernel: WireGuard netlink, `wg`/`ip`/`nft` userland, UDP NAT-PMP.
+`docker-compose.wg-integration.yml` stands up:
+
+| Service | Image | Role |
+|---|---|---|
+| `wg-server` | `windlass-testkit/wg-server/` (alpine + wireguard-tools + python3) | Fixture "VPN provider": fresh keys per run, server-side `wg0` at `10.2.0.1`, writes the client `wg.conf` into a shared volume, serves an exit-IP reflector (`:8080`) and a NAT-PMP responder (`:5351/udp`) on its tunnel address. |
+| `wg-test-runner` | `windlass-testkit/wg-runner/` (rust + iproute2/wireguard-tools/nftables) | Runs `windlass-net/tests/wg_integration.rs` with `NET_ADMIN` in its own namespace: real `wg0`, real nftables kill switch. |
+
+The suite drives a live `TunnelMachine` + `TunnelShell` pair through
+`windlass_machine::spawn` and asserts, in one lifecycle: the kernel
+handshake completes (`Up`), the dual UDP+TCP NAT-PMP grant surfaces
+as `PortReady` with the fixture's port, the exit-IP query observes
+the client's tunnel address, direct underlay egress is dropped by the
+kill switch while the tunnel path stays open, and several
+watchdog/leak-probe cycles pass without `Down`/`LeakDetected`.
+
+Requires the host kernel's `wireguard` module (mainline since 5.6).
+The runner mounts the repo and keeps its cargo registry + target dir
+in named volumes, so re-runs are incremental.
+
 ## Writing a new test
 
 Tests live in `windlass/tests/integration_contracts.rs` (one big file

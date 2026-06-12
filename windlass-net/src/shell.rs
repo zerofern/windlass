@@ -271,8 +271,21 @@ async fn configure_interface(
             .run("ip", &["link", "set", "dev", iface, "up"])
             .await
             .map_err(|e| InterfaceConfigureFailure::LinkUp(e.to_string()))?;
+        // Pin host routes to every peer endpoint via the CURRENT
+        // underlay path before touching the default route.  Without
+        // the pins, pointing the default at the tunnel would route
+        // the WireGuard handshake packets themselves into the tunnel
+        // — a blackhole — whenever the endpoint is beyond the local
+        // subnet.  All peers are pinned here (not just the active
+        // one) because endpoint rotation happens after the default
+        // route flip, when the original underlay can no longer be
+        // discovered.
+        pin_underlay_routes(runner, config).await?;
+        // `replace`, not `add`: a container namespace already has a
+        // default route (Docker installs one), and `ip route add
+        // default` fails with EEXIST against it.
         runner
-            .run("ip", &["route", "add", "default", "dev", iface])
+            .run("ip", &["route", "replace", "default", "dev", iface])
             .await
             .map_err(|e| InterfaceConfigureFailure::RouteAdd(format!("v4: {e}")))?;
         if config
@@ -283,7 +296,7 @@ async fn configure_interface(
             .any(|a| matches!(a.ip, std::net::IpAddr::V6(_)))
         {
             runner
-                .run("ip", &["-6", "route", "add", "default", "dev", iface])
+                .run("ip", &["-6", "route", "replace", "default", "dev", iface])
                 .await
                 .map_err(|e| InterfaceConfigureFailure::RouteAdd(format!("v6: {e}")))?;
         }
@@ -311,10 +324,84 @@ async fn configure_interface(
     outcome
 }
 
+/// Pins a host route to each peer's underlay endpoint, copying the
+/// next hop the kernel would use *today* (before the default route
+/// moves to the tunnel).  Idempotent via `ip route replace`.
+///
+/// Assumes a fresh network namespace per process start (the shipped
+/// containers guarantee this): if a previous run already replaced
+/// the default route and died, `ip route get` would resolve via the
+/// tunnel and the pin would be wrong — a container restart resets
+/// the namespace before that can happen.
+async fn pin_underlay_routes(
+    runner: &dyn Runner,
+    config: &TunnelShellConfig,
+) -> Result<(), InterfaceConfigureFailure> {
+    for peer in &config.wg.peers {
+        let Endpoint::Ip(addr) = &peer.endpoint else {
+            // Hostname endpoints are rejected earlier (see
+            // `endpoint_for_args`); nothing to pin.
+            continue;
+        };
+        let ip = addr.ip().to_string();
+        let out = runner
+            .run("ip", &["-j", "route", "get", &ip])
+            .await
+            .map_err(|e| {
+                InterfaceConfigureFailure::RouteAdd(format!("underlay route get {ip}: {e}"))
+            })?;
+        let hop = parse_route_get(&out.stdout).map_err(|e| {
+            InterfaceConfigureFailure::RouteAdd(format!("underlay route get {ip}: {e}"))
+        })?;
+        let dst = match addr.ip() {
+            IpAddr::V4(_) => format!("{ip}/32"),
+            IpAddr::V6(_) => format!("{ip}/128"),
+        };
+        let mut args: Vec<&str> = vec!["route", "replace", &dst];
+        if let Some(gw) = &hop.gateway {
+            args.push("via");
+            args.push(gw);
+        }
+        args.push("dev");
+        args.push(&hop.dev);
+        runner
+            .run("ip", &args)
+            .await
+            .map_err(|e| InterfaceConfigureFailure::RouteAdd(format!("pin underlay {dst}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// One resolved next hop from `ip -j route get`.
+struct UnderlayHop {
+    gateway: Option<String>,
+    dev: String,
+}
+
+/// Parses `ip -j route get <addr>` output: a one-element JSON array
+/// with `dev` (always) and `gateway` (absent when the destination is
+/// on-link).
+fn parse_route_get(json: &str) -> Result<UnderlayHop, String> {
+    let rows: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("parse: {e}"))?;
+    let row = rows
+        .get(0)
+        .ok_or_else(|| "empty route result".to_string())?;
+    let dev = row
+        .get("dev")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "route result missing `dev`".to_string())?
+        .to_string();
+    let gateway = row
+        .get("gateway")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    Ok(UnderlayHop { gateway, dev })
+}
+
 /// Programs the kernel's `WireGuard` interface with `wg set`.
 ///
-/// When `replace` is true, the peer set is replaced wholesale
-/// (`wg-quick` parlance: `replace-peers`).  This is the correct
+/// When `replace` is true, every configured peer other than the
+/// target is removed in the same invocation.  This is the correct
 /// semantics for endpoint rotation — without it, the previous peer
 /// stays configured and a second `0.0.0.0/0` `AllowedIPs` entry
 /// either errors or leaves ambiguous routing.
@@ -339,16 +426,28 @@ async fn set_wg_interface(
     // `key /dev/stdin` references from the same stdin stream in the
     // order they appear, separated by newlines.
     let mut args: Vec<&str> = vec!["set", iface];
-    if replace {
-        // Drop the existing peer set first so we never leave the
-        // previous endpoint configured after a rotation.
-        args.push("replace-peers");
-    }
     args.push("private-key");
     args.push("/dev/stdin");
     if let Some(ref lp) = listen_port_arg {
         args.push("listen-port");
         args.push(lp.as_str());
+    }
+    if replace {
+        // Drop every other configured peer so a rotation never
+        // leaves the previous endpoint reachable.  `wg set` has no
+        // replace-peers verb — that's `wg syncconf` input syntax,
+        // and the real binary rejects it with "Invalid argument"
+        // (caught by the wg integration suite) — so each non-target
+        // peer gets an explicit `peer <key> remove` clause.
+        // Removing an absent peer is a no-op, which keeps this
+        // idempotent for the boot path.
+        for (i, other) in config.wg.peers.iter().enumerate() {
+            if i != peer_index {
+                args.push("peer");
+                args.push(&other.public_key);
+                args.push("remove");
+            }
+        }
     }
     args.push("peer");
     args.push(&peer.public_key);
@@ -889,13 +988,6 @@ fn spawn_run_leak_probe(
                 Ok(snapshot) => {
                     let enum_outcome =
                         leak_outcome_from_snapshot(&snapshot, &config.interface_name);
-                    // If layer 1 found a stray interface, we already
-                    // have a leak signal — escalate via the active
-                    // probe to get a real `observed_remote` rather
-                    // than the generic enumeration string.  If layer
-                    // 1 found nothing, the active probe is what
-                    // verifies the kill switch actually drops on
-                    // attempts.
                     Some((snapshot, enum_outcome))
                 }
                 Err(e) => {
@@ -923,18 +1015,24 @@ fn spawn_run_leak_probe(
             }
         };
         let (snapshot, enum_outcome) = layer1.expect("checked above");
-        let active = crate::probe::active_connect_probe(&snapshot, &config.interface_name);
-        // Either probe finding a leak is sufficient.  The active
-        // probe's `LeakDetected` carries the concrete remote we
-        // reached; if only enumeration detected something, we
-        // surface its more generic message.
-        let outcome = match (enum_outcome, active) {
-            (_, active @ windlass_tunnel_core::LeakProbeOutcome::LeakDetected { .. })
-            | (active @ windlass_tunnel_core::LeakProbeOutcome::LeakDetected { .. }, _) => active,
-            (windlass_tunnel_core::LeakProbeOutcome::NoEgressDetected, _) => {
+        // Non-tunnel interfaces are *expected* in the shipped
+        // topology (the compose attaches a control network for
+        // Postgres and the dashboard) — the leak invariant per
+        // docs/vpn-ownership.md is that egress on them is DROPPED,
+        // not that they don't exist.  So enumeration alone is never
+        // a leak verdict: strays found by layer 1 are verified by
+        // the active connect probe, and only a connect that actually
+        // succeeds outside the tunnel is a leak.
+        let outcome = match enum_outcome {
+            windlass_tunnel_core::LeakProbeOutcome::NoEgressDetected => {
                 windlass_tunnel_core::LeakProbeOutcome::NoEgressDetected
             }
-            (other, _) => other,
+            windlass_tunnel_core::LeakProbeOutcome::LeakDetected { .. } => {
+                crate::probe::active_connect_probe(&snapshot, &config.interface_name)
+            }
+            inconclusive @ windlass_tunnel_core::LeakProbeOutcome::Inconclusive { .. } => {
+                inconclusive
+            }
         };
         send_event(&tx, TunnelEvent::LeakProbeCompleted { outcome });
     });
@@ -1128,16 +1226,23 @@ Endpoint = 198.51.100.8:51821
                 stdin.map(str::to_string),
             ));
         }
-        fn next_response(&self) -> Result<CommandOutcome, CommandError> {
-            self.responses
-                .lock()
-                .unwrap()
-                .pop()
-                .unwrap_or(Ok(CommandOutcome {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                }))
+        fn next_response(&self, args: &[&str]) -> Result<CommandOutcome, CommandError> {
+            if let Some(queued) = self.responses.lock().unwrap().pop() {
+                return queued;
+            }
+            // `ip -j route get` must return parseable JSON even when
+            // the test didn't queue a response — the underlay-pinning
+            // step consumes it.
+            let stdout = if args.starts_with(&["-j", "route", "get"]) {
+                r#"[{"dst":"198.51.100.7","gateway":"172.31.0.1","dev":"eth0"}]"#.to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandOutcome {
+                stdout,
+                stderr: String::new(),
+                exit_code: 0,
+            })
         }
     }
 
@@ -1145,7 +1250,7 @@ Endpoint = 198.51.100.8:51821
     impl Runner for RecordingRunner {
         async fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutcome, CommandError> {
             self.record(program, args, None);
-            self.next_response()
+            self.next_response(args)
         }
         async fn run_with_stdin(
             &self,
@@ -1154,7 +1259,7 @@ Endpoint = 198.51.100.8:51821
             stdin: &str,
         ) -> Result<CommandOutcome, CommandError> {
             self.record(program, args, Some(stdin));
-            self.next_response()
+            self.next_response(args)
         }
     }
 
@@ -1200,12 +1305,11 @@ PersistentKeepalive = 25
                 .iter()
                 .any(|l| l == "ip link add dev wg0 type wireguard")
         );
-        // wg set carries replace-peers + listen-port + peer/endpoint/allowed-ips
+        // wg set carries listen-port + peer/endpoint/allowed-ips
         let wg_set = lines
             .iter()
             .find(|l| l.starts_with("wg set"))
             .expect("wg set call");
-        assert!(wg_set.contains("replace-peers"));
         assert!(wg_set.contains("private-key /dev/stdin"));
         assert!(wg_set.contains("listen-port 51820"));
         assert!(wg_set.contains("persistent-keepalive 25"));
@@ -1216,7 +1320,37 @@ PersistentKeepalive = 25
         // Address + link up + default route happen after wg set.
         assert!(lines.iter().any(|l| l == "ip addr add 10.2.0.2/32 dev wg0"));
         assert!(lines.iter().any(|l| l == "ip link set dev wg0 up"));
-        assert!(lines.iter().any(|l| l == "ip route add default dev wg0"));
+        // The endpoint's underlay path is pinned BEFORE the default
+        // route moves to the tunnel, and both use `replace` so a
+        // pre-existing (Docker-installed) default route can't fail
+        // the boot with EEXIST.
+        let pin_pos = lines
+            .iter()
+            .position(|l| l == "ip route replace 198.51.100.7/32 via 172.31.0.1 dev eth0")
+            .expect("underlay pin");
+        let default_pos = lines
+            .iter()
+            .position(|l| l == "ip route replace default dev wg0")
+            .expect("default route replace");
+        assert!(
+            pin_pos < default_pos,
+            "underlay pin must precede the default-route flip"
+        );
+    }
+
+    #[test]
+    fn parse_route_get_handles_gateway_and_onlink() {
+        let via = parse_route_get(r#"[{"dst":"1.2.3.4","gateway":"10.0.0.1","dev":"eth0"}]"#)
+            .expect("gateway row parses");
+        assert_eq!(via.gateway.as_deref(), Some("10.0.0.1"));
+        assert_eq!(via.dev, "eth0");
+        // On-link destination: no gateway field.
+        let onlink = parse_route_get(r#"[{"dst":"172.31.0.10","dev":"eth0","scope":"link"}]"#)
+            .expect("on-link row parses");
+        assert_eq!(onlink.gateway, None);
+        assert_eq!(onlink.dev, "eth0");
+        assert!(parse_route_get("not json").is_err());
+        assert!(parse_route_get("[]").is_err());
     }
 
     #[tokio::test]
@@ -1294,7 +1428,7 @@ Endpoint = 198.51.100.7:51820
     }
 
     #[tokio::test]
-    async fn rotation_uses_replace_peers_so_old_peer_is_dropped() {
+    async fn rotation_removes_other_peers_so_old_endpoint_is_dropped() {
         let multi_peer = "\
 [Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
@@ -1323,13 +1457,18 @@ Endpoint = 198.51.100.8:51821
             .into_iter()
             .find(|l| l.starts_with("wg set"))
             .expect("wg set call");
-        assert!(
-            wg_set.contains("replace-peers"),
-            "missing replace-peers: {wg_set}"
-        );
-        // The rotation should configure peer 1's public key, not peer 0's.
-        assert!(wg_set.contains("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="));
-        assert!(!wg_set.contains("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="));
+        // Peer 0 must be explicitly removed (there is no
+        // replace-peers verb in `wg set` — the real binary rejects
+        // it), and the removal must precede the new peer config so
+        // a shared public key could never be configured-then-removed.
+        let remove_pos = wg_set
+            .find("peer BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB= remove")
+            .expect("old peer removal clause");
+        let add_pos = wg_set
+            .find("peer CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=")
+            .expect("new peer clause");
+        assert!(remove_pos < add_pos, "removal must precede the new peer");
+        assert!(!wg_set.contains("replace-peers"));
     }
 
     #[tokio::test]

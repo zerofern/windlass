@@ -6,9 +6,12 @@
 //! Parses `ip -j addr show` JSON output via the shared
 //! [`crate::command::Runner`] and reports whether any interface
 //! other than `lo` and the configured tunnel interface carries a
-//! non-link-local IPv4 or IPv6 address.  Anything beyond that — a
-//! leftover `eth0`, a stray bridge — implies a path the kill
-//! switch can't protect.  See [`leak_outcome_from_snapshot`].
+//! non-link-local IPv4 or IPv6 address.  See
+//! [`leak_outcome_from_snapshot`].  Strays are *candidates*, not a
+//! verdict: the shipped tunnel topology deliberately attaches a
+//! control-network interface (Postgres, dashboard ingress), and the
+//! leak invariant per `docs/vpn-ownership.md` is that egress on it
+//! is dropped by the kill switch — not that it doesn't exist.
 //!
 //! ## Layer 2 — Active connect-bind
 //!
@@ -16,9 +19,11 @@
 //! Under a correctly configured namespace + nftables ruleset the
 //! connect must fail (no route or firewall drop); a successful
 //! connect proves we have an egress path the kill switch isn't
-//! enforcing.  Implemented with `SO_BINDTODEVICE` on Linux via
-//! [`active_connect_probe`].  Skipped on platforms without that
-//! socket option (only Linux for this project).
+//! enforcing.  This is the authoritative leak verdict for strays
+//! found by layer 1.  Implemented with `SO_BINDTODEVICE` on Linux
+//! via [`active_connect_probe`]; platforms without that socket
+//! option (only non-Linux test builds for this project) fall back
+//! to the layer-1 outcome.
 
 use std::collections::BTreeSet;
 
@@ -95,9 +100,13 @@ fn is_link_scope(info: &IpAddrInfo) -> bool {
     matches!(&info.scope, Some(s) if s == "link")
 }
 
-/// Applies the leak-decision rule to a snapshot: any interface with a
-/// global address that isn't `lo` or the configured tunnel name
-/// is a leak path.
+/// Applies the layer-1 rule to a snapshot.
+///
+/// Any interface with a global address that isn't `lo` or the
+/// configured tunnel name is a leak *candidate*.  On Linux the
+/// active connect probe delivers the verdict for candidates;
+/// expected control-network interfaces that the kill switch fences
+/// resolve to `NoEgressDetected` there.
 #[must_use]
 pub fn leak_outcome_from_snapshot(
     snapshot: &InterfaceSnapshot,
@@ -218,12 +227,12 @@ fn try_bound_connect(
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn active_connect_probe(
-    _snapshot: &InterfaceSnapshot,
-    _tunnel_interface: &str,
+    snapshot: &InterfaceSnapshot,
+    tunnel_interface: &str,
 ) -> LeakProbeOutcome {
     // Non-Linux targets (currently only tests in CI) don't have
     // SO_BINDTODEVICE.  Fall back to the layer-1 outcome.
-    LeakProbeOutcome::NoEgressDetected
+    leak_outcome_from_snapshot(snapshot, tunnel_interface)
 }
 
 #[cfg(test)]

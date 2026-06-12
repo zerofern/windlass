@@ -32,6 +32,18 @@ integration:
     cargo test --test integration_contracts -- --ignored --test-threads=1 --nocapture; \
     cargo test --test qbit_integration -- --ignored --test-threads=1 --nocapture
 
+# Real-WireGuard tunnel integration suite: a fixture WireGuard peer +
+# a NET_ADMIN test runner drive TunnelMachine/TunnelShell end to end
+# (real wg0, real nftables kill switch, real NAT-PMP).  Requires the
+# host kernel's wireguard module.
+integration-wg:
+    set -e; \
+    cleanup() { docker compose -p windlass-wg-integration -f docker-compose.wg-integration.yml down -v --remove-orphans; }; \
+    trap cleanup EXIT; \
+    docker compose -p windlass-wg-integration -f docker-compose.wg-integration.yml build; \
+    docker compose -p windlass-wg-integration -f docker-compose.wg-integration.yml up --wait -d wg-server; \
+    docker compose -p windlass-wg-integration -f docker-compose.wg-integration.yml run --rm wg-test-runner
+
 # Run qBit-specific integration tests (requires docker-compose.qbit-integration.yml up)
 integration-qbit:
     set -e; \

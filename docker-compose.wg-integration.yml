@@ -1,0 +1,67 @@
+# Real-WireGuard integration topology (run via `just integration-wg`).
+#
+# wg-server is the fixture "VPN provider": a WireGuard peer that
+# generates fresh keys per run, writes the client's wg.conf into the
+# shared volume, and serves the in-tunnel services (exit-IP reflector
+# + NAT-PMP responder) on its tunnel address 10.2.0.1.
+#
+# wg-test-runner mounts the repo and runs the `wg_integration` suite
+# inside its own network namespace with NET_ADMIN: TunnelShell brings
+# up a real `wg0`, installs the real nftables kill switch, and the
+# suite asserts handshake → Up, the dual NAT-PMP port grant, the
+# exit-IP observation, and that the kill switch drops direct underlay
+# egress while the tunnel path stays open.
+#
+# Requires the host kernel's `wireguard` module (mainline since 5.6;
+# autoloaded on `ip link add ... type wireguard`).
+
+services:
+  wg-server:
+    build:
+      context: windlass-testkit/wg-server
+    cap_add:
+      - NET_ADMIN
+    networks:
+      wg-int:
+        ipv4_address: 172.31.0.10
+    volumes:
+      - wg-shared:/shared
+    healthcheck:
+      test: ["CMD", "test", "-f", "/shared/wg.conf"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  wg-test-runner:
+    build:
+      context: windlass-testkit/wg-runner
+    cap_add:
+      - NET_ADMIN
+    networks:
+      wg-int:
+        ipv4_address: 172.31.0.20
+    environment:
+      CARGO_TARGET_DIR: /work/target-wg
+      WG_INT_CONF: /shared/wg.conf
+      WG_INT_UNDERLAY_REFLECTOR: 172.31.0.10:8080
+      WG_INT_EXPECTED_PORT: "43210"
+    volumes:
+      - .:/work
+      - wg-shared:/shared
+      - wg-cargo-registry:/usr/local/cargo/registry
+      - wg-target:/work/target-wg
+    depends_on:
+      wg-server:
+        condition: service_healthy
+    command: cargo test -p windlass-net --test wg_integration -- --ignored --test-threads=1 --nocapture
+
+volumes:
+  wg-shared:
+  wg-cargo-registry:
+  wg-target:
+
+networks:
+  wg-int:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

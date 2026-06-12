@@ -1,4 +1,6 @@
 target/
+# Mountpoint for the wg-integration runner's named target volume.
+target-wg/
 mlm/
 mousehole/
 *.zip
