@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::net::SocketAddr;
 
 use windlass_observability::ObservabilityConfig;
 use windlass_observability::ring::parse_byte_budget;
@@ -9,10 +10,6 @@ pub struct Config {
     pub qbit_user: String,
     pub qbit_pass: QbitPassword,
     pub mam_session: MamSessionId,
-    /// Gluetun's built-in HTTP proxy, used to route MAM traffic through the VPN.
-    /// When `None` (env var absent), the VPN client makes direct connections — useful
-    /// in integration tests and local dev where no VPN tunnel is running.
-    pub gluetun_proxy_url: Option<String>,
     /// Full URL for the MAM dynamic-seedbox endpoint.
     /// Override via `MAM_SEEDBOX_URL` to point at a mock in integration tests.
     pub mam_seedbox_url: String,
@@ -38,8 +35,37 @@ pub struct Config {
     pub data_path: String,
     pub dump_dir: String,
     pub database_url: String,
+    /// Legacy Gluetun IP file. Used only when `WG_CONFIG_PATH` is
+    /// absent and Windlass is running in the Gluetun-compatible mode.
     pub vpn_ip_file: String,
+    /// Legacy Gluetun forwarded-port file. Used only when
+    /// `WG_CONFIG_PATH` is absent.
     pub vpn_port_file: String,
+    /// Path to a `ProtonVPN`-generated `wg.conf` file. When present,
+    /// Windlass owns the `WireGuard` tunnel in-process via
+    /// `windlass-tunnel-core` + `windlass-net`. Requires `NET_ADMIN`
+    /// and a network namespace Windlass can manage. When absent, the
+    /// legacy Gluetun-compatible shell remains active.
+    pub wg_config_path: Option<String>,
+    /// Interface name for the in-process tunnel (when
+    /// `wg_config_path` is set).  Defaults to `wg0`.
+    pub wg_interface_name: String,
+    /// `ProtonVPN` NAT-PMP gateway, `host:port`.  Defaults to
+    /// `10.2.0.1:5351` — `ProtonVPN`'s documented address.  Override
+    /// for other WireGuard-with-NAT-PMP providers.
+    pub natpmp_gateway: String,
+    /// Comma-separated TCP endpoints allowed outside the tunnel by the
+    /// nftables kill switch. Used for local control-plane dependencies
+    /// such as the shipped Postgres service.
+    pub tunnel_firewall_allow_tcp: Vec<SocketAddr>,
+    /// Name of the Docker container whose network namespace
+    /// dependents (like qBittorrent) share via
+    /// `network_mode: container:<name>`.  In tunnel mode this is
+    /// Windlass itself; the default is `windlass` to match the
+    /// shipped `docker-compose.tunnel.yml`.  Operators with a
+    /// different container name (or legacy Gluetun mode during
+    /// migration) can override with `WINDLASS_ANCHOR_CONTAINER`.
+    pub anchor_container: String,
     /// Interval between compliance polls in seconds (default: 60).
     pub compliance_poll_interval_secs: u64,
     /// Maximum unsatisfied torrents before alerting (default: 50).
@@ -60,7 +86,6 @@ impl Config {
                 var("QBITTORRENT_PASS").context("QBITTORRENT_PASS missing")?,
             ),
             mam_session: MamSessionId::new(var("MAM_SESSION").context("MAM_SESSION missing")?),
-            gluetun_proxy_url: var("GLUETUN_PROXY_URL").ok(),
             mam_seedbox_url: var("MAM_SEEDBOX_URL").unwrap_or_else(|_| {
                 "https://t.myanonamouse.net/json/dynamicSeedbox.php".to_string()
             }),
@@ -83,6 +108,17 @@ impl Config {
             vpn_ip_file: var("VPN_IP_FILE").unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),
             vpn_port_file: var("VPN_PORT_FILE")
                 .unwrap_or_else(|_| "/tmp/gluetun/forwarded_port".to_string()),
+            wg_config_path: var("WG_CONFIG_PATH").ok(),
+            wg_interface_name: var("WG_INTERFACE_NAME").unwrap_or_else(|_| "wg0".to_string()),
+            natpmp_gateway: var("NATPMP_GATEWAY").unwrap_or_else(|_| "10.2.0.1:5351".to_string()),
+            tunnel_firewall_allow_tcp: parse_socket_addr_list(
+                var("TUNNEL_FIREWALL_ALLOW_TCP")
+                    .unwrap_or_default()
+                    .as_str(),
+            )
+            .context("TUNNEL_FIREWALL_ALLOW_TCP")?,
+            anchor_container: var("WINDLASS_ANCHOR_CONTAINER")
+                .unwrap_or_else(|_| "windlass".to_string()),
             compliance_poll_interval_secs: var("COMPLIANCE_POLL_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -97,6 +133,17 @@ impl Config {
             ),
         })
     }
+}
+
+fn parse_socket_addr_list(raw: &str) -> Result<Vec<SocketAddr>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<SocketAddr>()
+                .with_context(|| format!("expected socket address `ip:port`, got `{s}`"))
+        })
+        .collect()
 }
 
 fn execute_service_actions_setting(current: Option<&str>, legacy: Option<&str>) -> bool {
@@ -152,7 +199,9 @@ fn parse_execute_service_actions(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_service_actions_setting, parse_execute_service_actions};
+    use super::{
+        execute_service_actions_setting, parse_execute_service_actions, parse_socket_addr_list,
+    };
 
     #[test]
     fn parse_execute_service_actions_accepts_enabled_values() {
@@ -184,6 +233,21 @@ mod tests {
     fn execute_service_actions_accepts_legacy_env_name() {
         assert!(!execute_service_actions_setting(None, Some("false")));
         assert!(execute_service_actions_setting(None, None));
+    }
+
+    #[test]
+    fn parse_socket_addr_list_accepts_comma_separated_values() {
+        let values =
+            parse_socket_addr_list("172.30.0.10:5432, [fd00::10]:5432").expect("list parses");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "172.30.0.10:5432".parse().unwrap());
+        assert_eq!(values[1], "[fd00::10]:5432".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_socket_addr_list_rejects_hostnames() {
+        let err = parse_socket_addr_list("postgres:5432").expect_err("hostnames are not allowed");
+        assert!(err.to_string().contains("expected socket address"));
     }
 
     #[test]

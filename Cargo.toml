@@ -10,6 +10,8 @@ members = [
     "windlass-domain-core",
     "windlass-db-core",
     "windlass-qbit-core",
+    "windlass-net",
+    "windlass-tunnel-core",
     "windlass-vpn-core",
     "windlass-local",
     "windlass-clients",
@@ -57,6 +59,8 @@ windlass-observability = { path = "windlass-observability" }
 async-trait      = "0.1"
 windlass-qbit-core = { path = "windlass-qbit-core" }
 windlass-types   = { path = "windlass-types" }
+windlass-net = { path = "windlass-net" }
+windlass-tunnel-core = { path = "windlass-tunnel-core" }
 windlass-vpn-core = { path = "windlass-vpn-core" }
 windlass-local   = { path = "windlass-local" }
 windlass-clients = { path = "windlass-clients" }

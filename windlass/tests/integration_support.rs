@@ -61,8 +61,8 @@ async fn docker_helpers_inspect_and_restart_windlass() {
     .await
     .expect("restart windlass-test");
 
-    // Windlass has no healthcheck configured (info.health = None), so
-    // is_ready() falls back to state == "running".
+    // The image-level healthcheck probes /api/v1/health, so a restarted
+    // container must return to Docker-ready before tests continue.
     let after = docker::inspect(support::WINDLASS_CONTAINER)
         .await
         .expect("inspect windlass post-restart");

@@ -1,0 +1,17 @@
+[package]
+name = "windlass-tunnel-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono           = { workspace = true }
+nutype           = { workspace = true }
+secrecy          = { workspace = true }
+serde            = { workspace = true }
+thiserror        = { workspace = true }
+windlass-machine = { workspace = true }
+windlass-types   = { workspace = true }
+
+[dev-dependencies]
+proptest   = { workspace = true }
+serde_json = { workspace = true }

@@ -2,4 +2,3 @@
 
 pub mod docker;
 pub mod monitors;
-pub mod vpn_files;

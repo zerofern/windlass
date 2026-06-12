@@ -409,6 +409,8 @@ impl Machine for VpnMachine {
                     }
                     self.last_verified_ip = None;
                     self.verification_failures = 0;
+                    self.last_mam_verified_ip = None;
+                    self.mam_verification_failures = 0;
                     Outcome {
                         actions: Vec::new(),
                         publishes,
@@ -628,7 +630,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use windlass_machine::{ExternalCause, Machine, Outcome, Timed};
-    use windlass_types::VpnPort;
+    use windlass_types::{VpnIp, VpnPort};
 
     use crate::{VpnAction, VpnCommand, VpnConfig, VpnEvent, VpnMachine, VpnPublish, VpnTimer};
 
@@ -638,7 +640,7 @@ mod tests {
                 health_poll_interval: Duration::from_secs(2),
                 unhealthy_poll_interval: Duration::from_millis(250),
                 port_read_retry_interval: Duration::from_millis(500),
-                public_ip_verify_interval: Duration::from_secs(6 * 60 * 60),
+                public_ip_verify_interval: Duration::from_hours(6),
                 public_ip_verify_failure_threshold: 3,
             },
             Instant::now(),
@@ -871,6 +873,39 @@ mod tests {
     }
 
     #[test]
+    fn state_read_disconnected_clears_mam_verification_state() {
+        // StateRead{connected:false} must mirror ContainerUnhealthy fully
+        // (VPN-1): both verification sources reset, not just ifconfig.co.
+        let mut machine = machine();
+        handle(&mut machine, VpnEvent::ContainerHealthy);
+        machine.last_mam_verified_ip = Some(VpnIp(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        machine.mam_verification_failures = 2;
+
+        handle(
+            &mut machine,
+            VpnEvent::StateRead {
+                connected: false,
+                port: None,
+            },
+        );
+
+        assert_eq!(machine.last_mam_verified_ip(), None);
+        // Counter reset: one more failure must not cross the threshold of 3.
+        let out = handle(
+            &mut machine,
+            VpnEvent::MamIpVerifyFailed {
+                reason: "down".to_string(),
+            },
+        );
+        assert!(
+            !out.publishes
+                .iter()
+                .any(|p| matches!(p, VpnPublish::MamIpVerificationDegraded { .. })),
+            "failure counter must have been reset by the disconnect"
+        );
+    }
+
+    #[test]
     fn state_snapshot_reflects_post_event_state() {
         // §37b: snapshot is an owned, serializable view of the machine
         // state. After ContainerHealthy the connected flag is set, and
@@ -958,7 +993,7 @@ mod prop_tests {
                             health_poll_interval: Duration::from_secs(2),
                             unhealthy_poll_interval: Duration::from_millis(250),
                             port_read_retry_interval: Duration::from_millis(500),
-                            public_ip_verify_interval: Duration::from_secs(6 * 60 * 60),
+                            public_ip_verify_interval: Duration::from_hours(6),
                             public_ip_verify_failure_threshold: 3,
                         },
                         Instant::now(),
@@ -1007,9 +1042,6 @@ mod prop_tests {
             any::<String>().prop_map(|reason| VpnEvent::PublicIpVerifyFailed { reason }),
             any_verified_ip_info().prop_map(|info| VpnEvent::MamIpVerified { info }),
             any::<String>().prop_map(|reason| VpnEvent::MamIpVerifyFailed { reason }),
-            // §35: DependentInspected with arbitrary names + started_at.
-            // The Utc::now() snapshot is fine since the predicates only
-            // compare against healthy_since (also a chrono timestamp).
             (any::<bool>(), proptest::option::of(any_vpn_port()))
                 .prop_map(|(connected, port)| VpnEvent::StateRead { connected, port }),
             any::<String>().prop_map(|reason| VpnEvent::StateReadFailed { reason }),

@@ -3227,8 +3227,10 @@ dependencies = [
  "windlass-local",
  "windlass-machine",
  "windlass-mam-core",
+ "windlass-net",
  "windlass-observability",
  "windlass-qbit-core",
+ "windlass-tunnel-core",
  "windlass-types",
  "windlass-vpn-core",
  "windlass-web",
@@ -3363,6 +3365,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "windlass-net"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "libc",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "windlass-machine",
+ "windlass-tunnel-core",
+ "windlass-types",
+]
+
+[[package]]
 name = "windlass-observability"
 version = "0.1.0"
 dependencies = [
@@ -3404,6 +3427,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windlass-clients",
+ "windlass-types",
+]
+
+[[package]]
+name = "windlass-tunnel-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nutype",
+ "proptest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "windlass-machine",
  "windlass-types",
 ]
 

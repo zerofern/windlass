@@ -5,10 +5,10 @@ use tokio::sync::mpsc;
 use windlass_db_core::DbMachine;
 use windlass_disk_core::DiskMachine;
 use windlass_domain_core::WindlassMachine;
-use windlass_local::vpn_files::PortFileResult;
 use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
 use windlass_mam_core::{MamEvent, MamMachine};
 use windlass_qbit_core::{QbitEvent, QbitMachine};
+use windlass_tunnel_core::{TunnelEvent, TunnelMachine};
 use windlass_types::VpnPort;
 use windlass_vpn_core::{VpnEvent, VpnMachine};
 
@@ -26,6 +26,12 @@ pub(super) struct ServiceCores {
     qbit: ServiceHandles<QbitMachine>,
     mam: ServiceHandles<MamMachine>,
     disk: ServiceHandles<DiskMachine>,
+    /// In-process `WireGuard` tunnel handles.  Phase 5 review fix
+    /// (issue 1): without storing these here, `dispatch_init` had no
+    /// way to deliver `TunnelEvent::Init` to the tunnel core, so the
+    /// runtime would spawn the machine but never tell it to bring
+    /// the interface up.
+    tunnel: Option<ServiceHandles<TunnelMachine>>,
     /// Cached forwarded port, shared with the VPN forwarder task.
     /// Updated by the VPN forwarder on PortReady/PortUnavailable/Disconnected.
     forwarded_port: Arc<Mutex<Option<VpnPort>>>,
@@ -33,6 +39,7 @@ pub(super) struct ServiceCores {
 
 impl ServiceCores {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         domain: ServiceHandles<WindlassMachine>,
         db: ServiceHandles<DbMachine>,
@@ -40,6 +47,7 @@ impl ServiceCores {
         qbit: ServiceHandles<QbitMachine>,
         mam: ServiceHandles<MamMachine>,
         disk: ServiceHandles<DiskMachine>,
+        tunnel: Option<ServiceHandles<TunnelMachine>>,
         forwarded_port: Arc<Mutex<Option<VpnPort>>>,
     ) -> Self {
         Self {
@@ -49,6 +57,7 @@ impl ServiceCores {
             qbit,
             mam,
             disk,
+            tunnel,
             forwarded_port,
         }
     }
@@ -68,7 +77,14 @@ impl ServiceCores {
     /// `init_shell` after every runtime is spawned and every
     /// forwarder task is running, so the first events each core sees
     /// have causes tagged `ExternalCause::Init`.
-    pub fn dispatch_init(&self, is_gluetun_healthy: bool, port_files: &PortFileResult) {
+    ///
+    /// Phase 5 (docs/vpn-ownership.md): the Gluetun-boot priming
+    /// (`is_gluetun_healthy`, port-file replay) is gone.  The
+    /// `TunnelMachine` surfaces its own first-pass state through the
+    /// bridge in `init_shell`; downstream cores see the same
+    /// `VpnEvent` shape they always did, but sourced from the tunnel
+    /// core instead of file polls.
+    pub fn dispatch_init(&self) {
         let now = Instant::now();
         let _ = self.domain.events.send(Timed::external(
             now,
@@ -87,19 +103,11 @@ impl ServiceCores {
             .mam
             .events
             .send(Timed::external(now, ExternalCause::Init, MamEvent::Init));
-        if is_gluetun_healthy {
-            let _ = self.vpn.events.send(Timed::external(
-                now,
-                ExternalCause::Init,
-                VpnEvent::ContainerHealthy,
-            ));
-        }
-        if let Ok((_, port)) = port_files {
-            let _ = self.vpn.events.send(Timed::external(
-                now,
-                ExternalCause::Init,
-                VpnEvent::PortFileChanged { port: *port },
-            ));
+        if let Some(tunnel) = &self.tunnel {
+            let _ =
+                tunnel
+                    .events
+                    .send(Timed::external(now, ExternalCause::Init, TunnelEvent::Init));
         }
     }
 }
@@ -116,6 +124,7 @@ mod tests {
     use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
     use windlass_mam_core::{MamEvent, MamMachine};
     use windlass_qbit_core::{QbitEvent, QbitMachine, QbitPublish};
+    use windlass_tunnel_core::{TunnelEvent, TunnelMachine};
     use windlass_vpn_core::{VpnEvent, VpnMachine, VpnPublish};
 
     use super::ServiceCores;
@@ -145,6 +154,23 @@ mod tests {
     ) {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Timed<VpnEvent>>();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
+        let (sub_tx, _sub_rx) = mpsc::unbounded_channel();
+        (
+            ServiceHandles {
+                events: ev_tx,
+                commands: cmd_tx,
+                subscribe: sub_tx,
+            },
+            ev_rx,
+        )
+    }
+
+    fn make_tunnel_handles() -> (
+        ServiceHandles<TunnelMachine>,
+        mpsc::UnboundedReceiver<Timed<TunnelEvent>>,
+    ) {
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Timed<TunnelEvent>>();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Command<TunnelMachine>>();
         let (sub_tx, _sub_rx) = mpsc::unbounded_channel();
         (
             ServiceHandles {
@@ -235,6 +261,7 @@ mod tests {
         let (qbit_handles, _qbit_cmd_rx) = make_qbit_handles();
         let (mam_handles, _mam_cmd_rx) = make_mam_handles();
         let (disk_handles, _disk_ev_rx) = make_disk_handles();
+        let (tunnel_handles, _tunnel_ev_rx) = make_tunnel_handles();
         let forwarded_port = Arc::new(Mutex::new(None));
         let cores = ServiceCores::new(
             domain_handles,
@@ -243,6 +270,7 @@ mod tests {
             qbit_handles,
             mam_handles,
             disk_handles,
+            Some(tunnel_handles),
             Arc::clone(&forwarded_port),
         );
         (cores, domain_ev_rx, forwarded_port)
@@ -363,6 +391,7 @@ mod tests {
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
+                    restart_anchor_on_crash: false,
                     initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,
@@ -638,6 +667,7 @@ mod tests {
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
+                    restart_anchor_on_crash: false,
                     initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,
@@ -707,6 +737,7 @@ mod tests {
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
                     gluetun_anchor: "gluetun".to_string(),
+                    restart_anchor_on_crash: false,
                     initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,

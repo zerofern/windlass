@@ -26,12 +26,16 @@ pub enum CoreId {
     Disk,
     Docker,
     Domain,
+    /// In-process `WireGuard` tunnel — the core that replaces the
+    /// Gluetun container after the vpn-branch cutover.  See
+    /// `docs/vpn-ownership.md`.
+    Tunnel,
 }
 
 impl CoreId {
-    /// All seven cores in cores-rail display order.
+    /// All eight cores in cores-rail display order.
     #[must_use]
-    pub const fn all() -> [Self; 7] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::Vpn,
             Self::Qbit,
@@ -40,6 +44,7 @@ impl CoreId {
             Self::Disk,
             Self::Docker,
             Self::Domain,
+            Self::Tunnel,
         ]
     }
 }
@@ -54,6 +59,7 @@ impl std::fmt::Display for CoreId {
             Self::Disk => "disk",
             Self::Docker => "docker",
             Self::Domain => "domain",
+            Self::Tunnel => "tunnel",
         };
         f.write_str(name)
     }
@@ -131,8 +137,25 @@ impl NullHttpTap {
 
 // ── IPs ──────────────────────────────────────────────────────────────────────
 
+/// Deliberately IPv4-only: MAM does not support IPv6, so an IPv6 exit
+/// IP is never a valid value to observe, verify, or register anywhere
+/// this type flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnIp(pub Ipv4Addr);
+
+impl VpnIp {
+    /// Builds from any `IpAddr`, returning `None` for IPv6 inputs.
+    /// IPv6 exit IPs are surfaced via a dedicated path; this
+    /// constructor is a pragmatic narrowing site for callers that
+    /// only deal with IPv4.
+    #[must_use]
+    pub const fn from_ip(ip: std::net::IpAddr) -> Option<Self> {
+        match ip {
+            std::net::IpAddr::V4(v4) => Some(Self(v4)),
+            std::net::IpAddr::V6(_) => None,
+        }
+    }
+}
 
 // ── Ports ────────────────────────────────────────────────────────────────────
 
@@ -460,6 +483,7 @@ pub enum MamStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
     #[test]
@@ -610,6 +634,26 @@ mod tests {
             !logged.contains("pw-cleartext-xyz"),
             "QbitPassword cleartext leaked: {logged}"
         );
+    }
+
+    #[test]
+    fn core_id_display_names_are_stable() {
+        let names: Vec<String> = CoreId::all().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            names,
+            vec![
+                "vpn", "qbit", "mam", "db", "disk", "docker", "domain", "tunnel"
+            ]
+        );
+    }
+
+    #[test]
+    fn vpn_ip_from_ip_accepts_ipv4_and_rejects_ipv6() {
+        assert_eq!(
+            VpnIp::from_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            Some(VpnIp(Ipv4Addr::new(203, 0, 113, 7)))
+        );
+        assert_eq!(VpnIp::from_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)), None);
     }
 
     #[test]

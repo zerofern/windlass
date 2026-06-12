@@ -20,9 +20,23 @@ use windlass_vpn_core::{VerificationSource, VpnCommand, VpnPublish};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindlassConfig {
     pub snapshot_interval: Duration,
-    /// §38: name of the Gluetun anchor container.  Used to address
-    /// `Docker(RestartContainer { name })` during crash recovery.
+    /// §38: name of the network-namespace anchor container.  Used to
+    /// address `Docker(RestartContainer { name })` during crash
+    /// recovery, and threaded into the operator-facing alert title.
+    /// In tunnel mode this is Windlass itself; in legacy Gluetun
+    /// mode it was `gluetun`.  The field name is preserved for diff
+    /// continuity.
     pub gluetun_anchor: String,
+    /// vpn-branch H1 fix: when `false`, the
+    /// `WindlassEvent::Vpn(Crashed)` reaction skips the
+    /// `Docker(RestartContainer { name = gluetun_anchor })` action.
+    /// In tunnel mode the anchor is Windlass itself, so issuing
+    /// the restart would tear down the current process and qBit's
+    /// shared namespace — the tunnel core's own recovery
+    /// (rotation, eventual `Stuck`) is the right response.
+    /// In legacy Gluetun mode this should be `true` to preserve
+    /// the §38 crash-restart behavior.
+    pub restart_anchor_on_crash: bool,
     /// §36 step 5: blacklisted MAM torrent ids loaded from the DB at
     /// boot.  Manual-download admission rejects any candidate whose
     /// `mam_id` is in this set.  Empty in tests.
@@ -499,19 +513,40 @@ impl Machine for WindlassMachine {
             // transition (VPN-17).
             WindlassEvent::Vpn(VpnPublish::Crashed) => {
                 use windlass_docker_core::DockerCommand;
+                let anchor = self.config.gluetun_anchor.clone();
+                let mut actions = vec![
+                    WindlassAction::Docker(DockerCommand::DumpAllLogs),
+                    WindlassAction::Docker(DockerCommand::StopDependents),
+                ];
+                // vpn-branch H1: in tunnel mode the anchor IS Windlass,
+                // so issuing RestartContainer would kill the current
+                // process and qBit's shared namespace.  The tunnel
+                // core handles its own recovery.  Only restart the
+                // anchor when the operator opted in (legacy Gluetun
+                // topology).
+                if self.config.restart_anchor_on_crash {
+                    actions.push(WindlassAction::Docker(DockerCommand::RestartContainer {
+                        name: anchor.clone(),
+                    }));
+                }
+                actions.push(WindlassAction::SendAlert {
+                    priority: AlertPriority::Critical,
+                    title: format!("VPN anchor `{anchor}` crashed"),
+                    body: if self.config.restart_anchor_on_crash {
+                        format!(
+                            "💀 VPN anchor `{anchor}` crashed.  Dumping logs, stopping \
+                             dependents, and restarting."
+                        )
+                    } else {
+                        format!(
+                            "💀 VPN anchor `{anchor}` reported unhealthy.  Dumping logs and \
+                             stopping dependents — the tunnel core will drive recovery \
+                             without restarting Windlass."
+                        )
+                    },
+                });
                 Outcome {
-                    actions: vec![
-                        WindlassAction::Docker(DockerCommand::DumpAllLogs),
-                        WindlassAction::Docker(DockerCommand::StopDependents),
-                        WindlassAction::Docker(DockerCommand::RestartContainer {
-                            name: self.config.gluetun_anchor.clone(),
-                        }),
-                        WindlassAction::SendAlert {
-                            priority: AlertPriority::Critical,
-                            title: "Gluetun died".to_string(),
-                            body: "💀 Gluetun crashed.  Dumping logs, stopping dependents, and restarting.".to_string(),
-                        },
-                    ],
+                    actions,
                     publishes: Vec::new(),
                 }
             }
@@ -1856,10 +1891,29 @@ mod tests {
     };
 
     fn machine() -> WindlassMachine {
+        // Default test machine runs in tunnel mode
+        // (`restart_anchor_on_crash: false`), which is the only mode
+        // shipped today.
         WindlassMachine::new(
             WindlassConfig {
                 snapshot_interval: Duration::from_secs(60),
                 gluetun_anchor: "gluetun".to_string(),
+                restart_anchor_on_crash: false,
+                initial_blacklist: std::collections::HashSet::new(),
+            },
+            Instant::now(),
+        )
+    }
+
+    /// Legacy-mode test machine — the operator opted in to having
+    /// the domain restart the Docker anchor on Crashed.  Used only
+    /// by the Crashed test that still verifies the legacy fan-out.
+    fn machine_legacy_restart_anchor() -> WindlassMachine {
+        WindlassMachine::new(
+            WindlassConfig {
+                snapshot_interval: Duration::from_secs(60),
+                gluetun_anchor: "gluetun".to_string(),
+                restart_anchor_on_crash: true,
                 initial_blacklist: std::collections::HashSet::new(),
             },
             Instant::now(),
@@ -2745,14 +2799,14 @@ mod tests {
     // ── §38 / DOM-27 + DOM-28: VPN crash-recovery orchestration ──────────
 
     #[test]
-    fn vpn_crashed_drives_dump_stop_restart_and_critical_alert() {
-        // DOM-27: rising-edge Vpn(Crashed) emits the full crash-recovery
-        // fan-out in order: DumpAllLogs, StopDependents, RestartContainer
-        // (anchor), SendAlert(Critical).
+    fn vpn_crashed_legacy_mode_restarts_anchor() {
+        // DOM-27 legacy: when `restart_anchor_on_crash` is true (the
+        // historical Gluetun deployment), Vpn(Crashed) emits the
+        // full crash-recovery fan-out including RestartContainer.
         use windlass_docker_core::DockerCommand;
         use windlass_types::AlertPriority;
 
-        let mut machine = machine();
+        let mut machine = machine_legacy_restart_anchor();
         let out = handle(&mut machine, WindlassEvent::Vpn(VpnPublish::Crashed));
 
         assert_eq!(out.actions.len(), 4, "expected 4 crash-recovery actions");
@@ -2772,6 +2826,45 @@ mod tests {
             &out.actions[3],
             WindlassAction::SendAlert { priority, .. } if *priority == AlertPriority::Critical
         ));
+    }
+
+    /// vpn-branch H1 fix: in tunnel mode the anchor IS Windlass, so
+    /// Crashed must NOT emit RestartContainer — that would tear down
+    /// the current process and qBit's shared namespace.  Dependents
+    /// are still stopped; the tunnel core handles its own recovery.
+    #[test]
+    fn vpn_crashed_tunnel_mode_skips_restart_container() {
+        use windlass_docker_core::DockerCommand;
+        use windlass_types::AlertPriority;
+
+        let mut machine = machine();
+        let out = handle(&mut machine, WindlassEvent::Vpn(VpnPublish::Crashed));
+
+        assert_eq!(
+            out.actions.len(),
+            3,
+            "expected 3 actions (no RestartContainer)"
+        );
+        assert!(matches!(
+            out.actions[0],
+            WindlassAction::Docker(DockerCommand::DumpAllLogs)
+        ));
+        assert!(matches!(
+            out.actions[1],
+            WindlassAction::Docker(DockerCommand::StopDependents)
+        ));
+        assert!(matches!(
+            &out.actions[2],
+            WindlassAction::SendAlert { priority, .. } if *priority == AlertPriority::Critical
+        ));
+        // No RestartContainer anywhere in the action list.
+        assert!(
+            !out.actions.iter().any(|a| matches!(
+                a,
+                WindlassAction::Docker(DockerCommand::RestartContainer { .. })
+            )),
+            "tunnel-mode Crashed must not restart the anchor (would restart Windlass itself)"
+        );
     }
 
     // ── §36 step 6 / DOM-40: torrent-records persistence ─────────────────
@@ -2876,6 +2969,7 @@ mod prop_tests {
                     WindlassConfig {
                         snapshot_interval: Duration::from_secs(60),
                         gluetun_anchor: "gluetun".to_string(),
+                        restart_anchor_on_crash: false,
                         initial_blacklist: std::collections::HashSet::new(),
                     },
                     Instant::now(),

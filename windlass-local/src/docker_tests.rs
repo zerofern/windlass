@@ -5,7 +5,11 @@
 use super::*;
 
 fn test_client() -> DockerClient {
-    DockerClient::connect("/tmp".into()).expect("Docker socket unavailable")
+    DockerClient::connect("/tmp".into(), "gluetun".into()).expect("Docker socket unavailable")
+}
+
+fn test_client_with_anchor(anchor: &str) -> DockerClient {
+    DockerClient::connect("/tmp".into(), anchor.to_string()).expect("Docker socket unavailable")
 }
 
 async fn ensure_test_image(docker: &bollard::Docker) {
@@ -41,10 +45,10 @@ async fn docker_discover_dependents_finds_containers_in_network_mode() {
     };
     use bollard::models::HostConfig;
 
-    let mut client = test_client();
-    let docker = &client.inner.clone();
     let anchor = "windlass_test_anchor";
     let dependent = "windlass_test_dep";
+    let client = test_client_with_anchor(anchor);
+    let docker = &client.inner.clone();
 
     ensure_test_image(docker).await;
 
@@ -101,7 +105,6 @@ async fn docker_discover_dependents_finds_containers_in_network_mode() {
         .await
         .expect("start dependent");
 
-    client.gluetun_anchor = anchor.to_string();
     let found = client.discover_dependents().await;
 
     for name in [dependent, anchor] {
@@ -173,8 +176,11 @@ async fn docker_fetch_and_dump_logs_creates_log_file() {
         .expect("start container");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let dump_client = DockerClient::connect(dump_dir.path().to_str().unwrap().to_string())
-        .expect("Docker socket unavailable");
+    let dump_client = DockerClient::connect(
+        dump_dir.path().to_str().unwrap().to_string(),
+        "gluetun".into(),
+    )
+    .expect("Docker socket unavailable");
     dump_client
         .fetch_and_dump_logs(&[container_name.to_string()])
         .await;

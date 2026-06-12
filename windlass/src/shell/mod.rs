@@ -7,6 +7,7 @@ mod init;
 mod mam_shell;
 mod qbit_shell;
 mod service;
+mod tunnel_bridge;
 mod vpn_shell;
 
 use std::sync::Arc;

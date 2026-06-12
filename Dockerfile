@@ -1,5 +1,5 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:latest AS builder
+FROM rust:bookworm AS builder
 WORKDIR /app
 
 ENV SQLX_OFFLINE=true
@@ -14,10 +14,12 @@ COPY windlass-disk-core/ windlass-disk-core/
 COPY windlass-docker-core/ windlass-docker-core/
 COPY windlass-mam-core/ windlass-mam-core/
 COPY windlass-qbit-core/ windlass-qbit-core/
+COPY windlass-tunnel-core/ windlass-tunnel-core/
 COPY windlass-vpn-core/ windlass-vpn-core/
 COPY windlass-domain-core/ windlass-domain-core/
 COPY windlass-local/   windlass-local/
 COPY windlass-clients/ windlass-clients/
+COPY windlass-net/     windlass-net/
 COPY windlass-db/      windlass-db/
 COPY windlass-web/     windlass-web/
 COPY windlass/         windlass/
@@ -28,10 +30,30 @@ RUN cargo build --release -p windlass
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
+
+# Tunnel-mode userland: wireguard-tools provides `wg`, iproute2 provides
+# `ip`, nftables provides `nft`.  These are only used when the operator
+# sets `WG_CONFIG_PATH` and runs with `cap_add: NET_ADMIN`.  Leaving them
+# installed unconditionally is cheap (~5 MB) and keeps the image
+# topology identical between Gluetun-mode and tunnel-mode deployments.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iproute2 \
+        wireguard-tools \
+        nftables \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/windlass /usr/local/bin/windlass
+
+# Healthcheck so `depends_on: service_healthy` works for any
+# container that shares Windlass's namespace (qBittorrent in
+# tunnel mode).  The web server exposes /api/v1/health; we use
+# wget because we already pull in the standard Debian image
+# which includes it.  --quiet --tries=1 --spider keeps the
+# probe lightweight.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://127.0.0.1:5010/api/v1/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/windlass"]

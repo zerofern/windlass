@@ -54,10 +54,9 @@ pub async fn reset_stack() -> Result<()> {
     //    handles the migration schema and we don't want to drop it.
     truncate_db().await.context("truncate db")?;
 
-    // 5. Restart Windlass.  The container has no healthcheck, so
-    //    `restart_and_wait_healthy` falls back to "state == running"
-    //    — we follow up with an HTTP readiness poll on /api/v1/health
-    //    to ensure the API server is up before returning.
+    // 5. Restart Windlass.  The image-level healthcheck probes
+    //    /api/v1/health; we also poll HTTP directly so failures point
+    //    at the API surface instead of only Docker state.
     docker::restart_and_wait_healthy(WINDLASS_CONTAINER, RESTART_TIMEOUT)
         .await
         .context("restart windlass")?;

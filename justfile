@@ -25,7 +25,7 @@ integration:
     set -e; \
     cleanup() { docker compose -f docker-compose.dev.yml down -v --remove-orphans; docker compose -p windlass-qbit-integration -f docker-compose.qbit-integration.yml down -v --remove-orphans; }; \
     trap cleanup EXIT; \
-    docker compose -f docker-compose.dev.yml up --build -d; \
+    docker compose -f docker-compose.dev.yml up --build --wait -d; \
     docker compose -p windlass-qbit-integration -f docker-compose.qbit-integration.yml up --build --wait -d; \
     cargo test -p windlass-local -- --include-ignored --test-threads=1 --nocapture; \
     cargo test --test integration_support -- --ignored --test-threads=1 --nocapture; \

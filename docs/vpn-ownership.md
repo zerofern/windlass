@@ -225,8 +225,11 @@ The redesign is complete when all of these can be demonstrated.
 **Failure and recovery.**
 
 - A simulated handshake stall (no peer response for the timeout
-  window) is detected, triggers a re-key, and recovers without a
-  Windlass restart.
+  window) is detected and surfaces via the watchdog.  Recovery is
+  driven by kernel `WireGuard`'s automatic re-key on its rekey timer
+  combined with the operator-configurable endpoint rotation Windlass
+  performs after `stall_count_before_rotate` consecutive stalls.
+  No Windlass process restart is required.
 - A simulated endpoint outage (peer unreachable for the rotation
   threshold) triggers an endpoint rotation, if alternative peers are
   present in the configuration, without a Windlass restart.

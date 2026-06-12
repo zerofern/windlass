@@ -15,7 +15,9 @@ windlass-docker-core = { workspace = true }
 windlass-domain-core = { workspace = true }
 windlass-machine = { workspace = true }
 windlass-mam-core = { workspace = true }
+windlass-net = { workspace = true }
 windlass-qbit-core = { workspace = true }
+windlass-tunnel-core = { workspace = true }
 windlass-vpn-core = { workspace = true }
 sqlx             = { workspace = true }
 arc-swap         = { workspace = true }
