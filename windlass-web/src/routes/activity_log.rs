@@ -8,6 +8,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_EVENT_LIMIT: i64 = 100;
+/// Upper bound for the caller-supplied `limit`.  Also fences
+/// negative values, which Postgres rejects with an error the client
+/// would only see as a 500.
+const MAX_EVENT_LIMIT: i64 = 1_000;
 
 #[derive(Deserialize)]
 struct EventQuery {
@@ -36,7 +40,10 @@ async fn get_events(
     State(app): State<AppState>,
     Query(params): Query<EventQuery>,
 ) -> Result<Json<Vec<EventJson>>, StatusCode> {
-    let limit = params.limit.unwrap_or(DEFAULT_EVENT_LIMIT);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_EVENT_LIMIT)
+        .clamp(1, MAX_EVENT_LIMIT);
     let entries = windlass_db::activity_log::get_recent(&app.db_pool, limit)
         .await
         .map_err(|e| {

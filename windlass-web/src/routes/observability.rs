@@ -213,10 +213,12 @@ fn parse_core(s: &str) -> Result<CoreId, (StatusCode, String)> {
         "disk" => Ok(CoreId::Disk),
         "docker" => Ok(CoreId::Docker),
         "domain" => Ok(CoreId::Domain),
+        "tunnel" => Ok(CoreId::Tunnel),
         _ => Err((
             StatusCode::NOT_FOUND,
             format!(
-                "unknown core '{s}'; expected one of: vpn, qbit, mam, db, disk, docker, domain"
+                "unknown core '{s}'; expected one of: vpn, qbit, mam, db, disk, docker, domain, \
+                 tunnel"
             ),
         )),
     }

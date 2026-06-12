@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { useActivitySignal } from '@/hooks/useActivitySignal'
+import { fetchJson } from '@/lib/utils'
 
 interface Torrent {
   hash: string
@@ -62,13 +63,12 @@ export function TorrentMonitor() {
   const { tick } = useActivitySignal()
 
   const fetchTorrents = useCallback(() => {
-    fetch('/api/v1/torrents')
-      .then(r => r.json())
-      .then((data: Torrent[]) => {
+    fetchJson<Torrent[]>('/api/v1/torrents')
+      .then(data => {
         setTorrents(data)
         setError('')
       })
-      .catch(() => setError('Failed to load torrents'))
+      .catch((e: Error) => setError(`Failed to load torrents: ${e.message}`))
   }, [])
 
   useEffect(() => {

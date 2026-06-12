@@ -16,9 +16,6 @@ pub struct AppState {
     /// Constructed once at startup and threaded into every
     /// `ServiceRuntime::spawn` so gates and tap calls flow through it.
     pub observability: Arc<ObservabilityController>,
-    /// URL of the chaos controller, if running (dev stack only).
-    /// Set via `CHAOS_URL` env var. `None` in production.
-    pub chaos_url: Option<String>,
     /// Postgres connection pool for reading persistent state from the web layer.
     pub db_pool: windlass_db::DbPool,
 }

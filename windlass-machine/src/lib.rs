@@ -6,6 +6,7 @@ pub mod pubsub;
 pub mod runtime;
 pub mod shell;
 pub mod tap;
+pub mod timers;
 
 pub use machine::{
     ActionEnvelope, CommandOutcome, EventCause, ExternalCause, Machine, Outcome, PublishEnvelope,
@@ -18,3 +19,4 @@ pub use tap::{
     CommandResponseStatus, CoreId, CoreStatus, EventGateView, NullRuntimeTap, OutcomeGateView,
     RuntimeTap, StepKind, StepRecordView,
 };
+pub use timers::KeyedTimers;

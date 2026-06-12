@@ -33,7 +33,6 @@ pub(crate) async fn test_state_with_observability(
     AppState {
         domain_command_tx,
         observability,
-        chaos_url: None,
         db_pool: pool,
     }
 }

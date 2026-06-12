@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useActivitySignal } from '@/hooks/useActivitySignal'
+import { fetchJson } from '@/lib/utils'
 
 interface EventEntry {
   id: number
@@ -16,13 +17,12 @@ export function EventLog() {
   const { tick } = useActivitySignal()
 
   const fetchEvents = useCallback(() => {
-    fetch('/api/v1/events?limit=100')
-      .then(r => r.json())
-      .then((data: EventEntry[]) => {
+    fetchJson<EventEntry[]>('/api/v1/events?limit=100')
+      .then(data => {
         setEvents(data)
         setError('')
       })
-      .catch(() => setError('Failed to load events'))
+      .catch((e: Error) => setError(`Failed to load events: ${e.message}`))
   }, [])
 
   useEffect(() => {

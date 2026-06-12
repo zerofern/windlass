@@ -1,7 +1,7 @@
 // SSE wire shape for /api/v1/observability/stream.  Mirrors
 // windlass-observability's SseMessage / supporting types.
 
-export type CoreId = 'vpn' | 'qbit' | 'mam' | 'db' | 'disk' | 'docker' | 'domain'
+export type CoreId = 'vpn' | 'qbit' | 'mam' | 'db' | 'disk' | 'docker' | 'domain' | 'tunnel'
 
 export const ALL_CORES: readonly CoreId[] = [
   'vpn',
@@ -11,6 +11,7 @@ export const ALL_CORES: readonly CoreId[] = [
   'disk',
   'docker',
   'domain',
+  'tunnel',
 ] as const
 
 export type CoreStatus =

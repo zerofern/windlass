@@ -103,13 +103,26 @@ pub enum BodyKind {
 }
 
 /// Captured HTTP body, with byte-budget enforcement at capture time.
+///
+/// Struct variants, not newtypes: serde's internal tagging cannot
+/// serialize a newtype variant wrapping a non-map value at runtime,
+/// and that error poisoned every SSE message containing a body
+/// (including the entire `Hello` snapshot, which the route silently
+/// degraded to an empty `data:` frame browsers discard).  The
+/// `value` field also matches the frontend's `BodyCapture` union.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BodyCapture {
-    Inline(serde_json::Value),
-    Text(String),
+    Inline {
+        value: serde_json::Value,
+    },
+    Text {
+        value: String,
+    },
     /// Binary body — only the length is captured.
-    Bytes(usize),
+    Bytes {
+        value: usize,
+    },
     /// Oversized body — truncated to `captured`, original size preserved.
     Truncated {
         body_kind: BodyKind,
@@ -128,7 +141,12 @@ impl BodyCapture {
     pub fn from_text(body: &str, max_bytes: usize) -> (Self, bool) {
         let original_len = body.len();
         if original_len <= max_bytes {
-            return (Self::Text(body.to_owned()), false);
+            return (
+                Self::Text {
+                    value: body.to_owned(),
+                },
+                false,
+            );
         }
         let captured: String = body.chars().take(max_bytes).collect();
         (
@@ -311,9 +329,11 @@ fn json_size(v: &serde_json::Value) -> usize {
 
 fn body_capture_size(b: &BodyCapture) -> usize {
     match b {
-        BodyCapture::Inline(v) | BodyCapture::Truncated { captured: v, .. } => json_size(v),
-        BodyCapture::Text(s) => s.len(),
-        BodyCapture::Bytes(_) => 16,
+        BodyCapture::Inline { value: v } | BodyCapture::Truncated { captured: v, .. } => {
+            json_size(v)
+        }
+        BodyCapture::Text { value } => value.len(),
+        BodyCapture::Bytes { .. } => 16,
         BodyCapture::None => 0,
     }
 }

@@ -3,11 +3,15 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use windlass_clients::mam::{MamClient, MamFetchError, MamSeedboxResult};
-use windlass_machine::{ExternalCause, Shell, Timed};
-use windlass_mam_core::{MamAction, MamEvent};
+use windlass_machine::{ExternalCause, KeyedTimers, Shell, Timed};
+use windlass_mam_core::{MamAction, MamEvent, MamTimer};
 
 pub struct MamShell {
     client: MamClient,
+    /// Replace-semantics timers: at most one pending sleep per
+    /// [`MamTimer`] id, so retry paths and the keep-alive chain can
+    /// never stack duplicate self-perpetuating chains.
+    timers: KeyedTimers<MamTimer>,
 }
 
 impl Shell for MamShell {
@@ -16,7 +20,10 @@ impl Shell for MamShell {
     type Action = MamAction;
 
     async fn new(client: Self::Config, _event_tx: UnboundedSender<Timed<MamEvent>>) -> Self {
-        Self { client }
+        Self {
+            client,
+            timers: KeyedTimers::new(),
+        }
     }
 
     fn dispatch(&mut self, action: MamAction, event_tx: &UnboundedSender<Timed<MamEvent>>) {
@@ -66,9 +73,15 @@ impl Shell for MamShell {
                             registered_asn,
                             registered_as,
                         },
-                        MamSeedboxResult::RateLimited => MamEvent::RateLimited {
-                            retry_after: Duration::from_secs(1),
-                        },
+                        // The client reports the honest remaining
+                        // window (up to 1h for the dynamic-seedbox
+                        // guard).  Mapping this to a short constant
+                        // (the old `1s`) made the machine retry
+                        // against a closed guard once per second —
+                        // a critical-alert storm.
+                        MamSeedboxResult::RateLimited { retry_after } => {
+                            MamEvent::RateLimited { retry_after }
+                        }
                         // §30: ASN mismatch is a distinct compliance signal.
                         MamSeedboxResult::AsnMismatch { ip } => MamEvent::AsnMismatch { ip },
                         // §28: transport-level failure routes as Unreachable.
@@ -87,16 +100,13 @@ impl Shell for MamShell {
                 });
             }
             MamAction::ScheduleTimer { timer, after } => {
-                let tx = event_tx.clone();
-                windlass_machine::causal::spawn(async move {
-                    let scheduled_at = std::time::Instant::now() + after;
-                    tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::external(
-                        scheduled_at,
-                        ExternalCause::Timer { name: timer.name() },
-                        MamEvent::TimerFired(timer),
-                    ));
-                });
+                self.timers.schedule(
+                    timer,
+                    timer.name(),
+                    after,
+                    event_tx,
+                    MamEvent::TimerFired(timer),
+                );
             }
             // §36 step 5: fetch the `.torrent` bytes for a manual-download
             // admission.  `mam_client.fetch_torrent` returns `None` on any

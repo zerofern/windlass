@@ -1,12 +1,10 @@
 import { Routes, Route, NavLink, Navigate } from 'react-router-dom'
 import { Observability } from '@/routes/Observability'
-import { Chaos } from '@/routes/Chaos'
 import { Download } from '@/routes/Download'
 import { DownloadQueue } from '@/routes/DownloadQueue'
 import { EventLog } from '@/routes/EventLog'
 import { Notifications } from '@/routes/Notifications'
 import { TorrentMonitor } from '@/routes/TorrentMonitor'
-import { useConfig } from '@/hooks/useConfig'
 
 function NavItem({ to, end, label }: { to: string; end?: boolean; label: string }) {
   return (
@@ -23,8 +21,6 @@ function NavItem({ to, end, label }: { to: string; end?: boolean; label: string 
 }
 
 export default function App() {
-  const config = useConfig()
-
   return (
     <div className="min-h-screen bg-background">
       <header className="border-b">
@@ -36,7 +32,6 @@ export default function App() {
           <NavItem to="/events" label="Events" />
           <NavItem to="/observability" label="Observability" />
           <NavItem to="/notifications" label="Notifications" />
-          {config.chaos_url && <NavItem to="/chaos" label="Chaos" />}
         </nav>
       </header>
       <main className="container mx-auto px-4 py-6">
@@ -48,9 +43,6 @@ export default function App() {
           <Route path="/events" element={<EventLog />} />
           <Route path="/observability" element={<Observability />} />
           <Route path="/notifications" element={<Notifications />} />
-          {config.chaos_url && (
-            <Route path="/chaos" element={<Chaos chaosUrl={config.chaos_url} />} />
-          )}
         </Routes>
       </main>
     </div>

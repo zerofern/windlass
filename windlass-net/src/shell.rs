@@ -118,12 +118,12 @@ pub struct TunnelShell {
     /// Shared HTTP client for the exit-IP query.  Built once at
     /// shell-construction so we don't re-handshake TLS every 6h.
     http: reqwest::Client,
-    /// Pending sleep task per timer id.  `ScheduleTimer` has replace
-    /// semantics (see the action's doc): re-scheduling a pending
-    /// timer aborts the old sleep, so re-armed chains (duplicate
-    /// `FirewallInstalled`, operator commands racing the periodic
-    /// chains) can never stack a second self-perpetuating chain.
-    timers: std::collections::HashMap<TunnelTimer, tokio::task::AbortHandle>,
+    /// Replace-semantics timers (see the `ScheduleTimer` action doc):
+    /// re-scheduling a pending timer aborts the old sleep, so
+    /// re-armed chains (duplicate `FirewallInstalled`, operator
+    /// commands racing the periodic chains) can never stack a second
+    /// self-perpetuating chain.
+    timers: windlass_machine::KeyedTimers<TunnelTimer>,
 }
 
 impl Shell for TunnelShell {
@@ -142,7 +142,7 @@ impl Shell for TunnelShell {
             runner,
             natpmp: Arc::new(tokio::sync::OnceCell::new()),
             http,
-            timers: std::collections::HashMap::new(),
+            timers: windlass_machine::KeyedTimers::new(),
         }
     }
 
@@ -191,27 +191,13 @@ impl Shell for TunnelShell {
                 spawn_run_leak_probe(self.runner.clone(), self.config.clone(), event_tx.clone());
             }
             TunnelAction::ScheduleTimer { timer, after } => {
-                // Same pattern as VpnShell: sleep then re-inject a
-                // `TimerFired` event causally tagged with the named
-                // timer so the observability layer can render the
-                // timer as the external cause of the next step.
-                let tx = event_tx.clone();
-                let handle = windlass_machine::causal::spawn(async move {
-                    let scheduled_at = std::time::Instant::now() + after;
-                    tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::external(
-                        scheduled_at,
-                        ExternalCause::Timer { name: timer.name() },
-                        TunnelEvent::TimerFired(timer),
-                    ));
-                });
-                // Replace semantics: at most one pending sleep per
-                // timer id.  Aborting a task that already fired is a
-                // no-op, so the race with an in-flight TimerFired is
-                // harmless.
-                if let Some(prev) = self.timers.insert(timer, handle.abort_handle()) {
-                    prev.abort();
-                }
+                self.timers.schedule(
+                    timer,
+                    timer.name(),
+                    after,
+                    event_tx,
+                    TunnelEvent::TimerFired(timer),
+                );
             }
         }
     }

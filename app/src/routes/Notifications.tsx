@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { fetchJson } from '@/lib/utils'
 
 interface Alert {
   id: number
@@ -19,12 +20,15 @@ function priorityVariant(p: string): 'secondary' | 'warning' | 'destructive' {
 
 export function Notifications() {
   const [alerts, setAlerts] = useState<Alert[]>([])
+  const [error, setError] = useState('')
 
   const fetchAlerts = () => {
-    fetch('/api/v1/alerts')
-      .then(r => r.json())
-      .then(setAlerts)
-      .catch(console.error)
+    fetchJson<Alert[]>('/api/v1/alerts')
+      .then(data => {
+        setAlerts(data)
+        setError('')
+      })
+      .catch((e: Error) => setError(`Failed to load alerts: ${e.message}`))
   }
 
   useEffect(() => { fetchAlerts() }, [])
@@ -32,7 +36,7 @@ export function Notifications() {
   const markRead = (id: number) => {
     fetch(`/api/v1/alerts/${id}/read`, { method: 'POST' })
       .then(fetchAlerts)
-      .catch(console.error)
+      .catch((e: Error) => setError(`Failed to mark alert read: ${e.message}`))
   }
 
   const unreadCount = alerts.filter(a => !a.read).length
@@ -45,7 +49,8 @@ export function Notifications() {
           <Badge variant="destructive">{unreadCount} unread</Badge>
         )}
       </div>
-      {alerts.length === 0 && (
+      {error && <p className="text-red-500 text-sm">{error}</p>}
+      {alerts.length === 0 && !error && (
         <p className="text-muted-foreground">No alerts.</p>
       )}
       {alerts.map(alert => (

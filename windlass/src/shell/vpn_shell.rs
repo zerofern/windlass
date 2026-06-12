@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 use windlass_local::docker::DockerClient;
-use windlass_machine::{ExternalCause, Shell, Timed};
+use windlass_machine::{ExternalCause, KeyedTimers, Shell, Timed};
 use windlass_types::{VpnIp, VpnPort};
 use windlass_vpn_core::{VpnAction, VpnEvent, VpnTimer};
 
@@ -24,7 +24,7 @@ pub enum VpnShellConfig {
     },
 }
 
-pub enum VpnShell {
+enum VpnShellMode {
     TunnelMode,
     LegacyGluetun {
         docker: DockerClient,
@@ -33,30 +33,54 @@ pub enum VpnShell {
     },
 }
 
+pub struct VpnShell {
+    mode: VpnShellMode,
+    /// Replace-semantics timers: at most one pending sleep per
+    /// [`VpnTimer`] id (see [`KeyedTimers`]).
+    timers: KeyedTimers<VpnTimer>,
+}
+
 impl Shell for VpnShell {
     type Config = VpnShellConfig;
     type Event = VpnEvent;
     type Action = VpnAction;
 
     async fn new(config: Self::Config, _event_tx: UnboundedSender<Timed<Self::Event>>) -> Self {
-        match config {
-            VpnShellConfig::TunnelMode => Self::TunnelMode,
+        let mode = match config {
+            VpnShellConfig::TunnelMode => VpnShellMode::TunnelMode,
             VpnShellConfig::LegacyGluetun {
                 docker,
                 vpn_ip_file,
                 vpn_port_file,
-            } => Self::LegacyGluetun {
+            } => VpnShellMode::LegacyGluetun {
                 docker,
                 vpn_ip_file,
                 vpn_port_file,
             },
+        };
+        Self {
+            mode,
+            timers: KeyedTimers::new(),
         }
     }
 
     fn dispatch(&mut self, action: VpnAction, event_tx: &UnboundedSender<Timed<VpnEvent>>) {
-        match self {
-            Self::TunnelMode => {}
-            Self::LegacyGluetun {
+        if matches!(self.mode, VpnShellMode::TunnelMode) {
+            return;
+        }
+        if let VpnAction::ScheduleTimer { timer, after } = action {
+            self.timers.schedule(
+                timer,
+                timer.name(),
+                after,
+                event_tx,
+                VpnEvent::TimerFired(timer),
+            );
+            return;
+        }
+        match &self.mode {
+            VpnShellMode::TunnelMode => {}
+            VpnShellMode::LegacyGluetun {
                 docker,
                 vpn_ip_file,
                 vpn_port_file,
@@ -115,7 +139,8 @@ fn dispatch_legacy(
                 },
             );
         }
-        VpnAction::ScheduleTimer { timer, after } => schedule_timer(*timer, *after, tx),
+        // Handled in `dispatch` (needs the shell's KeyedTimers).
+        VpnAction::ScheduleTimer { .. } => {}
     }
 }
 
@@ -218,18 +243,6 @@ async fn read_legacy_port(vpn_port_file: &str) -> Result<Option<VpnPort>, String
         .parse::<u16>()
         .ok()
         .and_then(|port| VpnPort::try_new(port).ok()))
-}
-
-fn schedule_timer(timer: VpnTimer, after: Duration, tx: UnboundedSender<Timed<VpnEvent>>) {
-    windlass_machine::causal::spawn(async move {
-        let scheduled_at = std::time::Instant::now() + after;
-        tokio::time::sleep(after).await;
-        let _ = tx.send(Timed::external(
-            scheduled_at,
-            ExternalCause::Timer { name: timer.name() },
-            VpnEvent::TimerFired(timer),
-        ));
-    });
 }
 
 fn send_event(tx: &UnboundedSender<Timed<VpnEvent>>, event: VpnEvent) {

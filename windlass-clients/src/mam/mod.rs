@@ -22,8 +22,11 @@ pub enum MamSeedboxResult {
     /// Transport-level failure — DNS / TCP / TLS / timeout.
     Unreachable { reason: String },
     /// MAM's documented 1-hour rolling rate limit, or the operator's
-    /// 400ms inter-request guard.
-    RateLimited,
+    /// 400ms inter-request guard.  `retry_after` is the actual time
+    /// remaining on the guard — the machine schedules its retry from
+    /// this, so reporting a too-short value here turns into a retry
+    /// (and a critical alert) storm.
+    RateLimited { retry_after: std::time::Duration },
     /// MAM responded with an error (non-1.0 IP/port, etc.).
     Failed { reason: String },
 }
@@ -366,9 +369,12 @@ impl MamClient {
         // client-side.  Without this guard our retry/heartbeat paths can
         // hit the dynamic-seedbox endpoint repeatedly during normal
         // operation and accumulate `Last change too recent` rejections.
-        if !self.check_seedbox_call_rate_limit() {
-            warn!("MAM dynamic-seedbox 1h client-side rate limit triggered");
-            return MamSeedboxResult::RateLimited;
+        if let Some(retry_after) = self.seedbox_call_rate_limit_remaining() {
+            warn!(
+                retry_after_secs = retry_after.as_secs(),
+                "MAM dynamic-seedbox 1h client-side rate limit triggered"
+            );
+            return MamSeedboxResult::RateLimited { retry_after };
         }
         self.wait_for_rate_limit().await;
         let current = self.current_session();
@@ -513,17 +519,20 @@ impl MamClient {
     }
 
     /// §32: enforces the documented 1-hour rolling rate limit on
-    /// `dynamicSeedbox.php` client-side.  Returns `true` if the call may
-    /// proceed.  Increments the timestamp on a successful gate.
-    fn check_seedbox_call_rate_limit(&self) -> bool {
+    /// `dynamicSeedbox.php` client-side.  Returns `None` if the call
+    /// may proceed (and arms the guard), or `Some(remaining)` — the
+    /// honest time until the guard expires — when it may not.
+    fn seedbox_call_rate_limit_remaining(&self) -> Option<std::time::Duration> {
+        const WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
         let mut last = self.last_seedbox_call_at.lock().unwrap();
-        if let Some(t) = *last
-            && t.elapsed() < std::time::Duration::from_hours(1)
-        {
-            return false;
+        if let Some(t) = *last {
+            let elapsed = t.elapsed();
+            if elapsed < WINDOW {
+                return Some(WINDOW.saturating_sub(elapsed));
+            }
         }
         *last = Some(std::time::Instant::now());
-        true
+        None
     }
 
     fn emit_http(
@@ -1034,7 +1043,7 @@ mod tests {
         mam.update_seedbox().await;
         // Second call immediately after should be rate-limited.
         let event = mam.update_seedbox().await;
-        assert!(matches!(event, MamSeedboxResult::RateLimited));
+        assert!(matches!(event, MamSeedboxResult::RateLimited { .. }));
     }
 
     // ── do_update_seedbox error paths ─────────────────────────────────────────

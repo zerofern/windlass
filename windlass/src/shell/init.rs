@@ -431,7 +431,6 @@ pub(super) async fn init_shell(
     let app_state = windlass_web::AppState {
         domain_command_tx: domain_handles.commands.clone(),
         observability: observability.clone(),
-        chaos_url: std::env::var("CHAOS_URL").ok(),
         db_pool: db_pool.clone(),
     };
     start_http_server(app_state).await?;

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { useActivitySignal } from '@/hooks/useActivitySignal'
+import { fetchJson } from '@/lib/utils'
 
 interface QueueEntry {
   id: number
@@ -29,13 +30,12 @@ export function DownloadQueue() {
   const { tick } = useActivitySignal()
 
   const fetchQueue = useCallback(() => {
-    fetch('/api/v1/download-queue')
-      .then(r => r.json())
-      .then((data: QueueEntry[]) => {
+    fetchJson<QueueEntry[]>('/api/v1/download-queue')
+      .then(data => {
         setQueue(data)
         setError('')
       })
-      .catch(() => setError('Failed to load download queue'))
+      .catch((e: Error) => setError(`Failed to load download queue: ${e.message}`))
   }, [])
 
   useEffect(() => {

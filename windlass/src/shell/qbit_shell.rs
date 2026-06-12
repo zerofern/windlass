@@ -3,12 +3,15 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use windlass_clients::qbit::{QbitAuthResult, QbitClient, QbitPortSyncResult, QbitTorrentState};
-use windlass_machine::{ExternalCause, Shell, Timed};
-use windlass_qbit_core::{QbitAction, QbitEvent};
+use windlass_machine::{ExternalCause, KeyedTimers, Shell, Timed};
+use windlass_qbit_core::{QbitAction, QbitEvent, QbitTimer};
 use windlass_types::{TorrentRecord, TorrentState};
 
 pub struct QbitShell {
     client: QbitClient,
+    /// Replace-semantics timers: at most one pending sleep per
+    /// [`QbitTimer`] id (see [`KeyedTimers`]).
+    timers: KeyedTimers<QbitTimer>,
 }
 
 impl Shell for QbitShell {
@@ -17,7 +20,10 @@ impl Shell for QbitShell {
     type Action = QbitAction;
 
     async fn new(client: Self::Config, _event_tx: UnboundedSender<Timed<QbitEvent>>) -> Self {
-        Self { client }
+        Self {
+            client,
+            timers: KeyedTimers::new(),
+        }
     }
 
     // Each action arm is a small `tokio::spawn` block; the function is long because
@@ -195,16 +201,13 @@ impl Shell for QbitShell {
                 });
             }
             QbitAction::ScheduleTimer { timer, after } => {
-                let tx = event_tx.clone();
-                windlass_machine::causal::spawn(async move {
-                    let scheduled_at = std::time::Instant::now() + after;
-                    tokio::time::sleep(after).await;
-                    let _ = tx.send(Timed::external(
-                        scheduled_at,
-                        ExternalCause::Timer { name: timer.name() },
-                        QbitEvent::TimerFired(timer),
-                    ));
-                });
+                self.timers.schedule(
+                    timer,
+                    timer.name(),
+                    after,
+                    event_tx,
+                    QbitEvent::TimerFired(timer),
+                );
             }
         }
     }
