@@ -60,9 +60,21 @@ pub enum ExternalCause {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum StoredExternalCause {
-    Timer { name: String },
-    FileWatcher { path: String },
-    DockerEvent { kind: String },
+    Timer {
+        name: String,
+    },
+    FileWatcher {
+        path: String,
+    },
+    DockerEvent {
+        /// Renamed on the wire: `StoredEventCause` is internally
+        /// tagged with `kind` and serde flattens this struct's
+        /// fields into the same JSON object — a field literally
+        /// named `kind` would emit a duplicate key and clobber the
+        /// discriminator on `JSON.parse`.
+        #[serde(rename = "event")]
+        kind: String,
+    },
     ManualCommand,
     Init,
     Unknown,

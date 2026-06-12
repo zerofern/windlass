@@ -40,7 +40,10 @@ export type StepKind = { kind: 'event' } | { kind: 'command'; response: 'sent' |
 export type StoredExternalCause =
   | { source: 'timer'; name: string }
   | { source: 'file_watcher'; path: string }
-  | { source: 'docker_event'; kind: string }
+  // `event`, not `kind`: the enclosing StoredEventCause is tagged
+  // with `kind`, and the Rust side flattens these fields into the
+  // same JSON object.
+  | { source: 'docker_event'; event: string }
   | { source: 'manual_command' }
   | { source: 'init' }
   | { source: 'unknown' }
@@ -89,6 +92,10 @@ export type BodyCapture =
     }
   | { kind: 'none' }
 
+// Untagged on the wire: a plain header value is a bare string; a
+// redacted one serializes as WireRedacted.
+export type MaybeSecret = string | { redacted: boolean; reveal_id: string }
+
 export interface StoredHttpExchange {
   exchange_id: string
   action_id: string | null
@@ -96,8 +103,10 @@ export interface StoredHttpExchange {
   at: string
   method: string
   url: string
+  request_headers: [string, MaybeSecret][]
   request_body: BodyCapture
   response_status: number
+  response_headers: [string, MaybeSecret][]
   response_body: BodyCapture
   duration_ms: number
 }

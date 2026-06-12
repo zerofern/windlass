@@ -3,12 +3,15 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
   ALL_CORES,
+  BodyCapture,
   Breakpoint,
   CoreCounters,
   CoreId,
   CoreStatus,
   LossCounters,
+  MaybeSecret,
   SseMessage,
+  StoredEventCause,
   StoredHttpExchange,
   StoredLogLine,
   StoredStepRecord,
@@ -50,6 +53,74 @@ function truncate(s: string, n: number): string {
 
 function isPaused(s: CoreStatus): boolean {
   return s.state !== 'running' && s.state !== 'stepping'
+}
+
+// ── Causal indices ────────────────────────────────────────────────────────────
+//
+// Every step carries its action/publish ids and its own cause id, and
+// every HTTP exchange carries the action_id that issued it.  The
+// client store holds the same rings the server does, so the causal
+// graph is resolvable entirely client-side.
+
+interface StepLocator {
+  core: CoreId
+  stepId: string
+  eventVariant: string
+  /** Variant of the action/publish itself (for index entries). */
+  variant: string
+}
+
+interface CausalIndex {
+  /** action_id → the step whose outcome emitted that action. */
+  byAction: Map<string, StepLocator>
+  /** publish_id → the step whose outcome emitted that publish. */
+  byPublish: Map<string, StepLocator>
+  /** action/publish id → every step whose event was caused by it. */
+  downstream: Map<string, StepLocator[]>
+  /** action_id → HTTP exchanges that action issued. */
+  httpByAction: Map<string, StoredHttpExchange[]>
+}
+
+function buildCausalIndex(
+  stepsByCore: Map<CoreId, StoredStepRecord[]>,
+  http: StoredHttpExchange[],
+): CausalIndex {
+  const byAction = new Map<string, StepLocator>()
+  const byPublish = new Map<string, StepLocator>()
+  const downstream = new Map<string, StepLocator[]>()
+  for (const [core, steps] of stepsByCore) {
+    for (const step of steps) {
+      for (const a of step.actions) {
+        byAction.set(a.action_id, { core, stepId: step.step_id, eventVariant: step.event_variant, variant: a.variant })
+      }
+      for (const p of step.publishes) {
+        byPublish.set(p.publish_id, { core, stepId: step.step_id, eventVariant: step.event_variant, variant: p.variant })
+      }
+      const cause = step.event_cause
+      if (cause.kind === 'action' || cause.kind === 'publish') {
+        const arr = downstream.get(cause.id) ?? []
+        arr.push({ core, stepId: step.step_id, eventVariant: step.event_variant, variant: step.event_variant })
+        downstream.set(cause.id, arr)
+      }
+    }
+  }
+  const httpByAction = new Map<string, StoredHttpExchange[]>()
+  for (const x of http) {
+    if (x.action_id) {
+      const arr = httpByAction.get(x.action_id) ?? []
+      arr.push(x)
+      httpByAction.set(x.action_id, arr)
+    }
+  }
+  return { byAction, byPublish, downstream, httpByAction }
+}
+
+/** Jump targets the page can scroll to + highlight. */
+interface Focus {
+  step?: { core: CoreId; stepId: string }
+  exchange?: string
+  /** Monotonic nonce so re-jumping to the same target re-triggers the scroll. */
+  nonce: number
 }
 
 // ── Cores rail ────────────────────────────────────────────────────────────────
@@ -118,14 +189,225 @@ function CoresRail({
   )
 }
 
+// ── Secrets + bodies ──────────────────────────────────────────────────────────
+
+/**
+ * One header value: plaintext renders as-is; a redacted slot shows a
+ * [reveal] button that fetches the cleartext (kept only until the
+ * component unmounts — reveal never persists, per the redesign spec).
+ */
+function SecretValue({ v }: { v: MaybeSecret }) {
+  const [revealed, setRevealed] = useState<string | null>(null)
+  if (typeof v === 'string') return <span className="break-all">{v}</span>
+  if (revealed !== null) {
+    return (
+      <span className="break-all">
+        <span className="text-yellow-300">{revealed}</span>{' '}
+        <button className="text-muted-foreground underline" onClick={() => setRevealed(null)}>hide</button>
+      </span>
+    )
+  }
+  return (
+    <span>
+      <span className="text-muted-foreground italic">redacted</span>{' '}
+      <button
+        className="text-blue-400 underline"
+        onClick={async () => {
+          const r = await fetch(`/api/v1/observability/reveal/${v.reveal_id}`, { method: 'POST' })
+          setRevealed(r.ok ? await r.text() : '(evicted from ring)')
+        }}
+      >
+        reveal
+      </button>
+    </span>
+  )
+}
+
+function HeaderList({ headers }: { headers: [string, MaybeSecret][] }) {
+  if (headers.length === 0) return <div className="text-muted-foreground">no headers captured</div>
+  return (
+    <table className="text-[10px] font-mono">
+      <tbody>
+        {headers.map(([k, v], i) => (
+          <tr key={i} className="align-top">
+            <td className="pr-2 text-muted-foreground whitespace-nowrap">{k}:</td>
+            <td><SecretValue v={v} /></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
+function BodyView({ body }: { body: BodyCapture }) {
+  switch (body.kind) {
+    case 'none':
+      return <div className="text-muted-foreground">no body</div>
+    case 'bytes':
+      return <div className="text-muted-foreground">binary body, {body.value} bytes (not captured)</div>
+    case 'text':
+      return <pre className="text-[10px] overflow-auto max-h-48 whitespace-pre-wrap break-all">{body.value}</pre>
+    case 'inline':
+      return <pre className="text-[10px] overflow-auto max-h-48">{JSON.stringify(body.value, null, 2)}</pre>
+    case 'truncated':
+      return (
+        <div>
+          <div className="text-yellow-400 text-[10px] mb-1">
+            truncated — {body.original_len} bytes original ({body.body_kind})
+          </div>
+          <pre className="text-[10px] overflow-auto max-h-48 whitespace-pre-wrap break-all">
+            {typeof body.captured === 'string' ? body.captured : JSON.stringify(body.captured, null, 2)}
+          </pre>
+        </div>
+      )
+  }
+}
+
+// ── HTTP exchange row ─────────────────────────────────────────────────────────
+
+function HttpRow({
+  x,
+  index,
+  focusNonce,
+  onJumpToStep,
+}: {
+  x: StoredHttpExchange
+  index: CausalIndex
+  /** Non-zero when this row is the current jump target; bumping it re-triggers. */
+  focusNonce: number
+  onJumpToStep: (core: CoreId, stepId: string) => void
+}) {
+  // Manual open/close wins until the next jump re-focuses this row.
+  const [toggle, setToggle] = useState<{ nonce: number; open: boolean } | null>(null)
+  const expanded = toggle && toggle.nonce === focusNonce ? toggle.open : focusNonce > 0
+  const focused = focusNonce > 0
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (focusNonce > 0) ref.current?.scrollIntoView({ block: 'nearest' })
+  }, [focusNonce])
+  const origin = x.action_id ? index.byAction.get(x.action_id) : undefined
+  return (
+    <div ref={ref} className={`border-b ${focused ? 'bg-blue-500/10' : ''}`}>
+      <div
+        className="flex gap-2 px-2 py-1 cursor-pointer hover:bg-muted/30"
+        onClick={() => setToggle({ nonce: focusNonce, open: !expanded })}
+      >
+        <span className="text-muted-foreground tabular-nums">{fmtTime(x.at)}</span>
+        <span className="text-muted-foreground">{x.core.toUpperCase()}</span>
+        <span className="font-semibold">{x.method}</span>
+        <span className="truncate max-w-[600px]">{x.url}</span>
+        <span className={x.response_status < 400 ? 'text-green-400' : 'text-red-400'}>{x.response_status}</span>
+        <span className="text-muted-foreground ml-auto">{fmtDuration(x.duration_ms)}</span>
+        <span className="text-muted-foreground">{expanded ? '▼' : '▶'}</span>
+      </div>
+      {expanded && (
+        <div className="px-4 pb-2 space-y-2 text-[11px]">
+          <div className="text-muted-foreground">
+            {origin ? (
+              <>
+                caused by action <span className="text-blue-300 font-mono">{origin.variant}</span>
+                {' '}← event <span className="font-mono">{origin.eventVariant}</span>
+                {' '}({origin.core.toUpperCase()}){' '}
+                <button
+                  className="text-blue-400 underline"
+                  onClick={() => onJumpToStep(origin.core, origin.stepId)}
+                >
+                  jump to step
+                </button>
+              </>
+            ) : (
+              <span className="italic">no originating action recorded</span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+                request — {x.method} {x.url}
+              </div>
+              <HeaderList headers={x.request_headers} />
+              <div className="mt-1"><BodyView body={x.request_body} /></div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+                response — {x.response_status} in {fmtDuration(x.duration_ms)}
+              </div>
+              <HeaderList headers={x.response_headers} />
+              <div className="mt-1"><BodyView body={x.response_body} /></div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Cause rendering ───────────────────────────────────────────────────────────
+
+function CauseLine({
+  cause,
+  index,
+  onJumpToStep,
+}: {
+  cause: StoredEventCause
+  index: CausalIndex
+  onJumpToStep: (core: CoreId, stepId: string) => void
+}) {
+  if (cause.kind === 'external') {
+    const detail =
+      cause.source === 'timer' ? `timer ${cause.name}`
+      : cause.source === 'file_watcher' ? `file watcher ${cause.path}`
+      : cause.source === 'docker_event' ? `docker event ${cause.event}`
+      : cause.source.replace('_', ' ')
+    return <span className="text-muted-foreground">external: {detail}</span>
+  }
+  const origin = (cause.kind === 'action' ? index.byAction : index.byPublish).get(cause.id)
+  if (!origin) {
+    return <span className="text-muted-foreground italic">{cause.kind} {cause.id.slice(0, 8)}… (origin evicted)</span>
+  }
+  return (
+    <span className="text-muted-foreground">
+      {cause.kind} <span className={cause.kind === 'action' ? 'text-blue-300 font-mono' : 'text-green-300 font-mono'}>{origin.variant}</span>
+      {' '}← event <span className="font-mono">{origin.eventVariant}</span> ({origin.core.toUpperCase()}){' '}
+      <button className="text-blue-400 underline" onClick={() => onJumpToStep(origin.core, origin.stepId)}>
+        jump to origin
+      </button>
+    </span>
+  )
+}
+
 // ── StepRecord row ────────────────────────────────────────────────────────────
 
-function StepRow({ step, prevState }: { step: StoredStepRecord; prevState: unknown }) {
-  const [expanded, setExpanded] = useState(false)
+function StepRow({
+  step,
+  prevState,
+  index,
+  focusNonce,
+  onJumpToStep,
+  onViewExchange,
+}: {
+  step: StoredStepRecord
+  prevState: unknown
+  index: CausalIndex
+  /** Non-zero when this row is the current jump target; bumping it re-triggers. */
+  focusNonce: number
+  onJumpToStep: (core: CoreId, stepId: string) => void
+  onViewExchange: (exchangeId: string) => void
+}) {
+  // Manual open/close wins until the next jump re-focuses this row.
+  const [toggle, setToggle] = useState<{ nonce: number; open: boolean } | null>(null)
+  const expanded = toggle && toggle.nonce === focusNonce ? toggle.open : focusNonce > 0
+  const focused = focusNonce > 0
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (focusNonce > 0) ref.current?.scrollIntoView({ block: 'center' })
+  }, [focusNonce])
   const stateDelta = useMemo(() => diffJson(prevState, step.state_after), [prevState, step.state_after])
   return (
-    <div className="border-b py-2 text-xs cursor-pointer hover:bg-muted/30" onClick={() => setExpanded(!expanded)}>
-      <div className="flex items-center gap-2">
+    <div ref={ref} className={`border-b py-2 text-xs ${focused ? 'bg-blue-500/10 rounded' : ''}`}>
+      <div
+        className="flex items-center gap-2 cursor-pointer hover:bg-muted/30"
+        onClick={() => setToggle({ nonce: focusNonce, open: !expanded })}
+      >
         <span className="text-muted-foreground tabular-nums shrink-0">{fmtTime(step.recorded_at)}</span>
         <span className="font-semibold">{step.event_variant}</span>
         <span className="text-muted-foreground">{fmtDuration(step.duration_ms)}</span>
@@ -138,29 +420,70 @@ function StepRow({ step, prevState }: { step: StoredStepRecord; prevState: unkno
       {expanded && (
         <div className="mt-2 pl-4 space-y-2">
           <Section title="cause">
-            <pre className="text-[10px]">{JSON.stringify(step.event_cause, null, 2)}</pre>
+            <CauseLine cause={step.event_cause} index={index} onJumpToStep={onJumpToStep} />
           </Section>
           <Section title="event">
             <pre className="text-[10px] overflow-auto max-h-48">{JSON.stringify(step.event, null, 2)}</pre>
           </Section>
           {step.actions.length > 0 && (
             <Section title={`actions (${step.actions.length})`}>
-              {step.actions.map(a => (
-                <div key={a.action_id} className="border-l-2 border-blue-500/40 pl-2 mb-1">
-                  <div className="text-blue-300">{a.variant}</div>
-                  <pre className="text-[10px]">{JSON.stringify(a.payload, null, 2)}</pre>
-                </div>
-              ))}
+              {step.actions.map(a => {
+                const exchanges = index.httpByAction.get(a.action_id) ?? []
+                const downstream = index.downstream.get(a.action_id) ?? []
+                return (
+                  <div key={a.action_id} className="border-l-2 border-blue-500/40 pl-2 mb-1">
+                    <div className="text-blue-300">{a.variant}</div>
+                    <pre className="text-[10px]">{JSON.stringify(a.payload, null, 2)}</pre>
+                    {exchanges.map(x => (
+                      <div key={x.exchange_id} className="text-[10px] text-muted-foreground">
+                        → {x.method} {truncate(x.url, 60)}{' '}
+                        <span className={x.response_status < 400 ? 'text-green-400' : 'text-red-400'}>
+                          {x.response_status}
+                        </span>{' '}
+                        {fmtDuration(x.duration_ms)}{' '}
+                        <button
+                          className="text-blue-400 underline"
+                          onClick={() => onViewExchange(x.exchange_id)}
+                        >
+                          view req/res
+                        </button>
+                      </div>
+                    ))}
+                    {downstream.map(d => (
+                      <div key={d.stepId} className="text-[10px] text-muted-foreground">
+                        → resulting event <span className="font-mono">{d.eventVariant}</span> ({d.core.toUpperCase()}){' '}
+                        <button className="text-blue-400 underline" onClick={() => onJumpToStep(d.core, d.stepId)}>
+                          jump
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })}
             </Section>
           )}
           {step.publishes.length > 0 && (
             <Section title={`publishes (${step.publishes.length})`}>
-              {step.publishes.map(p => (
-                <div key={p.publish_id} className="border-l-2 border-green-500/40 pl-2 mb-1">
-                  <div className="text-green-300">{p.topic}: {p.variant}</div>
-                  <pre className="text-[10px]">{JSON.stringify(p.payload, null, 2)}</pre>
-                </div>
-              ))}
+              {step.publishes.map(p => {
+                const downstream = index.downstream.get(p.publish_id) ?? []
+                return (
+                  <div key={p.publish_id} className="border-l-2 border-green-500/40 pl-2 mb-1">
+                    <div className="text-green-300">{p.topic}: {p.variant}</div>
+                    <pre className="text-[10px]">{JSON.stringify(p.payload, null, 2)}</pre>
+                    {downstream.map(d => (
+                      <div key={d.stepId} className="text-[10px] text-muted-foreground">
+                        → resulting event <span className="font-mono">{d.eventVariant}</span> ({d.core.toUpperCase()}){' '}
+                        <button className="text-blue-400 underline" onClick={() => onJumpToStep(d.core, d.stepId)}>
+                          jump
+                        </button>
+                      </div>
+                    ))}
+                    {downstream.length === 0 && (
+                      <div className="text-[10px] text-muted-foreground italic">no resulting events recorded</div>
+                    )}
+                  </div>
+                )
+              })}
             </Section>
           )}
           <Section title="state after">
@@ -212,33 +535,46 @@ function jsonShort(v: unknown): string {
 function BottomPanel({
   http,
   logs,
+  tab,
+  onTab,
+  index,
+  focusExchange,
+  onJumpToStep,
 }: {
   http: StoredHttpExchange[]
   logs: StoredLogLine[]
+  tab: 'http' | 'logs'
+  onTab: (t: 'http' | 'logs') => void
+  index: CausalIndex
+  focusExchange: { id: string; nonce: number } | null
+  onJumpToStep: (core: CoreId, stepId: string) => void
 }) {
-  const [tab, setTab] = useState<'http' | 'logs'>('http')
   return (
     <div className="border-t bg-background">
-      <div className="flex gap-2 border-b px-2 py-1">
-        <Button size="sm" variant={tab === 'http' ? 'default' : 'ghost'} onClick={() => setTab('http')}>
+      <div className="flex gap-2 border-b px-2 py-1 items-center">
+        <Button size="sm" variant={tab === 'http' ? 'default' : 'ghost'} onClick={() => onTab('http')}>
           HTTP ({http.length})
         </Button>
-        <Button size="sm" variant={tab === 'logs' ? 'default' : 'ghost'} onClick={() => setTab('logs')}>
+        <Button size="sm" variant={tab === 'logs' ? 'default' : 'ghost'} onClick={() => onTab('logs')}>
           Logs ({logs.length})
         </Button>
+        {tab === 'http' && (
+          <span className="text-[10px] text-muted-foreground ml-2">
+            click a row to inspect the full request/response
+          </span>
+        )}
       </div>
-      <div className="h-48 overflow-auto text-xs">
+      <div className="h-56 overflow-auto text-xs">
         {tab === 'http' && (
           <div className="font-mono">
             {http.slice(-200).reverse().map(x => (
-              <div key={x.exchange_id} className="flex gap-2 px-2 py-1 border-b">
-                <span className="text-muted-foreground tabular-nums">{fmtTime(x.at)}</span>
-                <span className="text-muted-foreground">{x.core.toUpperCase()}</span>
-                <span className="font-semibold">{x.method}</span>
-                <span className="truncate max-w-[600px]">{x.url}</span>
-                <span className={x.response_status < 400 ? 'text-green-400' : 'text-red-400'}>{x.response_status}</span>
-                <span className="text-muted-foreground ml-auto">{fmtDuration(x.duration_ms)}</span>
-              </div>
+              <HttpRow
+                key={x.exchange_id}
+                x={x}
+                index={index}
+                focusNonce={focusExchange?.id === x.exchange_id ? focusExchange.nonce : 0}
+                onJumpToStep={onJumpToStep}
+              />
             ))}
           </div>
         )}
@@ -363,6 +699,8 @@ export function Observability() {
   const [breakpoints, setBreakpoints] = useState<Breakpoint[]>([])
   const [selected, setSelected] = useState<CoreId>('mam')
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [bottomTab, setBottomTab] = useState<'http' | 'logs'>('http')
+  const [focus, setFocus] = useState<Focus>({ nonce: 0 })
   const esRef = useRef<EventSource | null>(null)
 
   const refreshBreakpoints = useCallback(async () => {
@@ -445,6 +783,18 @@ export function Observability() {
     }
   }, [])
 
+  const index = useMemo(() => buildCausalIndex(stepsByCore, http), [stepsByCore, http])
+
+  const jumpToStep = useCallback((core: CoreId, stepId: string) => {
+    setSelected(core)
+    setFocus(f => ({ step: { core, stepId }, nonce: f.nonce + 1 }))
+  }, [])
+
+  const viewExchange = useCallback((exchangeId: string) => {
+    setBottomTab('http')
+    setFocus(f => ({ exchange: exchangeId, nonce: f.nonce + 1 }))
+  }, [])
+
   const visibleSteps = useMemo(() => {
     const arr = stepsByCore.get(selected) ?? []
     return [...arr].reverse()
@@ -478,18 +828,38 @@ export function Observability() {
           <CoresRail selected={selected} statuses={statuses} onSelect={setSelected} loss={loss} />
         </div>
         <div className="flex-1 overflow-auto p-3">
-          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-            {selected.toUpperCase()} steps ({visibleSteps.length})
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            {selected.toUpperCase()} step stream ({visibleSteps.length})
+          </div>
+          <div className="text-[10px] text-muted-foreground mb-2">
+            one step = one event the core handled → the actions, publishes, and state change it produced.
+            expand a step and follow the links to walk the causal chain.
           </div>
           {visibleSteps.length === 0 && (
             <div className="text-sm text-muted-foreground">no steps recorded yet</div>
           )}
           {visibleSteps.map(step => (
-            <StepRow key={step.step_id} step={step} prevState={prevStates.get(step.step_id)} />
+            <StepRow
+              key={step.step_id}
+              step={step}
+              prevState={prevStates.get(step.step_id)}
+              index={index}
+              focusNonce={focus.step?.stepId === step.step_id ? focus.nonce : 0}
+              onJumpToStep={jumpToStep}
+              onViewExchange={viewExchange}
+            />
           ))}
         </div>
       </div>
-      <BottomPanel http={http} logs={logs} />
+      <BottomPanel
+        http={http}
+        logs={logs}
+        tab={bottomTab}
+        onTab={setBottomTab}
+        index={index}
+        focusExchange={focus.exchange ? { id: focus.exchange, nonce: focus.nonce } : null}
+        onJumpToStep={jumpToStep}
+      />
       {drawerOpen && (
         <BreakpointDrawer
           breakpoints={breakpoints}
