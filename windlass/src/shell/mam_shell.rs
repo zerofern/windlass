@@ -69,15 +69,6 @@ impl Shell for MamShell {
                             registered_asn,
                             registered_as,
                         },
-                        // The client reports the honest remaining
-                        // window (up to 1h for the dynamic-seedbox
-                        // guard).  Mapping this to a short constant
-                        // (the old `1s`) made the machine retry
-                        // against a closed guard once per second —
-                        // a critical-alert storm.
-                        MamSeedboxResult::RateLimited { retry_after } => {
-                            MamEvent::RateLimited { retry_after }
-                        }
                         // §30: ASN mismatch is a distinct compliance signal.
                         MamSeedboxResult::AsnMismatch { ip } => MamEvent::AsnMismatch { ip },
                         // §28: transport-level failure routes as Unreachable.

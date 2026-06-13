@@ -72,7 +72,7 @@ pub struct ContainerInfo {
     /// healthcheck is configured.
     pub health: Option<String>,
     /// ISO-8601 timestamp; useful for §35-style stale-namespace
-    /// assertions ("dependent started before Gluetun's `healthy_since`").
+    /// assertions ("dependent started before the anchor's `healthy_since`").
     pub started_at: String,
 }
 

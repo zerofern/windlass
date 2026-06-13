@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::{
-    DATABASE_URL, GLUETUN_CONTROL, MAM_BASE, WINDLASS_BASE, WINDLASS_CONTAINER, docker, mam, qbit,
+    DATABASE_URL, MAM_BASE, WG_CONTROL, WINDLASS_BASE, WINDLASS_CONTAINER, docker, mam, qbit,
 };
 
 /// Restart-window deadline for the Windlass container.
@@ -19,7 +19,8 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(45);
 /// Restore the stack to a known baseline:
 ///
 /// 1. Clear fake-MAM journal + restore endpoint defaults.
-/// 2. Reset fake-Gluetun IP/port files + healthy state.
+/// 2. Reset the WireGuard fixture (default NAT-PMP port, no exit-IP
+///    override).
 /// 3. Delete every torrent from qBit.
 /// 4. Truncate Windlass DB tables.
 /// 5. Restart the Windlass container; wait for `/api/v1/health` to
@@ -37,15 +38,14 @@ pub async fn reset_stack() -> Result<()> {
         .await
         .context("fake-mam reset")?;
 
-    // 2. fake-Gluetun.  The testkit gluetun mode exposes /set + /clear-port.
+    // 2. WireGuard fixture: default NAT-PMP port, no exit-IP override.
     let http = reqwest::Client::new();
-    http.post(format!("{GLUETUN_CONTROL}/set"))
-        .json(&serde_json::json!({ "ip": "10.8.0.1", "port": 51_820 }))
+    http.post(format!("{WG_CONTROL}/control/reset"))
         .send()
         .await
-        .context("gluetun set")?
+        .context("wg fixture reset")?
         .error_for_status()
-        .context("gluetun set status")?;
+        .context("wg fixture reset status")?;
 
     // 3. qBit.
     qbit::delete_all().await.context("qbit delete_all")?;

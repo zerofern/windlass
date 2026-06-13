@@ -24,7 +24,7 @@ use windlass_net::{TunnelShell, TunnelShellConfig};
 use windlass_qbit_core::{QbitConfig, QbitMachine, QbitPublish, QbitTopic};
 use windlass_tunnel_core::config::{EndpointResolutionPolicy, WgConfig};
 use windlass_tunnel_core::{TunnelConfig, TunnelMachine, TunnelPublish, TunnelTopic};
-use windlass_vpn_core::{VpnConfig, VpnMachine, VpnPublish, VpnTopic};
+use windlass_vpn_core::{VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
 use super::db_shell::DbShell;
@@ -35,7 +35,7 @@ use super::mam_shell::MamShell;
 use super::qbit_shell::QbitShell;
 use super::service::ServiceCores;
 use super::tunnel_bridge::{bridge_tunnel_publish, wrap_publish_for_domain};
-use super::vpn_shell::{VpnShell, VpnShellConfig};
+use super::vpn_shell::VpnShell;
 
 /// Owns everything constructed by `init_shell` that needs to outlive
 /// the function call.  `shell::run` keeps the bundle alive for the
@@ -77,10 +77,9 @@ pub(super) async fn init_shell(
         .await
         .map_err(|e| anyhow::anyhow!("Database migration failed: {e}"))?;
 
-    // Phase 5 (docs/vpn-ownership.md): the Gluetun file-watcher
-    // pump is gone.  Tunnel mode is the only source of VPN-state
-    // truth now; the bridge below synthesizes VpnEvents from
-    // TunnelPublishes for the legacy VpnMachine state translator.
+    // The tunnel core is the only source of VPN-state truth; the
+    // bridge below synthesizes VpnEvents from TunnelPublishes for the
+    // VpnMachine state translator.
     info!("Windlass started");
 
     let direct = reqwest::Client::builder()
@@ -147,7 +146,7 @@ pub(super) async fn init_shell(
         windlass_machine::CoreId::Docker,
         runtime_tap.clone(),
         DockerConfig {
-            gluetun_anchor: docker.gluetun_anchor.clone(),
+            anchor: docker.anchor.clone(),
             // §35: restart circuit-breaker — 3 restarts per 10-minute
             // window.  Defaults preserved from the VPN-core era.
             max_restarts_per_window: 3,
@@ -199,28 +198,13 @@ pub(super) async fn init_shell(
         .send((vec![DiskTopic::Pressure], disk_pub_tx))
         .expect("disk pub subscription");
 
-    let tunnel_mode_active = config.wg_config_path.is_some();
-    let vpn_shell_config = if tunnel_mode_active {
-        VpnShellConfig::TunnelMode
-    } else {
-        VpnShellConfig::LegacyGluetun {
-            docker: docker.clone(),
-            vpn_ip_file: config.vpn_ip_file.clone(),
-            vpn_port_file: config.vpn_port_file.clone(),
-        }
-    };
+    // VpnMachine is a thin translator driven by the tunnel bridge —
+    // no config, no shell I/O.
     let (vpn_handles, _vpn_join) = windlass_machine::spawn::<VpnMachine, VpnShell>(
         windlass_machine::CoreId::Vpn,
         runtime_tap.clone(),
-        VpnConfig {
-            health_poll_interval: Duration::from_secs(30),
-            unhealthy_poll_interval: Duration::from_secs(5),
-            port_read_retry_interval: Duration::from_millis(500),
-            // §31: ifconfig.co verification cadence + threshold.
-            public_ip_verify_interval: Duration::from_hours(6),
-            public_ip_verify_failure_threshold: 3,
-        },
-        vpn_shell_config,
+        (),
+        (),
     )
     .await;
     let (vpn_pub_tx, mut vpn_pub_rx) =
@@ -235,24 +219,17 @@ pub(super) async fn init_shell(
 
     // ── In-process WireGuard tunnel (docs/vpn-ownership.md) ──────────────────
     //
-    // When `WG_CONFIG_PATH` is set, Windlass owns the tunnel:
-    // `windlass-tunnel-core` + `windlass-net` bring up `wg0`, install
-    // the nftables kill switch, talk NAT-PMP to the ProtonVPN gateway,
-    // poll handshake age, and run the leak probe.  The legacy
-    // VpnMachine still spawns alongside for the moment so the
-    // domain core's existing VpnPublish consumers don't have to
-    // change — a follow-up commit on this branch retires VpnMachine
-    // and the Gluetun-aware code paths once the tunnel-mode
-    // deployment has been verified.  Tunnel publishes are bridged
-    // into the existing VpnMachine event channel so PortReady/
-    // Disconnected/etc. drive the same downstream paths Gluetun-
-    // sourced events do today.
-    // Read + parse wg.conf exactly once when tunnel mode is enabled.
-    // Compliance publishes must come from the real exit-IP query —
-    // never the tunnel interface address from wg.conf.
-    let (tunnel_handles_opt, tunnel_bridge_rx) = if let Some(wg_path) =
-        config.wg_config_path.clone()
-    {
+    // Windlass owns the tunnel: `windlass-tunnel-core` + `windlass-net`
+    // bring up `wg0`, install the nftables kill switch, talk NAT-PMP to
+    // the ProtonVPN gateway, poll handshake age, and run the leak
+    // probe.  Tunnel publishes are bridged into the VpnMachine event
+    // channel (and directly into the domain) so PortReady/Disconnected/
+    // etc. drive the existing downstream consumers.
+    // Read + parse wg.conf exactly once.  Compliance publishes must
+    // come from the real exit-IP query — never the tunnel interface
+    // address from wg.conf.
+    let (tunnel_handles, tunnel_pub_rx) = {
+        let wg_path = config.wg_config_path.clone();
         let wg_content = tokio::fs::read_to_string(&wg_path)
             .await
             .map_err(|e| anyhow::anyhow!("read WG_CONFIG_PATH ({wg_path}): {e}"))?;
@@ -270,6 +247,7 @@ pub(super) async fn init_shell(
             runtime_tap.clone(),
             TunnelConfig {
                 peer_count,
+                exit_ip_query_interval: Duration::from_secs(config.exit_ip_query_interval_secs),
                 ..TunnelConfig::default()
             },
             TunnelShellConfig {
@@ -278,10 +256,7 @@ pub(super) async fn init_shell(
                 natpmp_gateway,
                 natpmp_timeout: Duration::from_secs(2),
                 natpmp_lifetime_seconds: 60,
-                exit_ip_urls: vec![
-                    "https://api.ipify.org".to_string(),
-                    "https://ipv4.icanhazip.com".to_string(),
-                ],
+                exit_ip_urls: config.exit_ip_urls.clone(),
                 allowed_tcp_endpoints: config.tunnel_firewall_allow_tcp.clone(),
                 tap: http_tap.clone(),
             },
@@ -306,20 +281,13 @@ pub(super) async fn init_shell(
                 tunnel_pub_tx,
             ))
             .expect("tunnel pub subscription");
-        (Some(tunnel_handles), Some(tunnel_pub_rx))
-    } else {
-        info!("WG_CONFIG_PATH not set; tunnel mode disabled");
-        (None, None)
+        (tunnel_handles, tunnel_pub_rx)
     };
 
     // The actual bridge forwarder is spawned later, once
     // `domain_handles` exists — it needs both `vpn_handles.events`
     // (for VpnEvent injection) and `domain_handles.events` (for
     // direct VpnPublish synthesis into the §29 admission path).
-
-    // Phase 5: the Gluetun file-watcher pump is gone.  TunnelMachine
-    // owns the IP + port state and the bridge above synthesizes
-    // VpnEvents directly from TunnelPublishes.
 
     let (qbit_handles, _qbit_join) = windlass_machine::spawn::<QbitMachine, QbitShell>(
         windlass_machine::CoreId::Qbit,
@@ -374,7 +342,11 @@ pub(super) async fn init_shell(
             stale_registration_interval: windlass_mam_core::DEFAULT_STALE_REGISTRATION_INTERVAL,
             // §32 machine-side dynamicSeedbox spacing — keeps every
             // update path off MAM's 1-hour limit by construction.
-            seedbox_update_min_interval: windlass_mam_core::DEFAULT_SEEDBOX_UPDATE_MIN_INTERVAL,
+            // Env-tunable so the integration stack can exercise
+            // IP-change contracts without hour-long waits.
+            seedbox_update_min_interval: Duration::from_secs(
+                config.seedbox_update_min_interval_secs,
+            ),
         },
         mam.clone(),
     )
@@ -401,17 +373,11 @@ pub(super) async fn init_shell(
         runtime_tap.clone(),
         WindlassConfig {
             snapshot_interval: Duration::from_secs(config.compliance_poll_interval_secs),
-            gluetun_anchor: docker.gluetun_anchor.clone(),
-            // vpn-branch H1: tunnel mode owns recovery in-process,
-            // so the domain must NOT issue
-            // `Docker(RestartContainer { name = windlass })` on
-            // Crashed.  Legacy Gluetun deploys would set this true.
-            restart_anchor_on_crash: !tunnel_mode_active,
+            anchor: docker.anchor.clone(),
             initial_blacklist,
         },
         DomainShellConfig {
             db: db_handles.commands.clone(),
-            vpn: vpn_handles.commands.clone(),
             qbit: qbit_handles.commands.clone(),
             mam: mam_handles.commands.clone(),
             docker: docker_handles.commands.clone(),
@@ -472,8 +438,7 @@ pub(super) async fn init_shell(
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
-                    | VpnPublish::PublicIpVerificationDegraded { .. }
-                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
+                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::from_publish(
                     std::time::Instant::now(),
@@ -495,7 +460,8 @@ pub(super) async fn init_shell(
     // and a clear-port hint that the runtime applies to the shared
     // forwarded_port arc so qBit stops trusting a port the tunnel no
     // longer holds.
-    if let Some(mut tunnel_pub_rx) = tunnel_bridge_rx {
+    {
+        let mut tunnel_pub_rx = tunnel_pub_rx;
         let vpn_event_tx_bridge = vpn_handles.events.clone();
         let domain_ev_tx_bridge = domain_handles.events.clone();
         let fp_for_bridge = Arc::clone(&forwarded_port);
@@ -691,7 +657,7 @@ pub(super) async fn init_shell(
         qbit_handles,
         mam_handles,
         disk_handles,
-        tunnel_handles_opt,
+        tunnel_handles,
         forwarded_port,
     );
     let execute_service_actions = config.execute_service_actions;

@@ -1,5 +1,5 @@
 //! §34 contract tests: real Docker stack, real qBittorrent, fake MAM,
-//! fake Gluetun.  Each test starts from a known baseline via
+//! the WireGuard fixture.  Each test starts from a known baseline via
 //! `reset_stack()` and asserts on a wire Windlass depends on.
 //!
 //! Run with the dev stack up:
@@ -18,8 +18,8 @@ use windlass_clients::qbit::{QbitAuthResult, QbitClient, QbitPortSyncResult, Qbi
 use windlass_types::{NullHttpTap, QbitPassword, VpnPort};
 
 use support::{
-    DATABASE_URL, GLUETUN_CONTROL, MAM_BASE, QBIT_BASE, QBIT_PASS, QBIT_USER, WINDLASS_BASE, mam,
-    qbit, reset, wait_for,
+    DATABASE_URL, MAM_BASE, QBIT_BASE, QBIT_PASS, QBIT_USER, WG_CONTROL, WINDLASS_BASE, mam, qbit,
+    reset, wait_for,
 };
 
 /// Build a fresh, authed reqwest client against the real qBit.  Used
@@ -57,32 +57,35 @@ async fn qbit_listen_port() -> Option<u64> {
     prefs.get("listen_port").and_then(Value::as_u64)
 }
 
-// ── #1 — Gluetun re-syncs port to qBit ───────────────────────────────────────
+// ── #1 — NAT-PMP port change re-syncs to qBit ────────────────────────────────
 
-/// **Contract:** when fake Gluetun writes a new IP/port pair to its
-/// shared volume, Windlass observes the file change via `inotify` and
-/// POSTs `setPreferences` to qBit with the new `listen_port` value.
+/// **Contract:** when the NAT-PMP gateway grants a different external
+/// port, Windlass picks it up on the next lease renewal and POSTs
+/// `setPreferences` to qBit with the new `listen_port` value.
 ///
-/// Verifies the Gluetun-file → Windlass → qBit wire end-to-end.
+/// Verifies the NAT-PMP → tunnel core → bridge → domain → qBit wire
+/// end-to-end.  The fixture's lease is 15 s in the dev stack, so the
+/// renewal lands within a couple of cycles.
 #[tokio::test]
 #[ignore = "requires the §34 dev stack: just stack-up"]
-async fn gluetun_set_files_resyncs_port_to_qbit() {
+async fn natpmp_port_change_resyncs_port_to_qbit() {
     reset::reset_stack().await.expect("reset_stack");
     let http = reqwest::Client::new();
 
-    // Push a new ip+port via the fake-Gluetun control plane.
-    http.post(format!("{GLUETUN_CONTROL}/set"))
-        .json(&serde_json::json!({ "ip": "10.8.0.2", "port": 51_821 }))
+    // Change the granted external port via the fixture control plane.
+    http.post(format!("{WG_CONTROL}/control/natpmp-port"))
+        .body("51821")
         .send()
         .await
-        .expect("gluetun set")
+        .expect("set natpmp port")
         .error_for_status()
-        .expect("gluetun set 200");
+        .expect("set natpmp port 200");
 
-    // Wait for Windlass to push the new port into qBit's preferences.
+    // Wait for the renewal to pick it up and Windlass to push the new
+    // port into qBit's preferences.
     wait_for(
         "qbit listen_port becomes 51821",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async { qbit_listen_port().await == Some(51_821) },
     )
     .await;
@@ -115,29 +118,30 @@ async fn boot_authenticates_qbit() {
     assert!(body.is_array(), "expected JSON array, got: {body}");
 }
 
-// ── #3 — Boot syncs port 51820 to qBit preferences ───────────────────────────
+// ── #3 — Boot syncs the NAT-PMP port to qBit preferences ─────────────────────
 
-/// **Contract:** after a clean restart Windlass reads Gluetun's port
-/// file (51820 by default per `reset_stack()`) and pushes that into
-/// qBit's preferences within the boot window.
+/// **Contract:** after a clean restart Windlass obtains the forwarded
+/// port via NAT-PMP (the fixture grants 43210 by default per
+/// `reset_stack()`) and pushes it into qBit's preferences within the
+/// boot window.
 #[tokio::test]
 #[ignore = "requires the §34 dev stack: just stack-up"]
 async fn boot_syncs_default_port_to_qbit_preferences() {
     reset::reset_stack().await.expect("reset_stack");
 
     wait_for(
-        "qbit listen_port becomes 51820 after boot",
-        Duration::from_secs(30),
-        || async { qbit_listen_port().await == Some(51_820) },
+        "qbit listen_port becomes 43210 after boot",
+        Duration::from_secs(60),
+        || async { qbit_listen_port().await == Some(43_210) },
     )
     .await;
 }
 
 // ── #4 — Boot updates MAM seedbox ────────────────────────────────────────────
 
-/// **Contract:** at boot, Windlass POSTs / GETs the MAM
-/// `/json/dynamicSeedbox.php` endpoint with the IP it observed from
-/// the Gluetun file.  Asserted via the fake-MAM request journal.
+/// **Contract:** at boot, Windlass calls the MAM
+/// `/json/dynamicSeedbox.php` endpoint once the tunnel observes its
+/// exit IP.  Asserted via the fake-MAM request journal.
 #[tokio::test]
 #[ignore = "requires the §34 dev stack: just stack-up"]
 async fn boot_updates_mam_seedbox() {
@@ -231,23 +235,24 @@ async fn qbit_torrent_persists_to_db_via_api() {
     .await;
 }
 
-// ── #7 (audit #5) — Gluetun IP change drives a new seedbox call ──────────────
+// ── #7 (audit #5) — Exit-IP change drives a new seedbox call ─────────────────
 
-/// **Contract:** when Gluetun's IP file changes, Windlass detects the
-/// change (§31) and calls MAM's `/json/dynamicSeedbox.php`.  The
-/// fake-MAM journal must contain a fresh entry posted *after* the IP
-/// change.  Endpoint takes no body, so the contract is "request count
-/// increases" — what MAM does with it is the server's concern.
+/// **Contract:** when the tunnel's observed exit IP changes, Windlass
+/// detects it (§31, via the periodic exit-IP query) and calls MAM's
+/// `/json/dynamicSeedbox.php` again.  The MAM machine's §32 update
+/// window (20 s in the dev stack; 61 min in production) defers — not
+/// drops — the call, so the journal must gain a fresh entry once the
+/// window passes.
 #[tokio::test]
 #[ignore = "requires the §34 dev stack: just stack-up"]
-async fn gluetun_ip_change_triggers_new_seedbox_call() {
+async fn exit_ip_change_triggers_new_seedbox_call() {
     reset::reset_stack().await.expect("reset_stack");
     let fake = mam::FakeMam::new(MAM_BASE);
 
     // Wait for the boot-time call to land so we have a known baseline.
     wait_for(
         "boot-time dynamicSeedbox call lands",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             fake.journal()
                 .await
@@ -256,27 +261,23 @@ async fn gluetun_ip_change_triggers_new_seedbox_call() {
     )
     .await;
 
-    // Reset the journal so the count below starts at 0.
+    // Reset the journal so the count below starts at 0, then change
+    // the exit IP the fixture's reflector reports.
     fake.reset().await.expect("clear journal");
-
-    // Push a new IP via fake-Gluetun.  §32's 1-hour rate limit just
-    // ticked (during boot) — so this second call would normally be
-    // suppressed.  Reset the rate limiter by restarting Windlass.
-    docker_restart_windlass().await;
-    // Now write the new IP and wait for Windlass to react with a
-    // fresh dynamicSeedbox call against the just-cleared journal.
     let http = reqwest::Client::new();
-    http.post(format!("{GLUETUN_CONTROL}/set"))
-        .json(&serde_json::json!({ "ip": "10.8.0.42", "port": 51_820 }))
+    http.post(format!("{WG_CONTROL}/control/exit-ip"))
+        .body("10.8.0.42")
         .send()
         .await
-        .expect("gluetun set")
+        .expect("set exit-ip override")
         .error_for_status()
-        .expect("gluetun set 200");
+        .expect("set exit-ip override 200");
 
+    // Exit-IP query cadence (5 s) + §32 window deferral (20 s) both
+    // fit comfortably in the wait budget.
     wait_for(
         "new dynamicSeedbox call appears post-IP-change",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             fake.journal()
                 .await
@@ -286,46 +287,27 @@ async fn gluetun_ip_change_triggers_new_seedbox_call() {
     .await;
 }
 
-async fn docker_restart_windlass() {
-    support::docker::restart_and_wait_healthy(support::WINDLASS_CONTAINER, Duration::from_secs(45))
-        .await
-        .expect("restart windlass");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("build readiness client");
-    wait_for(
-        "windlass /api/v1/health 200",
-        Duration::from_secs(45),
-        || async {
-            http.get(format!("{WINDLASS_BASE}/api/v1/health"))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-        },
-    )
-    .await;
-}
+// ── #8 (audit #8) — §32 dedup: unchanged exit IP never re-calls ──────────────
 
-// ── #8 (audit #8) — §32 1-hour seedbox rate limit suppresses re-call ─────────
-
-/// **Contract:** within an hour of a successful `dynamicSeedbox.php`
-/// call, Windlass's MAM client must not make a second one.  A second
-/// IP change during the cool-down should be silently suppressed at the
-/// client-side gate (§32).
+/// **Contract:** an unchanged exit IP must never produce a second
+/// `dynamicSeedbox.php` call — the Mousehole-style dedup
+/// (`registered_ip == observed_ip`) holds across exit-IP query cycles
+/// regardless of the §32 update window.  (The window's deferral
+/// semantics are pinned by mam-core unit tests; the wire contract
+/// here is "no change → no call".)
 ///
-/// We let the boot-time call land, then change the Gluetun IP and
-/// confirm no second call shows up in the journal within ~8 seconds.
+/// We let the boot-time call land, then ride out several exit-IP
+/// query cycles (5 s cadence in the dev stack) past the 20 s dev
+/// window and confirm the journal still holds exactly one call.
 #[tokio::test]
 #[ignore = "requires the §34 dev stack: just stack-up"]
-async fn seedbox_rate_limit_suppresses_second_call_within_hour() {
+async fn seedbox_unchanged_ip_never_recalls() {
     reset::reset_stack().await.expect("reset_stack");
     let fake = mam::FakeMam::new(MAM_BASE);
 
-    // Boot-time call has fired once: rate limiter is now armed.
     wait_for(
         "boot-time dynamicSeedbox call",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             fake.journal()
                 .await
@@ -334,26 +316,14 @@ async fn seedbox_rate_limit_suppresses_second_call_within_hour() {
     )
     .await;
 
-    // Try to force a second call by changing the Gluetun IP.
-    let http = reqwest::Client::new();
-    http.post(format!("{GLUETUN_CONTROL}/set"))
-        .json(&serde_json::json!({ "ip": "10.8.0.99", "port": 51_820 }))
-        .send()
-        .await
-        .expect("gluetun set")
-        .error_for_status()
-        .expect("gluetun set 200");
+    // Several query cycles, past the dev-stack update window.
+    tokio::time::sleep(Duration::from_secs(25)).await;
 
-    // Give Windlass plenty of time to react.
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
-    // Rate limit must still be in effect: exactly one dynamicSeedbox
-    // entry in the journal.
     let entries = fake.journal().await.expect("journal");
     let count = count_seedbox_calls(&entries);
     assert_eq!(
         count, 1,
-        "expected exactly 1 dynamicSeedbox call under 1h rate limit; got {count}"
+        "expected exactly 1 dynamicSeedbox call for an unchanged IP; got {count}"
     );
 }
 

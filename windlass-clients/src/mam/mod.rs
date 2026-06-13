@@ -21,12 +21,6 @@ pub enum MamSeedboxResult {
     AsnMismatch { ip: VpnIp },
     /// Transport-level failure — DNS / TCP / TLS / timeout.
     Unreachable { reason: String },
-    /// MAM's documented 1-hour rolling rate limit, or the operator's
-    /// 400ms inter-request guard.  `retry_after` is the actual time
-    /// remaining on the guard — the machine schedules its retry from
-    /// this, so reporting a too-short value here turns into a retry
-    /// (and a critical alert) storm.
-    RateLimited { retry_after: std::time::Duration },
     /// MAM responded with an error (non-1.0 IP/port, etc.).
     Failed { reason: String },
 }
@@ -108,9 +102,11 @@ pub struct DynamicSeedboxOutcome {
     pub as_org: Option<String>,
 }
 
-/// §32: typed result of `fetch_mam_ip()` — MAM's view of our current IP
-/// and ASN, returned from `/json/jsonIp.php`.  Used by §31's verification
-/// path to cross-check Gluetun's file against what MAM sees.
+/// §32: typed result of `fetch_mam_ip()`.
+///
+/// MAM's view of our current IP and ASN, returned from
+/// `/json/jsonIp.php`.  Used by §31's verification path to
+/// cross-check the tunnel-observed exit IP against what MAM sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MamIpInfo {
     pub ip: VpnIp,
@@ -227,10 +223,6 @@ pub struct MamClient {
     /// short-circuiting on the second-and-after caller.  See the
     /// `wait_for_rate_limit` doc comment for the rationale.
     last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
-    /// §32: timestamp of the last successful (or attempted) call to the
-    /// dynamic-seedbox endpoint.  Enforces MAM's documented 1-hour rolling
-    /// limit on top of the existing 400 ms inter-request guard.
-    last_seedbox_call_at: Arc<Mutex<Option<std::time::Instant>>>,
     hook: Arc<dyn HttpTap>,
 }
 
@@ -267,7 +259,6 @@ impl MamClient {
             json_ip_url: "https://t.myanonamouse.net/json/jsonIp.php".into(),
             torrent_base_url: "https://www.myanonamouse.net".into(),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
-            last_seedbox_call_at: Arc::new(Mutex::new(None)),
             hook,
         })
     }
@@ -365,17 +356,12 @@ impl MamClient {
     /// # Panics
     /// Panics if the internal session mutex is poisoned.
     pub async fn update_seedbox(&self) -> MamSeedboxResult {
-        // §32: enforce MAM's documented 1-hour rolling rate limit
-        // client-side.  Without this guard our retry/heartbeat paths can
-        // hit the dynamic-seedbox endpoint repeatedly during normal
-        // operation and accumulate `Last change too recent` rejections.
-        if let Some(retry_after) = self.seedbox_call_rate_limit_remaining() {
-            warn!(
-                retry_after_secs = retry_after.as_secs(),
-                "MAM dynamic-seedbox 1h client-side rate limit triggered"
-            );
-            return MamSeedboxResult::RateLimited { retry_after };
-        }
+        // §32: update spacing (MAM's 1-hour dynamic-seedbox limit) is
+        // enforced authoritatively by the MAM core's update gateway
+        // (`request_seedbox_update`), which is the only thing that
+        // emits `UpdateSeedbox`.  The client just performs the call;
+        // it keeps only the 400 ms inter-request guard shared with
+        // every other MAM endpoint.
         self.wait_for_rate_limit().await;
         let current = self.current_session();
         let (result, new_session) = self.do_update_seedbox(&current).await;
@@ -516,23 +502,6 @@ impl MamClient {
             }
         }
         *last = Some(std::time::Instant::now());
-    }
-
-    /// §32: enforces the documented 1-hour rolling rate limit on
-    /// `dynamicSeedbox.php` client-side.  Returns `None` if the call
-    /// may proceed (and arms the guard), or `Some(remaining)` — the
-    /// honest time until the guard expires — when it may not.
-    fn seedbox_call_rate_limit_remaining(&self) -> Option<std::time::Duration> {
-        const WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
-        let mut last = self.last_seedbox_call_at.lock().unwrap();
-        if let Some(t) = *last {
-            let elapsed = t.elapsed();
-            if elapsed < WINDOW {
-                return Some(WINDOW.saturating_sub(elapsed));
-            }
-        }
-        *last = Some(std::time::Instant::now());
-        None
     }
 
     fn emit_http(
@@ -1019,10 +988,16 @@ mod tests {
         assert_eq!(mam.session_value(), "rotated");
     }
 
-    // ── rate limiting ─────────────────────────────────────────────────────────
+    // ── seedbox update spacing ──────────────────────────────────────────────
+    //
+    // The client no longer carries its own seedbox throttle — update
+    // spacing (MAM's 1-hour limit) is owned authoritatively by the MAM
+    // core's gateway (`request_seedbox_update`), unit-tested there.  The
+    // client just performs the call; two back-to-back calls both reach
+    // MAM (serialized only by the shared 400 ms inter-request guard).
 
     #[tokio::test]
-    async fn update_seedbox_rate_limit_returns_violation() {
+    async fn update_seedbox_has_no_client_side_throttle() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1039,11 +1014,15 @@ mod tests {
             windlass_types::NullHttpTap::arc(),
         )
         .unwrap();
-        // First call consumes the rate limit slot.
-        mam.update_seedbox().await;
-        // Second call immediately after should be rate-limited.
-        let event = mam.update_seedbox().await;
-        assert!(matches!(event, MamSeedboxResult::RateLimited { .. }));
+        // Both calls reach MAM and succeed; no client-side throttle.
+        assert!(matches!(
+            mam.update_seedbox().await,
+            MamSeedboxResult::Success { .. }
+        ));
+        assert!(matches!(
+            mam.update_seedbox().await,
+            MamSeedboxResult::Success { .. }
+        ));
     }
 
     // ── do_update_seedbox error paths ─────────────────────────────────────────

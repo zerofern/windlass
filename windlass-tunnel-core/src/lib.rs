@@ -2,7 +2,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 //! Pure, sans-IO state machine and protocol codecs for the in-process
-//! `WireGuard` tunnel that replaces the Gluetun container.
+//! `WireGuard` tunnel owned by Windlass in-process.
 //!
 //! See `docs/vpn-ownership.md` for the design rationale, objectives,
 //! external requirements, and acceptance criteria.

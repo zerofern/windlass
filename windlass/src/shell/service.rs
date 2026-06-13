@@ -10,7 +10,7 @@ use windlass_mam_core::{MamEvent, MamMachine};
 use windlass_qbit_core::{QbitEvent, QbitMachine};
 use windlass_tunnel_core::{TunnelEvent, TunnelMachine};
 use windlass_types::VpnPort;
-use windlass_vpn_core::{VpnEvent, VpnMachine};
+use windlass_vpn_core::VpnMachine;
 
 use windlass_domain_core::WindlassEvent;
 
@@ -26,12 +26,9 @@ pub(super) struct ServiceCores {
     qbit: ServiceHandles<QbitMachine>,
     mam: ServiceHandles<MamMachine>,
     disk: ServiceHandles<DiskMachine>,
-    /// In-process `WireGuard` tunnel handles.  Phase 5 review fix
-    /// (issue 1): without storing these here, `dispatch_init` had no
-    /// way to deliver `TunnelEvent::Init` to the tunnel core, so the
-    /// runtime would spawn the machine but never tell it to bring
-    /// the interface up.
-    tunnel: Option<ServiceHandles<TunnelMachine>>,
+    /// In-process `WireGuard` tunnel handles; `dispatch_init`
+    /// delivers `TunnelEvent::Init` here to bring the interface up.
+    tunnel: ServiceHandles<TunnelMachine>,
     /// Cached forwarded port, shared with the VPN forwarder task.
     /// Updated by the VPN forwarder on PortReady/PortUnavailable/Disconnected.
     forwarded_port: Arc<Mutex<Option<VpnPort>>>,
@@ -47,7 +44,7 @@ impl ServiceCores {
         qbit: ServiceHandles<QbitMachine>,
         mam: ServiceHandles<MamMachine>,
         disk: ServiceHandles<DiskMachine>,
-        tunnel: Option<ServiceHandles<TunnelMachine>>,
+        tunnel: ServiceHandles<TunnelMachine>,
         forwarded_port: Arc<Mutex<Option<VpnPort>>>,
     ) -> Self {
         Self {
@@ -78,12 +75,9 @@ impl ServiceCores {
     /// forwarder task is running, so the first events each core sees
     /// have causes tagged `ExternalCause::Init`.
     ///
-    /// Phase 5 (docs/vpn-ownership.md): the Gluetun-boot priming
-    /// (`is_gluetun_healthy`, port-file replay) is gone.  The
-    /// `TunnelMachine` surfaces its own first-pass state through the
-    /// bridge in `init_shell`; downstream cores see the same
-    /// `VpnEvent` shape they always did, but sourced from the tunnel
-    /// core instead of file polls.
+    /// The `TunnelMachine` surfaces its first-pass state through the
+    /// bridge in `init_shell`; downstream cores receive `VpnEvent`s
+    /// sourced from the tunnel core.
     pub fn dispatch_init(&self) {
         let now = Instant::now();
         let _ = self.domain.events.send(Timed::external(
@@ -92,10 +86,6 @@ impl ServiceCores {
             WindlassEvent::Init,
         ));
         let _ = self
-            .vpn
-            .events
-            .send(Timed::external(now, ExternalCause::Init, VpnEvent::Init));
-        let _ = self
             .qbit
             .events
             .send(Timed::external(now, ExternalCause::Init, QbitEvent::Init));
@@ -103,12 +93,10 @@ impl ServiceCores {
             .mam
             .events
             .send(Timed::external(now, ExternalCause::Init, MamEvent::Init));
-        if let Some(tunnel) = &self.tunnel {
-            let _ =
-                tunnel
-                    .events
-                    .send(Timed::external(now, ExternalCause::Init, TunnelEvent::Init));
-        }
+        let _ =
+            self.tunnel
+                .events
+                .send(Timed::external(now, ExternalCause::Init, TunnelEvent::Init));
     }
 }
 
@@ -270,7 +258,7 @@ mod tests {
             qbit_handles,
             mam_handles,
             disk_handles,
-            Some(tunnel_handles),
+            tunnel_handles,
             Arc::clone(&forwarded_port),
         );
         (cores, domain_ev_rx, forwarded_port)
@@ -318,8 +306,7 @@ mod tests {
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
-                    | VpnPublish::PublicIpVerificationDegraded { .. }
-                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
+                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::external(
                     std::time::Instant::now(),
@@ -372,13 +359,11 @@ mod tests {
         let (qbit_cmd_tx, mut qbit_cmd_rx) = mpsc::unbounded_channel::<Command<QbitMachine>>();
         let (mam_cmd_tx, mut mam_cmd_rx) = mpsc::unbounded_channel::<Command<MamMachine>>();
         let (db_cmd_tx, _db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
-        let (vpn_cmd_tx, _vpn_cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
 
         let (docker_cmd_tx, _docker_cmd_rx) =
             mpsc::unbounded_channel::<Command<windlass_docker_core::DockerMachine>>();
         let domain_shell_cfg = crate::shell::domain_shell::DomainShellConfig {
             db: db_cmd_tx,
-            vpn: vpn_cmd_tx,
             qbit: qbit_cmd_tx,
             mam: mam_cmd_tx,
             docker: docker_cmd_tx,
@@ -390,8 +375,7 @@ mod tests {
                 windlass_machine::NullRuntimeTap::arc(),
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
-                    gluetun_anchor: "gluetun".to_string(),
-                    restart_anchor_on_crash: false,
+                    anchor: "windlass".to_string(),
                     initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,
@@ -424,8 +408,7 @@ mod tests {
                     | VpnPublish::PublicIpObserved { .. }
                     | VpnPublish::PublicIpUnavailable
                     | VpnPublish::PublicIpMismatch { .. }
-                    | VpnPublish::PublicIpVerificationDegraded { .. }
-                    | VpnPublish::MamIpVerificationDegraded { .. } => {}
+                    | VpnPublish::PublicIpVerificationDegraded { .. } => {}
                 }
                 let _ = domain_ev_tx.send(Timed::external(
                     std::time::Instant::now(),
@@ -651,13 +634,11 @@ mod tests {
         let (qbit_cmd_tx, _qbit_cmd_rx) = mpsc::unbounded_channel::<Command<QbitMachine>>();
         let (mam_cmd_tx, _mam_cmd_rx) = mpsc::unbounded_channel::<Command<MamMachine>>();
         let (db_cmd_tx, _db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
-        let (vpn_cmd_tx, _vpn_cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
 
         let (docker_cmd_tx, _docker_cmd_rx) =
             mpsc::unbounded_channel::<Command<windlass_docker_core::DockerMachine>>();
         let domain_shell_cfg = crate::shell::domain_shell::DomainShellConfig {
             db: db_cmd_tx,
-            vpn: vpn_cmd_tx,
             qbit: qbit_cmd_tx,
             mam: mam_cmd_tx,
             docker: docker_cmd_tx,
@@ -669,8 +650,7 @@ mod tests {
                 windlass_machine::NullRuntimeTap::arc(),
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
-                    gluetun_anchor: "gluetun".to_string(),
-                    restart_anchor_on_crash: false,
+                    anchor: "windlass".to_string(),
                     initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,
@@ -721,13 +701,11 @@ mod tests {
         let (qbit_cmd_tx, _qbit_cmd_rx) = mpsc::unbounded_channel::<Command<QbitMachine>>();
         let (mam_cmd_tx, _mam_cmd_rx) = mpsc::unbounded_channel::<Command<MamMachine>>();
         let (db_cmd_tx, _db_cmd_rx) = mpsc::unbounded_channel::<Command<DbMachine>>();
-        let (vpn_cmd_tx, _vpn_cmd_rx) = mpsc::unbounded_channel::<Command<VpnMachine>>();
 
         let (docker_cmd_tx, _docker_cmd_rx) =
             mpsc::unbounded_channel::<Command<windlass_docker_core::DockerMachine>>();
         let domain_shell_cfg = crate::shell::domain_shell::DomainShellConfig {
             db: db_cmd_tx,
-            vpn: vpn_cmd_tx,
             qbit: qbit_cmd_tx,
             mam: mam_cmd_tx,
             docker: docker_cmd_tx,
@@ -739,8 +717,7 @@ mod tests {
                 windlass_machine::NullRuntimeTap::arc(),
                 WindlassConfig {
                     snapshot_interval: Duration::from_secs(3600),
-                    gluetun_anchor: "gluetun".to_string(),
-                    restart_anchor_on_crash: false,
+                    anchor: "windlass".to_string(),
                     initial_blacklist: std::collections::HashSet::new(),
                 },
                 domain_shell_cfg,

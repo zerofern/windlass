@@ -14,29 +14,18 @@ use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 use windlass_mam_core::{MamCommand, MamPublish};
 use windlass_qbit_core::{QbitCommand, QbitPublish};
 use windlass_types::{AlertPriority, MamTorrentId, VpnIp, VpnPort};
-use windlass_vpn_core::{VerificationSource, VpnCommand, VpnPublish};
+use windlass_vpn_core::{VerificationSource, VpnPublish};
 
-// `WindlassConfig` is no longer `Copy` (§38 adds `gluetun_anchor: String`).
+// `WindlassConfig` is no longer `Copy` (§38 adds `anchor: String`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindlassConfig {
     pub snapshot_interval: Duration,
-    /// §38: name of the network-namespace anchor container.  Used to
-    /// address `Docker(RestartContainer { name })` during crash
-    /// recovery, and threaded into the operator-facing alert title.
-    /// In tunnel mode this is Windlass itself; in legacy Gluetun
-    /// mode it was `gluetun`.  The field name is preserved for diff
-    /// continuity.
-    pub gluetun_anchor: String,
-    /// vpn-branch H1 fix: when `false`, the
-    /// `WindlassEvent::Vpn(Crashed)` reaction skips the
-    /// `Docker(RestartContainer { name = gluetun_anchor })` action.
-    /// In tunnel mode the anchor is Windlass itself, so issuing
-    /// the restart would tear down the current process and qBit's
-    /// shared namespace — the tunnel core's own recovery
-    /// (rotation, eventual `Stuck`) is the right response.
-    /// In legacy Gluetun mode this should be `true` to preserve
-    /// the §38 crash-restart behavior.
-    pub restart_anchor_on_crash: bool,
+    /// §38: name of the network-namespace anchor container — Windlass
+    /// itself in the tunnel topology.  Threaded into operator-facing
+    /// alerts; the anchor is never restarted from inside (that would
+    /// tear down the current process and qBit's shared namespace —
+    /// the tunnel core drives its own recovery).
+    pub anchor: String,
     /// §36 step 5: blacklisted MAM torrent ids loaded from the DB at
     /// boot.  Manual-download admission rejects any candidate whose
     /// `mam_id` is in this set.  Empty in tests.
@@ -82,7 +71,6 @@ impl WindlassTimer {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindlassAction {
-    Vpn(VpnCommand),
     Qbit(QbitCommand),
     Mam(MamCommand),
     Db(DbCommand),
@@ -487,7 +475,6 @@ impl Machine for WindlassMachine {
         match event.inner {
             WindlassEvent::Init => Outcome {
                 actions: vec![
-                    WindlassAction::Vpn(VpnCommand::StartMonitoring),
                     WindlassAction::Qbit(QbitCommand::EnsureAuthenticated),
                     WindlassAction::Mam(MamCommand::EnsureAuthenticated),
                     WindlassAction::ScheduleTimer {
@@ -508,43 +495,29 @@ impl Machine for WindlassMachine {
             }
             // §38 / DOM-27: rising-edge VPN crash drives the full Docker
             // crash-recovery sequence — dump logs, stop dependents,
-            // restart Gluetun — plus a Critical alert so the operator
+            // plus a Critical alert so the operator
             // knows.  Fires exactly once per VPN healthy → unhealthy
             // transition (VPN-17).
             WindlassEvent::Vpn(VpnPublish::Crashed) => {
                 use windlass_docker_core::DockerCommand;
-                let anchor = self.config.gluetun_anchor.clone();
-                let mut actions = vec![
+                let anchor = self.config.anchor.clone();
+                // The anchor is Windlass itself: never restart it from
+                // inside (the tunnel core drives its own recovery).
+                // Dump logs + stop dependents + alert, exactly once per
+                // healthy → unhealthy transition (VPN-17).
+                let actions = vec![
                     WindlassAction::Docker(DockerCommand::DumpAllLogs),
                     WindlassAction::Docker(DockerCommand::StopDependents),
-                ];
-                // vpn-branch H1: in tunnel mode the anchor IS Windlass,
-                // so issuing RestartContainer would kill the current
-                // process and qBit's shared namespace.  The tunnel
-                // core handles its own recovery.  Only restart the
-                // anchor when the operator opted in (legacy Gluetun
-                // topology).
-                if self.config.restart_anchor_on_crash {
-                    actions.push(WindlassAction::Docker(DockerCommand::RestartContainer {
-                        name: anchor.clone(),
-                    }));
-                }
-                actions.push(WindlassAction::SendAlert {
-                    priority: AlertPriority::Critical,
-                    title: format!("VPN anchor `{anchor}` crashed"),
-                    body: if self.config.restart_anchor_on_crash {
-                        format!(
-                            "💀 VPN anchor `{anchor}` crashed.  Dumping logs, stopping \
-                             dependents, and restarting."
-                        )
-                    } else {
-                        format!(
+                    WindlassAction::SendAlert {
+                        priority: AlertPriority::Critical,
+                        title: format!("VPN anchor `{anchor}` crashed"),
+                        body: format!(
                             "💀 VPN anchor `{anchor}` reported unhealthy.  Dumping logs and \
                              stopping dependents — the tunnel core will drive recovery \
                              without restarting Windlass."
-                        )
+                        ),
                     },
-                });
+                ];
                 Outcome {
                     actions,
                     publishes: Vec::new(),
@@ -575,14 +548,14 @@ impl Machine for WindlassMachine {
                 self.state.forwarded_port = None;
                 self.publish_state()
             }
-            // §31: VPN observed a fresh public IP from the Gluetun file.
+            // §31: a fresh public exit IP was observed through the tunnel.
             // Forward to MAM so it can issue UpdateSeedbox (deduped against
             // the last observed IP) and arm the stale-registration timer.
             WindlassEvent::Vpn(VpnPublish::PublicIpObserved { ip }) => Outcome {
                 actions: vec![WindlassAction::Mam(MamCommand::ObservedIpChanged { ip })],
                 publishes: Vec::new(),
             },
-            // §31: VPN disconnected or Gluetun deleted the IP file.  Clear
+            // §31: VPN disconnected or the exit IP is unconfirmed.  Clear
             // the §29 admission gate to its unknown default — autograb is
             // blocked until the next PublicIpObserved.
             WindlassEvent::Vpn(VpnPublish::PublicIpUnavailable) => {
@@ -603,7 +576,7 @@ impl Machine for WindlassMachine {
                 Self::on_public_ip_mismatch(file_ip, verified_ip, source, wall_now)
             }
             // §31 / DOM-22: persistent ifconfig.co failure.  Warning alert
-            // + Activity, does NOT block admission (Gluetun file is still
+            // + Activity, does NOT block admission (the tunnel-observed IP is still
             // trusted as the IP source).
             WindlassEvent::Vpn(VpnPublish::PublicIpVerificationDegraded {
                 consecutive_failures,
@@ -613,14 +586,6 @@ impl Machine for WindlassMachine {
                 &last_reason,
                 wall_now,
             ),
-            // §33 / DOM-24: same Warning shape for the MAM-jsonIp source.
-            // Independent counter, distinct alert title.
-            WindlassEvent::Vpn(VpnPublish::MamIpVerificationDegraded {
-                consecutive_failures,
-                last_reason,
-            }) => {
-                Self::on_mam_ip_verification_degraded(consecutive_failures, &last_reason, wall_now)
-            }
             // §35 / DOM-25 (§38 migrated to Docker core): stale-namespace
             // dependent — Critical alert + admission block.  Docker core
             // has already requested the restart; the Critical signal makes
@@ -628,13 +593,13 @@ impl Machine for WindlassMachine {
             WindlassEvent::Docker(DockerPublish::DependentNetworkUntrusted {
                 name,
                 dependent_started_at,
-                gluetun_healthy_since,
+                anchor_healthy_since,
             }) => {
                 self.admission.vpn_ip_compliant = Some(false);
                 Self::on_dependent_network_untrusted(
                     &name,
                     dependent_started_at,
-                    gluetun_healthy_since,
+                    anchor_healthy_since,
                     wall_now,
                 )
             }
@@ -651,35 +616,14 @@ impl Machine for WindlassMachine {
                 self.admission.vpn_ip_compliant = Some(false);
                 Self::on_restart_storm(window_count, max, wall_now)
             }
-            // §38 PR 6: Docker-core anchor lifecycle drives VPN core.
-            // Translate per-name publishes for the anchor into
-            // VpnCommand variants so VPN core no longer polls Docker
-            // directly.  Non-anchor lifecycle is informational here;
-            // PR 4's crash-recovery path already covers the anchor
-            // alert via VpnPublish::Crashed.
-            WindlassEvent::Docker(DockerPublish::ContainerHealthy { name }) => {
-                if name == self.config.gluetun_anchor {
-                    Outcome {
-                        actions: vec![WindlassAction::Vpn(VpnCommand::ContainerHealthy)],
-                        publishes: Vec::new(),
-                    }
-                } else {
-                    Outcome::none()
-                }
-            }
-            WindlassEvent::Docker(DockerPublish::ContainerCrashed { name }) => {
-                if name == self.config.gluetun_anchor {
-                    Outcome {
-                        actions: vec![WindlassAction::Vpn(VpnCommand::ContainerUnhealthy)],
-                        publishes: Vec::new(),
-                    }
-                } else {
-                    Outcome::none()
-                }
-            }
-            // Other DockerPublish variants are informational only.
+            // Container lifecycle is informational at the domain level:
+            // VPN health comes from the tunnel core's handshake watch
+            // (via the bridge), not from container health.  Docker core
+            // handles dependent autoheal itself.
             WindlassEvent::Docker(
-                DockerPublish::Stopped { .. }
+                DockerPublish::ContainerHealthy { .. }
+                | DockerPublish::ContainerCrashed { .. }
+                | DockerPublish::Stopped { .. }
                 | DockerPublish::Started { .. }
                 | DockerPublish::LogsDumped { .. },
             )
@@ -1166,7 +1110,6 @@ impl Machine for WindlassMachine {
         match cmd {
             WindlassCommand::Refresh => {
                 let actions = vec![
-                    WindlassAction::Vpn(VpnCommand::RefreshState),
                     WindlassAction::Qbit(QbitCommand::RefreshTorrents),
                     WindlassAction::Mam(MamCommand::RefreshStatus),
                 ];
@@ -1486,7 +1429,7 @@ impl WindlassMachine {
 
     /// Handles `Vpn(PublicIpMismatch)` (DOM-21 / §31 + DOM-23 / §33).
     ///
-    /// Gluetun's file IP and an external verification source disagree —
+    /// The trusted exit IP and an external verification source disagree —
     /// strong indicator that traffic is leaking around the VPN.  Emits one
     /// `RecordAlert(Critical)`, one `RecordActivity`, and one `Activity`
     /// publish whose title and body name the source so the operator can
@@ -1512,7 +1455,7 @@ impl WindlassMachine {
             ),
         };
         let body = format!(
-            "Gluetun reports the VPN exit as {} but {} reports we appear \
+            "The tunnel reports the VPN exit as {} but {} reports we appear \
              as {}. Treat as a potential leak; autograb is blocked until \
              verification recovers.",
             file_ip.0, source_human, verified_ip.0,
@@ -1542,68 +1485,28 @@ impl WindlassMachine {
         }
     }
 
-    /// Handles `Vpn(MamIpVerificationDegraded)` (DOM-24 / §33).
-    ///
-    /// MAM `/json/jsonIp.php` has been unreachable past the configured
-    /// failure threshold.  Same Warning shape as the ifconfig.co counterpart
-    /// (DOM-22); does **not** block admission.
-    fn on_mam_ip_verification_degraded(
-        consecutive_failures: u32,
-        last_reason: &str,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> Outcome<WindlassAction, WindlassPublish> {
-        let body = format!(
-            "MAM /json/jsonIp.php verification failed {consecutive_failures} \
-             times in a row. Last reason: {last_reason}. The Gluetun-reported \
-             IP is still the source of truth; admission is unaffected.",
-        );
-        let message = format!(
-            "VPN MAM-IP verification degraded: {consecutive_failures} \
-             consecutive failures (last: {last_reason})",
-        );
-        Outcome {
-            actions: vec![
-                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    at,
-                    priority: AlertPriority::Warning,
-                    title: "MAM IP verification failing".to_string(),
-                    body,
-                })),
-                WindlassAction::Db(DbCommand::RecordActivity(ActivityRecord {
-                    at,
-                    source: ActivitySource::Vpn,
-                    action: "vpn_mam_ip_verification_degraded".to_string(),
-                    book_id: None,
-                    detail: Some(message.clone()),
-                    metadata: serde_json::Value::Null,
-                })),
-            ],
-            publishes: vec![WindlassPublish::Activity { message }],
-        }
-    }
-
     /// Handles `Vpn(DependentNetworkUntrusted)` (DOM-25 / §35).
     ///
     /// A dependent container's network namespace is stale (it started
-    /// before the current Gluetun health window).  Emits one
+    /// before the current anchor health window).  Emits one
     /// `RecordAlert(Critical)`, one `RecordActivity`, and one `Activity`
     /// publish.  Caller has already flipped
     /// `admission.vpn_ip_compliant` to `Some(false)`.
     fn on_dependent_network_untrusted(
         name: &str,
         dependent_started_at: chrono::DateTime<chrono::Utc>,
-        gluetun_healthy_since: chrono::DateTime<chrono::Utc>,
+        anchor_healthy_since: chrono::DateTime<chrono::Utc>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "Dependent container `{name}` started at {dependent_started_at} \
-             before Gluetun became healthy at {gluetun_healthy_since}. Its \
+             before the anchor became healthy at {anchor_healthy_since}. Its \
              network namespace may be stale; the VPN core has requested a \
              restart. Autograb is blocked until trust recovers.",
         );
         let message = format!(
             "dependent `{name}` on stale namespace (started {dependent_started_at}, \
-             gluetun healthy_since {gluetun_healthy_since})",
+             anchor healthy_since {anchor_healthy_since})",
         );
         Outcome {
             actions: vec![
@@ -1695,7 +1598,7 @@ impl WindlassMachine {
     /// Handles `Vpn(PublicIpVerificationDegraded)` (DOM-22 / §31).
     ///
     /// ifconfig.co has been unreachable for at least the configured
-    /// failure threshold.  Surface as a `Warning` — Gluetun's file is
+    /// failure threshold.  Surface as a `Warning` — the tunnel-observed IP is
     /// still the source of truth, so admission is not blocked.
     fn on_public_ip_verification_degraded(
         consecutive_failures: u32,
@@ -1704,7 +1607,7 @@ impl WindlassMachine {
     ) -> Outcome<WindlassAction, WindlassPublish> {
         let body = format!(
             "Public-IP verification (ifconfig.co) failed {consecutive_failures} \
-             times in a row. Last reason: {last_reason}. The Gluetun-reported \
+             times in a row. Last reason: {last_reason}. The tunnel-observed \
              IP is still the source of truth; admission is unaffected.",
         );
         let message = format!(
@@ -1891,29 +1794,10 @@ mod tests {
     };
 
     fn machine() -> WindlassMachine {
-        // Default test machine runs in tunnel mode
-        // (`restart_anchor_on_crash: false`), which is the only mode
-        // shipped today.
         WindlassMachine::new(
             WindlassConfig {
                 snapshot_interval: Duration::from_secs(60),
-                gluetun_anchor: "gluetun".to_string(),
-                restart_anchor_on_crash: false,
-                initial_blacklist: std::collections::HashSet::new(),
-            },
-            Instant::now(),
-        )
-    }
-
-    /// Legacy-mode test machine — the operator opted in to having
-    /// the domain restart the Docker anchor on Crashed.  Used only
-    /// by the Crashed test that still verifies the legacy fan-out.
-    fn machine_legacy_restart_anchor() -> WindlassMachine {
-        WindlassMachine::new(
-            WindlassConfig {
-                snapshot_interval: Duration::from_secs(60),
-                gluetun_anchor: "gluetun".to_string(),
-                restart_anchor_on_crash: true,
+                anchor: "windlass".to_string(),
                 initial_blacklist: std::collections::HashSet::new(),
             },
             Instant::now(),
@@ -2798,36 +2682,6 @@ mod tests {
 
     // ── §38 / DOM-27 + DOM-28: VPN crash-recovery orchestration ──────────
 
-    #[test]
-    fn vpn_crashed_legacy_mode_restarts_anchor() {
-        // DOM-27 legacy: when `restart_anchor_on_crash` is true (the
-        // historical Gluetun deployment), Vpn(Crashed) emits the
-        // full crash-recovery fan-out including RestartContainer.
-        use windlass_docker_core::DockerCommand;
-        use windlass_types::AlertPriority;
-
-        let mut machine = machine_legacy_restart_anchor();
-        let out = handle(&mut machine, WindlassEvent::Vpn(VpnPublish::Crashed));
-
-        assert_eq!(out.actions.len(), 4, "expected 4 crash-recovery actions");
-        assert!(matches!(
-            out.actions[0],
-            WindlassAction::Docker(DockerCommand::DumpAllLogs)
-        ));
-        assert!(matches!(
-            out.actions[1],
-            WindlassAction::Docker(DockerCommand::StopDependents)
-        ));
-        assert!(matches!(
-            &out.actions[2],
-            WindlassAction::Docker(DockerCommand::RestartContainer { name }) if name == "gluetun"
-        ));
-        assert!(matches!(
-            &out.actions[3],
-            WindlassAction::SendAlert { priority, .. } if *priority == AlertPriority::Critical
-        ));
-    }
-
     /// vpn-branch H1 fix: in tunnel mode the anchor IS Windlass, so
     /// Crashed must NOT emit RestartContainer — that would tear down
     /// the current process and qBit's shared namespace.  Dependents
@@ -2968,8 +2822,7 @@ mod prop_tests {
                 let mut machine = WindlassMachine::new(
                     WindlassConfig {
                         snapshot_interval: Duration::from_secs(60),
-                        gluetun_anchor: "gluetun".to_string(),
-                        restart_anchor_on_crash: false,
+                        anchor: "windlass".to_string(),
                         initial_blacklist: std::collections::HashSet::new(),
                     },
                     Instant::now(),
@@ -3192,7 +3045,7 @@ mod prop_tests {
                 DockerPublish::DependentNetworkUntrusted {
                     name,
                     dependent_started_at: chrono::Utc::now() - chrono::Duration::seconds(dep),
-                    gluetun_healthy_since: chrono::Utc::now() - chrono::Duration::seconds(healthy),
+                    anchor_healthy_since: chrono::Utc::now() - chrono::Duration::seconds(healthy),
                 }
             }),
             any::<String>().prop_map(|name| DockerPublish::DependentNetworkTrusted { name }),
@@ -3780,7 +3633,7 @@ mod prop_tests {
 
         // DOM-22 [safety] (§31): Vpn(PublicIpVerificationDegraded) emits
         // exactly one RecordAlert(Warning) + RecordActivity + Activity, but
-        // does NOT block admission (Gluetun's file is still the source of
+        // does NOT block admission (the tunnel-observed IP is still the source of
         // truth).  Total.
         #[test]
         fn public_ip_verification_degraded_emits_warning_only(
@@ -3854,38 +3707,6 @@ mod prop_tests {
             prop_assert_eq!(machine.admission().vpn_ip_compliant, Some(false));
         }
 
-        // DOM-24 [safety] (§33): Vpn(MamIpVerificationDegraded) emits one
-        // Warning alert + Activity, does NOT block admission.  Mirrors
-        // DOM-22 for the MAM source.
-        #[test]
-        fn mam_ip_verification_degraded_emits_warning_only(
-            mut machine in any_windlass_machine(),
-            consecutive_failures in any::<u32>(),
-            last_reason in any::<String>(),
-        ) {
-            use windlass_db_core::{AlertRecord, DbCommand};
-            use windlass_types::AlertPriority;
-
-            let pre_compliant = machine.admission().vpn_ip_compliant;
-            let out = machine.handle(
-                Instant::now(),
-                chrono::Utc::now(),
-                Timed::external(Instant::now(), ExternalCause::Unknown, WindlassEvent::Vpn(VpnPublish::MamIpVerificationDegraded {
-                    consecutive_failures,
-                    last_reason,
-                })),
-            );
-
-            let warning_count = out.actions.iter().filter(|a| matches!(
-                a,
-                WindlassAction::Db(DbCommand::RecordAlert(AlertRecord {
-                    priority: AlertPriority::Warning,
-                    ..
-                }))
-            )).count();
-            prop_assert_eq!(warning_count, 1);
-            prop_assert_eq!(machine.admission().vpn_ip_compliant, pre_compliant);
-        }
 
         // DOM-25 [safety] (§35): DependentNetworkUntrusted emits one
         // Critical alert + RecordActivity + Activity, and flips
@@ -3906,7 +3727,7 @@ mod prop_tests {
                 WindlassEvent::Docker(windlass_docker_core::DockerPublish::DependentNetworkUntrusted {
                     name,
                     dependent_started_at: started,
-                    gluetun_healthy_since: healthy,
+                    anchor_healthy_since: healthy,
                 }),
             ));
             let critical = out.actions.iter().filter(|a| matches!(

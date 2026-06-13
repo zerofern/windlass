@@ -40,8 +40,8 @@ use windlass_machine::{CommandOutcome, HasTopic, Machine, Outcome, Timed};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerConfig {
     /// Name of the anchor (VPN) container.  Other containers using
-    /// `network_mode: service:<gluetun_anchor>` are treated as dependents.
-    pub gluetun_anchor: String,
+    /// `network_mode: service:<anchor>` are treated as dependents.
+    pub anchor: String,
     /// §35: maximum number of `RestartContainer` actions emitted within
     /// `restart_window_duration` before the circuit breaker trips and
     /// suppresses further restarts (publishing `RestartStorm` instead).
@@ -60,7 +60,7 @@ pub struct DockerConfig {
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
-            gluetun_anchor: "gluetun".to_string(),
+            anchor: "windlass".to_string(),
             max_restarts_per_window: 3,
             restart_window_duration: Duration::from_mins(10),
             autoheal_dependents: false,
@@ -75,13 +75,13 @@ impl Default for DockerConfig {
 /// single container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DockerCommand {
-    /// Stop every container in the dependent registry (e.g. before a Gluetun
+    /// Stop every container in the dependent registry (e.g. before an anchor
     /// restart so dependents don't sit with a broken network namespace).
     StopDependents,
-    /// Start every container in the dependent registry (e.g. after Gluetun
+    /// Start every container in the dependent registry (e.g. after the anchor
     /// recovers).
     StartDependents,
-    /// Restart a single named container.  Used for the anchor (Gluetun
+    /// Restart a single named container.  Used for the anchor
     /// recovery) and, in PR 3+, for the §35 stale-namespace recovery path.
     RestartContainer { name: String },
     /// Stop a single named container.
@@ -146,7 +146,7 @@ pub enum DockerAction {
     /// Result arrives as `DockerEvent::LogsDumped` or `LogsDumpFailed`.
     DumpLogs { name: String },
     /// Refresh the dependent registry by enumerating containers using
-    /// `network_mode: service:<gluetun_anchor>`.  Result arrives as
+    /// `network_mode: service:<anchor>`.  Result arrives as
     /// `DockerEvent::DependentsDiscovered`.
     DiscoverDependents,
 }
@@ -178,7 +178,7 @@ pub enum DockerPublish {
     DependentNetworkUntrusted {
         name: String,
         dependent_started_at: DateTime<Utc>,
-        gluetun_healthy_since: DateTime<Utc>,
+        anchor_healthy_since: DateTime<Utc>,
     },
     /// §35: a dependent's `started_at` is now at-or-after
     /// `anchor_healthy_since` — the namespace is trusted again.  Rising-
@@ -294,7 +294,7 @@ impl DockerMachine {
     /// Returns the configured anchor (VPN) container name.
     #[must_use]
     pub fn anchor(&self) -> &str {
-        &self.config.gluetun_anchor
+        &self.config.anchor
     }
 
     /// Returns the current dependent registry.
@@ -361,7 +361,7 @@ impl DockerMachine {
             if !self.crash_dump_emitted_for_current_incident {
                 self.crash_dump_emitted_for_current_incident = true;
                 actions.push(DockerAction::DumpLogs {
-                    name: self.config.gluetun_anchor.clone(),
+                    name: self.config.anchor.clone(),
                 });
                 for dep_name in self.dependents.clone() {
                     actions.push(DockerAction::DumpLogs { name: dep_name });
@@ -414,7 +414,7 @@ impl Machine for DockerMachine {
                 actions: vec![
                     DockerAction::DiscoverDependents,
                     DockerAction::InspectContainer {
-                        name: self.config.gluetun_anchor.clone(),
+                        name: self.config.anchor.clone(),
                     },
                 ],
                 publishes: Vec::new(),
@@ -430,7 +430,7 @@ impl Machine for DockerMachine {
                 entry.health = ContainerHealth::Healthy;
                 let mut publishes = Vec::new();
                 let mut actions = Vec::new();
-                if name == self.config.gluetun_anchor {
+                if name == self.config.anchor {
                     let was_anchor_healthy = self.anchor_healthy_since.is_some();
                     if !was_anchor_healthy {
                         // Rising-edge anchor recovery — new incident
@@ -457,7 +457,7 @@ impl Machine for DockerMachine {
                 entry.health = ContainerHealth::Unhealthy;
                 let mut publishes = Vec::new();
                 let mut actions = Vec::new();
-                if name == self.config.gluetun_anchor {
+                if name == self.config.anchor {
                     let was_anchor_healthy = self.anchor_healthy_since.is_some();
                     if was_anchor_healthy {
                         // Rising-edge anchor crash — clear healthy_since
@@ -505,7 +505,7 @@ impl Machine for DockerMachine {
                 // §35 stale-namespace check only runs for known dependents
                 // (the anchor itself doesn't participate) when we have an
                 // anchor `healthy_since` to compare against.
-                if name != self.config.gluetun_anchor
+                if name != self.config.anchor
                     && self.dependents.contains(&name)
                     && let Some(healthy_since) = self.anchor_healthy_since
                 {
@@ -520,7 +520,7 @@ impl Machine for DockerMachine {
                         publishes.push(DockerPublish::DependentNetworkUntrusted {
                             name: name.clone(),
                             dependent_started_at: started_at,
-                            gluetun_healthy_since: healthy_since,
+                            anchor_healthy_since: healthy_since,
                         });
                         let (restart_actions, restart_publish) = self.try_restart(name, wall_now);
                         actions.extend(restart_actions);
@@ -576,7 +576,7 @@ impl Machine for DockerMachine {
             ),
             DockerCommand::DumpAllLogs => {
                 let mut actions = vec![DockerAction::DumpLogs {
-                    name: self.config.gluetun_anchor.clone(),
+                    name: self.config.anchor.clone(),
                 }];
                 actions.extend(
                     self.dependents
@@ -638,7 +638,7 @@ mod tests {
             value["dependents"],
             serde_json::json!(["qbittorrent", "mlm"])
         );
-        assert_eq!(value["config"]["gluetun_anchor"], "gluetun");
+        assert_eq!(value["config"]["anchor"], "windlass");
     }
 
     #[test]
@@ -657,7 +657,7 @@ mod tests {
             vec![
                 DockerAction::DiscoverDependents,
                 DockerAction::InspectContainer {
-                    name: "gluetun".to_string()
+                    name: "windlass".to_string()
                 },
             ]
         );
@@ -727,13 +727,13 @@ mod tests {
             Instant::now(),
             chrono::Utc::now(),
             DockerCommand::RestartContainer {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         assert_eq!(
             out.actions,
             vec![DockerAction::RestartContainer {
-                name: "gluetun".to_string()
+                name: "windlass".to_string()
             }]
         );
     }
@@ -751,7 +751,7 @@ mod tests {
             out.actions,
             vec![
                 DockerAction::DumpLogs {
-                    name: "gluetun".to_string()
+                    name: "windlass".to_string()
                 },
                 DockerAction::DumpLogs {
                     name: "qbittorrent".to_string()
@@ -812,7 +812,7 @@ mod tests {
         let out = handle(
             &mut m,
             DockerEvent::ContainerHealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         assert!(m.anchor_healthy_since().is_some());
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(
             out.publishes,
             vec![DockerPublish::ContainerHealthy {
-                name: "gluetun".to_string()
+                name: "windlass".to_string()
             }]
         );
     }
@@ -845,7 +845,7 @@ mod tests {
         handle(
             &mut m,
             DockerEvent::ContainerHealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         let healthy_since_first = m.anchor_healthy_since();
@@ -853,7 +853,7 @@ mod tests {
         let out = handle(
             &mut m,
             DockerEvent::ContainerHealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         assert_eq!(m.anchor_healthy_since(), healthy_since_first);
@@ -869,20 +869,20 @@ mod tests {
         handle(
             &mut m,
             DockerEvent::ContainerHealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         let out = handle(
             &mut m,
             DockerEvent::ContainerUnhealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         assert!(m.anchor_healthy_since().is_none());
         assert_eq!(
             out.publishes,
             vec![DockerPublish::ContainerCrashed {
-                name: "gluetun".to_string()
+                name: "windlass".to_string()
             }]
         );
     }
@@ -931,7 +931,7 @@ mod tests {
                 .contains(&DockerPublish::DependentNetworkUntrusted {
                     name: "qbittorrent".to_string(),
                     dependent_started_at: started_at(900),
-                    gluetun_healthy_since: started_at(1000),
+                    anchor_healthy_since: started_at(1000),
                 })
         );
         assert!(!m.container("qbittorrent").unwrap().network_trusted);
@@ -946,7 +946,7 @@ mod tests {
         let out = handle(
             &mut m,
             DockerEvent::ContainerStarted {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
                 started_at: started_at(500),
             },
         );
@@ -1045,7 +1045,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(dump_names, vec!["gluetun", "qbittorrent", "mlm"]);
+        assert_eq!(dump_names, vec!["windlass", "qbittorrent", "mlm"]);
         // 5th attempt within the same incident: still suppressed, no
         // second dump fan-out (DOCKER-2 dedup).
         let out2 = handle(
@@ -1077,7 +1077,7 @@ mod tests {
         handle(
             &mut m,
             DockerEvent::ContainerHealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         assert_eq!(m.incident_id(), 1);
@@ -1104,13 +1104,13 @@ mod tests {
         handle(
             &mut m,
             DockerEvent::ContainerUnhealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         handle(
             &mut m,
             DockerEvent::ContainerHealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         assert_eq!(m.incident_id(), 2);
@@ -1144,7 +1144,7 @@ mod tests {
     fn autoheal_machine() -> DockerMachine {
         DockerMachine::new(
             DockerConfig {
-                gluetun_anchor: "gluetun".to_string(),
+                anchor: "windlass".to_string(),
                 max_restarts_per_window: 3,
                 restart_window_duration: Duration::from_secs(600),
                 autoheal_dependents: true,
@@ -1177,7 +1177,7 @@ mod tests {
         let out = handle(
             &mut m,
             DockerEvent::ContainerUnhealthy {
-                name: "gluetun".to_string(),
+                name: "windlass".to_string(),
             },
         );
         assert!(
@@ -1213,7 +1213,7 @@ mod tests {
         // the breaker per the shared budget.
         let mut m = DockerMachine::new(
             DockerConfig {
-                gluetun_anchor: "gluetun".to_string(),
+                anchor: "windlass".to_string(),
                 max_restarts_per_window: 2,
                 restart_window_duration: Duration::from_secs(600),
                 autoheal_dependents: true,

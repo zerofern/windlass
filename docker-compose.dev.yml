@@ -1,62 +1,86 @@
 # Development and integration test stack for Windlass.
 #
 # §34 (post-rebuild): runs Windlass against the contract-verification stack
-# documented in `docs/operator-readiness.md`:
+# documented in `docs/operator-readiness.md`, over the real owned-tunnel
+# control plane:
 #
-#   - Real qBittorrent (testkit qbit image)
-#   - Fake MAM        (windlass-testkit, TESTKIT_MODE=mam)
-#   - Fake Gluetun    (windlass-testkit, TESTKIT_MODE=gluetun)
+#   - WireGuard fixture  (windlass-testkit/wg-server: real wg peer +
+#                         exit-IP reflector + NAT-PMP responder + control)
+#   - Real qBittorrent   (own dev-network IP; reached via Docker DNS and
+#                         allow-listed through the kill switch)
+#   - Fake MAM           (windlass-testkit, TESTKIT_MODE=mam)
 #   - Real Postgres
-#   - Windlass        (built from source)
+#   - Windlass           (built from source, NET_ADMIN, owns wg0 + kill switch)
 #
-# WireMock and the chaos-controller were retired in §34 PR 2.  Per-test
-# control surfaces:
-#   - Fake MAM    : POST http://localhost:18082/control/...
-#   - Fake Gluetun: POST http://localhost:9001/...
-#   - qBittorrent : real web API at http://localhost:18080/api/v2/...
+# Windlass brings up a real `wg0` against the fixture peer and installs
+# the nftables kill switch; control-plane dependencies (Postgres, fake
+# MAM, qBit WebUI) are allow-listed, everything else must traverse the
+# tunnel.  The full in-namespace kill-switch + tunnel-egress behavior is
+# covered end-to-end by `just integration-wg`.
 #
-# ⚠ Uses container_name: gluetun — do NOT run alongside the production stack.
+# Per-test control surfaces:
+#   - Fake MAM   : POST http://localhost:18082/control/...
+#   - WG fixture : POST http://localhost:19090/control/... (natpmp-port,
+#                  exit-ip, reset)
+#   - qBittorrent: real web API at http://localhost:18080/api/v2/...
+#
+# Requires the host kernel's `wireguard` module (mainline since 5.6).
 #
 # Usage:
 #   docker compose -f docker-compose.dev.yml up --build
 #   docker compose -f docker-compose.dev.yml down -v
 
 services:
-  # ── Fake Gluetun (testkit) ───────────────────────────────────────────────────
-  mock-gluetun:
+  # ── WireGuard fixture (testkit) ──────────────────────────────────────────────
+  # Fresh keys per run; writes the client wg.conf into the shared volume.
+  # Its tunnel address 10.2.0.1 serves the exit-IP reflector (:8080) and
+  # the NAT-PMP responder (:5351/udp).  The control plane rides on the
+  # same HTTP server, reachable from the host via the published port.
+  wg-server:
     build:
-      context: .
-      dockerfile: windlass-testkit/Dockerfile
-    container_name: gluetun
+      context: windlass-testkit/wg-server
+    cap_add:
+      - NET_ADMIN
+    networks:
+      dev:
+        ipv4_address: 172.28.0.20
     ports:
-      - "9001:9001"
+      - "19090:8080"
     environment:
-      TESTKIT_MODE: gluetun
-      VPN_IP_FILE: /tmp/gluetun/ip
-      VPN_PORT_FILE: /tmp/gluetun/forwarded_port
-      RUST_LOG: info
+      WG_INT_ENDPOINT: 172.28.0.20:51820
+      # Short leases so port-change contracts propagate within a
+      # couple of renewal cycles instead of minutes.
+      NATPMP_LIFETIME_SECONDS: "15"
     volumes:
-      - vpn-files:/tmp/gluetun
+      - wg-shared:/shared
     healthcheck:
-      test: ["CMD-SHELL", "grep -q '[0-9]' /tmp/gluetun/forwarded_port"]
-      interval: 2s
-      timeout: 1s
-      retries: 5
-      start_period: 5s
+      test: ["CMD", "test", "-f", "/shared/wg.conf"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
 
   # ── Real qBittorrent ─────────────────────────────────────────────────────────
-  # Reuses the same image as windlass-clients/tests/qbit-image used by the
-  # standalone client-layer suite (docker-compose.qbit-integration.yml).  In
-  # this stack Windlass talks to the WebUI directly; no Gluetun netns share.
+  # On the dev network with its own IP (NOT sharing Windlass's
+  # namespace).  The contract suite restarts the windlass container in
+  # `reset_stack()` before every test; a `network_mode: container:`
+  # attachment would be orphaned by that restart.  Windlass reaches qBit
+  # via Docker DNS over a kill-switch allow-listed endpoint
+  # (`TUNNEL_FIREWALL_ALLOW_TCP`).  The full in-namespace kill-switch +
+  # tunnel-egress behavior is covered end-to-end by the dedicated
+  # `just integration-wg` suite; here we exercise the Windlass↔qBit
+  # contract over the real tunnel control plane.
   qbittorrent:
     build:
       context: ./windlass-clients/tests/qbit-image
+    networks:
+      dev:
+        ipv4_address: 172.28.0.12
+    ports:
+      - "18080:8080"
     environment:
       PUID: "1000"
       PGID: "1000"
       WEBUI_PORT: "8080"
-    ports:
-      - "18080:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/app/version || exit 1"]
       interval: 5s
@@ -68,6 +92,9 @@ services:
     build:
       context: .
       dockerfile: windlass-testkit/Dockerfile
+    networks:
+      dev:
+        ipv4_address: 172.28.0.11
     ports:
       - "18082:8080"
     environment:
@@ -82,6 +109,9 @@ services:
   # ── Postgres ─────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
+    networks:
+      dev:
+        ipv4_address: 172.28.0.10
     ports:
       - "15432:5432"
     environment:
@@ -103,21 +133,46 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: windlass-test
+    cap_add:
+      - NET_ADMIN
+    networks:
+      dev:
+        ipv4_address: 172.28.0.2
     ports:
-      - "5010:5010"
+      - "5010:5010"   # dashboard
     depends_on:
-      mock-gluetun:
-        condition: service_healthy
-      qbittorrent:
+      wg-server:
         condition: service_healthy
       mock-mam:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      qbittorrent:
+        condition: service_healthy
     volumes:
-      - vpn-files:/tmp/gluetun:ro
+      - wg-shared:/wg:ro
       - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:5010/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
     environment:
+      WG_CONFIG_PATH: /wg/wg.conf
+      NATPMP_GATEWAY: 10.2.0.1:5351
+      # The kill switch only permits these non-tunnel TCP endpoints
+      # (control plane: Postgres + fake MAM + qBit WebUI).  Everything
+      # else must go through the tunnel.
+      TUNNEL_FIREWALL_ALLOW_TCP: 172.28.0.10:5432,172.28.0.11:8080,172.28.0.12:8080
+      # In-tunnel exit-IP reflector (the fixture's tunnel address).
+      EXIT_IP_URLS: http://10.2.0.1:8080/
+      # Short cadences so IP-change contracts are testable; production
+      # defaults are 6 h / 61 min.
+      EXIT_IP_QUERY_INTERVAL_SECS: "5"
+      SEEDBOX_UPDATE_MIN_INTERVAL_SECS: "20"
+      WINDLASS_ANCHOR_CONTAINER: windlass-test
+      # qBit on the dev network, allow-listed through the kill switch.
       QBITTORRENT_URL: http://qbittorrent:8080
       QBITTORRENT_USER: admin
       QBITTORRENT_PASS: adminadmin
@@ -131,18 +186,17 @@ services:
       MAM_TORRENT_BASE_URL: http://mock-mam:8080
       DATA_PATH: /tmp
       DUMP_DIR: /tmp/windlass_dumps
-      VPN_IP_FILE: /tmp/gluetun/ip
-      VPN_PORT_FILE: /tmp/gluetun/forwarded_port
-      # Legacy Gluetun mode: the health-poll anchor is the fake
-      # Gluetun container.  The vpn-branch changed the default anchor
-      # to "windlass" (tunnel mode polls itself); without this
-      # override the VPN core inspects a nonexistent container and
-      # reports ContainerUnhealthy forever.
-      WINDLASS_ANCHOR_CONTAINER: gluetun
       WINDLASS_BIND: 0.0.0.0:5010
       DATABASE_URL: postgres://windlass:windlass@postgres:5432/windlass
       WINDLASS_EXECUTE_SERVICE_ACTIONS: ${WINDLASS_EXECUTE_SERVICE_ACTIONS:-${WINDLASS_EXECUTE_SHADOW_ACTIONS:-true}}
       RUST_LOG: windlass=debug,info
+
 volumes:
-  vpn-files:
+  wg-shared:
   postgres-data:
+
+networks:
+  dev:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

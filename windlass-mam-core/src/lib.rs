@@ -55,13 +55,13 @@ pub struct MamConfig {
     /// Default: 24 hours (`DEFAULT_STALE_REGISTRATION_INTERVAL`,
     /// mirrors Mousehole's `STALE_RESPONSE_SECONDS`).
     pub stale_registration_interval: Duration,
-    /// §32: minimum spacing between `UpdateSeedbox` attempts, enforced
-    /// in the machine so no command/timer path can storm
-    /// `dynamicSeedbox.php` (MAM documents a 1-hour rolling limit; the
-    /// HTTP client carries a belt-and-braces guard that should never
-    /// trip).  Callers inside the window get a deferral timer instead
-    /// of a doomed request.  Default: 61 minutes — one minute over the
-    /// client guard so a machine-side retry never races it.
+    /// §32: minimum spacing between `UpdateSeedbox` attempts.  This is
+    /// the single authoritative throttle for MAM's documented 1-hour
+    /// `dynamicSeedbox.php` limit — the gateway here is the only thing
+    /// that emits `UpdateSeedbox`, so no command/timer path can storm
+    /// the endpoint.  Callers inside the window get a deferral timer
+    /// instead of a doomed request.  Default: 61 minutes (one minute of
+    /// headroom over MAM's hour).
     pub seedbox_update_min_interval: Duration,
 }
 
@@ -362,10 +362,13 @@ pub struct MamMachine {
     /// `StaleRegistrationRefresh` timer.  Set on the first
     /// `ObservedIpChanged`, never cleared.
     stale_chain_scheduled: bool,
-    /// §32: IP MAM reported on the last successful dynamic-seedbox call —
-    /// "what MAM has on file for us right now".  This is Mousehole's primary
-    /// dedup target: `ObservedIpChanged { ip }` skips `UpdateSeedbox` iff
-    /// `registered_ip == Some(ip)`.
+    /// §32 dedup baseline: the exit IP we last successfully registered
+    /// with MAM (our `observed_ip` at the time of the successful
+    /// update), NOT MAM's echoed IP.  `ObservedIpChanged { ip }` and
+    /// `needs_seedbox_update` skip `UpdateSeedbox` iff `registered_ip
+    /// == observed_ip`.  Keying on what we sent (rather than MAM's
+    /// echo) keeps the dedup convergent even if MAM normalizes the
+    /// address it reports back.
     registered_ip: Option<VpnIp>,
     /// §32: ASN MAM reported on the last successful dynamic-seedbox call.
     /// Carried for logging and future ASN-aware dedup.
@@ -481,34 +484,47 @@ impl MamMachine {
         }
     }
 
-    /// Picks the right action on a retry/rate-limit-expiry tick.
-    ///
-    /// Avoids issuing a redundant `UpdateSeedbox` when the desired port has
-    /// already been registered with MAM — important because the dynamic-
-    /// seedbox endpoint should not be hit unnecessarily (see Mousehole's
-    /// `getUpdateReason`: skip the call when nothing changed).  A future
-    /// story will add IP-change detection so we *do* update on a public IP
-    /// change even when the port is unchanged.
+    /// Whether MAM's registered state diverges from what we want it to
+    /// be — either the desired forwarded port isn't registered yet, or
+    /// the observed exit IP differs from what MAM last recorded
+    /// (Mousehole's `getUpdateReason`: skip the call when nothing
+    /// changed).  This is the single source of truth for "does an
+    /// `UpdateSeedbox` need to happen", so a deferred retry can
+    /// re-decide correctly regardless of whether the trigger was a
+    /// port change or an IP change.
+    fn needs_seedbox_update(&self) -> bool {
+        let port_stale = self
+            .desired_seedbox_port
+            .is_some_and(|desired| self.seedbox_port != Some(desired));
+        let ip_stale = self
+            .observed_ip
+            .is_some_and(|observed| self.registered_ip != Some(observed));
+        port_stale || ip_stale
+    }
+
+    /// Picks the right action on a retry/rate-limit-expiry tick:
+    /// re-attempt the update if anything still diverges, else fall
+    /// back to a status poll (keep-alive).
     fn refresh_or_update_seedbox(
         &mut self,
         wall_now: chrono::DateTime<chrono::Utc>,
     ) -> Vec<MamAction> {
-        match self.desired_seedbox_port {
-            Some(desired) if self.seedbox_port != Some(desired) => {
-                self.request_seedbox_update(wall_now)
-            }
-            _ => vec![MamAction::FetchStatus],
+        if self.needs_seedbox_update() {
+            self.request_seedbox_update(wall_now)
+        } else {
+            vec![MamAction::FetchStatus]
         }
     }
 
+    /// Re-attempt an update if the registered state still diverges,
+    /// triggered by a completion (`StatusFetched` / `SeedboxUpdated`).
+    /// Unlike [`Self::refresh_or_update_seedbox`] it stays silent when
+    /// nothing is needed (no keep-alive poll on this path).
     fn converge_seedbox(&mut self, wall_now: chrono::DateTime<chrono::Utc>) -> Vec<MamAction> {
-        let Some(desired) = self.desired_seedbox_port else {
-            return Vec::new();
-        };
-        if self.seedbox_port == Some(desired) {
-            Vec::new()
-        } else {
+        if self.needs_seedbox_update() {
             self.request_seedbox_update(wall_now)
+        } else {
+            Vec::new()
         }
     }
 
@@ -517,11 +533,18 @@ impl MamMachine {
     /// Enforces single-flight and the machine-side min-interval window
     /// here — in the pure machine, where it is observable and testable
     /// — so no combination of commands, retries, and timer chains can
-    /// storm `dynamicSeedbox.php`.  A caller that wants an update
-    /// while one is in flight gets nothing (every completion handler
-    /// re-converges); a caller inside the window gets a deferral
-    /// timer for the window's remainder (`KeyedTimers` in the shell
-    /// collapses duplicates).
+    /// storm `dynamicSeedbox.php`.  A caller that wants an update while
+    /// one is in flight gets nothing (every completion handler
+    /// re-converges); a caller inside the window gets a deferral timer
+    /// for the window's remainder (`KeyedTimers` in the shell collapses
+    /// duplicates).
+    ///
+    /// This does NOT gate on [`Self::needs_seedbox_update`]: the
+    /// stale-registration refresh (§31) deliberately forces an update
+    /// even when nothing diverged, to keep the MAM session cookie
+    /// fresh.  Convergence callers gate themselves (the dedup in
+    /// `ObservedIpChanged`, the port check in `EnsureSeedboxPort`, and
+    /// the `needs_seedbox_update` check in the retry/converge paths).
     fn request_seedbox_update(
         &mut self,
         wall_now: chrono::DateTime<chrono::Utc>,
@@ -762,7 +785,9 @@ impl Machine for MamMachine {
                 }
             }
             MamEvent::SeedboxUpdated {
-                registered_ip,
+                // MAM's echoed IP is intentionally ignored for dedup
+                // (see below); only ASN/AS are recorded.
+                registered_ip: _,
                 registered_asn,
                 registered_as,
             } => {
@@ -771,14 +796,18 @@ impl Machine for MamMachine {
                 if let Some(p) = port {
                     self.seedbox_port = Some(p);
                 }
-                // §32: record MAM's view of what's currently registered.
-                // These overwrite whatever we had before — MAM's response is
-                // the source of truth for "the IP MAM has on file".  Carry
-                // through `None` honestly: a parse failure means we don't
-                // know, and the next dedup falls back to observed_ip.
-                if registered_ip.is_some() {
-                    self.registered_ip = registered_ip;
-                }
+                // §32 dedup baseline: record the exit IP *we just
+                // registered* (our observed IP), not MAM's echoed
+                // `registered_ip`.  The dedup question is "have I
+                // already told MAM about this observed IP", so the
+                // baseline must be what we sent.  Keying off MAM's echo
+                // instead means any divergence between the two (MAM
+                // normalizing the address, or — in tests — a fake that
+                // can't see our tunnel egress) makes the dedup never
+                // converge and re-calls `dynamicSeedbox.php` every
+                // interval forever.  MAM's echoed ASN/AS are still
+                // recorded for logging/compliance.
+                self.registered_ip = self.observed_ip;
                 if registered_asn.is_some() {
                     self.registered_asn = registered_asn;
                 }
@@ -1115,9 +1144,7 @@ mod tests {
 
     /// §32: the boot burst — port and IP arriving piecemeal within the
     /// same second — must produce exactly ONE `UpdateSeedbox`, not one
-    /// per command.  This was the production alert storm: each extra
-    /// attempt hit the client's 1-hour guard and published a critical
-    /// `RateLimited` alert.
+    /// per command (single-flight + window coalescing).
     #[test]
     fn piecemeal_boot_state_coalesces_into_one_update() {
         let mut machine = machine();
@@ -1190,6 +1217,91 @@ mod tests {
             vec![MamAction::UpdateSeedbox],
             "a stale in-flight marker must not block updates forever"
         );
+    }
+
+    /// §32 regression (caught by `exit_ip_change_triggers_new_seedbox_call`):
+    /// an exit-IP change that arrives inside the update window must
+    /// defer and then, when the window-expiry timer fires, re-emit
+    /// `UpdateSeedbox` — not collapse to `FetchStatus`.  The bug was a
+    /// deferral retry that only re-checked the *port*, dropping
+    /// IP-only changes on the floor.
+    #[test]
+    fn deferred_ip_change_retries_as_update_not_status() {
+        let ip_old = windlass_types::VpnIp(std::net::Ipv4Addr::new(10, 2, 0, 2));
+        let ip_new = windlass_types::VpnIp(std::net::Ipv4Addr::new(10, 8, 0, 42));
+        let mut machine = MamMachine::new(
+            MamConfig {
+                status_retry: Duration::from_secs(5),
+                min_global_ratio: 2.0,
+                min_upload_buffer_bytes: 25 * 1024 * 1024 * 1024,
+                keep_alive_interval: Duration::from_secs(300),
+                keep_alive_failure_threshold: 3,
+                stale_registration_interval: Duration::from_secs(86_400),
+                seedbox_update_min_interval: Duration::from_secs(3600),
+            },
+            Instant::now(),
+        );
+        // Controlled clock: the window is 1 h, so the timer fires an
+        // hour after the boot update.  Unit tests can't sleep, so we
+        // pass explicit `wall_now` values.
+        let t0 = chrono::Utc::now();
+        let cmd = |m: &mut MamMachine, at: chrono::DateTime<chrono::Utc>, c: MamCommand| {
+            m.handle_command(Instant::now(), at, c)
+        };
+        let ev = |m: &mut MamMachine, at: chrono::DateTime<chrono::Utc>, e: MamEvent| {
+            m.handle(
+                Instant::now(),
+                at,
+                Timed::external(Instant::now(), ExternalCause::Unknown, e),
+            )
+        };
+
+        // Register the first IP (boot path), arming the §32 window.
+        let _ = cmd(
+            &mut machine,
+            t0,
+            MamCommand::ObservedIpChanged { ip: ip_old },
+        );
+        let _ = ev(
+            &mut machine,
+            t0,
+            MamEvent::SeedboxUpdated {
+                registered_ip: Some(ip_old),
+                registered_asn: Some(1),
+                registered_as: Some("AS".to_string()),
+            },
+        );
+        // A new exit IP one second later (inside the window): must
+        // defer, not update.
+        let deferred = cmd(
+            &mut machine,
+            t0 + chrono::Duration::seconds(1),
+            MamCommand::ObservedIpChanged { ip: ip_new },
+        );
+        assert!(
+            !deferred
+                .actions
+                .iter()
+                .any(|a| matches!(a, MamAction::UpdateSeedbox)),
+            "inside the window the IP change must defer: {:?}",
+            deferred.actions
+        );
+        assert!(deferred.actions.iter().any(|a| matches!(
+            a,
+            MamAction::ScheduleTimer {
+                timer: MamTimer::RateLimitExpired,
+                ..
+            }
+        )));
+        // When the window-expiry timer fires (an hour later), the IP
+        // change must re-emit UpdateSeedbox (the bug returned
+        // FetchStatus here).
+        let retry = ev(
+            &mut machine,
+            t0 + chrono::Duration::seconds(3601),
+            MamEvent::TimerFired(MamTimer::RateLimitExpired),
+        );
+        assert_eq!(retry.actions, vec![MamAction::UpdateSeedbox]);
     }
 
     /// §32: a `RateLimited` refusal never reached MAM, so it must not
@@ -2520,7 +2632,9 @@ mod prop_tests {
         ) {
             let new_ip = new_ip_bytes
                 .map(|b| VpnIp(std::net::Ipv4Addr::from(b)));
-            let pre_registered_ip = machine.registered_ip;
+            // §32 dedup baseline mirrors `observed_ip` (what we sent),
+            // independent of MAM's echoed `registered_ip`.
+            let observed = machine.observed_ip;
             let pre_registered_asn = machine.registered_asn;
             let pre_registered_as = machine.registered_as.clone();
             machine.handle(Instant::now(), chrono::Utc::now(), Timed::external(Instant::now(), ExternalCause::Unknown,
@@ -2530,11 +2644,12 @@ mod prop_tests {
                     registered_as: new_as.clone(),
                 },
             ));
-            // None means "no fresh info" — keep the old value.
-            let expected_ip = if new_ip.is_some() { new_ip } else { pre_registered_ip };
+            // registered_ip tracks what we registered (observed_ip),
+            // NOT MAM's echo.  ASN/AS still come from the echo (None =
+            // no fresh info → keep the old value).
             let expected_asn = if new_asn.is_some() { new_asn } else { pre_registered_asn };
             let expected_as = if new_as.is_some() { new_as } else { pre_registered_as };
-            prop_assert_eq!(machine.registered_ip, expected_ip);
+            prop_assert_eq!(machine.registered_ip, observed);
             prop_assert_eq!(machine.registered_asn, expected_asn);
             prop_assert_eq!(machine.registered_as, expected_as);
         }

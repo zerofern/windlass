@@ -5,7 +5,7 @@
 use super::*;
 
 fn test_client() -> DockerClient {
-    DockerClient::connect("/tmp".into(), "gluetun".into()).expect("Docker socket unavailable")
+    DockerClient::connect("/tmp".into(), "windlass".into()).expect("Docker socket unavailable")
 }
 
 fn test_client_with_anchor(anchor: &str) -> DockerClient {
@@ -178,7 +178,7 @@ async fn docker_fetch_and_dump_logs_creates_log_file() {
 
     let dump_client = DockerClient::connect(
         dump_dir.path().to_str().unwrap().to_string(),
-        "gluetun".into(),
+        "windlass".into(),
     )
     .expect("Docker socket unavailable");
     dump_client

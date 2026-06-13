@@ -12,23 +12,21 @@ pub use bollard::container::StopContainerOptions;
 /// configuration it needs. All Docker operations are methods so call sites
 /// only pass `&self` instead of a long argument list.
 ///
-/// `gluetun_anchor` historically named the Gluetun container in the
-/// legacy topology.  In tunnel mode (`docs/vpn-ownership.md`) it names
-/// the Windlass container itself — qBittorrent shares Windlass's
-/// network namespace via `network_mode: container:<anchor>`.  The
-/// field name is preserved to keep the surface diff small; the new
-/// `anchor_container` config knob (`WINDLASS_ANCHOR_CONTAINER`)
-/// decides what name it actually carries.
+/// `anchor` names the network-namespace anchor container — the
+/// Windlass container itself (`docs/vpn-ownership.md`): qBittorrent
+/// shares Windlass's network namespace via
+/// `network_mode: container:<anchor>`.  The `WINDLASS_ANCHOR_CONTAINER`
+/// config knob decides what name it actually carries.
 #[derive(Clone)]
 pub struct DockerClient {
     pub(crate) inner: Docker,
-    pub gluetun_anchor: String,
+    pub anchor: String,
     pub dump_dir: String,
 }
 
 /// Returned by [`DockerClient::boot`] — boot-time state needed to fire `Event::Init`.
 pub struct DockerBootInfo {
-    pub is_gluetun_healthy: bool,
+    pub is_anchor_healthy: bool,
     pub dependents: Vec<String>,
 }
 
@@ -42,7 +40,7 @@ impl DockerClient {
     pub fn connect(dump_dir: String, anchor: String) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Docker::connect_with_socket_defaults()?,
-            gluetun_anchor: anchor,
+            anchor,
             dump_dir,
         })
     }
@@ -54,18 +52,18 @@ impl DockerClient {
     /// Returns an error if the Docker socket is unavailable.
     pub async fn boot(dump_dir: String, anchor: String) -> anyhow::Result<(Self, DockerBootInfo)> {
         let client = Self::connect(dump_dir, anchor)?;
-        let is_gluetun_healthy = client.is_gluetun_healthy().await;
+        let is_anchor_healthy = client.is_anchor_healthy().await;
         let dependents = client.discover_dependents().await;
         info!(
-            anchor = client.gluetun_anchor,
-            anchor_healthy = is_gluetun_healthy,
+            anchor = client.anchor,
+            anchor_healthy = is_anchor_healthy,
             dependents = ?dependents,
             "Docker ready"
         );
         Ok((
             client,
             DockerBootInfo {
-                is_gluetun_healthy,
+                is_anchor_healthy,
                 dependents,
             },
         ))
@@ -82,17 +80,17 @@ impl DockerClient {
 
     // ── Boot helpers ──────────────────────────────────────────────────────────
 
-    pub async fn is_gluetun_healthy(&self) -> bool {
-        self.is_container_healthy(&self.gluetun_anchor).await
+    pub async fn is_anchor_healthy(&self) -> bool {
+        self.is_container_healthy(&self.anchor).await
     }
 
-    /// Returns all containers sharing Gluetun's network namespace.
+    /// Returns all containers sharing the anchor's network namespace.
     /// Falls back to an empty list on error — actions will be no-ops, which is safe.
     pub async fn discover_dependents(&self) -> Vec<String> {
         // Resolve the anchor's container ID so we match both forms Docker may store:
         //   "container:<name>" — written by docker-compose
         //   "container:<id>"   — written by plain `docker run --network container:<name>`
-        let anchor = &self.gluetun_anchor;
+        let anchor = &self.anchor;
         let anchor_id = self
             .inner
             .inspect_container(anchor, None)
@@ -166,7 +164,7 @@ impl DockerClient {
     }
 
     /// Restarts the configured anchor container.  Used by the
-    /// legacy Gluetun-mode crash-recovery path
+    /// docker-core crash-recovery path
     /// (`WindlassConfig::restart_anchor_on_crash`); in tunnel
     /// mode the domain skips the call entirely because the anchor
     /// would be Windlass itself.
@@ -174,10 +172,10 @@ impl DockerClient {
         let options = RestartContainerOptions { t: 0 };
         if let Err(e) = self
             .inner
-            .restart_container(&self.gluetun_anchor, Some(options))
+            .restart_container(&self.anchor, Some(options))
             .await
         {
-            error!("Failed to restart anchor `{}`: {e}", self.gluetun_anchor);
+            error!("Failed to restart anchor `{}`: {e}", self.anchor);
         }
     }
 
@@ -190,8 +188,8 @@ impl DockerClient {
             warn!("Could not create dump dir {}: {e}", self.dump_dir);
         }
 
-        let containers = std::iter::once(self.gluetun_anchor.as_str())
-            .chain(dependents.iter().map(String::as_str));
+        let containers =
+            std::iter::once(self.anchor.as_str()).chain(dependents.iter().map(String::as_str));
 
         for name in containers {
             let options = LogsOptions::<String> {

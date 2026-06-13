@@ -83,7 +83,7 @@ impl Shell for DockerShell {
                     // §38 PR 6: also probe health here so domain can
                     // forward an initial ContainerHealthy/Unhealthy to
                     // the VPN core at boot, replacing the legacy
-                    // VpnShell `is_gluetun_healthy()` poll.
+                    // VpnShell `is_anchor_healthy()` poll.
                     let (started_at, healthy) = inspect_state(&docker, &name).await;
                     if let Some(started_at) = started_at {
                         let _ = tx.send(Timed::from_dispatch(
@@ -142,9 +142,7 @@ impl Shell for DockerShell {
 
 /// Streams Docker daemon events for *every* container, mapping
 /// `health_status` / `start` / `die` / `stop` / `kill` actions into
-/// `DockerEvent::*`.  Independent of the legacy `DockerClient::
-/// spawn_event_watcher` which is anchor-only and feeds `Event::Docker
-/// Gluetun*` for the legacy path.
+/// `DockerEvent::*`.
 fn spawn_event_watcher(docker: Docker, event_tx: UnboundedSender<Timed<DockerEvent>>) {
     windlass_machine::causal::spawn(async move {
         loop {

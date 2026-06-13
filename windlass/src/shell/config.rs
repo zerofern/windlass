@@ -35,18 +35,11 @@ pub struct Config {
     pub data_path: String,
     pub dump_dir: String,
     pub database_url: String,
-    /// Legacy Gluetun IP file. Used only when `WG_CONFIG_PATH` is
-    /// absent and Windlass is running in the Gluetun-compatible mode.
-    pub vpn_ip_file: String,
-    /// Legacy Gluetun forwarded-port file. Used only when
-    /// `WG_CONFIG_PATH` is absent.
-    pub vpn_port_file: String,
-    /// Path to a `ProtonVPN`-generated `wg.conf` file. When present,
+    /// Path to a `ProtonVPN`-generated `wg.conf` file.  Required:
     /// Windlass owns the `WireGuard` tunnel in-process via
-    /// `windlass-tunnel-core` + `windlass-net`. Requires `NET_ADMIN`
-    /// and a network namespace Windlass can manage. When absent, the
-    /// legacy Gluetun-compatible shell remains active.
-    pub wg_config_path: Option<String>,
+    /// `windlass-tunnel-core` + `windlass-net` and needs `NET_ADMIN`
+    /// plus a network namespace it can manage.
+    pub wg_config_path: String,
     /// Interface name for the in-process tunnel (when
     /// `wg_config_path` is set).  Defaults to `wg0`.
     pub wg_interface_name: String,
@@ -58,13 +51,28 @@ pub struct Config {
     /// nftables kill switch. Used for local control-plane dependencies
     /// such as the shipped Postgres service.
     pub tunnel_firewall_allow_tcp: Vec<SocketAddr>,
+    /// Comma-separated URLs the exit-IP query GETs through the tunnel
+    /// (`EXIT_IP_URLS`).  Each must return the connection's source IP
+    /// as plain text on the first line.  Defaults to two independent
+    /// public reflectors; the integration stack points this at its
+    /// in-tunnel fixture.
+    pub exit_ip_urls: Vec<String>,
+    /// Exit-IP query cadence in seconds (`EXIT_IP_QUERY_INTERVAL_SECS`,
+    /// default 6 h).  The integration stack shortens it so IP-change
+    /// contracts are testable.
+    pub exit_ip_query_interval_secs: u64,
+    /// Machine-side spacing between MAM dynamic-seedbox updates in
+    /// seconds (`SEEDBOX_UPDATE_MIN_INTERVAL_SECS`, default 61 min —
+    /// one minute over MAM's documented 1-hour limit).  The
+    /// integration stack shortens it so IP-change contracts are
+    /// testable.
+    pub seedbox_update_min_interval_secs: u64,
     /// Name of the Docker container whose network namespace
     /// dependents (like qBittorrent) share via
-    /// `network_mode: container:<name>`.  In tunnel mode this is
-    /// Windlass itself; the default is `windlass` to match the
-    /// shipped `docker-compose.tunnel.yml`.  Operators with a
-    /// different container name (or legacy Gluetun mode during
-    /// migration) can override with `WINDLASS_ANCHOR_CONTAINER`.
+    /// `network_mode: container:<name>` — Windlass itself.  The
+    /// default is `windlass` to match the shipped
+    /// `docker-compose.tunnel.yml`; operators with a different
+    /// container name override with `WINDLASS_ANCHOR_CONTAINER`.
     pub anchor_container: String,
     /// Interval between compliance polls in seconds (default: 60).
     pub compliance_poll_interval_secs: u64,
@@ -105,10 +113,10 @@ impl Config {
             dump_dir: var("DUMP_DIR").unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),
             database_url: var("DATABASE_URL")
                 .context("DATABASE_URL missing; expected postgres:// URL")?,
-            vpn_ip_file: var("VPN_IP_FILE").unwrap_or_else(|_| "/tmp/gluetun/ip".to_string()),
-            vpn_port_file: var("VPN_PORT_FILE")
-                .unwrap_or_else(|_| "/tmp/gluetun/forwarded_port".to_string()),
-            wg_config_path: var("WG_CONFIG_PATH").ok(),
+            wg_config_path: var("WG_CONFIG_PATH").context(
+                "WG_CONFIG_PATH missing; Windlass owns the WireGuard tunnel and \
+                 requires a ProtonVPN-generated wg.conf",
+            )?,
             wg_interface_name: var("WG_INTERFACE_NAME").unwrap_or_else(|_| "wg0".to_string()),
             natpmp_gateway: var("NATPMP_GATEWAY").unwrap_or_else(|_| "10.2.0.1:5351".to_string()),
             tunnel_firewall_allow_tcp: parse_socket_addr_list(
@@ -117,6 +125,29 @@ impl Config {
                     .as_str(),
             )
             .context("TUNNEL_FIREWALL_ALLOW_TCP")?,
+            exit_ip_urls: var("EXIT_IP_URLS").map_or_else(
+                |_| {
+                    vec![
+                        "https://api.ipify.org".to_string(),
+                        "https://ipv4.icanhazip.com".to_string(),
+                    ]
+                },
+                |raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string)
+                        .collect()
+                },
+            ),
+            exit_ip_query_interval_secs: var("EXIT_IP_QUERY_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6 * 60 * 60),
+            seedbox_update_min_interval_secs: var("SEEDBOX_UPDATE_MIN_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(61 * 60),
             anchor_container: var("WINDLASS_ANCHOR_CONTAINER")
                 .unwrap_or_else(|_| "windlass".to_string()),
             compliance_poll_interval_secs: var("COMPLIANCE_POLL_INTERVAL_SECS")

@@ -2,7 +2,8 @@
 
 The §34 (operator-readiness) integration suite verifies the **contracts
 between Windlass and its external dependencies** — qBittorrent, MAM,
-Gluetun, Docker, Postgres.  This is the only test layer that catches
+the WireGuard tunnel path, Docker, Postgres.  This is the only test
+layer that catches
 wire-format drift in services we don't own, side effects across the
 trust boundary, and real-I/O wiring between cores.
 
@@ -17,8 +18,9 @@ just integration
 
 That recipe:
 
-1. Brings up `docker-compose.dev.yml` (real qBit, fake MAM, fake
-   Gluetun, real Postgres, Windlass built from source).
+1. Brings up `docker-compose.dev.yml` (real qBit sharing Windlass's
+   namespace, fake MAM, the WireGuard fixture peer, real Postgres,
+   Windlass built from source with `NET_ADMIN`).
 2. Brings up `docker-compose.qbit-integration.yml` (standalone real
    qBit for the client-layer suite).
 3. Runs the test crates listed below in series.
@@ -38,7 +40,7 @@ just stack-down
 | Test crate | Lives in | Purpose |
 |---|---|---|
 | `mam_drift` | `windlass-testkit/tests/` | In-process: spins up the fake-MAM router on a random port and pins every MAM response shape through `windlass-clients::MamClient`. Catches contract drift between the fake and what the client decodes. |
-| `integration_contracts` | `windlass/tests/` | Live stack: each test calls `reset_stack()`, then drives a wire Windlass depends on (Gluetun → qBit, qBit auth, MAM seedbox, DB snapshot, torrent persistence, MAM rate limit, qBit drift smoke). |
+| `integration_contracts` | `windlass/tests/` | Live stack: each test calls `reset_stack()`, then drives a wire Windlass depends on (NAT-PMP → qBit port sync, qBit auth, MAM seedbox, DB snapshot, torrent persistence, MAM update dedup, qBit drift smoke). |
 | `integration_support` | `windlass/tests/` | Live stack: smoke tests for the helpers themselves (bollard restart, magnet fixture, fake-MAM control plane, full reset). |
 | `windlass-local` ignored tests | `windlass-local/src/docker_tests.rs` | Real Docker daemon: container lifecycle for the docker-core. |
 | `qbit_integration` | `windlass-clients/tests/` | Standalone real qBit (separate compose): client-layer contract for the qBit API. |
@@ -47,11 +49,11 @@ just stack-down
 
 | Service | Image | Exposes | Role |
 |---|---|---|---|
-| `gluetun` (`mock-gluetun`) | testkit `TESTKIT_MODE=gluetun` | `:9001` | Fake Gluetun: writes IP/port files in a shared volume; HTTP control plane for tests to change them. |
-| `qbittorrent` | `lscr.io/linuxserver/qbittorrent:5.2.0` | `:18080` | Real qBittorrent. Tests authenticate as `admin/adminadmin`. |
+| `wg-server` | `windlass-testkit/wg-server/` | `:19090` (control) | WireGuard fixture peer: fresh keys per run, exit-IP reflector + NAT-PMP responder on its tunnel address, `/control/...` plane (natpmp-port, exit-ip, reset). |
+| `qbittorrent` | `windlass-clients/tests/qbit-image` | `:18080` (via windlass) | Real qBittorrent sharing Windlass's network namespace — its egress goes through `wg0` and the kill switch. Tests authenticate as `admin/adminadmin`. |
 | `mock-mam` | testkit `TESTKIT_MODE=mam` | `:18082` | Fake MAM with the 8 endpoints Windlass calls + `/control/...` plane. |
 | `postgres` | `postgres:16-alpine` | `:15432` | Real Postgres with the windlass schema. |
-| `windlass-test` (`windlass`) | built from source | `:5010` | The system under test. Talks to the four other services via env-overridable URLs. |
+| `windlass-test` (`windlass`) | built from source | `:5010` | The system under test: `NET_ADMIN`, owns `wg0` + the nftables kill switch. Control-plane egress (Postgres, fake MAM) is allow-listed; everything else goes through the tunnel. Cadences are shortened via env (`EXIT_IP_QUERY_INTERVAL_SECS=5`, `SEEDBOX_UPDATE_MIN_INTERVAL_SECS=20`, NAT-PMP lease 15 s) so timing contracts are testable. |
 
 The chaos controller and the WireMock-based mocks were retired in §34
 PR 2; control surfaces moved to each fake's own HTTP plane.
@@ -96,8 +98,8 @@ use support::{reset, wait_for, MAM_BASE, mam};
 async fn descriptive_name_for_what_this_verifies() {
     reset::reset_stack().await.expect("reset_stack");
 
-    // Drive the stack (set fake-MAM state, change Gluetun files,
-    // add a torrent, etc.).
+    // Drive the stack (set fake-MAM state, drive the WG fixture
+    // control plane, add a torrent, etc.).
     let fake = mam::FakeMam::new(MAM_BASE);
     fake.set_seedbox(serde_json::json!({ "msg": "Completed" }))
         .await
@@ -124,8 +126,8 @@ Rules:
 - **`#[ignore = "..."]` is mandatory.**  `cargo test` runs only
   unignored; the integration recipe passes `--ignored`.
 - **Assert on a wire**, not on internal Windlass state.  Wires are
-  fake-MAM journal, qBit web API, Gluetun's files, the Postgres
-  tables, Windlass's `/api/v1/...` endpoints.
+  fake-MAM journal, qBit web API, the WG fixture control plane,
+  the Postgres tables, Windlass's `/api/v1/...` endpoints.
 - **`wait_for(label, timeout, fn)`** is the standard polling helper;
   it panics with the label on timeout.
 - **No `cargo test` parallelism for live-stack tests.**  Use
@@ -138,7 +140,7 @@ Rules:
 Brings the stack to a known baseline:
 
 1. Reset fake-MAM (clear journal + restore defaults).
-2. Reset fake-Gluetun (`10.8.0.1`, port `51820`, healthy).
+2. Reset the WG fixture (default NAT-PMP port `43210`, no exit-IP override).
 3. Delete every torrent in qBit; restore default preferences.
 4. Truncate the windlass DB tables.
 5. Restart the `windlass-test` container via bollard.
@@ -239,11 +241,11 @@ If you're about to add a test, the decision is:
 
 The harness deliberately does NOT cover:
 
-- **Real Gluetun.**  Windlass's contract with Gluetun is two text
-  files; running a real Gluetun container would need a WireGuard
-  peer sidecar, which is disproportionate.  Fake Gluetun encodes
-  the contract by definition.  When the operator bumps Gluetun in
-  production, the file format is verified manually.
+- **Real ProtonVPN.**  The WireGuard fixture is a real wg peer with
+  a synthetic NAT-PMP gateway + exit-IP reflector; the protocol
+  surfaces are real, the provider behind them is not.  Provider
+  quirks (lease durations, ASN changes) are covered by unit tests
+  against captured shapes.
 - **External notifications.**  The current notification surface is
   in-app only (`SendAlert` → `alerts` DB row → `/api/v1/alerts`).
   When Telegram / Pushover / webhook / SMTP surfaces are added, each

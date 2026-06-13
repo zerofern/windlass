@@ -1,17 +1,20 @@
 # Windlass
 
-Windlass is a lightweight Rust operator for self-hosted torrent stacks running
-behind a Gluetun VPN. It watches the VPN tunnel and keeps everything in sync
-automatically, so a VPN reconnect or IP change requires no manual intervention.
+Windlass is a lightweight Rust operator for self-hosted torrent stacks.  It
+owns its WireGuard VPN tunnel in-process (`docs/vpn-ownership.md`) and keeps
+everything in sync automatically, so a VPN reconnect or IP change requires no
+manual intervention.
 
 ## What it does
 
-- **Port forwarding sync** — reads Gluetun's forwarded port file and updates
-  qBittorrent's listen port whenever it changes
-- **MAM seedbox updates** — notifies MyAnonamouse of your current VPN IP and
-  port so you stay connectable on the tracker
-- **Container health monitoring** — detects when Gluetun dies or becomes
-  unhealthy, dumps logs, restarts dependent containers when the tunnel recovers
+- **In-process WireGuard tunnel** — brings up `wg0`, installs an nftables
+  kill switch, watches the handshake, and rotates endpoints on stalls
+- **Port forwarding sync** — obtains the forwarded port via NAT-PMP and
+  updates qBittorrent's listen port whenever it changes
+- **MAM seedbox updates** — notifies MyAnonamouse of your current VPN exit IP
+  and port so you stay connectable on the tracker
+- **Tunnel health monitoring** — detects when the tunnel dies, dumps logs,
+  restarts dependent containers when it recovers
 - **New torrent alerts** — records an alert when new torrents appear in
   qBittorrent
 - **Low disk space alerts** — records an alert when available space drops below
@@ -56,52 +59,44 @@ just stack-up         # builds and starts all containers
 # open http://localhost:5010
 ```
 
-The stack includes:
+The stack runs the same tunnel topology as production (requires the host
+kernel's `wireguard` module):
 
-| Container          | Role                                  | Ports            |
-| ------------------ | ------------------------------------- | ---------------- |
-| `mock-gluetun`     | Writes VPN IP/port files; control API | `:9001`          |
-| `mock-qbittorrent` | WireMock stub for qBit API            | `:18080` (admin) |
-| `mock-mam`         | WireMock stub for MAM                 | `:18082` (admin) |
-| `chaos-controller` | Named scenario API                    | `:9000`          |
-| `windlass`         | Built from source                     | `:5010`          |
+| Container     | Role                                                     | Ports    |
+| ------------- | -------------------------------------------------------- | -------- |
+| `wg-server`   | WireGuard fixture peer + exit-IP reflector + NAT-PMP     | `:19090` (control) |
+| `qbittorrent` | Real qBittorrent, sharing Windlass's network namespace   | `:18080` (via windlass) |
+| `mock-mam`    | Fake MAM (testkit) with a request journal + control API  | `:18082` |
+| `postgres`    | Real Postgres                                            | `:15432` |
+| `windlass`    | Built from source; `NET_ADMIN`, owns `wg0` + kill switch | `:5010`  |
 
-### Chaos scenarios
-
-The chaos controller lets you inject fault conditions at runtime to observe
-how Windlass responds:
+### Driving the fixture
 
 ```fish
-# Trigger a named scenario
-curl -X POST http://localhost:9000/scenario/qbit-auth-fail
-curl -X POST http://localhost:9000/scenario/mam-rate-limit
+# Change the NAT-PMP granted port (propagates on the next renewal)
+curl -X POST http://localhost:19090/control/natpmp-port -d '51821'
 
-# Restore all mocks to the happy-path default
-curl -X POST http://localhost:9000/reset
+# Override the exit IP the reflector reports (simulates an IP change)
+curl -X POST http://localhost:19090/control/exit-ip -d '10.8.0.42'
 
-# Simulate VPN reconnect with a new port
-curl -X POST http://localhost:9001/set \
-  -H "Content-Type: application/json" \
-  -d '{"ip":"10.8.0.2","port":51821}'
-
-# Write an empty port file (simulates Gluetun not yet having a port)
-curl -X POST http://localhost:9001/clear-port
+# Restore fixture defaults
+curl -X POST http://localhost:19090/control/reset
 ```
 
 Watch the dashboard at `http://localhost:5010` to see Windlass react in real time.
 
 ### Integration tests
 
-Integration tests are in `windlass/tests/integration.rs`. They are `#[ignore]`
-by default and require the dev stack to be running. `just integration` handles
-everything automatically:
+Contract tests live in `windlass/tests/integration_contracts.rs`. They are
+`#[ignore]` by default and require the dev stack to be running.
+`just integration` handles everything automatically:
 
 ```fish
 just integration      # builds stack → runs tests → tears down
+just integration-wg   # real-WireGuard tunnel lifecycle suite
 ```
 
-When adding new external API behaviour, add a corresponding scenario to
-`windlass-testkit/src/scenarios.rs` and a test to `windlass/tests/integration.rs`.
+See `docs/integration-tests.md` for the harness and how to add tests.
 
 ## Configuration
 
@@ -113,7 +108,7 @@ Windlass is configured entirely via environment variables.
 | `QBITTORRENT_USER`  | ✓        | —                             | qBittorrent WebUI username          |
 | `QBITTORRENT_PASS`  | ✓        | —                             | qBittorrent WebUI password          |
 | `MAM_SESSION`       | ✓        | —                             | MyAnonamouse session cookie value   |
-| `WG_CONFIG_PATH`    | tunnel mode | —                          | Path to the ProtonVPN-generated `wg.conf` Windlass uses to bring up the in-process WireGuard tunnel. When unset, Windlass keeps the legacy Gluetun-compatible VPN shell active. See `docs/vpn-ownership.md`. |
+| `WG_CONFIG_PATH`    | ✓        | —                             | Path to the ProtonVPN-generated `wg.conf` Windlass uses to bring up the in-process WireGuard tunnel. See `docs/vpn-ownership.md`. |
 | `MAM_USER_AGENT`    |          | `windlass`                    | User-Agent sent to MAM              |
 | `DATA_PATH`         |          | `/mnt/Data`                   | Path to monitor for disk space      |
 | `DUMP_DIR`          |          | `/mnt/Data/windlass_dumps`    | Directory for crash log dumps       |
@@ -122,6 +117,9 @@ Windlass is configured entirely via environment variables.
 | `WG_INTERFACE_NAME` |          | `wg0`                         | Tunnel interface name |
 | `NATPMP_GATEWAY`    |          | `10.2.0.1:5351`               | NAT-PMP gateway address for the in-process port-forwarding flow |
 | `TUNNEL_FIREWALL_ALLOW_TCP` | | — | Comma-separated `ip:port` allow-list for non-tunnel TCP control-plane dependencies. The shipped compose uses this only for Postgres. |
+| `EXIT_IP_URLS`      |          | `api.ipify.org,ipv4.icanhazip.com` | Comma-separated URLs the exit-IP query GETs through the tunnel |
+| `EXIT_IP_QUERY_INTERVAL_SECS` | | `21600` (6 h) | Exit-IP query cadence |
+| `SEEDBOX_UPDATE_MIN_INTERVAL_SECS` | | `3660` (61 min) | Machine-side spacing between MAM dynamic-seedbox updates |
 
 `WINDLASS_EXECUTE_SHADOW_ACTIONS` is still accepted as a deprecated alias for
 the service action switch. Legacy service orchestration has been retired from

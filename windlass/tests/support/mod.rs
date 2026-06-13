@@ -25,14 +25,15 @@ pub const QBIT_PASS: &str = "adminadmin";
 
 pub const MAM_BASE: &str = "http://localhost:18082";
 
-pub const GLUETUN_CONTROL: &str = "http://localhost:9001";
+/// WireGuard fixture control plane (wg-server service): set the
+/// NAT-PMP granted port, override the reflected exit IP, or reset.
+pub const WG_CONTROL: &str = "http://localhost:19090";
 
 pub const DATABASE_URL: &str = "postgres://windlass:windlass@localhost:15432/windlass";
 
 pub const WINDLASS_CONTAINER: &str = "windlass-test";
 pub const QBIT_CONTAINER: &str = "windlass-qbittorrent-1";
 pub const MAM_CONTAINER: &str = "windlass-mock-mam-1";
-pub const GLUETUN_CONTAINER: &str = "gluetun";
 
 // ── Waiting helpers ──────────────────────────────────────────────────────────
 

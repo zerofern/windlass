@@ -27,7 +27,7 @@ pub enum CoreId {
     Docker,
     Domain,
     /// In-process `WireGuard` tunnel — the core that replaces the
-    /// Gluetun container after the vpn-branch cutover.  See
+    /// per-container VPN sidecar after the vpn-branch cutover.  See
     /// `docs/vpn-ownership.md`.
     Tunnel,
 }

@@ -9,13 +9,11 @@ use windlass_domain_core::{WindlassAction, WindlassEvent};
 use windlass_machine::{Command, EventCause, ExternalCause, KeyedTimers, Shell, Timed};
 use windlass_mam_core::{MamMachine, MamResponse};
 use windlass_qbit_core::{QbitMachine, QbitResponse};
-use windlass_vpn_core::{VpnMachine, VpnResponse};
 
 /// Configuration holding all service command senders the `DomainShell` needs
 /// to route domain actions to the appropriate downstream runtimes.
 pub struct DomainShellConfig {
     pub db: UnboundedSender<Command<DbMachine>>,
-    pub vpn: UnboundedSender<Command<VpnMachine>>,
     pub qbit: UnboundedSender<Command<QbitMachine>>,
     pub mam: UnboundedSender<Command<MamMachine>>,
     pub docker: UnboundedSender<Command<DockerMachine>>,
@@ -30,7 +28,6 @@ pub struct DomainShellConfig {
 ///   back through the domain event channel, preserving the scheduled fire time.
 pub struct DomainShell {
     db: UnboundedSender<Command<DbMachine>>,
-    vpn: UnboundedSender<Command<VpnMachine>>,
     qbit: UnboundedSender<Command<QbitMachine>>,
     mam: UnboundedSender<Command<MamMachine>>,
     docker: UnboundedSender<Command<DockerMachine>>,
@@ -47,7 +44,6 @@ impl Shell for DomainShell {
     async fn new(config: Self::Config, _event_tx: UnboundedSender<Timed<WindlassEvent>>) -> Self {
         Self {
             db: config.db,
-            vpn: config.vpn,
             qbit: config.qbit,
             mam: config.mam,
             docker: config.docker,
@@ -95,10 +91,6 @@ impl Shell for DomainShell {
                 });
                 let _ = self.db.send((cmd, cause, reply_tx));
             }
-            WindlassAction::Vpn(cmd) => {
-                let (reply_tx, _reply_rx) = oneshot::channel::<VpnResponse>();
-                let _ = self.vpn.send((cmd, cause, reply_tx));
-            }
             WindlassAction::Qbit(cmd) => {
                 let (reply_tx, _reply_rx) = oneshot::channel::<QbitResponse>();
                 let _ = self.qbit.send((cmd, cause, reply_tx));
@@ -141,7 +133,6 @@ mod tests {
     #[tokio::test]
     async fn routed_commands_carry_the_domain_action_id_as_cause() {
         let (db_tx, _db_rx) = mpsc::unbounded_channel();
-        let (vpn_tx, _vpn_rx) = mpsc::unbounded_channel();
         let (qbit_tx, _qbit_rx) = mpsc::unbounded_channel();
         let (mam_tx, mut mam_rx) = mpsc::unbounded_channel();
         let (docker_tx, _docker_rx) = mpsc::unbounded_channel();
@@ -149,7 +140,6 @@ mod tests {
         let mut shell = DomainShell::new(
             DomainShellConfig {
                 db: db_tx,
-                vpn: vpn_tx,
                 qbit: qbit_tx,
                 mam: mam_tx,
                 docker: docker_tx,
@@ -179,7 +169,6 @@ mod tests {
     #[tokio::test]
     async fn routed_commands_without_scope_fall_back_to_unknown() {
         let (db_tx, _db_rx) = mpsc::unbounded_channel();
-        let (vpn_tx, _vpn_rx) = mpsc::unbounded_channel();
         let (qbit_tx, _qbit_rx) = mpsc::unbounded_channel();
         let (mam_tx, mut mam_rx) = mpsc::unbounded_channel();
         let (docker_tx, _docker_rx) = mpsc::unbounded_channel();
@@ -187,7 +176,6 @@ mod tests {
         let mut shell = DomainShell::new(
             DomainShellConfig {
                 db: db_tx,
-                vpn: vpn_tx,
                 qbit: qbit_tx,
                 mam: mam_tx,
                 docker: docker_tx,
