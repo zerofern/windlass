@@ -148,6 +148,7 @@ GitHub Actions publishes the production image to:
 ghcr.io/zerofern/windlass
 ```
 
-Every build from `main` receives `latest` and an immutable
-`sha-<commit>` tag. Pushing a tag such as `v1.2.3` also publishes `1.2.3`
-and `1.2`. Production deployments should use the immutable SHA tag.
+Every build from `main` receives `latest` and an immutable tag containing
+the full commit SHA: `sha-<40-character-commit>`. Pushing a tag such as
+`v1.2.3` also publishes `1.2.3` and `1.2`. Production deployments should
+use the immutable full-SHA tag.
