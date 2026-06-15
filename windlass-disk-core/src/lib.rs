@@ -7,12 +7,6 @@
 //! only holds the decision logic.  The shell feeds `DiskEvent::DiskSpaceObserved`
 //! and the core publishes `DiskPublish::BelowFloor` or `DiskPublish::AboveFloor`.
 //!
-//! # Deferred shell wiring
-//!
-//! No shell action for reading disk space is wired up yet.  Story 32 will add
-//! the live disk-read loop.  For now, the core compiles and all tests exercise it
-//! via direct event injection.
-//!
 //! # Rank classes (deferred)
 //!
 //! The four real deletion-value rank classes — (1) completed + low rating (≤2★),
@@ -39,8 +33,8 @@ pub struct DiskConfig {
 
 /// Commands accepted by `DiskMachine`.
 ///
-/// `RefreshDisk` is included for symmetry with the other service cores; it is
-/// optional and the shell may omit it until story 32.
+/// `RefreshDisk` is reserved for an operator-triggered refresh. Periodic reads
+/// are driven by the shell's polling loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiskCommand {
     /// Request a fresh disk-space observation.
@@ -61,8 +55,7 @@ pub enum DiskEvent {
 
 /// Actions that `DiskMachine` asks the shell to perform.
 ///
-/// Currently empty: the machine has no immediate I/O need of its own.
-/// Story 32 may add a `ReadDiskSpace` action when the live poll loop is wired.
+/// Currently empty: periodic reads are an imperative-shell concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiskAction {}
 

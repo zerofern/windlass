@@ -30,6 +30,7 @@ axum             = { workspace = true }
 bollard          = { workspace = true }
 chrono           = { workspace = true }
 futures-util     = { workspace = true }
+ipnet            = { workspace = true }
 tokio            = { workspace = true }
 anyhow           = { workspace = true }
 tracing          = { workspace = true }
@@ -40,3 +41,6 @@ uom              = { workspace = true }
 uuid             = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

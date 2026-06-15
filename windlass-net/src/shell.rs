@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ipnet::IpNet;
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
@@ -64,6 +65,9 @@ pub struct TunnelShellConfig {
     /// for the Postgres service's fixed private address; general internet
     /// egress must go through the tunnel interface.
     pub allowed_tcp_endpoints: Vec<SocketAddr>,
+    /// Private destination networks that retain Docker's original
+    /// underlay route after the default route moves to the tunnel.
+    pub local_routes: Vec<IpNet>,
     /// Observability tap.  Every subprocess invocation and NAT-PMP
     /// exchange is captured here so the `/observability` ring sees
     /// tunnel ops alongside MAM/qBit HTTP.
@@ -93,6 +97,7 @@ impl TunnelShellConfig {
                 .map(|s| (*s).to_string())
                 .collect(),
             allowed_tcp_endpoints: Vec::new(),
+            local_routes: Vec::new(),
             tap: NullHttpTap::arc(),
         }
     }
@@ -267,6 +272,7 @@ async fn configure_interface(
         // route flip, when the original underlay can no longer be
         // discovered.
         pin_underlay_routes(runner, config).await?;
+        pin_local_routes(runner, config).await?;
         // `replace`, not `add`: a container namespace already has a
         // default route (Docker installs one), and `ip route add
         // default` fails with EEXIST against it.
@@ -354,6 +360,46 @@ async fn pin_underlay_routes(
             .run("ip", &args)
             .await
             .map_err(|e| InterfaceConfigureFailure::RouteAdd(format!("pin underlay {dst}: {e}")))?;
+    }
+    Ok(())
+}
+
+async fn pin_local_routes(
+    runner: &dyn Runner,
+    config: &TunnelShellConfig,
+) -> Result<(), InterfaceConfigureFailure> {
+    for network in &config.local_routes {
+        let destination = network.addr().to_string();
+        let family = if network.addr().is_ipv6() {
+            Some("-6")
+        } else {
+            None
+        };
+        let mut get_args = Vec::with_capacity(5);
+        if let Some(family) = family {
+            get_args.push(family);
+        }
+        get_args.extend(["-j", "route", "get", &destination]);
+        let out = runner.run("ip", &get_args).await.map_err(|e| {
+            InterfaceConfigureFailure::RouteAdd(format!("local route get {destination}: {e}"))
+        })?;
+        let hop = parse_route_get(&out.stdout).map_err(|e| {
+            InterfaceConfigureFailure::RouteAdd(format!("local route get {destination}: {e}"))
+        })?;
+
+        let network = network.to_string();
+        let mut replace_args = Vec::with_capacity(8);
+        if let Some(family) = family {
+            replace_args.push(family);
+        }
+        replace_args.extend(["route", "replace", &network]);
+        if let Some(gateway) = &hop.gateway {
+            replace_args.extend(["via", gateway]);
+        }
+        replace_args.extend(["dev", &hop.dev]);
+        runner.run("ip", &replace_args).await.map_err(|e| {
+            InterfaceConfigureFailure::RouteAdd(format!("pin local route {network}: {e}"))
+        })?;
     }
     Ok(())
 }
@@ -1311,7 +1357,11 @@ Endpoint = 198.51.100.7:51820
 PersistentKeepalive = 25
 ";
         let wg = WgConfig::parse(content, EndpointResolutionPolicy::RequireIpLiteral).unwrap();
-        let config = TunnelShellConfig::new(wg);
+        let mut config = TunnelShellConfig::new(wg);
+        config.local_routes = vec![
+            "100.64.0.0/10".parse().unwrap(),
+            "192.168.2.0/24".parse().unwrap(),
+        ];
         let runner = RecordingRunner::default();
 
         configure_interface(&runner, &config)
@@ -1355,10 +1405,20 @@ PersistentKeepalive = 25
             .iter()
             .position(|l| l == "ip route replace default dev wg0")
             .expect("default route replace");
+        let tailscale_pos = lines
+            .iter()
+            .position(|l| l == "ip route replace 100.64.0.0/10 via 172.31.0.1 dev eth0")
+            .expect("Tailscale route");
+        let lan_pos = lines
+            .iter()
+            .position(|l| l == "ip route replace 192.168.2.0/24 via 172.31.0.1 dev eth0")
+            .expect("LAN route");
         assert!(
             pin_pos < default_pos,
             "underlay pin must precede the default-route flip"
         );
+        assert!(tailscale_pos < default_pos);
+        assert!(lan_pos < default_pos);
     }
 
     #[test]

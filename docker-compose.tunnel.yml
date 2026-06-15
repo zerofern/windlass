@@ -37,10 +37,17 @@ services:
       QBITTORRENT_PASS: ${QBITTORRENT_PASS:?QBITTORRENT_PASS missing}
       MAM_SESSION: ${MAM_SESSION:?MAM_SESSION missing}
       DATABASE_URL: ${DATABASE_URL:-postgres://windlass:windlass@172.30.0.10:5432/windlass}
+      DATA_PATH: /downloads
+      DISK_POLL_INTERVAL_SECS: ${DISK_POLL_INTERVAL_SECS:-60}
+      DISK_HARD_FLOOR_BYTES: ${DISK_HARD_FLOOR_BYTES:-53687091200}
       # Only this non-tunnel TCP endpoint is allowed by the nftables kill switch.
       TUNNEL_FIREWALL_ALLOW_TCP: 172.30.0.10:5432
+      # Preserve return routes to Tailscale and the local LAN when the
+      # namespace default route moves to WireGuard.
+      TUNNEL_LOCAL_ROUTES: 100.64.0.0/10,192.168.2.0/24
     volumes:
       - ./wg.conf:/config/wg.conf:ro
+      - ./downloads:/downloads:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
       - "5010:5010"   # windlass dashboard
