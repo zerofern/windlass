@@ -30,11 +30,8 @@ use init::init_shell;
 /// typed events directly.  This function only blocks waiting for a
 /// shutdown signal — the runtimes are self-driving.
 pub async fn run(observability: Arc<ObservabilityController>) -> Result<()> {
-    // `init_shell` spawns every per-core runtime, every forwarder
-    // task, the HTTP server, and dispatches the boot Init events.
-    // The bundle it returns is kept alive (rather than dropped)
-    // because it owns the runtime/handle/client values the spawned
-    // tasks reference via clones.
+    // Runtime command senders are lifecycle keepalives. Retain them until
+    // process shutdown so no service loop observes a closed command channel.
     let _shell = init_shell(observability).await?;
 
     info!("Shell up; waiting for shutdown signal (Ctrl+C)");

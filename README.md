@@ -111,19 +111,17 @@ Windlass is configured entirely via environment variables.
 | `WG_CONFIG_PATH`    | ✓        | —                             | Path to the ProtonVPN-generated `wg.conf` Windlass uses to bring up the in-process WireGuard tunnel. See `docs/vpn-ownership.md`. |
 | `MAM_USER_AGENT`    |          | `windlass`                    | User-Agent sent to MAM              |
 | `DATA_PATH`         |          | `/mnt/Data`                   | Path to monitor for disk space      |
+| `DISK_POLL_INTERVAL_SECS` | | `60` | Seconds between available-space observations |
+| `DISK_HARD_FLOOR_BYTES` | | `53687091200` (50 GiB) | Free-space threshold below which disk-pressure handling starts |
 | `DUMP_DIR`          |          | `/mnt/Data/windlass_dumps`    | Directory for crash log dumps       |
-| `WINDLASS_BIND`     |          | `0.0.0.0:5010`                | Address for the embedded web server |
-| `WINDLASS_EXECUTE_SERVICE_ACTIONS` | | `true` | Execute the sans-I/O service-core action path; disabling is diagnostic only |
+| `WINDLASS_BIND`     |          | `0.0.0.0:5010`                | Address inside the container for the embedded web server |
 | `WG_INTERFACE_NAME` |          | `wg0`                         | Tunnel interface name |
 | `NATPMP_GATEWAY`    |          | `10.2.0.1:5351`               | NAT-PMP gateway address for the in-process port-forwarding flow |
 | `TUNNEL_FIREWALL_ALLOW_TCP` | | — | Comma-separated `ip:port` allow-list for non-tunnel TCP control-plane dependencies. The shipped compose uses this only for Postgres. |
+| `TUNNEL_LOCAL_ROUTES` | | — | Comma-separated private network ranges whose replies bypass the tunnel. Empty means host-local access only; the shipped Compose enables Tailscale and `192.168.2.0/24`. |
 | `EXIT_IP_URLS`      |          | `api.ipify.org,ipv4.icanhazip.com` | Comma-separated URLs the exit-IP query GETs through the tunnel |
 | `EXIT_IP_QUERY_INTERVAL_SECS` | | `21600` (6 h) | Exit-IP query cadence |
 | `SEEDBOX_UPDATE_MIN_INTERVAL_SECS` | | `3660` (61 min) | Machine-side spacing between MAM dynamic-seedbox updates |
-
-`WINDLASS_EXECUTE_SHADOW_ACTIONS` is still accepted as a deprecated alias for
-the service action switch. Legacy service orchestration has been retired from
-`windlass-core`, so this is no longer a rollback to a complete legacy path.
 
 ## Running with Docker Compose
 

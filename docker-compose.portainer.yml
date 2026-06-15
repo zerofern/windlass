@@ -1,0 +1,119 @@
+# Portainer production stack for Windlass's owned-WireGuard topology.
+#
+# Required host paths on the Docker host running Portainer's endpoint:
+#   /opt/windlass/config/wg.conf
+#   /opt/windlass/postgres/data
+#   /opt/qbittorrent/config
+#   /mnt/Data
+#
+# Configure the required ${...} variables in Portainer's stack environment.
+# Windlass starts with every core paused. PostgreSQL and the dashboard start
+# normally, while qBittorrent waits for Windlass to be resumed and create wg0.
+
+services:
+  windlass:
+    image: ${WINDLASS_IMAGE:?Set WINDLASS_IMAGE to an immutable published tag}
+    container_name: windlass
+    cap_add:
+      - NET_ADMIN
+    networks:
+      windlass-control:
+        ipv4_address: 172.30.0.2
+    environment:
+      TZ: ${TZ:-Europe/Copenhagen}
+      RUST_LOG: ${RUST_LOG:-info}
+      PAUSE_ON_START: "true"
+      WG_CONFIG_PATH: /config/wg.conf
+      QBITTORRENT_URL: http://localhost:8080
+      QBITTORRENT_USER: ${QBITTORRENT_USER:?Set QBITTORRENT_USER}
+      QBITTORRENT_PASS: ${QBITTORRENT_PASS:?Set QBITTORRENT_PASS}
+      MAM_SESSION: ${MAM_SESSION:?Set MAM_SESSION}
+      MAM_USER_AGENT: ${MAM_USER_AGENT:-windlass}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+      DATA_PATH: /mnt/Data
+      DUMP_DIR: /mnt/Data/windlass_dumps
+      DISK_POLL_INTERVAL_SECS: ${DISK_POLL_INTERVAL_SECS:-60}
+      DISK_HARD_FLOOR_BYTES: ${DISK_HARD_FLOOR_BYTES:-53687091200}
+      TUNNEL_FIREWALL_ALLOW_TCP: 172.30.0.10:5432
+      TUNNEL_LOCAL_ROUTES: ${TUNNEL_LOCAL_ROUTES:-100.64.0.0/10,192.168.2.0/24}
+      WINDLASS_ANCHOR_CONTAINER: windlass
+    volumes:
+      - /opt/windlass/config/wg.conf:/config/wg.conf:ro
+      - /mnt/Data:/mnt/Data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "5010:5010"
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:5010/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:5.1.4-r2-ls446
+    container_name: qbittorrent
+    network_mode: "container:windlass"
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Europe/Copenhagen}
+      WEBUI_PORT: 8080
+    volumes:
+      - /opt/qbittorrent/config:/config
+      - /mnt/Data:/mnt/Data
+    # In a paused deployment Windlass has not installed its kill switch or
+    # created wg0. Do not start qBittorrent's process until the operator
+    # resumes Windlass and the tunnel interface exists.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until test -d /sys/class/net/wg0; do
+          echo "Waiting for Windlass WireGuard interface wg0"
+          sleep 2
+        done
+        exec /init
+    depends_on:
+      windlass:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /sys/class/net/wg0 && curl -fsS http://127.0.0.1:8080/api/v2/app/version >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 60s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: windlass-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-windlass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-windlass}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - /opt/windlass/postgres/data:/var/lib/postgresql/data
+    networks:
+      windlass-control:
+        ipv4_address: 172.30.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+networks:
+  windlass-control:
+    name: windlass-control
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
