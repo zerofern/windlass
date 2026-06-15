@@ -139,3 +139,15 @@ docker compose -f docker-compose.tunnel.yml up -d
 See `docker-compose.tunnel.yml` for the override skeleton and the
 required `WG_CONFIG_PATH` env var.  Background on the design:
 `docs/vpn-ownership.md`.
+
+## Container image
+
+GitHub Actions publishes the production image to:
+
+```text
+ghcr.io/zerofern/windlass
+```
+
+Every build from `main` receives `latest` and an immutable
+`sha-<commit>` tag. Pushing a tag such as `v1.2.3` also publishes `1.2.3`
+and `1.2`. Production deployments should use the immutable SHA tag.

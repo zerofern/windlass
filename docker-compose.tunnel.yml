@@ -20,7 +20,7 @@
 
 services:
   windlass:
-    image: ghcr.io/stirlingmouse/windlass:vpn
+    image: ${WINDLASS_IMAGE:-ghcr.io/zerofern/windlass:latest}
     container_name: windlass
     cap_add:
       - NET_ADMIN
