@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use ipnet::IpNet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use windlass_observability::ObservabilityConfig;
 use windlass_observability::ring::parse_byte_budget;
@@ -32,7 +35,9 @@ pub struct Config {
     pub mam_torrent_base_url: String,
     pub mam_user_agent: String,
     /// Mount path to check for available disk space.
-    pub data_path: String,
+    pub data_path: PathBuf,
+    pub disk_poll_interval: Duration,
+    pub disk_hard_floor_bytes: u64,
     pub dump_dir: String,
     pub database_url: String,
     /// Path to a `ProtonVPN`-generated `wg.conf` file.  Required:
@@ -51,6 +56,9 @@ pub struct Config {
     /// nftables kill switch. Used for local control-plane dependencies
     /// such as the shipped Postgres service.
     pub tunnel_firewall_allow_tcp: Vec<SocketAddr>,
+    /// Private networks whose replies must bypass the tunnel and use
+    /// Docker's original gateway. Empty means host-local access only.
+    pub tunnel_local_routes: Vec<IpNet>,
     /// Comma-separated URLs the exit-IP query GETs through the tunnel
     /// (`EXIT_IP_URLS`).  Each must return the connection's source IP
     /// as plain text on the first line.  Defaults to two independent
@@ -78,10 +86,6 @@ pub struct Config {
     pub compliance_poll_interval_secs: u64,
     /// Maximum unsatisfied torrents before alerting (default: 50).
     pub unsatisfied_quota_limit: u32,
-    /// Executes service actions produced by the sans-I/O service cores. Enabled
-    /// by default; disabling is diagnostic only because legacy service
-    /// orchestration has been retired from `windlass-core`.
-    pub execute_service_actions: bool,
 }
 
 impl Config {
@@ -109,7 +113,17 @@ impl Config {
             mam_torrent_base_url: var("MAM_TORRENT_BASE_URL")
                 .unwrap_or_else(|_| "https://www.myanonamouse.net".to_string()),
             mam_user_agent: var("MAM_USER_AGENT").unwrap_or_else(|_| "windlass".to_string()),
-            data_path: var("DATA_PATH").unwrap_or_else(|_| "/mnt/Data".to_string()),
+            data_path: PathBuf::from(var("DATA_PATH").unwrap_or_else(|_| "/mnt/Data".to_string())),
+            disk_poll_interval: Duration::from_secs(parse_nonzero_u64(
+                "DISK_POLL_INTERVAL_SECS",
+                var("DISK_POLL_INTERVAL_SECS").ok().as_deref(),
+                60,
+            )?),
+            disk_hard_floor_bytes: parse_nonzero_u64(
+                "DISK_HARD_FLOOR_BYTES",
+                var("DISK_HARD_FLOOR_BYTES").ok().as_deref(),
+                50 * 1_073_741_824,
+            )?,
             dump_dir: var("DUMP_DIR").unwrap_or_else(|_| "/mnt/Data/windlass_dumps".to_string()),
             database_url: var("DATABASE_URL")
                 .context("DATABASE_URL missing; expected postgres:// URL")?,
@@ -125,6 +139,10 @@ impl Config {
                     .as_str(),
             )
             .context("TUNNEL_FIREWALL_ALLOW_TCP")?,
+            tunnel_local_routes: parse_ip_net_list(
+                var("TUNNEL_LOCAL_ROUTES").unwrap_or_default().as_str(),
+            )
+            .context("TUNNEL_LOCAL_ROUTES")?,
             exit_ip_urls: var("EXIT_IP_URLS").map_or_else(
                 |_| {
                     vec![
@@ -158,10 +176,6 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
-            execute_service_actions: execute_service_actions_setting(
-                var("WINDLASS_EXECUTE_SERVICE_ACTIONS").ok().as_deref(),
-                var("WINDLASS_EXECUTE_SHADOW_ACTIONS").ok().as_deref(),
-            ),
         })
     }
 }
@@ -177,8 +191,29 @@ fn parse_socket_addr_list(raw: &str) -> Result<Vec<SocketAddr>> {
         .collect()
 }
 
-fn execute_service_actions_setting(current: Option<&str>, legacy: Option<&str>) -> bool {
-    current.or(legacy).is_none_or(parse_execute_service_actions)
+fn parse_ip_net_list(raw: &str) -> Result<Vec<IpNet>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            anyhow::ensure!(
+                s.contains('/'),
+                "expected IP network in CIDR notation, got `{s}`"
+            );
+            s.parse::<IpNet>()
+                .with_context(|| format!("expected IP network in CIDR notation, got `{s}`"))
+        })
+        .collect()
+}
+
+fn parse_nonzero_u64(name: &str, raw: Option<&str>, default: u64) -> Result<u64> {
+    let value = raw.map_or(Ok(default), |value| {
+        value
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be a positive integer"))
+    })?;
+    anyhow::ensure!(value > 0, "{name} must be greater than zero");
+    Ok(value)
 }
 
 /// Read the `WINDLASS_OBS_*` env vars into an [`ObservabilityConfig`].
@@ -224,46 +259,20 @@ pub fn load_observability_config() -> Result<ObservabilityConfig> {
     Ok(cfg)
 }
 
-fn parse_execute_service_actions(value: &str) -> bool {
-    !matches!(value, "0" | "false" | "FALSE" | "no" | "NO")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        execute_service_actions_setting, parse_execute_service_actions, parse_socket_addr_list,
-    };
+    use super::{parse_ip_net_list, parse_nonzero_u64, parse_socket_addr_list};
 
     #[test]
-    fn parse_execute_service_actions_accepts_enabled_values() {
-        assert!(parse_execute_service_actions("1"));
-        assert!(parse_execute_service_actions("true"));
-        assert!(parse_execute_service_actions("yes"));
-        assert!(parse_execute_service_actions("anything-else"));
+    fn parse_nonzero_u64_accepts_default_and_explicit_value() {
+        assert_eq!(parse_nonzero_u64("TEST", None, 60).unwrap(), 60);
+        assert_eq!(parse_nonzero_u64("TEST", Some("15"), 60).unwrap(), 15);
     }
 
     #[test]
-    fn parse_execute_service_actions_accepts_disabled_values() {
-        assert!(!parse_execute_service_actions("0"));
-        assert!(!parse_execute_service_actions("false"));
-        assert!(!parse_execute_service_actions("FALSE"));
-        assert!(!parse_execute_service_actions("no"));
-        assert!(!parse_execute_service_actions("NO"));
-    }
-
-    #[test]
-    fn execute_service_actions_prefers_current_env_name() {
-        assert!(execute_service_actions_setting(Some("true"), Some("false")));
-        assert!(!execute_service_actions_setting(
-            Some("false"),
-            Some("true")
-        ));
-    }
-
-    #[test]
-    fn execute_service_actions_accepts_legacy_env_name() {
-        assert!(!execute_service_actions_setting(None, Some("false")));
-        assert!(execute_service_actions_setting(None, None));
+    fn parse_nonzero_u64_rejects_zero_and_invalid_values() {
+        assert!(parse_nonzero_u64("TEST", Some("0"), 60).is_err());
+        assert!(parse_nonzero_u64("TEST", Some("nope"), 60).is_err());
     }
 
     #[test]
@@ -279,6 +288,25 @@ mod tests {
     fn parse_socket_addr_list_rejects_hostnames() {
         let err = parse_socket_addr_list("postgres:5432").expect_err("hostnames are not allowed");
         assert!(err.to_string().contains("expected socket address"));
+    }
+
+    #[test]
+    fn parse_ip_net_list_accepts_comma_separated_networks() {
+        let values = parse_ip_net_list("100.64.0.0/10, 192.168.2.0/24").expect("list parses");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "100.64.0.0/10".parse().unwrap());
+        assert_eq!(values[1], "192.168.2.0/24".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_ip_net_list_defaults_to_empty() {
+        assert!(parse_ip_net_list("").expect("empty list parses").is_empty());
+    }
+
+    #[test]
+    fn parse_ip_net_list_rejects_invalid_networks() {
+        let err = parse_ip_net_list("192.168.2.1").expect_err("prefix is required");
+        assert!(err.to_string().contains("expected IP network"));
     }
 
     #[test]

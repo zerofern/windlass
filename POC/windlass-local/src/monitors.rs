@@ -3,9 +3,9 @@ use uom::si::f64::Information;
 use uom::si::information::byte;
 
 /// Returns available disk space at `path`. On error, returns `f64::MAX`
-/// so the Core never triggers a false low-space alert.
+/// so callers that need the legacy quantity API never trigger a false alert.
 pub fn check_disk_space(path: &str) -> Information {
-    match available_bytes(path) {
+    match available_bytes(std::path::Path::new(path)) {
         #[allow(clippy::cast_precision_loss)]
         // f64 mantissa is 52 bits (~8 PiB exact range). Practical disk sizes
         // are well under this, so the precision loss is negligible for alerting.
@@ -17,11 +17,22 @@ pub fn check_disk_space(path: &str) -> Information {
     }
 }
 
-fn available_bytes(path: &str) -> anyhow::Result<u64> {
+/// Returns the available bytes reported by `statvfs` for `path`.
+///
+/// Shell polling should use this fallible API so read failures are logged and
+/// retried without emitting a fabricated observation into the core.
+///
+/// # Errors
+///
+/// Returns an error when the path contains an interior NUL byte or when
+/// `statvfs` cannot inspect the path.
+pub fn available_bytes(path: &std::path::Path) -> anyhow::Result<u64> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
 
-    let c_path = CString::new(path)?;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
     let mut stat = MaybeUninit::<libc::statvfs>::uninit();
     let ret = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
     if ret != 0 {

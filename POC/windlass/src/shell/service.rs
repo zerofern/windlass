@@ -1,15 +1,13 @@
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::sync::mpsc;
 use windlass_db_core::DbMachine;
 use windlass_disk_core::DiskMachine;
+use windlass_docker_core::DockerMachine;
 use windlass_domain_core::WindlassMachine;
-use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
+use windlass_machine::{ExternalCause, ServiceHandles, Timed};
 use windlass_mam_core::{MamEvent, MamMachine};
 use windlass_qbit_core::{QbitEvent, QbitMachine};
 use windlass_tunnel_core::{TunnelEvent, TunnelMachine};
-use windlass_types::VpnPort;
 use windlass_vpn_core::VpnMachine;
 
 use windlass_domain_core::WindlassEvent;
@@ -21,53 +19,54 @@ use windlass_domain_core::WindlassEvent;
 /// post-§37j).
 pub(super) struct ServiceCores {
     domain: ServiceHandles<WindlassMachine>,
-    db: ServiceHandles<DbMachine>,
-    vpn: ServiceHandles<VpnMachine>,
     qbit: ServiceHandles<QbitMachine>,
     mam: ServiceHandles<MamMachine>,
-    disk: ServiceHandles<DiskMachine>,
+    _keepalives: ServiceKeepalives,
     /// In-process `WireGuard` tunnel handles; `dispatch_init`
     /// delivers `TunnelEvent::Init` here to bring the interface up.
     tunnel: ServiceHandles<TunnelMachine>,
-    /// Cached forwarded port, shared with the VPN forwarder task.
-    /// Updated by the VPN forwarder on PortReady/PortUnavailable/Disconnected.
-    forwarded_port: Arc<Mutex<Option<VpnPort>>>,
+}
+
+pub(super) struct ServiceKeepalives {
+    _db: ServiceHandles<DbMachine>,
+    _vpn: ServiceHandles<VpnMachine>,
+    _disk: ServiceHandles<DiskMachine>,
+    _docker: ServiceHandles<DockerMachine>,
+}
+
+impl ServiceKeepalives {
+    #[must_use]
+    pub const fn new(
+        db: ServiceHandles<DbMachine>,
+        vpn: ServiceHandles<VpnMachine>,
+        disk: ServiceHandles<DiskMachine>,
+        docker: ServiceHandles<DockerMachine>,
+    ) -> Self {
+        Self {
+            _db: db,
+            _vpn: vpn,
+            _disk: disk,
+            _docker: docker,
+        }
+    }
 }
 
 impl ServiceCores {
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         domain: ServiceHandles<WindlassMachine>,
-        db: ServiceHandles<DbMachine>,
-        vpn: ServiceHandles<VpnMachine>,
         qbit: ServiceHandles<QbitMachine>,
         mam: ServiceHandles<MamMachine>,
-        disk: ServiceHandles<DiskMachine>,
         tunnel: ServiceHandles<TunnelMachine>,
-        forwarded_port: Arc<Mutex<Option<VpnPort>>>,
+        keepalives: ServiceKeepalives,
     ) -> Self {
         Self {
             domain,
-            db,
-            vpn,
             qbit,
             mam,
-            disk,
+            _keepalives: keepalives,
             tunnel,
-            forwarded_port,
         }
-    }
-
-    /// Returns the sender for issuing DB commands to the DB runtime.
-    pub const fn db_command_tx(&self) -> &mpsc::UnboundedSender<Command<DbMachine>> {
-        &self.db.commands
-    }
-
-    /// Returns a clone of the shared forwarded-port arc so the VPN forwarder
-    /// task can write to it.
-    pub fn forwarded_port_arc(&self) -> Arc<Mutex<Option<VpnPort>>> {
-        Arc::clone(&self.forwarded_port)
     }
 
     /// Dispatch the per-core boot Init events.  Called once from
@@ -107,15 +106,11 @@ mod tests {
 
     use tokio::sync::mpsc;
     use windlass_db_core::{DbEvent, DbMachine, DbPublish};
-    use windlass_disk_core::DiskMachine;
     use windlass_domain_core::{WindlassEvent, WindlassMachine, WindlassPublish, WindlassTopic};
     use windlass_machine::{Command, ExternalCause, ServiceHandles, Timed};
     use windlass_mam_core::{MamEvent, MamMachine};
     use windlass_qbit_core::{QbitEvent, QbitMachine, QbitPublish};
-    use windlass_tunnel_core::{TunnelEvent, TunnelMachine};
     use windlass_vpn_core::{VpnEvent, VpnMachine, VpnPublish};
-
-    use super::ServiceCores;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -153,23 +148,6 @@ mod tests {
         )
     }
 
-    fn make_tunnel_handles() -> (
-        ServiceHandles<TunnelMachine>,
-        mpsc::UnboundedReceiver<Timed<TunnelEvent>>,
-    ) {
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Timed<TunnelEvent>>();
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Command<TunnelMachine>>();
-        let (sub_tx, _sub_rx) = mpsc::unbounded_channel();
-        (
-            ServiceHandles {
-                events: ev_tx,
-                commands: cmd_tx,
-                subscribe: sub_tx,
-            },
-            ev_rx,
-        )
-    }
-
     fn make_qbit_handles() -> (
         ServiceHandles<QbitMachine>,
         mpsc::UnboundedReceiver<Command<QbitMachine>>,
@@ -184,23 +162,6 @@ mod tests {
                 subscribe: sub_tx,
             },
             cmd_rx,
-        )
-    }
-
-    fn make_disk_handles() -> (
-        ServiceHandles<DiskMachine>,
-        mpsc::UnboundedReceiver<Timed<windlass_disk_core::DiskEvent>>,
-    ) {
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Timed<windlass_disk_core::DiskEvent>>();
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Command<DiskMachine>>();
-        let (sub_tx, _sub_rx) = mpsc::unbounded_channel();
-        (
-            ServiceHandles {
-                events: ev_tx,
-                commands: cmd_tx,
-                subscribe: sub_tx,
-            },
-            ev_rx,
         )
     }
 
@@ -236,32 +197,6 @@ mod tests {
             },
             ev_rx,
         )
-    }
-
-    fn make_cores() -> (
-        ServiceCores,
-        mpsc::UnboundedReceiver<Timed<WindlassEvent>>,
-        Arc<Mutex<Option<windlass_types::VpnPort>>>,
-    ) {
-        let (domain_handles, domain_ev_rx) = make_domain_handles();
-        let (db_handles, _db_cmd_rx) = make_db_handles();
-        let (vpn_handles, _vpn_ev_rx) = make_vpn_handles();
-        let (qbit_handles, _qbit_cmd_rx) = make_qbit_handles();
-        let (mam_handles, _mam_cmd_rx) = make_mam_handles();
-        let (disk_handles, _disk_ev_rx) = make_disk_handles();
-        let (tunnel_handles, _tunnel_ev_rx) = make_tunnel_handles();
-        let forwarded_port = Arc::new(Mutex::new(None));
-        let cores = ServiceCores::new(
-            domain_handles,
-            db_handles,
-            vpn_handles,
-            qbit_handles,
-            mam_handles,
-            disk_handles,
-            tunnel_handles,
-            Arc::clone(&forwarded_port),
-        );
-        (cores, domain_ev_rx, forwarded_port)
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────

@@ -1,16 +1,14 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use windlass_clients::{mam, qbit};
 use windlass_db::DbPool;
 use windlass_local::docker;
-use windlass_types::{VpnPort, WakeupId};
+use windlass_types::VpnPort;
 
 use windlass_db_core::{ActivityRecord, ActivitySource, DbCommand, DbMachine, DbPublish, DbTopic};
 use windlass_disk_core::{DiskConfig, DiskMachine, DiskPublish, DiskTopic};
@@ -28,31 +26,22 @@ use windlass_vpn_core::{VpnMachine, VpnPublish, VpnTopic};
 
 use super::config::Config;
 use super::db_shell::DbShell;
-use super::disk_shell::DiskShell;
+use super::disk_shell::{DiskShell, DiskShellConfig};
 use super::docker_shell::{DockerShell, DockerShellConfig};
 use super::domain_shell::{DomainShell, DomainShellConfig};
 use super::mam_shell::MamShell;
 use super::qbit_shell::QbitShell;
-use super::service::ServiceCores;
+use super::service::{ServiceCores, ServiceKeepalives};
 use super::tunnel_bridge::{bridge_tunnel_publish, wrap_publish_for_domain};
 use super::vpn_shell::VpnShell;
 
-/// Owns everything constructed by `init_shell` that needs to outlive
-/// the function call.  `shell::run` keeps the bundle alive for the
-/// lifetime of the process so background tasks can keep using the
-/// clones they captured at spawn time.
+/// Keeps the external command senders alive for every service runtime.
+/// Closing a runtime's command channel is its shutdown signal.
 pub(super) struct ShellRuntime {
-    pub(super) docker: docker::DockerClient,
-    pub(super) dependents: Vec<String>,
-    pub(super) qbit: qbit::QbitClient,
-    pub(super) mam: mam::MamClient,
-    pub(super) data_path: String,
-    pub(super) wakeups: HashMap<WakeupId, JoinHandle<()>>,
-    pub(super) service_cores: ServiceCores,
-    pub(super) execute_service_actions: bool,
+    _service_cores: ServiceCores,
 }
 
-/// Bootstraps all infrastructure and returns the runtime bundle.
+/// Bootstraps all infrastructure and starts the runtime tasks.
 /// Spawns the HTTP server and sends the `Init` event before returning.
 ///
 /// `observability` is constructed in `main` so its log layer can
@@ -65,7 +54,7 @@ pub(super) async fn init_shell(
 ) -> Result<ShellRuntime> {
     let config = Config::from_env()?;
 
-    let (docker, boot) =
+    let (docker, _boot) =
         docker::DockerClient::boot(config.dump_dir.clone(), config.anchor_container.clone())
             .await?;
 
@@ -111,13 +100,10 @@ pub(super) async fn init_shell(
     .with_json_ip_url(config.mam_json_ip_url.clone())
     .with_torrent_base_url(config.mam_torrent_base_url.clone());
 
-    let data_path = config.data_path.clone();
-
     // §36 step 5: HTTP server start is deferred until after the domain
     // runtime is spawned so AppState can carry the domain command channel
     // (for `WindlassCommand::ManualDownload`).
 
-    let wakeups: HashMap<WakeupId, JoinHandle<()>> = HashMap::new();
     let blacklisted = windlass_db::download_queue::get_blacklisted_ids(&db_pool)
         .await
         .unwrap_or_default();
@@ -175,20 +161,20 @@ pub(super) async fn init_shell(
         ))
         .expect("docker pub subscription");
 
-    // §36 step 4: spawn DiskShell + DiskMachine.  DiskShell has no
-    // actions; events arrive via the service-events bridge from
-    // `Event::DiskSpaceObserved`.  Domain DOM-9 consumes
+    // DiskShell polls the configured filesystem and emits typed observations.
+    // Domain DOM-9 consumes
     // `DiskPublish::BelowFloor` to fire the Warning alert and trigger
     // disk-pressure eviction.
     let (disk_handles, _disk_join) = windlass_machine::spawn::<DiskMachine, DiskShell>(
         windlass_machine::CoreId::Disk,
         runtime_tap.clone(),
-        // 50 GiB hard floor — mirrors the legacy threshold so the alert
-        // and eviction trigger at the same point.
         DiskConfig {
-            hard_floor_bytes: 50 * 1_073_741_824,
+            hard_floor_bytes: config.disk_hard_floor_bytes,
         },
-        (),
+        DiskShellConfig {
+            data_path: config.data_path.clone(),
+            poll_interval: config.disk_poll_interval,
+        },
     )
     .await;
     let (disk_pub_tx, mut disk_pub_rx) =
@@ -258,6 +244,7 @@ pub(super) async fn init_shell(
                 natpmp_lifetime_seconds: 60,
                 exit_ip_urls: config.exit_ip_urls.clone(),
                 allowed_tcp_endpoints: config.tunnel_firewall_allow_tcp.clone(),
+                local_routes: config.tunnel_local_routes.clone(),
                 tap: http_tap.clone(),
             },
         )
@@ -300,7 +287,7 @@ pub(super) async fn init_shell(
             // MAM Power User class cap (MAM Rule 2.8 — §25).
             // Set to 0 to disable the gate (e.g. for lower-class accounts where
             // the real limit is unknown; operators should set this explicitly).
-            unsatisfied_quota_limit: 100,
+            unsatisfied_quota_limit: config.unsatisfied_quota_limit,
             // §36 step 3: 3 consecutive port-sync failures trip the
             // persistent-failure publish (Warning alert + cookie clear).
             max_sync_attempts: 3,
@@ -652,15 +639,11 @@ pub(super) async fn init_shell(
 
     let service_cores = ServiceCores::new(
         domain_handles,
-        db_handles,
-        vpn_handles,
         qbit_handles,
         mam_handles,
-        disk_handles,
         tunnel_handles,
-        forwarded_port,
+        ServiceKeepalives::new(db_handles, vpn_handles, disk_handles, docker_handles),
     );
-    let execute_service_actions = config.execute_service_actions;
 
     if let Err(e) = mam.check_session().await {
         warn!("MAM session check failed at startup: {e} — continuing anyway");
@@ -673,14 +656,7 @@ pub(super) async fn init_shell(
     service_cores.dispatch_init();
 
     Ok(ShellRuntime {
-        docker,
-        dependents: boot.dependents,
-        qbit,
-        mam,
-        data_path,
-        wakeups,
-        service_cores,
-        execute_service_actions,
+        _service_cores: service_cores,
     })
 }
 
