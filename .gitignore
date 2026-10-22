@@ -1,20 +1,9 @@
+# Build artifacts.
 target/
-# Mountpoint for the wg-integration runner's named target volume.
 target-wg/
-mlm/
-mousehole/
-*.zip
-proptest-regressions/
-dynamicSeedbox.md
-load_user_data.md
-plan.md
-mam-conectability.md
-llm-features.md
-mam-rules.md
-user-profile-example.md
-rreading-glasses-main
-loadSearchJSONbasic.md
-book-recomendation/
 
-# Local agent worktrees managed by Claude Code
+# Official MAM documentation kept locally.
+/docs/MAM/
+
+# Local agent worktrees.
 .claude/

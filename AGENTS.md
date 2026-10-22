@@ -65,34 +65,6 @@ Clippy must pass with zero warnings. Do not suppress lints unless the suppressio
 Run `just check && just coverage`. Both must pass with zero warnings, zero test
 failures, and no coverage regression.
 
-## Design discipline
-
-The owner wants to be included in design decisions.
-
-When you notice an improvement beyond the literal task, ask instead of silently skipping it.
-
-Good:
-
-> While implementing X, I noticed Y would be cleaner. Want me to do it now or save it for later?
-
-Bad:
-
-> This would be cleaner, but it is outside scope, so I left it.
-
-## Type-design sessions
-
-When designing new Rust interfaces:
-
-1. Understand the task.
-2. Inspect relevant existing types and modules.
-3. Confirm the baseline compiles.
-4. Propose one type/signature group at a time.
-5. Ask whether any field combinations are invalid.
-6. Show the proposed definition before writing it.
-7. Use `todo!()` bodies only.
-8. Run checks after each agreed group.
-9. Do not write tests during type design.
-
 ## Codebase architecture checks
 
 When improving existing architecture, look for:

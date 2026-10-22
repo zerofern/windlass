@@ -1,0 +1,23 @@
+target/
+# Mountpoint for the wg-integration runner's named target volume.
+target-wg/
+mlm/
+mousehole/
+*.zip
+proptest-regressions/
+dynamicSeedbox.md
+load_user_data.md
+plan.md
+mam-conectability.md
+llm-features.md
+mam-rules.md
+user-profile-example.md
+rreading-glasses-main
+loadSearchJSONbasic.md
+
+# Local agent worktrees managed by Claude Code
+.claude/
+
+# Untracked local research conversations.
+/book-recomendation/gemini-conversation-2026-04-11-15-46-28.json
+/book-recomendation/gemini-conversation-2026-04-12-14-05-37.json

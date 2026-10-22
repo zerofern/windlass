@@ -1,8 +1,10 @@
 # Windlass Operator: Product Specification
 
-This document is the long-term product specification for Windlass. It covers everything
-from the current operator core through the full AI Librarian vision. Use it as the
-authoritative reference as the project grows.
+This document preserves an earlier product vision. The current intended end state
+is maintained in [Direction](../../.workflow/direction.md).
+
+The AI librarian remains a future ambition. The detailed behaviours, architecture,
+and deployment assumptions below are historical proposals, not current commitments.
 
 ---
 
