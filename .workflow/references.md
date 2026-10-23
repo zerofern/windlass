@@ -28,7 +28,7 @@
 
 ## MAM rules and API documentation
 
-- Link: Owner-supplied [rules](../docs/MAM/rules.txt), [search](../docs/MAM/loadSearchJSONbasic.txt), [torrent download](../docs/MAM/download.txt), [user data](../docs/MAM/jsonLoad.txt), [dynamic seedbox](../docs/MAM/dynamicSeedbox.txt), and [IP lookup](../docs/MAM/jsonIp.txt).
-- Relevance: Constraints for Windlass's MAM integration. Rule 1.7 restricts automation to documented API functions or staff approval, prohibits scraping and automated email/password login, and specifies API-cookie authentication. Dynamic seedbox updates have a once-per-hour rolling limit; IP lookup has a once-per-minute limit.
-- Unverified: These are local copies, not a live verification. They do not establish Windlass's approval status or complete rate limits for every endpoint. Other files in docs/MAM have not yet been reviewed.
+- Link: Owner-supplied [rules](../docs/MAM/rules.txt), [search](../docs/MAM/loadSearchJSONbasic.txt), [torrent download](../docs/MAM/download.txt), [user data](../docs/MAM/jsonLoad.txt), [dynamic seedbox](../docs/MAM/dynamicSeedbox.txt), [IP lookup](../docs/MAM/jsonIp.txt), [bonus purchases](../docs/MAM/bonusBuy.txt), [bonus history](../docs/MAM/userBonusHistory.txt), and [form data](../docs/MAM/JSON+fast+fillout.txt).
+- Relevance: All nine supplied files were reviewed. Rule 1.7 limits automation to documented API functions or staff approval. Dynamic seedbox calls have a rolling hourly limit; IP lookup has a once-per-minute limit. Rule 1.2 requires a VPN IP that changes less than once an hour and notifying staff about VPN or seedbox use. Registration requires an IP- or ASN-locked API session with update permission.
+- Unverified: These local copies do not establish live conformance, Windlass's approval status, or complete rate limits for every endpoint. They do not specify retry timing, server-delay headers, or cookie-rotation headers.
 - Related: [API compliance](direction.md#mam-api-compliance)

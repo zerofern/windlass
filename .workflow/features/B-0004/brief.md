@@ -5,9 +5,8 @@ Feature ID: B-0004
 
 ## Goal
 
-Define the actual MAM requests needed to establish API access and maintain
-seedbox IP registration. Keep request outcomes visible without bypassing the
-agreed pause, privacy, and rate-limit policies.
+Establish API access and maintain seedbox IP registration. Explain outcomes
+while enforcing pause, privacy, and rate-limit policies.
 
 ## Stories and acceptance
 
@@ -19,23 +18,17 @@ establishes whether it can register the seedbox through the protected connection
 Acceptance:
 
 - A paused instance or unavailable VPN protection produces no new MAM requests.
+- The API cookie is a user-supplied credential, used like an API key and sent
+  as `mam_id`. Windlass changes it only through user configuration.
 - No email/password login or undocumented session-check endpoint is used.
 - The dashboard distinguishes unverified authentication, a rejected session,
   confirmed registration, and failed or deferred registration.
 
-Agreed request sequence:
-
-1. Load saved pause state and endpoint cooldowns before making requests.
-2. If MAM requests are not paused, VPN protection is available, and an API
-   cookie is configured, request seedbox registration when the shared bucket
-   and endpoint cooldown permit it.
-3. Send `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` with the
-   `mam_id` API cookie. No IP parameter is sent: MAM observes the source IP.
-4. Treat documented successful `Completed` and `No Change` outcomes as confirmed
-   registration. Preserve a replacement API cookie if the response supplies one.
-5. Do not interpret an IP returned with an error as proof of registration.
-
-If no API cookie is configured, show setup required and make no MAM requests.
+Load saved pause state and endpoint cooldowns before requests. Register when
+MAM requests are not paused, VPN protection is available, a cookie is
+configured, and shared and endpoint limits permit. Only documented successful `Completed` and
+`No Change` outcomes confirm registration; an error's returned IP does not.
+Without a cookie, show setup required and make no MAM requests.
 
 ### S2: Keep registration current
 
@@ -44,27 +37,19 @@ updates registration without exceeding the documented limits.
 
 Acceptance:
 
-- Requests use the common admission policy, including manual requests and retries.
-- Calls to dynamicSeedbox are limited to one request per rolling hour, including
-  calls that might return `No Change`. Mousehole's more frequent contact schedule
-  does not override the supplied MAM API documentation.
+- Registration calls are limited to one per rolling hour, including `No Change`.
 - Pausing or losing VPN protection discards queued requests and invalidates
   confidence in authentication and IP reporting, as defined in Direction.
-
-Agreed monitoring and recovery sequence:
-
-- Periodically send `GET https://t.myanonamouse.net/json/jsonIp.php` to observe
-  the exit IP every five minutes while MAM requests are not paused.
-  Never exceed its documented once-per-minute limit.
+- Observe the exit IP and ASN every five minutes, including registration cooldowns and
+  IP/ASN rejections. Pause or unavailable VPN protection stops these requests.
+  Never exceed the documented once-per-minute limit.
 - If that IP differs from the confirmed registration, request a seedbox update
   when allowed. An unchanged observed IP alone does not require another update.
-- Establish fresh confirmation after resume or VPN recovery rather than replaying
-  requests discarded during the interruption. Request
-  registration again when allowed, then resume periodic IP observation.
-- If the cooldown delays registration, keep its status unconfirmed and show the
-  next eligible update time. Do not treat an IP lookup as registration success.
-- Before sending a queued registration update, reconsider whether it is still
-  needed using the latest observation. IP changes must not accumulate updates.
+- After resume or VPN recovery, restart observation and obtain fresh registration
+  confirmation when allowed. Do not replay discarded work.
+- During registration cooldown, show unconfirmed status and the next eligible time.
+- Reconsider queued registration using the latest observation. IP changes must
+  not accumulate updates.
 
 ### S3: Explain failures
 
@@ -77,24 +62,44 @@ Acceptance:
   failure and from unverified authentication.
 - A 429 response defers work; available bucket tokens do not override it.
 - A timeout or malformed response does not confirm registration.
-- Failure handling and retry timing remain to be agreed before this brief is Ready.
+- A failed IP lookup holds new downloads and marks the current exit IP unverified.
+  Retain the last known IP and observation time; do not label the cookie rejected
+  or request registration solely because lookup failed.
+- Retry failed IP lookups after five minutes or any longer server delay.
+  A successful lookup matching the confirmed registration clears this hold.
+  It cannot establish registration or replace fresh confirmation after pause or VPN loss.
 
-Proposed failure handling, pending agreement:
+Agreed failure handling:
 
 | Outcome | Status and response |
 | --- | --- |
-| HTTP 200 and documented success | Confirm registration for the returned IP. |
-| HTTP 403 | Show the specific session or permission rejection; stop automatic registration retries until relevant configuration or network conditions change. |
-| HTTP 429 | Registration remains unconfirmed; wait for the endpoint cooldown and any longer server-directed delay. |
-| Timeout, transport failure, malformed response, or unexpected status | Outcome is uncertain; do not confirm registration or immediately repeat the request. |
+| HTTP 403, IP/ASN mismatch | Show the rejection. A changed observed IP or ASN permits another attempt after cooldown. |
+| HTTP 403, invalid cookie or permission | Show the rejection; wait for configuration changes. Other 403 recovery triggers remain open. |
+| HTTP 429 | Registration remains unconfirmed; retry automatically after the endpoint cooldown and any longer server-directed delay. |
+| Timeout, transport failure, malformed response, or unexpected status | Outcome is uncertain; keep registration unconfirmed and retry automatically at the next permitted time. |
 
-A failed or cancelled request may have reached MAM. Proposed policy: preserve
-the seedbox cooldown after dispatch even if its outcome is uncertain. Exact
-retry timing for other endpoints remains open.
+Every dispatched registration retains its one-hour cooldown, including failed
+or cancelled requests. Restart, cookie replacement, and pause/resume cannot shorten it. Automatic
+retries require MAM requests to remain unpaused and VPN protection to be available.
+Show the failure and next eligible attempt time without requiring user intervention.
+
+### S4: Replace the API cookie
+
+Story: The user replaces a nonworking API cookie and can correct a failed update.
+
+Acceptance:
+
+- Submitting a replacement stops use of the old cookie and invalidates its
+  authentication and registration confirmation. Late results cannot restore them.
+- Save the replacement before using it. A failed save blocks authenticated
+  requests and reports an error so the user can try again; never fall back.
+- A saved replacement requires fresh registration confirmation. Rejection reports
+  an error so the user can correct or retry it, without using the old cookie.
+- Cookie updates and user retries preserve pause and all request limits.
 
 ## Feature-wide constraints and acceptance
 
-- Apply the shared policies in [Direction](../../direction.md).
+- Apply [Direction](../../direction.md), including manual requests and retries.
 - Exercise HTTP behaviour against the local fake MAM server using synthetic data.
 
 ### External API calls
@@ -106,14 +111,9 @@ Both requests use HTTPS on `t.myanonamouse.net`, with no query parameters or bod
 | Register seedbox | `GET /json/dynamicSeedbox.php` | `Cookie: mam_id=<API cookie>` | [Official documentation](../../../docs/MAM/dynamicSeedbox.txt) |
 | Observe IP | `GET /json/jsonIp.php` | No cookie attached | [Official documentation](../../../docs/MAM/jsonIp.txt) |
 
-Registration requires an IP- or ASN-locked API session with seedbox-update
-permission. No IP or port is submitted; MAM observes the source address.
-Registration responses contain `Success`, `msg`, `ip`, `ASN`, and `AS`.
-The field table spells `asn` differently from the examples; examples also vary
-`No Change` capitalisation. Preserve these discrepancies in contract fixtures.
-IP observations contain `ip`, `ASN`, and `AS`, optionally `time`; they establish
-neither authentication nor registration. Keep fixtures for both source examples.
-Cookie rotation uses `Set-Cookie`; handling a failed cookie save remains open.
+Registration requires an IP- or ASN-locked API cookie with update permission.
+MAM observes the source IP; no IP or port is submitted. Rule 1.2 requires VPN
+IP changes less than once an hour. Staff notification is complete.
 
 ## Scope
 
@@ -121,8 +121,8 @@ API-cookie access, seedbox registration, exit-IP observation, and their status.
 
 ## Non-goals
 
-Torrent search, downloading torrent files, account polling, bonus purchases,
-library organisation, and VPN implementation are separate flows to discuss.
+Search, acquisition, account polling, bonus purchases, library organisation,
+and VPN implementation.
 
 ## Related records
 
@@ -133,8 +133,10 @@ library organisation, and VPN implementation are separate flows to discuss.
 
 ## Open questions and assumptions
 
-- What fresh requests should a changed cookie trigger?
-- How should retries, server-directed cooldowns, and uncertain outcomes recover?
-- How should endpoint cooldowns survive restarts and requests shared with other
-  tools using the account?
+- How should failed cookie replacement recover across restart when the old value
+  remains in storage?
+- Which changes should allow another attempt after each documented 403 rejection?
+- How should server-directed delays without a usable deadline be handled?
+- What should happen if a cooldown cannot be saved or restored, or another tool
+  updates registration using the account?
 - Account-data loading belongs to the [acquisition brief](../B-0005/brief.md).

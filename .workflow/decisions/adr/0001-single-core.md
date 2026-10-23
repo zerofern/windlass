@@ -4,53 +4,64 @@ Status: Accepted
 
 ## Context
 
-Windlass needs coordinated behaviour across MAM requests, persistent pause state,
-configuration, downloads, library organisation, disk monitoring, and notifications.
-The owner wants strong test coverage and prefers one core initially. The proof
-of concept's multiple cores and generic runtime do not constrain the new design.
+Windlass must coordinate MAM requests, persistent controls, downloads, and library
+work across multiple input sources. The owner chose one core with strong test
+coverage. The proof of concept's generic runtime does not constrain this design.
 
 ## Decision
 
-Use one pure, synchronous application core. It owns application state and handles
-events sequentially, returning actions for the imperative shell to execute.
-Time and external observations enter as explicit inputs. Completion and failure
-of actions return as events.
+Use one pure, synchronous core that owns its in-memory state. Expose that state
+read-only, without a separate status representation. Handle events sequentially,
+returning actions to the shell. Time and observations are inputs; action outcomes
+return as events.
 
-Internal modules and domain types may organise this core. They do not become
-independent cores with separate event loops or inter-core messaging.
+Internal modules may organise the core without independent event loops.
 
-Use one input stream for user commands, external observations, operation results,
-and timer expiry. The shell supplies time when dispatching each event. Only the
-core decides policy; shell tasks execute effects concurrently without borrowing
-the core. Returning multiple actions does not imply completion ordering.
-Dependent effects wait for explicit completion events.
+Separate the runner, core, and shell. The runner owns the core, consumes one event
+stream, and dispatches returned actions through the shell. The shell executes
+effects concurrently and returns result events. Dependent effects wait for
+explicit completion events; action order does not establish completion order.
 
-Outstanding operations have identities. The core rejects late or superseded
-results that no longer apply. Cancellation cannot recall a request already sent.
+Each producer pairs its event with occurrence time before enqueueing it. Preserve
+that timestamp through delivery. Process events in queue order, without sorting
+by timestamp. Processing time, if needed, is a separate input. The console and
+future HTTP API share the event ingress and observe read-only core state. An API
+validates public requests before translating them into permitted domain events.
+Queue acceptance does not acknowledge durable success.
+
+The ingress applies backpressure. Shutdown stops new submissions and drains
+accepted events and all resulting effects, including follow-up storage actions.
+Remaining producer handles cannot keep a requested shutdown alive.
+
+Start without operation identifiers. Result events name their operation. The
+core permits one outstanding MAM preference storage operation, issuing another
+after completion while other events remain responsive. Late results cannot undo
+newer controls. This limit does not serialise unrelated I/O. Cancellation cannot
+recall a request already sent.
 
 Timers are named one-shot actions with replacement and cancellation. Each timer
 instance has an identity, so obsolete expiry events are harmless. The core owns
 deadlines and rechecks eligibility on expiry; the shell only waits and reports.
 Periodic work explicitly schedules its next occurrence. No fixed tick is required.
 
-The shell supplies monotonic time for active deadlines and wall time for durable
-cooldowns. Startup loads configuration and durable state before external work
-can begin. A missing or unreadable store must not silently enable requests.
-Request blocking can take effect while a save is pending, but durable success
-is acknowledged only after the save for that change succeeds.
+Clock readings contain monotonic time for active deadlines and wall time for
+durable cooldowns. A startup event prompts the core to request configuration and
+stored facts through actions. The shell reads only when requested. The core's
+state stays in memory; writes persist specific facts rather than snapshots.
+Missing or unreadable storage cannot silently enable requests. Blocking can take
+effect during a save; durable success requires confirmed persistence.
 
 ## Rationale
 
-One core gives pause commands, configuration changes, timers, and external results
-one ordering. Tests can exercise their interactions directly through state and
-returned actions. This avoids needing a messaging runtime to test coordinated
-behaviour and keeps request policy in one place.
+One runner gives requests and observations one ordering across input sources.
+Occurrence timestamps survive queue delay. Separating event delivery from action
+execution keeps console and HTTP details outside the core's operating model.
+Core tests exercise coordination through state and actions without a runtime.
 
-MAM request permission, endpoint timing, and retry decisions belong in this core.
-The shell translates permitted actions into API calls. Core tests must cover
-manual commands, retries, resume, and restart without bypassing API restrictions.
-The core also owns the shared MAM token bucket, calculating refill from supplied
-time. Token availability does not override endpoint restrictions or other gates.
+MAM admission, endpoint timing, retries, and the shared token bucket belong in the
+core. Calculate refill from supplied time. Token availability does not override
+other admission gates. Tests cover manual requests, retries, resume, and restart
+without bypassing API restrictions.
 
 ## Scope
 
@@ -60,26 +71,22 @@ NixOS owns the VPN. The core neither performs I/O nor reads the clock.
 
 ## Consequences
 
-Core tests use concrete inputs and assert state and actions without mocks or
-dependency injection. Shell and operating-system guarantees still require
-integration tests. Reconsider multiple cores only when a demonstrated need
-justifies their coordination cost.
+Core tests assert concrete state and actions without mocks or dependency
+injection. Shell guarantees require integration tests. Reconsider multiple cores
+when a demonstrated need justifies their coordination cost.
 
-Use a local fake MAM HTTP server for shell integration tests, with synthetic
-credentials, controllable responses, and a request journal. Cover successful
-calls, authentication failures, rate-limit responses, malformed responses, and
-delayed requests for cancellation tests. Tests must not require live MAM access.
+Use a local fake MAM HTTP server with synthetic credentials, controllable
+responses, and a request journal. Cover success, authentication failures, rate
+limits, malformed responses, and delayed requests for cancellation. Tests must
+not require live MAM access.
 
-Derive endpoint contracts and fixtures from the supplied docs/MAM sources,
-independently of client implementation. Passing against the fake demonstrates
-agreement with those fixtures, not live MAM conformance. Unsupported endpoints
-must fail visibly rather than return generic success.
+Derive contracts and fixtures from docs/MAM independently of client code. Passing
+against the fake establishes agreement with those fixtures, not live conformance.
+Unsupported endpoints must fail visibly.
 
-The archived POC/windlass-testkit fake is a reuse candidate, not authority for the
-new contract. Audit its routes, response shapes, and placeholder handlers before
-reuse. The fake supports shell tests; core tests still use events and actions
-directly. Tests of rate-limit timing should use controlled time rather than wait
-through real API cooldowns.
+Audit the archived POC/windlass-testkit fake's routes, response shapes, and
+placeholder handlers before reuse. It supports shell tests; core tests use events
+and actions directly. Test timing with controlled time instead of real cooldowns.
 
 ## Related records
 

@@ -1,0 +1,32 @@
+[package]
+name = "windlass"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A cohesive MAM acquisition and library service"
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+dbg_macro = "deny"
+exit = "deny"
