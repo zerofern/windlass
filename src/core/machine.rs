@@ -1,7 +1,7 @@
 use super::{
     Action, ClockReading, Event, HistoryState, MamPreferencePersistence, MamPreferenceState,
-    MamPreferenceUpdate, PortForwarding, Qbittorrent, Registry, SettingsState, Step, TimerName,
-    mam_pause, settings, startup, timer::Timers,
+    MamPreferenceUpdate, PortForwarding, PortForwardingEvent, Qbittorrent, Registry, SettingsState,
+    Step, TimerName, Tunnel, TunnelEvent, mam_pause, settings, startup, timer::Timers,
 };
 
 /// Owns application state and makes decisions without performing I/O.
@@ -13,6 +13,7 @@ pub struct Core {
     port_forwarding: PortForwarding,
     qbittorrent: Qbittorrent,
     registry: Registry,
+    tunnel: Tunnel,
     timers: Timers,
     step: Step,
 }
@@ -65,6 +66,7 @@ impl Core {
             port_forwarding: PortForwarding::Disabled,
             qbittorrent: Qbittorrent::Disabled,
             registry: Registry::Unread,
+            tunnel: Tunnel::new(),
             timers: Timers::new(),
             step: Step::ZERO,
         }
@@ -85,6 +87,7 @@ impl Core {
                     actions.extend(self.settings.start_reading());
                     actions.extend(self.history.open(self.step));
                     actions.extend(self.registry.start_reading());
+                    actions.extend(self.tunnel.start_reading());
                 }
                 actions
             }
@@ -97,16 +100,33 @@ impl Core {
             Event::TimerExpired { name, id } => match name {
                 TimerName::PortLease => self.port_forwarding.timer_expired(id),
                 TimerName::QbittorrentPoll => self.qbittorrent.timer_expired(id),
+                TimerName::TunnelCheck => self.tunnel.timer_expired(occurred_at, id),
             },
             Event::PortForwarding(event) => {
-                self.port_forwarding
-                    .handle(occurred_at, event, &mut self.timers)
+                let failed = matches!(event, PortForwardingEvent::MappingFailed { .. });
+                let mut actions = self
+                    .port_forwarding
+                    .handle(occurred_at, event, &mut self.timers);
+                if failed {
+                    actions.extend(self.tunnel.suspect(occurred_at));
+                }
+                actions
             }
             Event::Qbittorrent(event) => {
                 self.qbittorrent
                     .handle(occurred_at, event, &mut self.timers)
             }
             Event::Registry(event) => self.registry.handle(occurred_at.monotonic, event),
+            Event::Tunnel(event) => {
+                let switched = matches!(event, TunnelEvent::Switched);
+                let before = self.tunnel.current().cloned();
+                let mut actions = self.tunnel.handle(occurred_at, event, &mut self.timers);
+                // A new server has a new gateway and forwarded port.
+                if switched && self.tunnel.current() != before.as_ref() {
+                    actions.extend(self.port_forwarding.renew());
+                }
+                actions
+            }
         };
         self.port_forwarding.expire(occurred_at.monotonic);
         if let Some((session, true)) = self.qbittorrent.deciding() {
@@ -152,6 +172,12 @@ impl Core {
     #[must_use]
     pub const fn qbittorrent(&self) -> &Qbittorrent {
         &self.qbittorrent
+    }
+
+    /// Inspect the VPN tunnel.
+    #[must_use]
+    pub const fn tunnel(&self) -> &Tunnel {
+        &self.tunnel
     }
 
     /// Inspect the torrent registry.

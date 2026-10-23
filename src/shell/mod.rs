@@ -15,6 +15,7 @@ use tokio::{
 
 use crate::core::{
     Action, ClockReading, Event, PortForwardingEvent, QbittorrentEvent, TimedEvent, TimerName,
+    TunnelEvent, VpnServer,
 };
 
 pub mod console;
@@ -24,6 +25,7 @@ mod ingress;
 mod natpmp;
 mod qbittorrent;
 mod storage;
+mod tunnel;
 pub mod web;
 
 use history::{Command, HistoryEntry, HistoryWriter};
@@ -36,6 +38,21 @@ pub struct Integrations {
     pub qbittorrent: Option<reqwest::Url>,
     /// The NAT-PMP gateway that forwards ports, such as Proton VPN's `10.2.0.1:5351`.
     pub nat_pmp_gateway: Option<SocketAddrV4>,
+    /// Tunnel checks and server failover.
+    pub tunnel: Option<TunnelChecks>,
+}
+
+/// How the tunnel is checked and which servers it may switch between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelChecks {
+    /// A neutral service that answers with the caller's IP address as text.
+    pub exit_ip_service: reqwest::Url,
+    /// The configured servers, in failover order.
+    pub servers: Vec<VpnServer>,
+    /// The server connected at startup, if known.
+    pub current: Option<VpnServer>,
+    /// The program that starts server units, normally `systemctl`.
+    pub unit_starter: PathBuf,
 }
 
 impl Integrations {
@@ -49,11 +66,18 @@ impl Integrations {
         if self.qbittorrent.is_some() {
             events.push(Event::Qbittorrent(QbittorrentEvent::Enable));
         }
+        if let Some(tunnel) = &self.tunnel {
+            events.push(Event::Tunnel(TunnelEvent::Enable {
+                servers: tunnel.servers.clone(),
+                current: tunnel.current.clone(),
+            }));
+        }
         events
     }
 }
 
 pub use ingress::EventSender;
+
 use ingress::{IngressState, Input};
 
 pub(crate) type ShellError = Box<dyn Error + Send + Sync>;
@@ -78,6 +102,7 @@ pub(crate) struct Shell {
     history: HistoryWriter,
     qbittorrent: Option<qbittorrent::Client>,
     nat_pmp_gateway: Option<SocketAddrV4>,
+    tunnel: Option<tunnel::Client>,
     timers: HashMap<TimerName, JoinHandle<()>>,
 }
 
@@ -102,6 +127,9 @@ impl Shell {
                 history,
                 qbittorrent: integrations.qbittorrent.map(qbittorrent::Client::new),
                 nat_pmp_gateway: integrations.nat_pmp_gateway,
+                tunnel: integrations
+                    .tunnel
+                    .map(|checks| tunnel::Client::new(checks.exit_ip_service, checks.unit_starter)),
                 timers: HashMap::new(),
             },
             events,
@@ -203,6 +231,12 @@ impl Shell {
             Action::QbittorrentCommand { command } => {
                 return self.qbittorrent(qbittorrent::Request::Command(command));
             }
+            Action::CheckExitIp => return self.tunnel(tunnel::Request::CheckExitIp),
+            Action::SwitchVpnServer { server } => {
+                return self.tunnel(tunnel::Request::Switch(server));
+            }
+            Action::ReadLastVpnSwitch => Operation::ReadLastVpnSwitch,
+            Action::SaveVpnSwitch { switch } => Operation::SaveVpnSwitch(switch),
             Action::ReadTorrentRegistry => Operation::ReadTorrentRegistry,
             Action::SaveTorrents { records } => Operation::SaveTorrents(records),
             Action::OpenStorage { mode } => Operation::OpenStorage(mode),
@@ -246,6 +280,11 @@ impl Shell {
         });
     }
 
+    fn tunnel(&mut self, request: tunnel::Request) {
+        let client = self.tunnel.clone();
+        self.spawn(async move { Event::Tunnel(tunnel::perform(client.as_ref(), request).await) });
+    }
+
     fn store(&mut self, operation: Operation) {
         self.active_workers += 1;
         let path = self.database.clone();
@@ -279,5 +318,48 @@ pub(crate) fn read_clock() -> ClockReading {
     ClockReading {
         monotonic: Instant::now(),
         wall: SystemTime::now(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, path::PathBuf, time::SystemTime};
+
+    use crate::core::{Action, Event, TunnelEvent, VpnServer, VpnSwitch};
+
+    use super::{Integrations, Shell, TunnelChecks};
+
+    #[tokio::test]
+    async fn switch_actions_report_their_outcome() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let server = VpnServer::try_new("two")?;
+        // Storage is never opened, so saving the switch fails.
+        let (mut shell, _events) = Shell::new(
+            PathBuf::from("/nonexistent/windlass.sqlite"),
+            Integrations {
+                tunnel: Some(TunnelChecks {
+                    exit_ip_service: "http://127.0.0.1:9/".parse()?,
+                    servers: vec![server.clone()],
+                    current: None,
+                    unit_starter: "true".into(),
+                }),
+                ..Integrations::default()
+            },
+        );
+        let save = Action::SaveVpnSwitch {
+            switch: VpnSwitch {
+                server: server.clone(),
+                at: SystemTime::UNIX_EPOCH,
+            },
+        };
+        for (action, expected) in [
+            (Action::SwitchVpnServer { server }, TunnelEvent::Switched),
+            (save, TunnelEvent::SwitchSaveFailed),
+        ] {
+            shell.dispatch(action);
+            let event = shell.next_event().await?.map(|event| event.event);
+            assert_eq!(event, Some(Event::Tunnel(expected)));
+        }
+        shell.finish().await?;
+        Ok(())
     }
 }

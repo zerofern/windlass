@@ -116,6 +116,21 @@ fn invalid_serve_arguments_are_refused() -> Result<(), Box<dyn Error>> {
             "--nat-pmp-gateway",
             "nowhere",
         ],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--exit-ip-service",
+            "not a url",
+        ],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--vpn-server",
+            "not/a/unit",
+        ],
+        vec!["serve", "initialise", database, "--vpn-server", "one"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_windlass"))
             .args(&arguments)
@@ -142,7 +157,15 @@ fn serve_until_terminated(
             "http://127.0.0.1:9/",
             "--nat-pmp-gateway",
             "127.0.0.1",
+            "--exit-ip-service",
+            "http://127.0.0.1:9/",
+            "--vpn-server",
+            "one",
+            "--vpn-server",
+            "two",
+            "--vpn-current-file",
         ])
+        .arg(database.with_extension("current"))
         .stderr(Stdio::piped())
         .spawn()?;
     let started = std::time::Instant::now();
@@ -163,6 +186,7 @@ fn serve_until_terminated(
 fn the_service_stops_cleanly_on_sigterm() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("windlass.sqlite");
+    std::fs::write(path.with_extension("current"), "one\n")?;
     assert!(
         serve_until_terminated("initialise", &path, std::time::Duration::from_secs(10))?.success()
     );
@@ -172,6 +196,12 @@ fn the_service_stops_cleanly_on_sigterm() -> Result<(), Box<dyn Error>> {
         |row| row.get(0),
     )?;
     assert!(entries >= 4, "{entries} history entries");
+    let connected: i64 = rusqlite::Connection::open(&path)?.query_row(
+        "SELECT COUNT(*) FROM history WHERE summary LIKE '%connected to one'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(connected, 1, "the current server is read from its file");
     let missing = directory.path().join("missing.sqlite");
     assert!(!serve_until_terminated("resume", &missing, std::time::Duration::ZERO)?.success());
     Ok(())

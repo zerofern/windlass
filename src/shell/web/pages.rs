@@ -741,6 +741,7 @@ mod tests {
             port_forwarding: PortForwarding::Disabled,
             qbittorrent: Qbittorrent::Disabled,
             registry: crate::core::Registry::Unread,
+            tunnel: crate::core::Tunnel::default(),
             last_event: None,
             storage_error: None,
         }

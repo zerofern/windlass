@@ -48,6 +48,8 @@ pub enum Event {
     Qbittorrent(QbittorrentEvent),
     /// Torrent registry storage results.
     Registry(RegistryEvent),
+    /// VPN tunnel commands, checks, and switches.
+    Tunnel(TunnelEvent),
 }
 
 /// An effect requested by the core for the shell to execute.
@@ -129,6 +131,20 @@ pub enum Action {
         /// The rows as they are now.
         records: Vec<TorrentRecord>,
     },
+    /// Ask a neutral service for the tunnel's public address.
+    CheckExitIp,
+    /// Read the last VPN server switch.
+    ReadLastVpnSwitch,
+    /// Save a VPN server switch before starting it.
+    SaveVpnSwitch {
+        /// The switch.
+        switch: VpnSwitch,
+    },
+    /// Start the NixOS unit that connects to this server.
+    SwitchVpnServer {
+        /// The server.
+        server: VpnServer,
+    },
 }
 
 mod history;
@@ -140,6 +156,7 @@ mod registry;
 mod settings;
 mod startup;
 mod timer;
+mod tunnel;
 
 pub use history::{HistoryEvent, HistoryState, Step, Trim};
 pub use machine::{Core, State};
@@ -165,3 +182,8 @@ pub use settings::{
 };
 pub use startup::{StartupEvent, StartupMode};
 pub use timer::{Deadline, TimerId, TimerName};
+pub use tunnel::{
+    CHECK_INTERVAL, Check, ExitIpFailure, FAILURES_BEFORE_SWITCH, Failover, LastSwitch, Protection,
+    RETRY_AFTER, SWITCH_SPACING, SwitchAllowance, Tunnel, TunnelEvent, VpnServer, VpnServerError,
+    VpnSwitch, Watch,
+};

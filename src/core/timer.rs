@@ -9,6 +9,8 @@ pub enum TimerName {
     QbittorrentPoll,
     /// Renew, or retry, the forwarded-port lease.
     PortLease,
+    /// Check the VPN tunnel again.
+    TunnelCheck,
 }
 
 /// One scheduled instance of a timer. Replacing a timer gives it a new

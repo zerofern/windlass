@@ -53,7 +53,8 @@ fn ready(saved: Option<Mode>) -> Core {
             Action::ReadMamRequestMode,
             Action::ReadSettings,
             Action::OpenHistory,
-            Action::ReadTorrentRegistry
+            Action::ReadTorrentRegistry,
+            Action::ReadLastVpnSwitch
         ]
     );
     assert_eq!(

@@ -11,7 +11,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Typ
 use crate::core::{
     ApiCookie, ByteSize, Desired, Event, HistoryLimit, Identity, MamPauseEvent, MamRequestMode,
     MamTorrentId, Observation, Origin, Progress, Ratio, RecordId, RegistryEvent, SettingsEvent,
-    StartupEvent, StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState,
+    StartupEvent, StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState, TunnelEvent,
+    VpnServer, VpnSwitch,
 };
 
 use super::qbittorrent::torrent_state;
@@ -96,6 +97,8 @@ pub(super) enum Operation {
     WriteApiCookie(Option<ApiCookie>),
     ReadTorrentRegistry,
     SaveTorrents(Vec<TorrentRecord>),
+    ReadLastVpnSwitch,
+    SaveVpnSwitch(VpnSwitch),
 }
 
 pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, FailedAction> {
@@ -131,6 +134,14 @@ pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, Failed
         Operation::SaveTorrents(records) => (
             save_torrents(path, &records),
             Event::Registry(RegistryEvent::SaveFailed),
+        ),
+        Operation::ReadLastVpnSwitch => (
+            read_last_switch(path),
+            Event::Tunnel(TunnelEvent::LastSwitchReadFailed),
+        ),
+        Operation::SaveVpnSwitch(switch) => (
+            save_switch(path, &switch),
+            Event::Tunnel(TunnelEvent::SwitchSaveFailed),
         ),
     };
     result.map_err(|error| FailedAction {
@@ -278,20 +289,22 @@ const TORRENT_COLUMNS: &str = "id, mam_id, hash, origin, desired, save_path, del
 
 fn read_registry(path: &Path) -> StorageResult<Event> {
     let connection = connection(path)?;
-    let mut statement = connection.prepare(&format!(
-        "SELECT {TORRENT_COLUMNS} FROM torrents ORDER BY id"
-    ))?;
-    let records = statement
-        .query_map([], |row| Ok(torrent_record(row)))?
-        .map(|record| record?)
-        .collect::<StorageResult<Vec<_>>>()?;
+    let query = format!("SELECT {TORRENT_COLUMNS} FROM torrents ORDER BY id");
+    let mut statement = connection.prepare(&query)?;
+    let mut rows = statement.query([])?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next()? {
+        records.push(torrent_record(row)?);
+    }
     Ok(Event::Registry(RegistryEvent::Read(records)))
 }
 
 fn torrent_record(row: &Row<'_>) -> StorageResult<TorrentRecord> {
-    let id: i64 = row.get(0)?;
-    let id = u64::try_from(id)
+    // The id is SQLite's integer row id, so only its range needs checking.
+    let id = row
+        .get::<_, i64>(0)
         .ok()
+        .and_then(|id| u64::try_from(id).ok())
         .and_then(RecordId::new)
         .ok_or_else(|| invalid_data("invalid torrent row id"))?;
     let mam: Option<i64> = row.get(1)?;
@@ -374,11 +387,12 @@ fn save_torrents(path: &Path, records: &[TorrentRecord]) -> StorageResult<Event>
     let mut connection = connection(path)?;
     let transaction = connection.transaction()?;
     {
-        let mut statement = transaction.prepare(&format!(
+        let insert = format!(
             "INSERT OR REPLACE INTO torrents({TORRENT_COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
              ?19, ?20, ?21)"
-        ))?;
+        );
+        let mut statement = transaction.prepare(&insert)?;
         for record in records {
             let observed = record.observation.as_ref();
             let torrent = observed.map(|observation| &observation.torrent);
@@ -442,6 +456,35 @@ const fn state_name(state: TorrentState) -> &'static str {
     }
 }
 
+fn read_last_switch(path: &Path) -> StorageResult<Event> {
+    let stored: Option<(String, i64)> = connection(path)?
+        .query_row(
+            "SELECT last_switch_server, last_switch_at FROM vpn_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let last_switch = stored
+        .map(|(server, at)| -> StorageResult<VpnSwitch> {
+            Ok(VpnSwitch {
+                server: VpnServer::try_new(server)?,
+                at: time_from_seconds(at)?,
+            })
+        })
+        .transpose()?;
+    Ok(Event::Tunnel(TunnelEvent::LastSwitchRead { last_switch }))
+}
+
+fn save_switch(path: &Path, switch: &VpnSwitch) -> StorageResult<Event> {
+    connection(path)?.execute(
+        "INSERT INTO vpn_state(singleton, last_switch_server, last_switch_at) VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET last_switch_server = excluded.last_switch_server,
+         last_switch_at = excluded.last_switch_at",
+        params![switch.server.as_ref(), seconds(switch.at)],
+    )?;
+    Ok(Event::Tunnel(TunnelEvent::SwitchSaved))
+}
+
 /// `SQLite` integers are signed; counts beyond `i64::MAX`, far past any real
 /// size or identity, are saved as the maximum.
 fn integer(count: u64) -> i64 {
@@ -463,16 +506,22 @@ fn time_from_seconds(seconds: i64) -> StorageResult<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::{
+        path::PathBuf,
+        time::{Duration, SystemTime},
+    };
+
+    use rusqlite::Connection;
 
     use crate::core::{
         ByteSize, Desired, Event, Identity, MamTorrentId, Observation, Origin, Progress, Ratio,
         RecordId, RegistryEvent, StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState,
+        TunnelEvent, VpnServer, VpnSwitch,
     };
 
     use super::{Operation, execute, state_name, torrent_state};
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// Compile-time constants: their unreachable branches are not run code.
     macro_rules! constant {
@@ -489,13 +538,9 @@ mod tests {
     constant!(MAM: MamTorrentId = MamTorrentId::new(77));
     constant!(DONE: Progress = Progress::from_permille(1000));
 
-    fn records() -> Result<Vec<TorrentRecord>, &'static str> {
-        let (Some(hash), Some(v2_hash)) = (
-            TorrentHash::parse(&"a".repeat(40)),
-            TorrentHash::parse(&"b".repeat(64)),
-        ) else {
-            return Err("invalid hash");
-        };
+    /// Sample rows: an adopted torrent with an observation, a queued MAM
+    /// torrent, and a removed one known to both.
+    fn records() -> Vec<TorrentRecord> {
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let observed = Observation {
             torrent: Torrent {
@@ -524,62 +569,85 @@ mod tests {
             deletion_allowed: id == SECOND,
             observation,
         };
-        Ok(vec![
+        let adopted = TorrentHash::parse(&"a".repeat(40)).map(|hash| {
             row(
                 FIRST,
                 Identity::Client(hash),
                 Origin::Adopted,
                 Desired::Active,
                 Some(observed),
-            ),
-            row(
-                SECOND,
-                Identity::Mam(MAM),
-                Origin::Bookmark,
-                Desired::Queued,
-                None,
-            ),
+            )
+        });
+        let queued = row(
+            SECOND,
+            Identity::Mam(MAM),
+            Origin::Bookmark,
+            Desired::Queued,
+            None,
+        );
+        let removed = TorrentHash::parse(&"b".repeat(64)).map(|hash| {
             row(
                 THIRD,
-                Identity::Linked {
-                    mam: MAM,
-                    hash: v2_hash,
-                },
+                Identity::Linked { mam: MAM, hash },
                 Origin::Redownload,
                 Desired::Removed,
                 None,
-            ),
-        ])
+            )
+        });
+        [adopted, Some(queued), removed]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Initialised storage holding the sample rows.
+    struct Storage {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+        connection: Connection,
+    }
+
+    fn storage() -> TestResult<Storage> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("windlass.sqlite");
+        let _ = execute(&path, Operation::OpenStorage(StartupMode::Initialise));
+        let _ = execute(&path, Operation::SaveTorrents(records()));
+        let connection = Connection::open(&path)?;
+        Ok(Storage {
+            _directory: directory,
+            path,
+            connection,
+        })
+    }
+
+    /// The event an operation reports, whether it succeeded or failed.
+    fn outcome(path: &std::path::Path, operation: Operation) -> Event {
+        execute(path, operation).unwrap_or_else(|failure| failure.event)
     }
 
     #[test]
     fn registry_rows_round_trip() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("windlass.sqlite");
-        let _ = execute(&path, Operation::OpenStorage(StartupMode::Initialise));
-        let rows = records()?;
-        assert_eq!(
-            execute(&path, Operation::SaveTorrents(rows.clone())).ok(),
-            Some(Event::Registry(RegistryEvent::Saved))
-        );
+        let storage = storage()?;
+        assert_eq!(records().len(), 3);
         // Saving again replaces rows rather than adding them.
-        let _ = execute(&path, Operation::SaveTorrents(rows.clone()));
         assert_eq!(
-            execute(&path, Operation::ReadTorrentRegistry).ok(),
-            Some(Event::Registry(RegistryEvent::Read(rows)))
+            outcome(&storage.path, Operation::SaveTorrents(records())),
+            Event::Registry(RegistryEvent::Saved)
+        );
+        assert_eq!(
+            outcome(&storage.path, Operation::ReadTorrentRegistry),
+            Event::Registry(RegistryEvent::Read(records()))
         );
         Ok(())
     }
 
     #[test]
     fn invalid_registry_rows_fail_the_read() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("windlass.sqlite");
-        let _ = execute(&path, Operation::OpenStorage(StartupMode::Initialise));
-        let _ = execute(&path, Operation::SaveTorrents(records()?));
-        let connection = rusqlite::Connection::open(&path)?;
+        let storage = storage()?;
         // Keep the valid rows to restore before each corruption.
-        connection.execute_batch("CREATE TABLE pristine AS SELECT * FROM torrents;")?;
+        storage
+            .connection
+            .execute_batch("CREATE TABLE pristine AS SELECT * FROM torrents;")?;
         for corruption in [
             "id = 0 WHERE id = 2",
             "mam_id = 0 WHERE id = 2",
@@ -612,14 +680,14 @@ mod tests {
             "observed_save_path = x'00' WHERE id = 1",
         ] {
             // Bypass the schema's own checks, as a damaged file would.
-            connection.execute_batch(&format!(
+            let damage = format!(
                 "DELETE FROM torrents; INSERT INTO torrents SELECT * FROM pristine; \
                  PRAGMA ignore_check_constraints = ON; UPDATE torrents SET {corruption};"
-            ))?;
-            let failure = execute(&path, Operation::ReadTorrentRegistry).err();
+            );
+            storage.connection.execute_batch(&damage)?;
             assert_eq!(
-                failure.map(|failure| failure.event),
-                Some(Event::Registry(RegistryEvent::ReadFailed)),
+                outcome(&storage.path, Operation::ReadTorrentRegistry),
+                Event::Registry(RegistryEvent::ReadFailed),
                 "{corruption}"
             );
         }
@@ -649,6 +717,113 @@ mod tests {
     }
 
     #[test]
+    fn the_last_vpn_switch_round_trips() -> TestResult {
+        let storage = storage()?;
+        let path = &storage.path;
+        assert_eq!(
+            outcome(path, Operation::ReadLastVpnSwitch),
+            Event::Tunnel(TunnelEvent::LastSwitchRead { last_switch: None })
+        );
+        let switches: Vec<VpnSwitch> = [("one", 1_700_000_000), ("two", 1_700_003_600)]
+            .into_iter()
+            .filter_map(|(name, seconds)| {
+                VpnServer::try_new(name).ok().map(|server| VpnSwitch {
+                    server,
+                    at: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                })
+            })
+            .collect();
+        assert_eq!(switches.len(), 2);
+        for switch in &switches {
+            assert_eq!(
+                outcome(path, Operation::SaveVpnSwitch(switch.clone())),
+                Event::Tunnel(TunnelEvent::SwitchSaved)
+            );
+            assert_eq!(
+                outcome(path, Operation::ReadLastVpnSwitch),
+                Event::Tunnel(TunnelEvent::LastSwitchRead {
+                    last_switch: Some(switch.clone())
+                })
+            );
+        }
+        for corruption in [
+            "last_switch_server = 'a b'",
+            "last_switch_server = x'00'",
+            "last_switch_at = -1",
+            "last_switch_at = 'x'",
+        ] {
+            let damage = format!(
+                "UPDATE vpn_state SET last_switch_server = 'two', last_switch_at = 0; \
+                 UPDATE vpn_state SET {corruption};"
+            );
+            storage.connection.execute_batch(&damage)?;
+            assert_eq!(
+                outcome(path, Operation::ReadLastVpnSwitch),
+                Event::Tunnel(TunnelEvent::LastSwitchReadFailed),
+                "{corruption}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_operation_reports_its_outcome() -> TestResult {
+        use crate::core::{
+            ApiCookie, HistoryLimit, MamPauseEvent, MamRequestMode, SettingsEvent, StartupEvent,
+        };
+
+        let storage = storage()?;
+        let path = &storage.path;
+        let cookie = ApiCookie::parse("cookie").ok();
+        for (operation, expected) in [
+            (
+                Operation::OpenStorage(StartupMode::Resume),
+                Event::Startup(StartupEvent::StorageOpened),
+            ),
+            (
+                Operation::WriteMamRequestMode(MamRequestMode::Enabled),
+                Event::MamPause(MamPauseEvent::Written),
+            ),
+            (
+                Operation::ReadMamRequestMode,
+                Event::MamPause(MamPauseEvent::Read {
+                    mode: Some(MamRequestMode::Enabled),
+                }),
+            ),
+            (
+                Operation::DeleteMamRequestMode,
+                Event::MamPause(MamPauseEvent::Deleted),
+            ),
+            (
+                Operation::WriteHistoryLimit(HistoryLimit::default()),
+                Event::Settings(SettingsEvent::HistoryLimitWritten),
+            ),
+            (
+                Operation::WriteApiCookie(cookie.clone()),
+                Event::Settings(SettingsEvent::ApiCookieWritten),
+            ),
+            (
+                Operation::ReadSettings,
+                Event::Settings(SettingsEvent::Read {
+                    history_limit: Some(HistoryLimit::default()),
+                    api_cookie: cookie,
+                }),
+            ),
+            (
+                Operation::ReadTorrentRegistry,
+                Event::Registry(RegistryEvent::Read(records())),
+            ),
+            (
+                Operation::ReadLastVpnSwitch,
+                Event::Tunnel(TunnelEvent::LastSwitchRead { last_switch: None }),
+            ),
+        ] {
+            assert_eq!(outcome(path, operation), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn out_of_range_values_are_saved_at_their_limits() {
         assert_eq!(
             super::seconds(SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
@@ -658,23 +833,47 @@ mod tests {
     }
 
     #[test]
-    fn missing_registry_storage_fails() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let missing = directory.path().join("missing.sqlite");
-        let path = directory.path().join("windlass.sqlite");
-        let _ = execute(&path, Operation::OpenStorage(StartupMode::Initialise));
-        rusqlite::Connection::open(&path)?.execute_batch("DROP TABLE torrents;")?;
-        for path in [&missing, &path] {
-            let failure = execute(path, Operation::ReadTorrentRegistry).err();
+    fn missing_storage_fails() -> TestResult {
+        let storage = storage()?;
+        let refuse = "CREATE TRIGGER refuse BEFORE INSERT ON torrents \
+                      BEGIN SELECT RAISE(ABORT, 'no'); END;";
+        storage.connection.execute_batch(refuse)?;
+        assert_eq!(
+            outcome(&storage.path, Operation::SaveTorrents(records())),
+            Event::Registry(RegistryEvent::SaveFailed),
+            "a refused row fails the whole batch"
+        );
+        storage
+            .connection
+            .execute_batch("DROP TABLE torrents; DROP TABLE vpn_state;")?;
+        let missing = storage.path.with_file_name("missing.sqlite");
+        let switches: Vec<VpnSwitch> = VpnServer::try_new("one")
+            .ok()
+            .map(|server| VpnSwitch {
+                server,
+                at: SystemTime::UNIX_EPOCH,
+            })
+            .into_iter()
+            .collect();
+        for path in [&missing, &storage.path] {
             assert_eq!(
-                failure.map(|failure| failure.event),
-                Some(Event::Registry(RegistryEvent::ReadFailed))
+                outcome(path, Operation::ReadTorrentRegistry),
+                Event::Registry(RegistryEvent::ReadFailed)
             );
-            let failure = execute(path, Operation::SaveTorrents(records()?)).err();
             assert_eq!(
-                failure.map(|failure| failure.event),
-                Some(Event::Registry(RegistryEvent::SaveFailed))
+                outcome(path, Operation::SaveTorrents(records())),
+                Event::Registry(RegistryEvent::SaveFailed)
             );
+            assert_eq!(
+                outcome(path, Operation::ReadLastVpnSwitch),
+                Event::Tunnel(TunnelEvent::LastSwitchReadFailed)
+            );
+            for switch in &switches {
+                assert_eq!(
+                    outcome(path, Operation::SaveVpnSwitch(switch.clone())),
+                    Event::Tunnel(TunnelEvent::SwitchSaveFailed)
+                );
+            }
         }
         Ok(())
     }

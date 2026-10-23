@@ -339,8 +339,8 @@ mod tests {
 
     #[tokio::test]
     async fn commands_to_a_closed_web_ui_fail_as_unreachable() -> Result<(), Box<dyn Error>> {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
-        let client = Client::new(format!("http://{closed}/").parse()?);
+        // Nothing listens on the discard port.
+        let client = Client::new("http://127.0.0.1:9/".parse()?);
         let hash = TorrentHash::parse(&"a".repeat(40)).ok_or("hash")?;
         for command in [
             TorrentCommand::SelectAllFiles(hash.clone()),

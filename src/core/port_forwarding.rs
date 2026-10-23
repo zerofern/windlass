@@ -204,6 +204,29 @@ impl PortForwarding {
         }
     }
 
+    /// Forget the lease and ask for a new one now: the gateway changed.
+    pub(super) fn renew(&mut self) -> Vec<Action> {
+        match self {
+            Self::Enabled {
+                lease,
+                request: request @ LeaseRequest::Waiting(_),
+                ..
+            } => {
+                *lease = None;
+                *request = LeaseRequest::Outstanding;
+                vec![Action::RequestPortMapping {
+                    lifetime: LEASE_LIFETIME,
+                }]
+            }
+            // An outstanding request already reaches the new gateway.
+            Self::Enabled { lease, .. } => {
+                *lease = None;
+                Vec::new()
+            }
+            Self::Disabled => Vec::new(),
+        }
+    }
+
     /// Forget a lease once its lifetime has passed.
     pub(super) fn expire(&mut self, now: Instant) {
         if let Self::Enabled { lease, .. } = self

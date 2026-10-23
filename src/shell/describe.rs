@@ -5,9 +5,9 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
-    Action, Event, HistoryEvent, MamPauseEvent, MamRequestMode, MappingFailure,
+    Action, Event, ExitIpFailure, HistoryEvent, MamPauseEvent, MamRequestMode, MappingFailure,
     PortForwardingEvent, QbittorrentEvent, QbittorrentFailure, RegistryEvent, SettingsEvent,
-    StartupEvent, StartupMode, TimerName, TorrentCommand,
+    StartupEvent, StartupMode, TimerName, TorrentCommand, TunnelEvent,
 };
 
 /// History categories, used for filtering.
@@ -28,8 +28,9 @@ pub(super) const fn category(event: &Event) -> &'static str {
         Event::Settings(_) => "settings",
         Event::History(_) => "history",
         Event::PortForwarding(_)
+        | Event::Tunnel(_)
         | Event::TimerExpired {
-            name: TimerName::PortLease,
+            name: TimerName::PortLease | TimerName::TunnelCheck,
             ..
         } => "vpn",
         Event::Qbittorrent(_)
@@ -47,7 +48,8 @@ pub(super) const fn is_routine(event: &Event) -> bool {
         Event::TimerExpired { .. }
         | Event::PortForwarding(PortForwardingEvent::Mapped { .. })
         | Event::Qbittorrent(QbittorrentEvent::PreferencesRead(_))
-        | Event::Registry(RegistryEvent::Saved) => true,
+        | Event::Registry(RegistryEvent::Saved)
+        | Event::Tunnel(TunnelEvent::ExitIpObserved { .. }) => true,
         Event::Qbittorrent(QbittorrentEvent::Synced(update)) => {
             !update.full && update.torrents.is_empty() && update.removed.is_empty()
         }
@@ -59,6 +61,7 @@ const fn timer(name: TimerName) -> &'static str {
     match name {
         TimerName::QbittorrentPoll => "qBittorrent poll",
         TimerName::PortLease => "forwarded-port lease",
+        TimerName::TunnelCheck => "tunnel check",
     }
 }
 
@@ -122,6 +125,50 @@ pub(super) fn event(event: &Event) -> String {
         Event::PortForwarding(event) => port_forwarding(*event),
         Event::Qbittorrent(event) => qbittorrent(event),
         Event::Registry(event) => registry(event),
+        Event::Tunnel(event) => tunnel(event),
+    }
+}
+
+pub(super) fn exit_ip_failure(reason: ExitIpFailure) -> String {
+    match reason {
+        ExitIpFailure::Unreachable => String::from("the exit-IP service did not answer"),
+        ExitIpFailure::Rejected { status } => {
+            format!("the exit-IP service answered with HTTP status {status}")
+        }
+        ExitIpFailure::Malformed => String::from("the exit-IP service's answer was not an address"),
+    }
+}
+
+fn tunnel(event: &TunnelEvent) -> String {
+    match event {
+        TunnelEvent::Enable { servers, current } => format!(
+            "Tunnel checks started with {} servers; connected to {}",
+            servers.len(),
+            current.as_ref().map_or("an unknown server", AsRef::as_ref)
+        ),
+        TunnelEvent::ExitIpObserved { ip } => format!("Tunnel works; exit IP {ip}"),
+        TunnelEvent::ExitIpCheckFailed { reason } => {
+            format!("Tunnel check failed: {}", exit_ip_failure(*reason))
+        }
+        TunnelEvent::LastSwitchRead { last_switch: None } => {
+            String::from("No earlier VPN server switch is recorded")
+        }
+        TunnelEvent::LastSwitchRead {
+            last_switch: Some(switch),
+        } => format!(
+            "Last VPN server switch read: to {} at {}",
+            switch.server,
+            timestamp(switch.at)
+        ),
+        TunnelEvent::LastSwitchReadFailed => {
+            String::from("The last VPN server switch could not be read; switches are blocked")
+        }
+        TunnelEvent::SwitchSaved => String::from("VPN server switch recorded"),
+        TunnelEvent::SwitchSaveFailed => {
+            String::from("VPN server switch could not be recorded, so it did not start")
+        }
+        TunnelEvent::Switched => String::from("VPN server switch completed"),
+        TunnelEvent::SwitchFailed => String::from("VPN server switch failed"),
     }
 }
 
@@ -319,6 +366,12 @@ pub(super) fn action(action: &Action) -> String {
         Action::SaveTorrents { records } => {
             format!("Save {} torrent registry rows", records.len())
         }
+        Action::CheckExitIp => String::from("Check the tunnel's exit IP"),
+        Action::ReadLastVpnSwitch => String::from("Read the last VPN server switch"),
+        Action::SaveVpnSwitch { switch } => {
+            format!("Record a switch to VPN server {}", switch.server)
+        }
+        Action::SwitchVpnServer { server } => format!("Switch to VPN server {server}"),
     }
 }
 
@@ -560,6 +613,137 @@ mod tests {
         }
         entries.push(qbittorrent(QbittorrentEvent::CommandDone, false));
         check(&entries);
+    }
+
+    #[test]
+    fn every_action_is_described() -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::SystemTime;
+
+        use crate::core::{
+            MamRequestMode, StartupMode, SyncPosition, TorrentCommand, VpnServer, VpnSwitch,
+        };
+
+        let server = VpnServer::try_new("two")?;
+        let mut actions = vec![
+            Action::OpenStorage {
+                mode: StartupMode::Initialise,
+            },
+            Action::ReadMamRequestMode,
+            Action::WriteMamRequestMode {
+                mode: MamRequestMode::Paused,
+            },
+            Action::DeleteMamRequestMode,
+            Action::ReadSettings,
+            Action::WriteHistoryLimit {
+                limit: HistoryLimit::default(),
+            },
+            Action::WriteApiCookie { cookie: None },
+            Action::OpenHistory,
+            Action::TrimHistory {
+                keep: EntryCount::new(1),
+            },
+            Action::RequestPortMapping {
+                lifetime: std::time::Duration::from_mins(1),
+            },
+            Action::ConnectQbittorrent,
+            Action::SyncQbittorrent {
+                position: SyncPosition(1),
+            },
+            Action::ReadQbittorrentPreferences,
+            Action::SetQbittorrentListenPort { port: PORT },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::Start(Vec::new()),
+            },
+            Action::ReadTorrentRegistry,
+            Action::SaveTorrents {
+                records: Vec::new(),
+            },
+            Action::CheckExitIp,
+            Action::ReadLastVpnSwitch,
+            Action::SaveVpnSwitch {
+                switch: VpnSwitch {
+                    server: server.clone(),
+                    at: SystemTime::UNIX_EPOCH,
+                },
+            },
+            Action::SwitchVpnServer { server },
+        ];
+        actions.extend(timer_actions());
+        for described in &actions {
+            assert!(!action(described).is_empty(), "{described:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tunnel_events_and_actions_are_described() -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::SystemTime;
+
+        use crate::core::{ExitIpFailure, TunnelEvent, VpnServer, VpnSwitch};
+
+        let server = VpnServer::try_new("two")?;
+        let switch = VpnSwitch {
+            server: server.clone(),
+            at: SystemTime::UNIX_EPOCH,
+        };
+        let vpn = |event, routine| (Event::Tunnel(event), "vpn", routine);
+        let mut entries = vec![
+            vpn(
+                TunnelEvent::Enable {
+                    servers: vec![server.clone()],
+                    current: None,
+                },
+                false,
+            ),
+            vpn(
+                TunnelEvent::Enable {
+                    servers: vec![server.clone()],
+                    current: Some(server.clone()),
+                },
+                false,
+            ),
+            vpn(
+                TunnelEvent::ExitIpObserved {
+                    ip: std::net::IpAddr::from([192, 0, 2, 7]),
+                },
+                true,
+            ),
+            vpn(TunnelEvent::LastSwitchRead { last_switch: None }, false),
+            vpn(
+                TunnelEvent::LastSwitchRead {
+                    last_switch: Some(switch.clone()),
+                },
+                false,
+            ),
+            vpn(TunnelEvent::LastSwitchReadFailed, false),
+            vpn(TunnelEvent::SwitchSaved, false),
+            vpn(TunnelEvent::SwitchSaveFailed, false),
+            vpn(TunnelEvent::Switched, false),
+            vpn(TunnelEvent::SwitchFailed, false),
+        ];
+        for reason in [
+            ExitIpFailure::Unreachable,
+            ExitIpFailure::Rejected { status: 503 },
+            ExitIpFailure::Malformed,
+        ] {
+            entries.push(vpn(TunnelEvent::ExitIpCheckFailed { reason }, false));
+        }
+        check(&entries);
+        assert!(
+            [
+                Action::CheckExitIp,
+                Action::ReadLastVpnSwitch,
+                Action::SaveVpnSwitch { switch },
+                Action::SwitchVpnServer { server },
+            ]
+            .iter()
+            .map(action)
+            .any(|description| description == "Switch to VPN server two")
+        );
+        let unique: std::collections::BTreeSet<_> =
+            entries.iter().map(|entry| event(&entry.0)).collect();
+        assert_eq!(unique.len(), entries.len(), "descriptions are distinct");
+        Ok(())
     }
 
     #[test]

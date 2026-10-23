@@ -11,13 +11,14 @@ use std::{
 
 use tokio::net::TcpListener;
 use windlass::{
-    core::StartupMode,
-    shell::{Integrations, console, web},
+    core::{StartupMode, VpnServer},
+    shell::{Integrations, TunnelChecks, console, web},
 };
 
 const USAGE: &str = "usage: windlass <initialise|resume> <database-path>\n       \
 windlass serve <initialise|resume> <database-path> --listen <address>... [--allowed-host <name>]... \
-[--qbittorrent <webui-url>] [--nat-pmp-gateway <address>]";
+[--qbittorrent <webui-url>] [--nat-pmp-gateway <address>] \
+[--exit-ip-service <url> [--vpn-server <name>]... [--vpn-current-file <path>]]";
 
 type MainResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -70,6 +71,9 @@ async fn serve(mut arguments: impl Iterator<Item = OsString>) -> MainResult<()> 
     let mut listen = Vec::new();
     let mut allowed_hosts = Vec::new();
     let mut integrations = Integrations::default();
+    let mut exit_ip_service = None;
+    let mut servers = Vec::new();
+    let mut current_file = None;
     while let Some(option) = arguments.next() {
         let value = arguments
             .next()
@@ -92,9 +96,29 @@ async fn serve(mut arguments: impl Iterator<Item = OsString>) -> MainResult<()> 
             Some("--nat-pmp-gateway") => {
                 integrations.nat_pmp_gateway = Some(nat_pmp_gateway(&value)?);
             }
+            Some("--exit-ip-service") => {
+                exit_ip_service = Some(
+                    value
+                        .parse()
+                        .map_err(|_| usage("invalid exit-IP service URL"))?,
+                );
+            }
+            Some("--vpn-server") => servers
+                .push(VpnServer::try_new(value).map_err(|_| usage("invalid VPN server name"))?),
+            Some("--vpn-current-file") => current_file = Some(PathBuf::from(value)),
             _ => return Err(usage("unknown option")),
         }
     }
+    integrations.tunnel = match exit_ip_service {
+        Some(exit_ip_service) => Some(TunnelChecks {
+            exit_ip_service,
+            servers,
+            current: current_file.as_deref().and_then(current_server),
+            unit_starter: PathBuf::from("systemctl"),
+        }),
+        None if servers.is_empty() && current_file.is_none() => None,
+        None => return Err(usage("VPN servers need --exit-ip-service")),
+    };
     if listen.is_empty() {
         return Err(usage("at least one --listen address is required"));
     }
@@ -126,6 +150,13 @@ fn nat_pmp_gateway(value: &str) -> MainResult<SocketAddrV4> {
                 .map(|address| SocketAddrV4::new(address, 5351))
         })
         .map_err(|_| usage("invalid NAT-PMP gateway address"))
+}
+
+/// The server the NixOS module last connected to, as it records it; absent
+/// or unreadable means unknown.
+fn current_server(path: &std::path::Path) -> Option<VpnServer> {
+    let name = std::fs::read_to_string(path).ok()?;
+    VpnServer::try_new(name.trim()).ok()
 }
 
 /// Complete on Ctrl-C or, from systemd, SIGTERM.

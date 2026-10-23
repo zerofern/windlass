@@ -21,12 +21,12 @@ use serde_json::{Value, json};
 use tokio::{net::UdpSocket, sync::watch};
 use windlass::{
     core::{
-        ByteSize, Desired, Event, MamApproval, MappingFailure, Port, PortForwarding, Qbittorrent,
-        QbittorrentFailure, Ratio, Registry, StartupEvent, StartupMode, State as CoreState,
-        TorrentHash, TorrentState,
+        ByteSize, Desired, Event, LastSwitch, MamApproval, MappingFailure, Port, PortForwarding,
+        Protection, Qbittorrent, QbittorrentFailure, Ratio, Registry, StartupEvent, StartupMode,
+        State as CoreState, TorrentHash, TorrentState, VpnServer,
     },
     runner::{Observation, Runner},
-    shell::Integrations,
+    shell::{Integrations, TunnelChecks},
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -310,6 +310,7 @@ async fn qbittorrent_listens_on_the_forwarded_port() -> TestResult {
     let webui = fake_qbittorrent(Arc::clone(&fake)).await?;
     let gateway = fake_gateway(Ok(41000)).await?;
     let running = run(Integrations {
+        tunnel: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -349,6 +350,7 @@ async fn unavailable_services_are_reported_and_retried() -> TestResult {
     };
     let gateway = fake_gateway(Err(3)).await?;
     let running = run(Integrations {
+        tunnel: None,
         qbittorrent: Some(format!("http://{closed}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -417,6 +419,7 @@ async fn rejected_and_malformed_answers_are_distinguished() -> TestResult {
     ] {
         let webui = broken_qbittorrent(preferences, maindata).await?;
         let running = run(Integrations {
+            tunnel: None,
             qbittorrent: Some(format!("http://{webui}/").parse()?),
             nat_pmp_gateway: None,
         })
@@ -436,6 +439,7 @@ async fn silent_gateways_time_out() -> TestResult {
     // A bound socket that never answers.
     let silent = UdpSocket::bind("127.0.0.1:0").await?;
     let running = run(Integrations {
+        tunnel: None,
         qbittorrent: None,
         nat_pmp_gateway: Some(match silent.local_addr()? {
             SocketAddr::V4(address) => address,
@@ -471,6 +475,7 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
     let fake = FakeQbittorrent::with(&[(UNWANTED, complete("stalledUP"))]);
     let webui = fake_qbittorrent(Arc::clone(&fake)).await?;
     let integrations = Integrations {
+        tunnel: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: None,
     };
@@ -540,5 +545,41 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
         |row| row.get(0),
     )?;
     assert_eq!(rows, 2, "both rows and their observations are saved");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_tunnel_is_checked_at_startup() -> TestResult {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let service = listener.local_addr()?;
+    let routes = Router::new().route("/ip", get(|| async { "192.0.2.7\n" }));
+    tokio::spawn(async move { axum::serve(listener, routes).await });
+    let one = VpnServer::try_new("one")?;
+    let running = run(Integrations {
+        tunnel: Some(TunnelChecks {
+            exit_ip_service: format!("http://{service}/ip").parse()?,
+            servers: vec![one.clone(), VpnServer::try_new("two")?],
+            current: Some(one.clone()),
+            unit_starter: "false".into(),
+        }),
+        ..Integrations::default()
+    })
+    .await?;
+    let observation =
+        running
+            .wait(|observation| {
+                observation.tunnel.last_switch == LastSwitch::Known(None)
+                    && observation.tunnel.watch.as_ref().is_some_and(|watch| {
+                        matches!(watch.protection, Protection::Available { .. })
+                    })
+            })
+            .await?;
+    let watch = observation.tunnel.watch.ok_or("no tunnel checks")?;
+    assert_eq!(watch.current, Some(one));
+    assert!(matches!(
+        watch.protection,
+        Protection::Available { exit_ip, .. } if exit_ip.to_string() == "192.0.2.7"
+    ));
+    running.stop().await?;
     Ok(())
 }
