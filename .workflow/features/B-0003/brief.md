@@ -1,6 +1,6 @@
 # Web dashboard and MAM pause control
 
-Status: Draft
+Status: Ready
 Feature ID: B-0003
 
 ## Goal
@@ -52,6 +52,8 @@ Acceptance:
 - The dashboard confirms the pause only after it has been durably saved. A
   failed save is shown as a failure and never as confirmation.
 - Resume requires an explicit user action. VPN recovery does not clear a pause.
+- A fresh installation starts paused. The user configures the API cookie and
+  then resumes to begin MAM contact.
 - While paused, authentication is shown as unverified and IP reporting as
   unconfirmed, not as rejected.
 
@@ -83,7 +85,8 @@ thing happened and when Windlass processed it.
 Acceptance:
 
 - Record every event the core handles and every action it returns, in core
-  processing order.
+  processing order. Timestamps are wall-clock times for display; processing
+  order is recorded separately, so clock changes cannot reorder entries.
 - Each entry is structured, not free text: a kind, typed fields, and identifiers
   that link related entries.
 - Event entries record when the event happened and when the core processed it.
@@ -96,11 +99,17 @@ Acceptance:
   so ignored results are visible rather than silently missing.
 - Secrets never appear in the log. A cookie change is recorded as "replaced",
   without the value.
-- The dashboard can filter history by kind and time range.
+- The dashboard can filter history by kind and time range. Routine
+  status-publishing actions are recorded but hidden by default, so periodic
+  work does not crowd out meaningful entries.
 - History is stored in SQLite and kept within a maximum entry count, 10,000 by
   default and changeable in the dashboard settings. The core decides when the
   bound is exceeded and which oldest entries to remove; the shell only carries
-  out the removal. Trimming is itself recorded in history.
+  out the removal. Trimming removes enough oldest entries to stay comfortably
+  under the bound, rather than deleting one entry per new write, and is itself
+  recorded in history.
+- A failed history write does not stop the core. Once writing recovers, the gap
+  is recorded as an explicit entry, so history never looks complete when it is not.
 - History is information for the user and for debugging. It is not the source
   of truth: restart restores saved state and does not replay history.
 
@@ -154,16 +163,7 @@ and actions stored in SQLite and trimmed by the core to a configurable 10,000
 entries by default, history as information for the user and for debugging only
 with no export, and pause as the only way to disable MAM contact.
 
-Proposed, pending agreement:
-
-- History entries carry wall-clock timestamps for display. Processing order is
-  recorded separately, so clock changes cannot reorder entries.
-- Trimming removes enough oldest entries to stay comfortably under the bound,
-  rather than deleting one entry per new write.
-- A fresh installation starts paused. The user configures the API cookie and
-  then resumes to begin MAM contact.
-- A failed history write does not stop the core. The gap is recorded as an
-  explicit entry once writing recovers, so the log never looks complete when it
-  is not.
-- Routine status-publishing actions are recorded but hidden by default in the
-  viewer, so that periodic work does not crowd out meaningful entries.
+The owner also agreed that a fresh installation starts paused and accepted the
+history timestamp, trimming, write-failure, and default-filter behaviour above.
+Detailed interfaces, the history schema, page layout, and the live-update
+mechanism belong to Design.

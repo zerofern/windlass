@@ -6,6 +6,7 @@ SQLite persistence, and native systemd services on NixOS.
 - [Direction](.workflow/direction.md) describes the intended product.
 - [Backlog](.workflow/backlog.md) retains future work.
 - [Application foundation](.workflow/features/B-0008/brief.md) is ready for Design.
+- [Web dashboard and MAM pause control](.workflow/features/B-0003/brief.md) is ready for Design.
 - [Feature Briefs](.workflow/features/) contain the agreed and proposed flows.
 - [Project instructions](AGENTS.md) define coding and testing conventions.
 
