@@ -30,7 +30,10 @@ just run serve initialise /tmp/windlass.sqlite --listen 127.0.0.1:8740
 
 Open `http://127.0.0.1:8740/`. Add `--qbittorrent http://127.0.0.1:8080/` to watch a
 qBittorrent web UI, and `--nat-pmp-gateway 10.2.0.1` to keep a ProtonVPN forwarded
-port and make qBittorrent listen on it. Use `resume` instead of `initialise` to restart an
+port and make qBittorrent listen on it. Add `--exit-ip-service <url>` to check that
+the VPN carries traffic, with `--vpn-server <name>` for each server Windlass may
+fail over to and `--vpn-current-file <path>` naming the one connected now. Use
+`resume` instead of `initialise` to restart an
 existing instance. Repeat `--listen` for each LAN or Tailscale address, and add
 `--allowed-host <name>` for host names such as a Tailscale name. Requests naming
 any other host are refused, as are form submissions from other websites. Windlass
@@ -47,9 +50,14 @@ times; it works without the script, without live updates. It shows:
   event happened, and when it was processed. Filter by kind and time; page through
   older entries. Routine entries, such as polls and lease renewals, are hidden unless
   asked for. Secrets are recorded as `[redacted]`.
+- **VPN tunnel:** whether the latest exit-IP check succeeded, the exit IP and
+  server, failed checks, and when Windlass may next switch servers.
 - **qBittorrent and port forwarding:** the client version and whether MAM allows it,
-  the network interface, the listen port against the forwarded port, the lease, and
-  every torrent with its state and progress.
+  the network interface, the listen port against the forwarded port, and the lease.
+- **Torrents:** every torrent in the registry with what Windlass wants for it, its
+  state, progress, size, upload, and completion, marking torrents missing from
+  qBittorrent and content missing on disk. Windlass adopts torrents it finds,
+  starts stopped ones, selects every file, and removes those marked removed.
 - **Settings:** the MAM API cookie and the history size limit, each
   confirmed only once saved, plus the read-only deployment settings.
 
@@ -93,11 +101,13 @@ ProtonVPN WireGuard tunnel ([ADR-0003](.workflow/decisions/adr/0003-vpn-namespac
 Generate each server's WireGuard configuration in ProtonVPN with NAT-PMP enabled,
 and keep the files out of the Nix store. The module creates the namespace, its
 firewall, one WireGuard tunnel at a time, the dashboard forwarding on the chosen
-interfaces, the ntfy.sh relay, and qBittorrent bound to the tunnel. Windlass may
-start `windlass-wireguard@<server>.service` to fail over; polkit allows nothing else.
+interfaces, the ntfy.sh relay, and qBittorrent bound to the tunnel. Windlass checks
+the tunnel through `vpn.exitIpService` (by default `https://ipv4.icanhazip.com/`)
+and, after three failed checks, starts `windlass-wireguard@<server>.service` for
+the next server in name order, at most once an hour; polkit allows nothing else.
 
 `nix build` builds and tests the package. `just vm-test` boots the module with fake
-WireGuard servers and checks the privacy boundary. It needs KVM for reasonable
+WireGuard servers and checks the privacy boundary and automatic failover. It needs KVM for reasonable
 speed; without it, the test driver falls back to software emulation.
 
 ## Inspect the core and shell

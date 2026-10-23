@@ -207,16 +207,21 @@ impl Tunnel {
         self.watch.as_ref().and_then(|watch| watch.current.as_ref())
     }
 
-    /// When the next automatic switch may start.
+    /// When the next automatic switch may start, as of `now`.
     #[must_use]
-    pub fn switch_allowance(&self) -> SwitchAllowance {
+    pub fn switch_allowance(&self, now: SystemTime) -> SwitchAllowance {
         if self.watch.as_ref().and_then(Watch::next_server).is_none() {
             return SwitchAllowance::NoAlternative;
         }
         match &self.last_switch {
             LastSwitch::Known(None) => SwitchAllowance::Now,
             LastSwitch::Known(Some(last)) => {
-                SwitchAllowance::After(last.at.checked_add(SWITCH_SPACING).unwrap_or(last.at))
+                let allowed = last.at.checked_add(SWITCH_SPACING).unwrap_or(last.at);
+                if allowed <= now {
+                    SwitchAllowance::Now
+                } else {
+                    SwitchAllowance::After(allowed)
+                }
             }
             LastSwitch::Unread | LastSwitch::Reading | LastSwitch::ReadFailed => {
                 SwitchAllowance::Unknown
@@ -230,7 +235,7 @@ impl Tunnel {
         event: TunnelEvent,
         timers: &mut Timers,
     ) -> Vec<Action> {
-        let allowance = self.switch_allowance();
+        let allowance = self.switch_allowance(now.wall);
         match (&mut self.watch, event) {
             (None, TunnelEvent::Enable { servers, current }) => {
                 self.watch = Some(Watch {
@@ -276,10 +281,8 @@ impl Tunnel {
                 }
                 watch.failures = watch.failures.saturating_add(1);
                 watch.last_failure = Some(reason);
-                let due = allowance == SwitchAllowance::Now
-                    || matches!(allowance, SwitchAllowance::After(at) if at <= now.wall);
                 if watch.failures >= FAILURES_BEFORE_SWITCH
-                    && due
+                    && allowance == SwitchAllowance::Now
                     && let Some(server) = watch.next_server()
                 {
                     watch.fail_over(now, server)

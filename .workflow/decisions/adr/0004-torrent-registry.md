@@ -87,6 +87,10 @@ how an adopted torrent's MAM torrent ID is established.
 - The core holds the registry in memory and requests registry writes as actions,
   following [ADR-0002](0002-sqlite-persistence.md).
 - Torrents found without a row are adopted, not removed.
+- Schema version 4 stores the registry in the `torrents` table: one row per
+  torrent with its intent columns, then the latest observation's columns, which
+  are present when `last_seen` is set. Changed rows are saved in one transaction
+  per batch, with one batch outstanding at a time.
 
 ## Related records
 

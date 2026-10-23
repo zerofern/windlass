@@ -7,13 +7,14 @@ use maud::{DOCTYPE, Markup, html};
 
 use crate::{
     core::{
-        Activity, ByteSize, EntryCount, HistoryState, MamApproval, MamRequestsStatus,
-        MappingFailure, POLL_INTERVAL, Port, PortForwarding, Qbittorrent, Setting, SettingStatus,
-        Settings, SettingsState, TorrentState, Trim,
+        Activity, ByteSize, Desired, EntryCount, Failover, HistoryState, MamApproval,
+        MamRequestsStatus, MappingFailure, Origin, POLL_INTERVAL, Port, PortForwarding, Protection,
+        Qbittorrent, Ratio, Records, Registry, Session, Setting, SettingStatus, Settings,
+        SettingsState, SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
     },
     runner::Observation,
     shell::{
-        describe::{CATEGORIES, qbittorrent_failure, timestamp},
+        describe::{CATEGORIES, exit_ip_failure, qbittorrent_failure, timestamp},
         history::{HistoryPage, HistoryQuery, Page},
     },
 };
@@ -250,10 +251,11 @@ fn status_live(observation: &Observation) -> Markup {
                     div.panel-head { h2 #history-panel { "History" } a href="/history" { "View history" } }
                     p { (history_status(observation.history, &observation.settings)) }
                 }
+                (tunnel_panel(&observation.tunnel, SystemTime::now()))
                 (port_forwarding_panel(&observation.port_forwarding))
                 (qbittorrent_panel(&observation.qbittorrent, observation.port_forwarding.forwarded_port()))
             }
-            (torrent_list(&observation.qbittorrent))
+            (torrent_list(&observation.qbittorrent, &observation.registry))
             @if let Some(error) = &observation.storage_error {
                 section.panel.error aria-labelledby="storage-error" {
                     h2 #storage-error { "Latest storage error" }
@@ -261,6 +263,77 @@ fn status_live(observation: &Observation) -> Markup {
                 }
             }
         }
+    }
+}
+
+fn tunnel_panel(tunnel: &Tunnel, now: SystemTime) -> Markup {
+    let Some(watch) = &tunnel.watch else {
+        return html! {
+            section.panel aria-labelledby="tunnel" {
+                div.panel-head {
+                    h2 #tunnel { "VPN tunnel" }
+                    span.tag.neutral { "Not configured" }
+                }
+                p { "No exit-IP service is configured, so Windlass cannot tell whether the VPN carries traffic." }
+            }
+        };
+    };
+    let (tag, tone) = match (&watch.failover, watch.protection) {
+        (Some(_), _) => ("Switching server…", "pending"),
+        (None, Protection::Unknown) => ("Checking…", "pending"),
+        (None, Protection::Available { .. }) => ("Protected", "ok"),
+        (None, Protection::Unavailable { .. }) => ("Unprotected", "error"),
+    };
+    html! {
+        section.panel aria-labelledby="tunnel" {
+            div.panel-head {
+                h2 #tunnel { "VPN tunnel" }
+                span class={ "tag " (tone) } { (tag) }
+            }
+            dl {
+                dt { "Server" }
+                dd {
+                    @match &watch.current {
+                        Some(server) => span.mono { (server) },
+                        None => span { "Unknown" },
+                    }
+                }
+                @match watch.protection {
+                    Protection::Available { exit_ip, checked_at } => {
+                        dt { "Exit IP" } dd.mono { (exit_ip) }
+                        dt { "Checked" } dd { (time(checked_at, "full")) }
+                    }
+                    Protection::Unavailable { since } => {
+                        dt { "Exit IP" } dd { "Unknown" }
+                        dt { "Failing since" } dd { (time(since, "full")) }
+                    }
+                    Protection::Unknown => { dt { "Exit IP" } dd { "Not checked yet" } }
+                }
+                @if let Some(reason) = watch.last_failure {
+                    dt { "Failed checks" } dd { (watch.failures) }
+                    dt { "Latest failure" } dd { (exit_ip_failure(reason)) }
+                }
+                dt { "Failover" }
+                dd {
+                    @match &watch.failover {
+                        Some(Failover::Saving(switch)) => { "Recording a switch to " span.mono { (switch.server) } "…" }
+                        Some(Failover::Switching(server)) => { "Switching to " span.mono { (server) } "…" }
+                        None => (switch_allowance(tunnel.switch_allowance(now))),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn switch_allowance(allowance: SwitchAllowance) -> Markup {
+    match allowance {
+        SwitchAllowance::Now => html! { "Allowed if checks keep failing" },
+        SwitchAllowance::After(at) => {
+            html! { "Not before " (time(at, "full")) ", as MAM allows one IP change an hour" }
+        }
+        SwitchAllowance::Unknown => html! { "Blocked: the last switch is not known" },
+        SwitchAllowance::NoAlternative => html! { "No other server is configured" },
     }
 }
 
@@ -405,13 +478,39 @@ const fn torrent_state(state: TorrentState) -> &'static str {
     }
 }
 
-fn torrent_list(qbittorrent: &Qbittorrent) -> Markup {
-    let Qbittorrent::Connected(session) = qbittorrent else {
+fn progress(torrent: &Torrent) -> String {
+    let permille = torrent.progress.permille();
+    format!("{}.{}%", permille / 10, permille % 10)
+}
+
+fn ratio(ratio: Ratio) -> String {
+    format!("{}.{:02}", ratio.0 / 1000, ratio.0 % 1000 / 10)
+}
+
+/// The torrent registry, with what qBittorrent reports now; while the
+/// registry is unavailable, what qBittorrent reports.
+fn torrent_list(qbittorrent: &Qbittorrent, registry: &Registry) -> Markup {
+    let session = match qbittorrent {
+        Qbittorrent::Connected(session) => Some(&**session),
+        _ => None,
+    };
+    match registry {
+        Registry::Loaded(records) => registry_table(records, session),
+        Registry::ReadFailed => html! {
+            section.panel.error aria-labelledby="registry-error" {
+                h2 #registry-error { "Torrent registry unavailable" }
+                p { "The torrent registry could not be read, so torrents are shown but not managed." }
+            }
+            (session_table(session))
+        },
+        Registry::Unread | Registry::Reading => session_table(session),
+    }
+}
+
+fn session_table(session: Option<&Session>) -> Markup {
+    let Some(session) = session.filter(|session| !session.torrents.is_empty()) else {
         return html! {};
     };
-    if session.torrents.is_empty() {
-        return html! {};
-    }
     let mut torrents: Vec<_> = session.torrents.values().collect();
     torrents.sort_by_key(|torrent| torrent.name.to_lowercase());
     html! {
@@ -429,8 +528,113 @@ fn torrent_list(qbittorrent: &Qbittorrent) -> Markup {
                         tr {
                             td { (torrent.name) }
                             td { (torrent_state(torrent.state)) }
-                            td.mono { (torrent.progress.permille() / 10) "." (torrent.progress.permille() % 10) "%" }
+                            td.mono { (progress(torrent)) }
                             td.mono { (size(torrent.size)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+const fn wanted(record: &TorrentRecord) -> &'static str {
+    match (record.desired, record.origin) {
+        (Desired::Queued, _) => "Queued",
+        (Desired::Active, Origin::Adopted) => "Active, adopted",
+        (Desired::Active, Origin::Bookmark | Origin::Redownload) => "Active",
+        (Desired::Removed, _) => "Removed",
+    }
+}
+
+/// What qBittorrent reports for a row now, and whether it needs attention.
+fn registry_state(
+    record: &TorrentRecord,
+    live: Option<&Torrent>,
+    listed: bool,
+) -> (&'static str, bool) {
+    match (live, record.desired) {
+        (Some(torrent), _) => (
+            torrent_state(torrent.state),
+            torrent.state == TorrentState::MissingFiles,
+        ),
+        (None, Desired::Active) if listed => ("Missing from qBittorrent", true),
+        (None, Desired::Queued) => ("Waiting for a MAM slot", false),
+        (None, Desired::Removed) => ("Not in qBittorrent", false),
+        (None, Desired::Active) => ("Unknown", false),
+    }
+}
+
+fn registry_table(records: &Records, session: Option<&Session>) -> Markup {
+    type Row<'a> = (
+        String,
+        &'a TorrentRecord,
+        Option<&'a Torrent>,
+        Option<&'a Torrent>,
+    );
+    let mut rows: Vec<Row<'_>> = records
+        .records()
+        .map(|record| {
+            let live = record
+                .identity
+                .hash()
+                .and_then(|hash| session?.torrents.get(hash));
+            // What qBittorrent reports now, or else what it reported last.
+            let seen = live.or_else(|| record.observation.as_ref().map(|seen| &seen.torrent));
+            let name = seen.map_or_else(
+                || {
+                    record
+                        .identity
+                        .mam_id()
+                        .map_or_else(String::new, |id| format!("MAM torrent {}", id.get()))
+                },
+                |torrent| torrent.name.clone(),
+            );
+            (name, record, live, seen)
+        })
+        .collect();
+    if rows.is_empty() {
+        return html! {};
+    }
+    rows.sort_by_key(|(name, ..)| name.to_lowercase());
+    let listed = session.is_some_and(Session::listed);
+    html! {
+        section.panel.table-box aria-labelledby="torrents" {
+            h2 #torrents .table-title { "Torrents" }
+            @if records.save_failed() {
+                p.note { "The latest changes could not be saved; Windlass retries with the next update." }
+            }
+            table.history {
+                thead { tr {
+                    th scope="col" { "Name" }
+                    th scope="col" { "Wanted" }
+                    th scope="col" { "State" }
+                    th scope="col" { "Progress" }
+                    th scope="col" { "Size" }
+                    th scope="col" { "Uploaded" }
+                    th scope="col" { "Completed" }
+                } }
+                tbody {
+                    @for (name, record, live, seen) in rows {
+                        @let (state, attention) = registry_state(record, live, listed);
+                        tr {
+                            td { (name) }
+                            td { (wanted(record)) }
+                            td class=[attention.then_some("attention")] { (state) }
+                            @match seen {
+                                Some(torrent) => {
+                                    td.mono { (progress(torrent)) }
+                                    td.mono { (size(torrent.size)) }
+                                    td.mono { (size(torrent.uploaded)) " · ratio " (ratio(torrent.ratio)) }
+                                    td {
+                                        @match torrent.completed_at {
+                                            Some(at) => (time(at, "full")),
+                                            None => "Not yet",
+                                        }
+                                    }
+                                }
+                                None => { td {} td {} td {} td {} }
+                            }
                         }
                     }
                 }
@@ -1023,13 +1227,14 @@ mod tests {
             for text in expected {
                 assert!(html.contains(text), "{text}: {html}");
             }
-            let list = render(torrent_list(core.qbittorrent()));
+            let list = render(torrent_list(core.qbittorrent(), core.registry()));
             assert!(
                 list.contains("A Synthetic Audiobook") && list.contains("50.0%"),
                 "{list}"
             );
         }
-        assert!(render(torrent_list(&Qbittorrent::Disabled)).is_empty());
+        let reading = crate::core::Registry::Reading;
+        assert!(render(torrent_list(&Qbittorrent::Disabled, &reading)).is_empty());
         assert_eq!(size(ByteSize(512)), "512 B");
         assert_eq!(size(ByteSize(1536)), "1.5 KiB");
         assert_eq!(size(ByteSize(5 * 1024 * 1024 * 1024)), "5.0 GiB");
@@ -1100,9 +1305,276 @@ mod tests {
         );
         // Connected, but with no torrents yet: no list.
         assert!(
-            super::torrent_list(core.qbittorrent())
+            super::torrent_list(core.qbittorrent(), core.registry())
                 .into_string()
                 .is_empty()
         );
+    }
+
+    /// A core driven with a clock that moves only when told to.
+    struct Clocked {
+        core: crate::core::Core,
+        start: std::time::Instant,
+        elapsed: std::time::Duration,
+    }
+
+    impl Clocked {
+        fn new() -> Self {
+            Self {
+                core: crate::core::Core::new(),
+                start: std::time::Instant::now(),
+                elapsed: std::time::Duration::from_hours(2),
+            }
+        }
+
+        fn send(&mut self, event: crate::core::Event) -> Vec<crate::core::Action> {
+            let clock = crate::core::ClockReading {
+                monotonic: self.start + self.elapsed,
+                wall: SystemTime::UNIX_EPOCH + self.elapsed,
+            };
+            self.core.handle(clock, event)
+        }
+
+        /// Fail the outstanding tunnel check, then start the next one.
+        fn fail_check(&mut self) {
+            use crate::core::{Check, Event, ExitIpFailure, TimerName, TunnelEvent};
+
+            let _ = self.send(Event::Tunnel(TunnelEvent::ExitIpCheckFailed {
+                reason: ExitIpFailure::Rejected { status: 503 },
+            }));
+            if let Some(Check::Waiting(id)) =
+                self.core.tunnel().watch.as_ref().map(|watch| watch.check)
+            {
+                let _ = self.send(Event::TimerExpired {
+                    name: TimerName::TunnelCheck,
+                    id,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn tunnel_states_have_words() -> Result<(), crate::core::VpnServerError> {
+        use crate::core::{
+            Event, StartupEvent, StartupMode, Tunnel, TunnelEvent, VpnServer, VpnSwitch,
+        };
+
+        use super::tunnel_panel;
+
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(2);
+        let render = |tunnel: &Tunnel| tunnel_panel(tunnel, now).into_string();
+        assert!(render(&Tunnel::default()).contains("Not configured"));
+        let one = VpnServer::try_new("one")?;
+        let two = VpnServer::try_new("two")?;
+        let mut clocked = Clocked::new();
+        let _ = clocked.send(Event::Tunnel(TunnelEvent::Enable {
+            servers: vec![one.clone()],
+            current: Some(one.clone()),
+        }));
+        let html = render(clocked.core.tunnel());
+        for text in ["Checking…", ">one<", "Not checked yet", "No other server"] {
+            assert!(html.contains(text), "{text}: {html}");
+        }
+        let _ = clocked.send(Event::Tunnel(TunnelEvent::ExitIpObserved {
+            ip: std::net::IpAddr::from([192, 0, 2, 7]),
+        }));
+        let html = render(clocked.core.tunnel());
+        assert!(
+            html.contains("Protected") && html.contains("192.0.2.7"),
+            "{html}"
+        );
+
+        let mut clocked = Clocked::new();
+        let _ = clocked.send(Event::Startup(StartupEvent::Start {
+            mode: StartupMode::Resume,
+        }));
+        let _ = clocked.send(Event::Startup(StartupEvent::StorageOpened));
+        let _ = clocked.send(Event::Tunnel(TunnelEvent::Enable {
+            servers: vec![one, two.clone()],
+            current: None,
+        }));
+        let html = render(clocked.core.tunnel());
+        assert!(
+            html.contains("the last switch is not known") && html.contains("Unknown"),
+            "{html}"
+        );
+        let _ = clocked.send(Event::Tunnel(TunnelEvent::LastSwitchRead {
+            last_switch: Some(VpnSwitch {
+                server: two,
+                at: SystemTime::UNIX_EPOCH,
+            }),
+        }));
+        clocked.fail_check();
+        let html = render(clocked.core.tunnel());
+        for text in [
+            "Unprotected",
+            "Failing since",
+            "HTTP status 503",
+            "Allowed if checks",
+        ] {
+            assert!(html.contains(text), "{text}: {html}");
+        }
+        clocked.fail_check();
+        clocked.fail_check();
+        let html = render(clocked.core.tunnel());
+        assert!(html.contains("Recording a switch to"), "{html}");
+        let _ = clocked.send(Event::Tunnel(TunnelEvent::SwitchSaved));
+        let html = render(clocked.core.tunnel());
+        assert!(
+            html.contains("Switching server…") && html.contains("Switching to"),
+            "{html}"
+        );
+        let _ = clocked.send(Event::Tunnel(TunnelEvent::Switched));
+        let html = render(clocked.core.tunnel());
+        assert!(
+            html.contains("Not before <time datetime=\"1970-01-01T03:00:00Z\""),
+            "{html}"
+        );
+        Ok(())
+    }
+
+    fn registry_rows() -> Result<Vec<crate::core::TorrentRecord>, &'static str> {
+        use crate::core::{
+            Desired, Identity, MamTorrentId, Origin, RecordId, TorrentHash, TorrentRecord,
+        };
+
+        let hash = |fill: char| TorrentHash::parse(&fill.to_string().repeat(40));
+        let (Some(missing), Some(gone)) = (hash('a'), hash('d')) else {
+            return Err("invalid hash");
+        };
+        let mam = MamTorrentId::new(77).ok_or("zero id")?;
+        let row = |id, identity, desired| -> Result<TorrentRecord, &'static str> {
+            Ok(TorrentRecord {
+                id: RecordId::new(id).ok_or("zero id")?,
+                identity,
+                origin: Origin::Bookmark,
+                desired,
+                save_path: None,
+                deletion_allowed: false,
+                observation: None,
+            })
+        };
+        Ok(vec![
+            row(1, Identity::Client(missing), Desired::Active)?,
+            row(2, Identity::Mam(mam), Desired::Queued)?,
+            row(3, Identity::Client(gone), Desired::Removed)?,
+        ])
+    }
+
+    /// Start a core whose registry holds these rows.
+    fn with_registry(rows: Vec<crate::core::TorrentRecord>) -> Clocked {
+        use crate::core::{Event, RegistryEvent, StartupEvent, StartupMode};
+
+        let mut clocked = Clocked::new();
+        for event in [
+            Event::Startup(StartupEvent::Start {
+                mode: StartupMode::Resume,
+            }),
+            Event::Startup(StartupEvent::StorageOpened),
+            Event::Registry(RegistryEvent::Read(rows)),
+        ] {
+            let _ = clocked.send(event);
+        }
+        clocked
+    }
+
+    #[test]
+    fn registry_rows_have_words() -> Result<(), &'static str> {
+        use crate::core::{
+            ByteSize, Event, Progress, QbittorrentEvent, QbittorrentPreferences, Ratio, Registry,
+            RegistryEvent, SyncPosition, SyncUpdate, TorrentHash, TorrentState, TorrentUpdate,
+        };
+
+        use super::torrent_list;
+
+        let hash = |fill: char| TorrentHash::parse(&fill.to_string().repeat(40));
+        let (Some(present), Some(damaged)) = (hash('b'), hash('c')) else {
+            return Err("invalid hash");
+        };
+        let update = |name: &str, state| TorrentUpdate {
+            name: Some(name.to_owned()),
+            state: Some(state),
+            progress: Some(Progress::from_fraction(1.0)),
+            size: Some(ByteSize(2048)),
+            total_size: Some(ByteSize(2048)),
+            uploaded: Some(ByteSize(4096)),
+            ratio: Some(Ratio(1500)),
+            completed_at: Some(Some(SystemTime::UNIX_EPOCH)),
+            ..TorrentUpdate::default()
+        };
+        let mut clocked = with_registry(registry_rows()?);
+        for event in [
+            Event::Qbittorrent(QbittorrentEvent::Enable),
+            Event::Qbittorrent(QbittorrentEvent::Connected {
+                version: String::from("v5.2.2"),
+                preferences: QbittorrentPreferences::default(),
+            }),
+            Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
+                position: SyncPosition(1),
+                full: true,
+                torrents: vec![
+                    (present, update("An Adopted Book", TorrentState::Seeding)),
+                    (
+                        damaged,
+                        update("A Damaged Book", TorrentState::MissingFiles),
+                    ),
+                ],
+                removed: Vec::new(),
+            })),
+            Event::Registry(RegistryEvent::SaveFailed),
+        ] {
+            let _ = clocked.send(event);
+        }
+        let html = torrent_list(clocked.core.qbittorrent(), clocked.core.registry()).into_string();
+        for text in [
+            "Active, adopted",
+            "Missing from qBittorrent",
+            "MAM torrent 77",
+            "Waiting for a MAM slot",
+            "Not in qBittorrent",
+            "class=\"attention\">Files missing",
+            "4.0 KiB · ratio 1.50",
+            "1970-01-01T00:00:00Z",
+            "could not be saved",
+        ] {
+            assert!(html.contains(text), "{text}: {html}");
+        }
+
+        let html = torrent_list(clocked.core.qbittorrent(), &Registry::ReadFailed).into_string();
+        assert!(
+            html.contains("Torrent registry unavailable") && html.contains("A Damaged Book"),
+            "{html}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registry_rows_without_qbittorrent_show_what_was_last_seen() -> Result<(), &'static str> {
+        use crate::core::{Observation, Torrent};
+
+        use super::torrent_list;
+
+        let mut rows = registry_rows()?;
+        if let Some(first) = rows.first_mut() {
+            first.observation = Some(Observation {
+                torrent: Torrent {
+                    name: String::from("A Remembered Book"),
+                    ..Torrent::default()
+                },
+                last_seen: SystemTime::UNIX_EPOCH,
+            });
+        }
+        let alone = with_registry(rows);
+        let html = torrent_list(&Qbittorrent::Disabled, alone.core.registry()).into_string();
+        for text in ["A Remembered Book", "Unknown", "Not yet", "<td></td>"] {
+            assert!(html.contains(text), "{text}: {html}");
+        }
+        let empty = with_registry(Vec::new());
+        assert!(
+            torrent_list(&Qbittorrent::Disabled, empty.core.registry())
+                .into_string()
+                .is_empty()
+        );
+        Ok(())
     }
 }

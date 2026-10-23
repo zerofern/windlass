@@ -145,6 +145,7 @@ input[aria-invalid="true"] { border: 2px solid var(--error); }
 .filter-summary { flex-basis: 100%; }
 .table-box { padding: 0; overflow-x: auto; }
 table.history { width: 100%; border-collapse: collapse; min-width: 760px; font-size: 14px; }
+table.history td.attention { color: var(--error); font-weight: 600; }
 .history th { text-align: left; font-weight: 500; color: var(--muted); padding: 10px 14px; background: var(--accent-soft); }
 .history td { padding: 10px 14px; border-top: 1px solid var(--line-soft); vertical-align: top; }
 .history td:nth-child(1) { width: 64px; }

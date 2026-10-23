@@ -169,7 +169,7 @@ fn repeated_failures_switch_to_the_next_server() -> TestResult {
         Protection::Unavailable { since }
     );
     assert_eq!(
-        harness.core.tunnel().switch_allowance(),
+        harness.core.tunnel().switch_allowance(harness.now()),
         SwitchAllowance::Now
     );
 
@@ -236,7 +236,7 @@ fn repeated_failures_switch_to_the_next_server() -> TestResult {
         "the new server's gateway is asked for a port at once"
     );
     assert_eq!(
-        harness.core.tunnel().switch_allowance(),
+        harness.core.tunnel().switch_allowance(harness.now()),
         SwitchAllowance::After(switch.at + SWITCH_SPACING)
     );
     Ok(())
@@ -258,10 +258,15 @@ fn switches_wait_an_hour_after_the_last_one() -> TestResult {
         "checks continue instead of a switch"
     );
     assert_eq!(
-        harness.core.tunnel().switch_allowance(),
+        harness.core.tunnel().switch_allowance(harness.now()),
         SwitchAllowance::After(start + Duration::from_mins(30))
     );
     harness.advance(Duration::from_mins(30));
+    assert_eq!(
+        harness.core.tunnel().switch_allowance(harness.now()),
+        SwitchAllowance::Now,
+        "an hour has passed since the last switch"
+    );
     let _ = harness.expire(timer(&blocked, RETRY_AFTER).ok_or("no retry")?);
     assert!(matches!(
         harness.fail().as_slice(),
@@ -293,7 +298,7 @@ fn failed_switches_are_retried_after_the_spacing() -> TestResult {
     let retry = harness.tunnel(TunnelEvent::SwitchSaveFailed);
     let id = timer(&retry, RETRY_AFTER).ok_or("no retry after a failed save")?;
     assert_eq!(
-        harness.core.tunnel().switch_allowance(),
+        harness.core.tunnel().switch_allowance(harness.now()),
         SwitchAllowance::Now
     );
     harness.advance(RETRY_AFTER);
@@ -307,7 +312,7 @@ fn failed_switches_are_retried_after_the_spacing() -> TestResult {
     assert!(timer(&retry, RETRY_AFTER).is_some());
     assert_eq!(harness.watch().current, None, "the server did not change");
     assert!(matches!(
-        harness.core.tunnel().switch_allowance(),
+        harness.core.tunnel().switch_allowance(harness.now()),
         SwitchAllowance::After(_)
     ));
     assert!(
@@ -334,7 +339,7 @@ fn switches_need_a_known_last_switch_and_another_server() {
         wall: SystemTime::UNIX_EPOCH,
     };
     assert_eq!(
-        core.tunnel().switch_allowance(),
+        core.tunnel().switch_allowance(now.wall),
         SwitchAllowance::NoAlternative
     );
     let _ = core.handle(
@@ -355,7 +360,10 @@ fn switches_need_a_known_last_switch_and_another_server() {
         .is_empty(),
         "enabling twice changes nothing"
     );
-    assert_eq!(core.tunnel().switch_allowance(), SwitchAllowance::Unknown);
+    assert_eq!(
+        core.tunnel().switch_allowance(now.wall),
+        SwitchAllowance::Unknown
+    );
     let _ = core.handle(now, Event::Tunnel(TunnelEvent::LastSwitchReadFailed));
     let _ = core.handle(
         now,
@@ -401,7 +409,7 @@ fn switches_need_a_known_last_switch_and_another_server() {
 
     let mut alone = Harness::new(None, &["one"], Some("one"));
     assert_eq!(
-        alone.core.tunnel().switch_allowance(),
+        alone.core.tunnel().switch_allowance(alone.now()),
         SwitchAllowance::NoAlternative
     );
     assert!(timer(&alone.fail_repeatedly(), RETRY_AFTER).is_some());

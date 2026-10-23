@@ -69,8 +69,10 @@ let
       done
       ip -n ${ns} link set wg0 up
       ip -n ${ns} route replace default dev wg0
-      mkdir -p /run/windlass-vpn
-      printf '%s\n' "$server" > /run/windlass-vpn/current
+      # Windlass reads which server is connected when it starts.
+      install -d -m 0755 /run/windlass-vpn
+      printf '%s\n' "$server" > "$work/current"
+      install -m 0644 "$work/current" /run/windlass-vpn/current
     '';
   };
 
@@ -83,6 +85,13 @@ let
       --listen ${dashboard} \
       --qbittorrent http://127.0.0.1:${toString cfg.qbittorrent.webuiPort}/ \
       --nat-pmp-gateway ${cfg.vpn.natPmpGateway} \
+      --exit-ip-service ${lib.escapeShellArg cfg.vpn.exitIpService} \
+      --vpn-current-file /run/windlass-vpn/current \
+      ${
+        lib.concatMapStringsSep " " (server: "--vpn-server ${lib.escapeShellArg server}") (
+          lib.attrNames cfg.vpn.servers
+        )
+      } \
       ${lib.concatMapStringsSep " " (
         host: "--allowed-host ${lib.escapeShellArg host}"
       ) cfg.dashboard.allowedHosts}
@@ -193,6 +202,15 @@ in
         default = "10.2.0.1";
         description = "The NAT-PMP gateway that forwards a port, reached through the tunnel.";
       };
+      exitIpService = lib.mkOption {
+        type = lib.types.str;
+        default = "https://ipv4.icanhazip.com/";
+        description = ''
+          A neutral service, not MAM, that answers with the caller's IP address as
+          plain text. Windlass asks it through the tunnel to prove the tunnel works,
+          and fails over to the next server, in name order, after repeated failures.
+        '';
+      };
     };
 
     notifications = {
@@ -220,6 +238,13 @@ in
       {
         assertion = cfg.vpn.servers ? ${cfg.vpn.defaultServer};
         message = "services.windlass.vpn.defaultServer must name one of services.windlass.vpn.servers.";
+      }
+      {
+        # Server names become unit instance names and Windlass arguments.
+        assertion = lib.all (name: builtins.match "[A-Za-z0-9_-]{1,64}" name != null) (
+          lib.attrNames cfg.vpn.servers
+        );
+        message = "services.windlass.vpn.servers names may use only letters, digits, - and _, up to 64.";
       }
       {
         # MAM's allowed clients: qBittorrent 5.0.1 to the latest 5.2.x, which it recommends.
@@ -315,6 +340,8 @@ in
 
     systemd.services.windlass = {
       description = "Windlass";
+      # systemctl starts another server's unit on failover, as polkit allows.
+      path = [ config.systemd.package ];
       wantedBy = [ "multi-user.target" ];
       requires = [ "windlass-netns.service" ];
       after = [

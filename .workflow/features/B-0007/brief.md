@@ -147,7 +147,13 @@ reconnects every 10 seconds.
 
 Implemented: connecting, version approval, polling, the torrent list, and keeping
 the listen port on ProtonVPN's forwarded port ([B-0010](../B-0010/brief.md) S2).
-Submission and cleanup (S1, S2) follow MAM acquisition.
+The torrent registry is implemented for the rules that need no MAM requests:
+adopting unknown torrents, saving observations, starting stopped active torrents,
+selecting every file of partial ones, removing torrents marked removed with their
+files, and showing missing torrents and missing content on the dashboard. One
+command is sent at a time, only after a fresh update, and an unchanged command is
+repeated at most once a minute. Submission, re-adding missing torrents, and
+cleanup (S1, S2) follow MAM acquisition.
 
 - The stopped-submission parameter for the pinned release, and supported
   torrent-hash formats.
