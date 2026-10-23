@@ -7,3 +7,7 @@ target-wg/
 
 # Local agent worktrees.
 .claude/
+
+# Nix build outputs.
+result
+result-*

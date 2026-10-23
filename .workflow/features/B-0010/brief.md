@@ -72,9 +72,10 @@ Acceptance:
 
 - The deployment provides several ProtonVPN WireGuard configurations, one per P2P
   server, each generated with NAT-PMP enabled and kept as a NixOS secret.
-- The core decides when to switch and which server is next, after repeated failed
-  checks. The shell asks a narrowly permitted NixOS unit to switch; Windlass has
-  no other privileged network access.
+- The core starts a failover whenever it is needed and MAM's limits allow it,
+  choosing the next server itself. The shell starts the NixOS unit
+  `windlass-wireguard@<server>.service`, which polkit lets the Windlass user
+  start and nothing else; Windlass has no other privileged network access.
 - Automatic switches respect MAM's requirement that the VPN IP change less than
   once an hour. When that limit blocks a switch, the dashboard says so and the
   user is notified.
@@ -141,9 +142,11 @@ tested locally with namespaces and fakes.
 
 Still open:
 
-- Which NixOS mechanism builds the namespace, and can it swap WireGuard
-  configurations without restarting qBittorrent?
+- The repository's NixOS module ([`nix/module.nix`](../../../nix/module.nix))
+  builds the namespace directly rather than through VPN-Confinement, and swaps
+  WireGuard configurations without restarting qBittorrent. Its VM test
+  ([`nix/tests/vpn.nix`](../../../nix/tests/vpn.nix)) checks S1 and the switch
+  mechanism of S4 against fake WireGuard servers.
 - Which exit-IP service, and how many failed checks trigger a switch?
-- How is the failover unit permitted: a polkit rule, a socket, or another route?
 - Can the user confirm an added ASN in Windlass, or should Windlass wait for a
   successful registration as confirmation?

@@ -53,6 +53,47 @@ not be saved are reported as a gap once saving works again. The API cookie is st
 unencrypted in the SQLite file, so keep that file private. Windlass does not
 contact MAM yet, so authentication and registration remain unverified.
 
+## Deploy on NixOS
+
+The flake provides the `windlass` package and a NixOS module that runs Windlass
+and qBittorrent inside a network namespace whose only internet route is a
+ProtonVPN WireGuard tunnel ([ADR-0003](.workflow/decisions/adr/0003-vpn-namespace-confinement.md)):
+
+```nix
+{
+  inputs.windlass.url = "github:zerofern/windlass";
+  outputs = { nixpkgs, windlass, ... }: {
+    nixosConfigurations.nuc = nixpkgs.lib.nixosSystem {
+      modules = [
+        windlass.nixosModules.default
+        {
+          services.windlass = {
+            enable = true;
+            vpn.servers = {
+              nl-1 = "/run/secrets/proton-nl-1.conf";
+              ch-1 = "/run/secrets/proton-ch-1.conf";
+            };
+            vpn.defaultServer = "nl-1";
+            dashboard.interfaces = [ "enp3s0" "tailscale0" ];
+            dashboard.allowedHosts = [ "192.168.1.20" "nuc.example.ts.net" ];
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Generate each server's WireGuard configuration in ProtonVPN with NAT-PMP enabled,
+and keep the files out of the Nix store. The module creates the namespace, its
+firewall, one WireGuard tunnel at a time, the dashboard forwarding on the chosen
+interfaces, the ntfy.sh relay, and qBittorrent bound to the tunnel. Windlass may
+start `windlass-wireguard@<server>.service` to fail over; polkit allows nothing else.
+
+`nix build` builds and tests the package. `just vm-test` boots the module with fake
+WireGuard servers and checks the privacy boundary. It needs KVM for reasonable
+speed; without it, the test driver falls back to software emulation.
+
 ## Inspect the core and shell
 
 ```sh
