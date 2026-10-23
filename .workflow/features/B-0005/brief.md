@@ -24,6 +24,10 @@ Acceptance:
 - Deleted files, removed client entries, and restart do not erase suppression.
 - A false or missing `my_snatched` flag cannot override local history.
 - Explicit re-download overrides historical suppression, not current active work.
+- A selected torrent that cannot start yet, for example because the account has
+  no free unsatisfied-torrent slot, is recorded as *Queued* in the
+  [torrent registry](../../decisions/adr/0004-torrent-registry.md) and admitted
+  when a slot frees.
 
 ### S2: Admit and acquire a torrent
 

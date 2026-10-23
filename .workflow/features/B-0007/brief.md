@@ -13,6 +13,11 @@ deleted to free disk space. A torrent already in qBittorrent without a Windlass
 record, such as one present before Windlass was installed, is adopted rather than
 ignored; how its MAM torrent ID and history are established remains to be agreed.
 
+The [torrent registry](../../decisions/adr/0004-torrent-registry.md) in SQLite is
+the desired state, and Windlass reconciles qBittorrent with it. Torrents are
+shared whole: every file stays selected, because MAM does not allow partial
+sharing. Missing content is reported to the user rather than downloaded again.
+
 MAM allows qBittorrent 5.0.1 to the latest 5.2.x and recommends 5.2.x; non-release
 versions are not allowed. nixos-26.05 provides 5.2.2. The NixOS module refuses a
 version outside the allowed range, and the dashboard shows MAM's position on the
