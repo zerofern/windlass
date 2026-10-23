@@ -38,6 +38,9 @@ Acceptance:
 Story: The user pauses all of Windlass's own MAM requests and knows the pause
 will survive a restart.
 
+Pause is the only control for disabling MAM contact; there is no separate
+"contact enabled" setting.
+
 Acceptance:
 
 - Pause behaves as defined in [Direction](../../direction.md#web-dashboard): it
@@ -63,7 +66,7 @@ Acceptance:
   - NixOS module: deployment facts such as bind address, filesystem paths, and
     the qBittorrent endpoint. The dashboard may display these but cannot change them.
   - SQLite, edited from the dashboard: operational settings such as the MAM API
-    cookie, MAM contact enabled, the ntfy topic, and disk thresholds. Later
+    cookie, the ntfy topic, and disk thresholds. Later
     features add their own settings here.
 - Secrets, including the MAM API cookie, are write-only. The dashboard can set,
   replace, or clear them and show whether one is configured, but never shows
@@ -94,6 +97,9 @@ Acceptance:
 - Secrets never appear in the log. A cookie change is recorded as "replaced",
   without the value.
 - The dashboard can filter history by kind and time range.
+- History is stored in SQLite and kept within a size bound. The core decides
+  when the bound is exceeded and which oldest entries to remove; the shell only
+  carries out the removal. Trimming is itself recorded in history.
 
 ## Feature-wide constraints and acceptance
 
@@ -139,16 +145,21 @@ accounts, and multi-user access are excluded. Notifications belong to
 
 Agreed with the owner: server-rendered HTML without Node, the configuration
 split above, LAN and Tailscale access without a login, framework ownership in
-this brief with panels in feature briefs, and a structured history of all
-events and actions.
+this brief with panels in feature briefs, a structured history of all events
+and actions stored in SQLite and trimmed by the core, and pause as the only way
+to disable MAM contact.
 
 Proposed, pending agreement:
 
 - History is a record for the user, not the source of truth. Restart restores
   saved state and does not replay the log.
-- History is stored in SQLite alongside other durable data, with wall-clock
-  timestamps for display. Processing order is recorded separately, so clock
-  changes cannot reorder entries.
+- History entries carry wall-clock timestamps for display. Processing order is
+  recorded separately, so clock changes cannot reorder entries.
+- The size bound is a maximum entry count set in the dashboard. Trimming removes
+  enough oldest entries to stay comfortably under it, rather than deleting one
+  entry per new write.
+- A fresh installation starts paused. The user configures the API cookie and
+  then resumes to begin MAM contact.
 - A failed history write does not stop the core. The gap is recorded as an
   explicit entry once writing recovers, so the log never looks complete when it
   is not.
@@ -157,7 +168,5 @@ Proposed, pending agreement:
 
 Still open:
 
-- How long is history kept, and how is it pruned?
+- What is the default history size bound?
 - Should history be exportable, for example as JSON lines?
-- Does the dashboard need a single control to disable MAM contact, distinct
-  from pause, or is the setting in S3 enough?

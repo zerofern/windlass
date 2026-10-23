@@ -13,7 +13,7 @@ agreed pause, privacy, and rate-limit policies.
 
 ### S1: Enable MAM contact
 
-Story: The user configures an API cookie and enables MAM contact. Windlass
+Story: The user configures an API cookie and resumes MAM requests. Windlass
 establishes whether it can register the seedbox through the protected connection.
 
 Acceptance:
@@ -26,9 +26,9 @@ Acceptance:
 Agreed request sequence:
 
 1. Load saved pause state and endpoint cooldowns before making requests.
-2. If contact is enabled, VPN protection is available, and an API cookie is
-   configured, request seedbox registration when the shared bucket and endpoint
-   cooldown permit it.
+2. If MAM requests are not paused, VPN protection is available, and an API
+   cookie is configured, request seedbox registration when the shared bucket
+   and endpoint cooldown permit it.
 3. Send `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` with the
    `mam_id` API cookie. No IP parameter is sent: MAM observes the source IP.
 4. Treat documented successful `Completed` and `No Change` outcomes as confirmed
@@ -39,7 +39,7 @@ If no API cookie is configured, show setup required and make no MAM requests.
 
 ### S2: Keep registration current
 
-Story: While MAM contact is enabled, the system detects a changed exit IP and
+Story: While MAM requests are not paused, the system detects a changed exit IP and
 updates registration without exceeding the documented limits.
 
 Acceptance:
@@ -54,7 +54,7 @@ Acceptance:
 Agreed monitoring and recovery sequence:
 
 - Periodically send `GET https://t.myanonamouse.net/json/jsonIp.php` to observe
-  the exit IP every five minutes while contact is enabled.
+  the exit IP every five minutes while MAM requests are not paused.
   Never exceed its documented once-per-minute limit.
 - If that IP differs from the confirmed registration, request a seedbox update
   when allowed. An unchanged observed IP alone does not require another update.
