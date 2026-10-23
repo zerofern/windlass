@@ -102,6 +102,20 @@ fn invalid_serve_arguments_are_refused() -> Result<(), Box<dyn Error>> {
         ],
         vec!["serve", "initialise", database, "--unknown", "value"],
         vec!["serve", "initialise", database, "--listen", "192.0.2.1:1"],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--qbittorrent",
+            "not a url",
+        ],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--nat-pmp-gateway",
+            "nowhere",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_windlass"))
             .args(&arguments)
@@ -122,6 +136,13 @@ fn serve_until_terminated(
         .args(["serve", mode])
         .arg(database)
         .args(["--listen", "127.0.0.1:0", "--allowed-host", "localhost"])
+        // Shutdown waits for requests to integrations that never answer to time out.
+        .args([
+            "--qbittorrent",
+            "http://127.0.0.1:9/",
+            "--nat-pmp-gateway",
+            "127.0.0.1",
+        ])
         .stderr(Stdio::piped())
         .spawn()?;
     let started = std::time::Instant::now();

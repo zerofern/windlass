@@ -423,6 +423,8 @@ async fn history_records_every_step_and_pages_through_it() -> TestResult {
     assert!(older_page.contains("Startup requested (initialise new storage)"));
     assert!(older_page.contains("ACTION</span>Open storage (initialise new storage)"));
     assert!(older_page.contains("Newer"));
+    let (_, everything) = dashboard.get("/history?routine=on").await?;
+    assert!(everything.contains("name=\"routine\" checked"));
     let (_, newer_page) = dashboard.get("/history?after=1").await?;
     assert!(newer_page.contains("Storage opened"));
 
@@ -578,6 +580,25 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
     assert!(matches!(observation.history, HistoryState::Open { .. }));
     dashboard.stop().await?;
 
+    // Version 2 storage gains the routine marker.
+    let version_two = tempfile::tempdir()?;
+    let version_two_path = version_two.path().join("windlass.sqlite");
+    Dashboard::start_at(None, version_two_path.clone(), StartupMode::Initialise)
+        .await?
+        .stop()
+        .await?;
+    Connection::open(&version_two_path)?
+        .execute_batch("ALTER TABLE history DROP COLUMN routine; PRAGMA user_version = 2;")?;
+    let dashboard =
+        Dashboard::start_at(Some(version_two), version_two_path, StartupMode::Resume).await?;
+    assert!(matches!(
+        dashboard.observations.borrow().history,
+        HistoryState::Open { .. }
+    ));
+    let (_, history) = dashboard.get("/history").await?;
+    assert!(history.contains("Startup requested (resume existing storage)"));
+    dashboard.stop().await?;
+
     let newer = tempfile::tempdir()?;
     let newer_path = newer.path().join("windlass.sqlite");
     Connection::open(&newer_path)?.execute_batch(
@@ -677,10 +698,13 @@ async fn the_server_answers_over_tcp_and_shuts_down_cleanly() -> TestResult {
     let address = listener.local_addr()?;
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(web::serve(
-        path.clone(),
-        StartupMode::Initialise,
-        vec![listener],
-        Vec::new(),
+        web::Serve {
+            database: path.clone(),
+            mode: StartupMode::Initialise,
+            listeners: vec![listener],
+            allowed_hosts: Vec::new(),
+            integrations: windlass::shell::Integrations::default(),
+        },
         async move {
             let _ = stopped.await;
         },

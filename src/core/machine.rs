@@ -1,6 +1,7 @@
 use super::{
     Action, ClockReading, Event, HistoryState, MamPreferencePersistence, MamPreferenceState,
-    MamPreferenceUpdate, SettingsState, Step, mam_pause, settings, startup,
+    MamPreferenceUpdate, PortForwarding, Qbittorrent, SettingsState, Step, TimerName, mam_pause,
+    settings, startup, timer::Timers,
 };
 
 /// Owns application state and makes decisions without performing I/O.
@@ -9,6 +10,9 @@ pub struct Core {
     state: State,
     settings: SettingsState,
     history: HistoryState,
+    port_forwarding: PortForwarding,
+    qbittorrent: Qbittorrent,
+    timers: Timers,
     step: Step,
 }
 
@@ -57,6 +61,9 @@ impl Core {
             state: State::NotStarted,
             settings: SettingsState::Unread,
             history: HistoryState::Closed,
+            port_forwarding: PortForwarding::Disabled,
+            qbittorrent: Qbittorrent::Disabled,
+            timers: Timers::new(),
             step: Step::ZERO,
         }
     }
@@ -84,7 +91,31 @@ impl Core {
                 self.history.handle(self.step, event);
                 Vec::new()
             }
+            Event::TimerExpired { name, id } => match name {
+                TimerName::PortLease => self.port_forwarding.timer_expired(id),
+                TimerName::QbittorrentPoll => self.qbittorrent.timer_expired(
+                    id,
+                    occurred_at,
+                    &mut self.timers,
+                    self.port_forwarding.forwarded_port(),
+                ),
+            },
+            Event::PortForwarding(event) => {
+                self.port_forwarding
+                    .handle(occurred_at, event, &mut self.timers)
+            }
+            Event::Qbittorrent(event) => self.qbittorrent.handle(
+                occurred_at,
+                event,
+                &mut self.timers,
+                self.port_forwarding.forwarded_port(),
+            ),
         };
+        self.port_forwarding.expire(occurred_at.monotonic);
+        actions.extend(
+            self.qbittorrent
+                .follow_forwarded_port(self.port_forwarding.forwarded_port()),
+        );
         actions.extend(
             self.history
                 .after_step(self.step, self.settings.history_limit()),
@@ -102,6 +133,18 @@ impl Core {
     #[must_use]
     pub const fn settings(&self) -> &SettingsState {
         &self.settings
+    }
+
+    /// Inspect Proton VPN port forwarding.
+    #[must_use]
+    pub const fn port_forwarding(&self) -> &PortForwarding {
+        &self.port_forwarding
+    }
+
+    /// Inspect what the core knows about qBittorrent.
+    #[must_use]
+    pub const fn qbittorrent(&self) -> &Qbittorrent {
+        &self.qbittorrent
     }
 
     /// Inspect what the core knows about stored history.

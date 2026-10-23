@@ -28,7 +28,9 @@ SQLite integration tests. The foundation feature is still incomplete.
 just run serve initialise /tmp/windlass.sqlite --listen 127.0.0.1:8740
 ```
 
-Open `http://127.0.0.1:8740/`. Use `resume` instead of `initialise` to restart an
+Open `http://127.0.0.1:8740/`. Add `--qbittorrent http://127.0.0.1:8080/` to watch a
+qBittorrent web UI, and `--nat-pmp-gateway 10.2.0.1` to keep a ProtonVPN forwarded
+port and make qBittorrent listen on it. Use `resume` instead of `initialise` to restart an
 existing instance. Repeat `--listen` for each LAN or Tailscale address, and add
 `--allowed-host <name>` for host names such as a Tailscale name. Requests naming
 any other host are refused, as are form submissions from other websites. Windlass
@@ -43,7 +45,11 @@ times; it works without the script, without live updates. It shows:
   instance starts paused and asks for the API cookie.
 - **History:** every event the core handled, with the actions it returned, when the
   event happened, and when it was processed. Filter by kind and time; page through
-  older entries. Secrets are recorded as `[redacted]`.
+  older entries. Routine entries, such as polls and lease renewals, are hidden unless
+  asked for. Secrets are recorded as `[redacted]`.
+- **qBittorrent and port forwarding:** the client version and whether MAM allows it,
+  the network interface, the listen port against the forwarded port, the lease, and
+  every torrent with its state and progress.
 - **Settings:** the MAM API cookie and the history size limit, each
   confirmed only once saved, plus the read-only deployment settings.
 
@@ -143,10 +149,13 @@ error. Slow observers retain the newest observation without blocking the runner.
 all resulting storage work. Sender clones can remain alive during shutdown.
 The runner records each handled event and its actions in history before
 dispatching the actions; a single writer keeps entries in processing order.
+The core schedules named timers with deadlines from supplied time. The shell
+sleeps until each deadline and reports the expiry; a replaced timer's expiry is
+recognised by its identity and ignored.
 
-Timers, task cancellation, deployment units, and actual MAM and qBittorrent
-clients remain to be built. The console is for reviewing the operating model; it
-does not implement the full service.
+Task cancellation, MAM requests, and torrent submission remain to be built. The
+console is for reviewing the operating model; it does not implement the full
+service.
 
 ## Development
 

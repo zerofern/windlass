@@ -7,12 +7,13 @@ use maud::{DOCTYPE, Markup, html};
 
 use crate::{
     core::{
-        EntryCount, HistoryState, MamRequestsStatus, Setting, SettingStatus, Settings,
-        SettingsState, Trim,
+        Activity, ByteSize, EntryCount, HistoryState, MamApproval, MamRequestsStatus,
+        MappingFailure, POLL_INTERVAL, Port, PortForwarding, Qbittorrent, Setting, SettingStatus,
+        Settings, SettingsState, TorrentState, Trim,
     },
     runner::Observation,
     shell::{
-        describe::{CATEGORIES, timestamp},
+        describe::{CATEGORIES, qbittorrent_failure, timestamp},
         history::{HistoryPage, HistoryQuery, Page},
     },
 };
@@ -249,11 +250,189 @@ fn status_live(observation: &Observation) -> Markup {
                     div.panel-head { h2 #history-panel { "History" } a href="/history" { "View history" } }
                     p { (history_status(observation.history, &observation.settings)) }
                 }
+                (port_forwarding_panel(&observation.port_forwarding))
+                (qbittorrent_panel(&observation.qbittorrent, observation.port_forwarding.forwarded_port()))
             }
+            (torrent_list(&observation.qbittorrent))
             @if let Some(error) = &observation.storage_error {
                 section.panel.error aria-labelledby="storage-error" {
                     h2 #storage-error { "Latest storage error" }
                     p.mono { (error) }
+                }
+            }
+        }
+    }
+}
+
+fn port_forwarding_panel(forwarding: &PortForwarding) -> Markup {
+    let (tag, tone) = match forwarding {
+        PortForwarding::Disabled => ("Not configured", "neutral"),
+        PortForwarding::Enabled { lease: None, .. } => ("No forwarded port", "error"),
+        PortForwarding::Enabled { failures: 0, .. } => ("Forwarded", "ok"),
+        PortForwarding::Enabled { .. } => ("Renewal failing", "warning"),
+    };
+    html! {
+        section.panel aria-labelledby="port-forwarding" {
+            div.panel-head {
+                h2 #port-forwarding { "Port forwarding" }
+                span class={ "tag " (tone) } { (tag) }
+            }
+            @match forwarding {
+                PortForwarding::Disabled => {
+                    p { "No ProtonVPN NAT-PMP gateway is configured, so peers cannot connect in." }
+                }
+                PortForwarding::Enabled { lease, failures, last_failure, .. } => {
+                    dl {
+                        @if let Some(lease) = lease {
+                            dt { "Forwarded port" }
+                            dd.mono { "TCP " (lease.tcp.get()) ", UDP " (lease.udp.get()) }
+                            dt { "Renewed" } dd { (time(lease.renewed_at, "full")) }
+                        } @else {
+                            dt { "Forwarded port" } dd { "None" }
+                        }
+                        @if let Some(reason) = last_failure {
+                            dt { "Failed attempts" } dd { (failures) }
+                            dt { "Latest failure" } dd { (port_failure(*reason)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+const fn port_failure(reason: MappingFailure) -> &'static str {
+    match reason {
+        MappingFailure::NoResponse => "The gateway did not answer",
+        MappingFailure::Refused { .. } => "The gateway refused the request",
+        MappingFailure::Malformed => "The gateway's answer was not valid",
+    }
+}
+
+const fn approval(approval: MamApproval) -> (&'static str, &'static str) {
+    match approval {
+        MamApproval::Recommended => ("Recommended by MAM", "ok"),
+        MamApproval::Allowed => ("Allowed by MAM", "ok"),
+        MamApproval::Discouraged => ("Discouraged by MAM", "warning"),
+        MamApproval::NotAllowed => ("Not allowed by MAM", "error"),
+    }
+}
+
+fn qbittorrent_panel(qbittorrent: &Qbittorrent, forwarded: Option<Port>) -> Markup {
+    let (tag, tone) = match qbittorrent {
+        Qbittorrent::Disabled => ("Not configured", "neutral"),
+        Qbittorrent::Connecting => ("Connecting…", "pending"),
+        Qbittorrent::Unreachable { .. } => ("Unreachable", "error"),
+        Qbittorrent::Connected(session) => approval(session.approval),
+    };
+    html! {
+        section.panel aria-labelledby="qbittorrent" {
+            div.panel-head {
+                h2 #qbittorrent { "qBittorrent" }
+                span class={ "tag " (tone) } { (tag) }
+            }
+            @match qbittorrent {
+                Qbittorrent::Disabled => p { "No qBittorrent WebUI is configured." },
+                Qbittorrent::Connecting => p { "Waiting for qBittorrent's WebUI to answer." },
+                Qbittorrent::Unreachable { reason, .. } => {
+                    p { (qbittorrent_failure(*reason)) ". Retrying every " (POLL_INTERVAL.as_secs()) " seconds." }
+                }
+                Qbittorrent::Connected(session) => {
+                    dl {
+                        dt { "Version" } dd.mono { (session.version) }
+                        dt { "Network interface" }
+                        dd {
+                            @match &session.preferences.interface {
+                                Some(interface) => span.mono { (interface) },
+                                None => span { "Any interface; not bound to the VPN" },
+                            }
+                        }
+                        dt { "Listen port" }
+                        dd {
+                            @match session.preferences.listen_port {
+                                Some(port) => span.mono { (port.get()) },
+                                None => span { "Unknown" },
+                            }
+                            @match (forwarded, session.activity) {
+                                (_, Activity::SettingListenPort(_)) => " · updating to the forwarded port…",
+                                (Some(port), _) if session.preferences.listen_port == Some(port) => " · matches the forwarded port",
+                                (Some(_), _) => " · differs from the forwarded port",
+                                (None, _) => "",
+                            }
+                        }
+                        dt { "Torrents" } dd { (session.torrents.len()) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn size(bytes: ByteSize) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes.0;
+    let mut unit = 0;
+    let mut tenths = 0;
+    while value >= 1024 && unit + 1 < UNITS.len() {
+        tenths = (value % 1024) * 10 / 1024;
+        value /= 1024;
+        unit += 1;
+    }
+    let unit = UNITS.get(unit).copied().unwrap_or("B");
+    if unit == "B" {
+        format!("{value} {unit}")
+    } else {
+        format!("{value}.{tenths} {unit}")
+    }
+}
+
+const fn torrent_state(state: TorrentState) -> &'static str {
+    match state {
+        TorrentState::FetchingMetadata => "Fetching metadata",
+        TorrentState::Downloading => "Downloading",
+        TorrentState::DownloadStalled => "Downloading, stalled",
+        TorrentState::DownloadQueued => "Queued to download",
+        TorrentState::Seeding => "Seeding",
+        TorrentState::SeedStalled => "Seeding, no peers",
+        TorrentState::SeedQueued => "Queued to seed",
+        TorrentState::Stopped { complete: true } => "Stopped, complete",
+        TorrentState::Stopped { complete: false } => "Stopped, incomplete",
+        TorrentState::Checking => "Checking",
+        TorrentState::Moving => "Moving",
+        TorrentState::MissingFiles => "Files missing",
+        TorrentState::Error => "Error",
+        TorrentState::Unknown => "Unknown",
+    }
+}
+
+fn torrent_list(qbittorrent: &Qbittorrent) -> Markup {
+    let Qbittorrent::Connected(session) = qbittorrent else {
+        return html! {};
+    };
+    if session.torrents.is_empty() {
+        return html! {};
+    }
+    let mut torrents: Vec<_> = session.torrents.values().collect();
+    torrents.sort_by_key(|torrent| torrent.name.to_lowercase());
+    html! {
+        section.panel.table-box aria-labelledby="torrents" {
+            h2 #torrents .table-title { "Torrents" }
+            table.history {
+                thead { tr {
+                    th scope="col" { "Name" }
+                    th scope="col" { "State" }
+                    th scope="col" { "Progress" }
+                    th scope="col" { "Size" }
+                } }
+                tbody {
+                    @for torrent in torrents {
+                        tr {
+                            td { (torrent.name) }
+                            td { (torrent_state(torrent.state)) }
+                            td.mono { (torrent.progress.permille() / 10) "." (torrent.progress.permille() % 10) "%" }
+                            td.mono { (size(torrent.size)) }
+                        }
+                    }
                 }
             }
         }
@@ -402,6 +581,9 @@ fn page_link(query: &HistoryQuery, page: Page) -> String {
     if let Some(category) = query.category {
         parameters.push(format!("kind={category}"));
     }
+    if query.routine {
+        parameters.push(String::from("routine=on"));
+    }
     for (name, value) in [("from", query.from), ("to", query.until)] {
         if let Some(value) = value {
             parameters.push(format!("{name}={}", timestamp(value).replace('+', "%2B")));
@@ -449,6 +631,10 @@ pub(super) fn history(
                     label for="to_local" { "To" }
                     input #to_local type="datetime-local" name="to_local";
                     input type="hidden" name="to" value=[query.until.map(timestamp)];
+                }
+                label.check {
+                    input type="checkbox" name="routine" checked[query.routine];
+                    "Show routine entries"
                 }
                 button.primary type="submit" { "Apply" }
                 @if query.from.is_some() || query.until.is_some() {
@@ -538,8 +724,8 @@ mod tests {
     use crate::{
         core::{
             ApiCookie, EntryCount, HistoryLimit, HistoryState, MamPreferencePersistence,
-            MamPreferenceState, MamPreferenceUpdate, MamRequestMode, Setting, SettingPersistence,
-            Settings, SettingsState, State, Step, Trim,
+            MamPreferenceState, MamPreferenceUpdate, MamRequestMode, PortForwarding, Qbittorrent,
+            Setting, SettingPersistence, Settings, SettingsState, State, Step, Trim,
         },
         runner::Observation,
         shell::history::{HistoryQuery, Page},
@@ -552,6 +738,8 @@ mod tests {
             state,
             settings,
             history,
+            port_forwarding: PortForwarding::Disabled,
+            qbittorrent: Qbittorrent::Disabled,
             last_event: None,
             storage_error: None,
         }
@@ -673,17 +861,245 @@ mod tests {
         assert_eq!(delay(now, now - Duration::from_secs(1)), "clock changed");
         let query = HistoryQuery {
             category: Some("mam"),
+            routine: true,
             from: Some(now),
             until: Some(now),
             page: Page::Newest,
         };
         assert_eq!(
             page_link(&query, Page::Before(7)),
-            "/history?kind=mam&from=1970-01-01T00:00:10Z&to=1970-01-01T00:00:10Z&before=7"
+            "/history?kind=mam&routine=on&from=1970-01-01T00:00:10Z&to=1970-01-01T00:00:10Z&before=7"
         );
         assert_eq!(
             page_link(&HistoryQuery::default(), Page::Newest),
             "/history?"
+        );
+    }
+
+    fn drive(events: Vec<crate::core::Event>) -> crate::core::Core {
+        let clock = crate::core::ClockReading {
+            monotonic: std::time::Instant::now(),
+            wall: SystemTime::UNIX_EPOCH,
+        };
+        let mut core = crate::core::Core::new();
+        for event in events {
+            let _ = core.handle(clock, event);
+        }
+        core
+    }
+
+    const FORWARDED: crate::core::Port = match crate::core::Port::new(41000) {
+        Some(port) => port,
+        None => unreachable!(),
+    };
+
+    fn lease(port: crate::core::Port) -> crate::core::Event {
+        crate::core::Event::PortForwarding(crate::core::PortForwardingEvent::Mapped {
+            tcp: port,
+            udp: port,
+            lifetime: crate::core::LEASE_LIFETIME,
+        })
+    }
+
+    #[test]
+    fn port_forwarding_states_have_words() {
+        use crate::core::{Event, LeaseRequest, MappingFailure, PortForwardingEvent};
+
+        use super::port_forwarding_panel;
+
+        let render = |forwarding| port_forwarding_panel(&forwarding).into_string();
+        assert!(render(PortForwarding::Disabled).contains("Not configured"));
+        for (reason, text) in [
+            (MappingFailure::NoResponse, "did not answer"),
+            (MappingFailure::Refused { result_code: 2 }, "refused"),
+            (MappingFailure::Malformed, "not valid"),
+        ] {
+            let html = render(PortForwarding::Enabled {
+                lease: None,
+                request: LeaseRequest::Outstanding,
+                failures: 2,
+                last_failure: Some(reason),
+            });
+            assert!(
+                html.contains("No forwarded port") && html.contains(text),
+                "{html}"
+            );
+        }
+        let core = drive(vec![
+            Event::PortForwarding(PortForwardingEvent::Enable),
+            lease(FORWARDED),
+        ]);
+        let html = render(*core.port_forwarding());
+        assert!(
+            html.contains("Forwarded") && html.contains("TCP 41000, UDP 41000"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn qbittorrent_states_have_words() -> Result<(), &'static str> {
+        use crate::core::{
+            ByteSize, Event, Port, PortForwardingEvent, Progress, QbittorrentEvent,
+            QbittorrentFailure, QbittorrentPreferences, SyncUpdate, TorrentHash, TorrentState,
+            TorrentUpdate,
+        };
+
+        use super::{qbittorrent_panel, size, torrent_list};
+
+        let render = |markup: maud::Markup| markup.into_string();
+        assert!(render(qbittorrent_panel(&Qbittorrent::Disabled, None)).contains("Not configured"));
+        assert!(render(qbittorrent_panel(&Qbittorrent::Connecting, None)).contains("Connecting"));
+        let unreachable = drive(vec![
+            Event::Qbittorrent(QbittorrentEvent::Enable),
+            Event::Qbittorrent(QbittorrentEvent::ConnectFailed {
+                reason: QbittorrentFailure::Rejected { status: 403 },
+            }),
+        ]);
+        assert!(
+            render(qbittorrent_panel(unreachable.qbittorrent(), None)).contains("HTTP status 403")
+        );
+        let hash = TorrentHash::parse(&"a".repeat(40)).ok_or("invalid hash")?;
+        let second = TorrentHash::parse(&"b".repeat(40)).ok_or("invalid hash")?;
+        let torrents = SyncUpdate {
+            full: true,
+            torrents: vec![
+                (
+                    hash,
+                    TorrentUpdate {
+                        name: Some(String::from("A Synthetic Audiobook")),
+                        state: Some(TorrentState::Stopped { complete: false }),
+                        progress: Some(Progress::from_fraction(0.5)),
+                        size: Some(ByteSize(1536)),
+                    },
+                ),
+                (
+                    second,
+                    TorrentUpdate {
+                        name: Some(String::from("Another Synthetic Book")),
+                        ..TorrentUpdate::default()
+                    },
+                ),
+            ],
+            ..SyncUpdate::default()
+        };
+        for (version, listen, interface, expected) in [
+            (
+                "v5.1.0",
+                41000,
+                Some("wg0"),
+                ["Allowed by MAM", "matches the forwarded port"],
+            ),
+            (
+                "v4.6.0",
+                1,
+                None,
+                ["Discouraged by MAM", "updating to the forwarded port"],
+            ),
+            (
+                "v5.2.2-dev",
+                1,
+                None,
+                ["Not allowed by MAM", "Any interface"],
+            ),
+        ] {
+            let core = drive(vec![
+                Event::Qbittorrent(QbittorrentEvent::Enable),
+                Event::Qbittorrent(QbittorrentEvent::Connected {
+                    version: String::from(version),
+                    preferences: QbittorrentPreferences {
+                        listen_port: Port::new(listen),
+                        interface: interface.map(str::to_owned),
+                    },
+                }),
+                Event::Qbittorrent(QbittorrentEvent::Synced(torrents.clone())),
+                Event::PortForwarding(PortForwardingEvent::Enable),
+                lease(FORWARDED),
+            ]);
+            let forwarded = core.port_forwarding().forwarded_port();
+            let html = render(qbittorrent_panel(core.qbittorrent(), forwarded));
+            for text in expected {
+                assert!(html.contains(text), "{text}: {html}");
+            }
+            let list = render(torrent_list(core.qbittorrent()));
+            assert!(
+                list.contains("A Synthetic Audiobook") && list.contains("50.0%"),
+                "{list}"
+            );
+        }
+        assert!(render(torrent_list(&Qbittorrent::Disabled)).is_empty());
+        assert_eq!(size(ByteSize(512)), "512 B");
+        assert_eq!(size(ByteSize(1536)), "1.5 KiB");
+        assert_eq!(size(ByteSize(5 * 1024 * 1024 * 1024)), "5.0 GiB");
+        Ok(())
+    }
+
+    #[test]
+    fn every_torrent_state_has_words() {
+        use crate::core::TorrentState;
+
+        use super::torrent_state;
+
+        let states = [
+            TorrentState::FetchingMetadata,
+            TorrentState::Downloading,
+            TorrentState::DownloadStalled,
+            TorrentState::DownloadQueued,
+            TorrentState::Seeding,
+            TorrentState::SeedStalled,
+            TorrentState::SeedQueued,
+            TorrentState::Stopped { complete: true },
+            TorrentState::Stopped { complete: false },
+            TorrentState::Checking,
+            TorrentState::Moving,
+            TorrentState::MissingFiles,
+            TorrentState::Error,
+            TorrentState::Unknown,
+        ];
+        let words: std::collections::BTreeSet<_> = states.into_iter().map(torrent_state).collect();
+        assert_eq!(words.len(), states.len());
+    }
+
+    #[test]
+    fn renewal_failures_and_recommended_versions_have_words() {
+        use crate::core::{Event, PortForwardingEvent, QbittorrentEvent, QbittorrentPreferences};
+
+        use super::{port_forwarding_panel, qbittorrent_panel};
+
+        let core = drive(vec![
+            Event::PortForwarding(PortForwardingEvent::Enable),
+            lease(FORWARDED),
+        ]);
+        // A failed renewal while the lease is still valid.
+        let mut forwarding = *core.port_forwarding();
+        if let PortForwarding::Enabled {
+            failures, request, ..
+        } = &mut forwarding
+        {
+            *failures = 1;
+            *request = crate::core::LeaseRequest::Outstanding;
+        }
+        assert!(
+            port_forwarding_panel(&forwarding)
+                .into_string()
+                .contains("Renewal failing")
+        );
+        let core = drive(vec![
+            Event::Qbittorrent(QbittorrentEvent::Enable),
+            Event::Qbittorrent(QbittorrentEvent::Connected {
+                version: String::from("v5.2.2"),
+                preferences: QbittorrentPreferences::default(),
+            }),
+        ]);
+        let html = qbittorrent_panel(core.qbittorrent(), None).into_string();
+        assert!(
+            html.contains("Recommended by MAM") && html.contains("Unknown"),
+            "{html}"
+        );
+        // Connected, but with no torrents yet: no list.
+        assert!(
+            super::torrent_list(core.qbittorrent())
+                .into_string()
+                .is_empty()
         );
     }
 }

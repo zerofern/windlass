@@ -4,7 +4,8 @@
 
 - Link: [WebUI API for 5.0+](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-%28qBittorrent-5.0%29), [current torrent controller](https://github.com/qbittorrent/qBittorrent/blob/master/src/webui/api/torrentscontroller.cpp), and [NixOS service module](https://github.com/NixOS/nixpkgs/blob/master/nixos/modules/services/torrent/qbittorrent.nix).
 - Relevance: Primary sources for HTTP integration and native service deployment. The API supports authentication, uploading torrent metadata, reading torrent state, and deletion.
-- Unverified: The deployment version and MAM approval remain to be established. The API wiki uses `paused` for submission, whereas current controller source uses `stopped`; pin the contract to the chosen release and test it against that binary.
+- MAM allowed clients (owner-supplied, from MAM's site): qBittorrent from 5.0.1 to the latest 5.2.x, with 5.2.x recommended. 4.5.2 to 4.6.7 and 4.3.4 to 4.4.5 are permitted but discouraged, lacking HTTPS certificate verification. Unlisted and non-release (alpha, beta, development) versions are not allowed; disable auto-update. Upgrading to 5.2.x from 5.1.4 or older can leave a lock file that stops qBittorrent launching.
+- Unverified: The API wiki uses `paused` for submission, whereas current controller source uses `stopped`; pin the contract to the chosen release and test it against that binary.
 - Related: [Deployment](direction.md#deployment), [qBittorrent Feature Brief](features/B-0007/brief.md).
 
 ## ProtonVPN

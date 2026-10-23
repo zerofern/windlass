@@ -81,6 +81,8 @@ let
     if [ -e "$database" ]; then mode=resume; else mode=initialise; fi
     exec ${lib.getExe cfg.package} serve "$mode" "$database" \
       --listen ${dashboard} \
+      --qbittorrent http://127.0.0.1:${toString cfg.qbittorrent.webuiPort}/ \
+      --nat-pmp-gateway ${cfg.vpn.natPmpGateway} \
       ${lib.concatMapStringsSep " " (
         host: "--allowed-host ${lib.escapeShellArg host}"
       ) cfg.dashboard.allowedHosts}
@@ -186,6 +188,11 @@ in
         default = [ "10.2.0.1" ];
         description = "Resolvers reached through the tunnel.";
       };
+      natPmpGateway = lib.mkOption {
+        type = lib.types.str;
+        default = "10.2.0.1";
+        description = "The NAT-PMP gateway that forwards a port, reached through the tunnel.";
+      };
     };
 
     notifications = {
@@ -213,6 +220,15 @@ in
       {
         assertion = cfg.vpn.servers ? ${cfg.vpn.defaultServer};
         message = "services.windlass.vpn.defaultServer must name one of services.windlass.vpn.servers.";
+      }
+      {
+        # MAM's allowed clients: qBittorrent 5.0.1 to the latest 5.2.x, which it recommends.
+        assertion =
+          let
+            version = config.services.qbittorrent.package.version;
+          in
+          lib.versionAtLeast version "5.0.1" && lib.versionOlder version "5.3";
+        message = "MAM allows qBittorrent 5.0.1 to 5.2.x; services.qbittorrent.package is ${config.services.qbittorrent.package.version}.";
       }
     ];
 

@@ -35,7 +35,7 @@ use crate::{
     },
     runner::{Observation, Runner},
     shell::{
-        EventSender, ShellError, ShellResult,
+        EventSender, Integrations, ShellError, ShellResult,
         describe::CATEGORIES,
         history::{self, HistoryQuery, Page},
     },
@@ -302,6 +302,7 @@ struct HistoryParameters {
     to_local: Option<String>,
     before: Option<i64>,
     after: Option<i64>,
+    routine: Option<String>,
 }
 
 /// Parse a filter time: exact RFC 3339 from the page script, or an unconverted
@@ -331,6 +332,7 @@ fn history_query(parameters: &HistoryParameters) -> HistoryQuery {
             .find(|value| parameters.kind.as_deref() == Some(*value)),
         from: filter_time(parameters.from.as_deref(), parameters.from_local.as_deref()),
         until: filter_time(parameters.to.as_deref(), parameters.to_local.as_deref()),
+        routine: parameters.routine.is_some(),
         page: match (parameters.before, parameters.after) {
             (Some(before), _) => Page::Before(before),
             (None, Some(after)) => Page::After(after),
@@ -359,6 +361,21 @@ async fn history_page(
     pages::history(&observation, &query, &result, retained)
 }
 
+/// What `windlass serve` runs.
+#[derive(Debug)]
+pub struct Serve {
+    /// The `SQLite` database.
+    pub database: PathBuf,
+    /// Whether to create the database or resume an existing one.
+    pub mode: StartupMode,
+    /// Bound dashboard listeners.
+    pub listeners: Vec<TcpListener>,
+    /// Host names accepted in addition to the listen addresses.
+    pub allowed_hosts: Vec<String>,
+    /// External services to use.
+    pub integrations: Integrations,
+}
+
 /// Run the core and serve the dashboard until `shutdown` completes.
 ///
 /// Shutdown stops accepting commands, finishes outstanding storage work and
@@ -368,12 +385,16 @@ async fn history_page(
 /// Returns an error if a listener cannot report its address, the core cannot
 /// start, or a server or worker fails unexpectedly.
 pub async fn serve(
-    database: PathBuf,
-    mode: StartupMode,
-    listeners: Vec<TcpListener>,
-    allowed_hosts: Vec<String>,
+    options: Serve,
     shutdown: impl Future<Output = ()> + Send,
 ) -> ShellResult<State> {
+    let Serve {
+        database,
+        mode,
+        listeners,
+        allowed_hosts,
+        integrations,
+    } = options;
     let deployment = Deployment {
         listen: listeners
             .iter()
@@ -382,10 +403,14 @@ pub async fn serve(
         allowed_hosts,
         database: database.clone(),
     };
-    let (runner, events, observations) = Runner::new(database);
+    let enable = integrations.enable_events();
+    let (runner, events, observations) = Runner::with_integrations(database, integrations);
     events
         .send(Event::Startup(StartupEvent::Start { mode }))
         .await?;
+    for event in enable {
+        events.send(event).await?;
+    }
     let routes = router(events.clone(), observations, deployment);
     let (stop, stopped) = watch::channel(false);
     let servers: Vec<_> = listeners

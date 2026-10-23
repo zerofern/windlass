@@ -22,12 +22,44 @@ let
     };
   };
 
+  # The port each fake server's NAT-PMP gateway forwards.
+  forwardedPorts = {
+    vpn1 = 41000;
+    vpn2 = 42000;
+  };
+
   # A WireGuard server standing in for a ProtonVPN P2P server: it forwards the
-  # client's traffic to the "internet" with its own address as the exit IP.
+  # client's traffic to the "internet" with its own address as the exit IP, and
+  # grants a fixed forwarded port over NAT-PMP like Proton's gateway.
   vpnServer =
     name:
     { pkgs, ... }:
     {
+      systemd.services.fake-nat-pmp = {
+        wantedBy = [ "multi-user.target" ];
+        after = [ "wireguard-wg0.service" ];
+        requires = [ "wireguard-wg0.service" ];
+        serviceConfig.Restart = "on-failure";
+        script = "exec ${
+          pkgs.writers.writePython3 "fake-nat-pmp" { } ''
+            import socket
+            import struct
+
+            gateway = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            gateway.bind(("10.2.0.1", 5351))
+            while True:
+                request, client = gateway.recvfrom(64)
+                if len(request) != 12 or request[0] != 0 or request[1] not in (1, 2):
+                    continue
+                lifetime = struct.unpack("!I", request[8:12])[0]
+                reply = struct.pack(
+                    "!BBHIHHI", 0, request[1] + 128, 0, 1, 0, ${toString forwardedPorts.${name}}, lifetime
+                )
+                gateway.sendto(reply, client)
+          ''
+        }";
+      };
+      networking.firewall.interfaces.wg0.allowedUDPPorts = [ 5351 ];
       networking.wireguard.interfaces.wg0 = {
         ips = [ "10.2.0.1/24" ];
         listenPort = 51820;
@@ -175,6 +207,14 @@ in
           # The namespace cannot reach the host's other services through its link.
           machine.fail(inside + "curl -sf --max-time 5 http://10.200.0.1:8740/")
 
+      with subtest("qBittorrent listens on the port Proton forwards"):
+          machine.wait_until_succeeds(
+              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/preferences"
+              + " | grep -q '\"listen_port\":${toString forwardedPorts.vpn1}'",
+              timeout=900,
+          )
+          web.succeed("curl -sf http://machine:8740/ | grep -q 'TCP ${toString forwardedPorts.vpn1}'")
+
       with subtest("qBittorrent is bound to the tunnel with UPnP off"):
           machine.wait_until_succeeds(
               inside + "curl -sf http://127.0.0.1:8080/api/v2/app/version", timeout=900
@@ -189,6 +229,12 @@ in
           machine.succeed("runuser -u windlass -- systemctl start windlass-wireguard@two.service")
           machine.wait_until_succeeds(exit_ip, timeout=900)
           assert machine.succeed(exit_ip).strip() == "${ipOf "vpn2"}"
+          # The next lease renewal reaches the new server's gateway.
+          machine.wait_until_succeeds(
+              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/preferences"
+              + " | grep -q '\"listen_port\":${toString forwardedPorts.vpn2}'",
+              timeout=900,
+          )
           machine.fail("systemctl start windlass-wireguard@unknown.service")
           machine.fail("runuser -u windlass -- systemctl stop windlass.service")
           machine.fail("runuser -u windlass -- systemctl start sshd.service")

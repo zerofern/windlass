@@ -35,6 +35,17 @@ pub enum Event {
     Settings(SettingsEvent),
     /// History storage results.
     History(HistoryEvent),
+    /// A scheduled timer expired.
+    TimerExpired {
+        /// Which timer.
+        name: TimerName,
+        /// Which instance; obsolete instances are ignored.
+        id: TimerId,
+    },
+    /// Proton VPN port-forwarding commands and NAT-PMP results.
+    PortForwarding(PortForwardingEvent),
+    /// qBittorrent commands and web UI API results.
+    Qbittorrent(QbittorrentEvent),
 }
 
 /// An effect requested by the core for the shell to execute.
@@ -76,13 +87,44 @@ pub enum Action {
         /// How many entries to keep.
         keep: EntryCount,
     },
+    /// Start a timer, replacing any running timer with the same name.
+    StartTimer {
+        /// Which timer.
+        name: TimerName,
+        /// This instance's identity, reported back on expiry.
+        id: TimerId,
+        /// When it expires.
+        deadline: Deadline,
+    },
+    /// Ask the NAT-PMP gateway to map TCP and UDP ports for this long.
+    RequestPortMapping {
+        /// The requested lease lifetime.
+        lifetime: std::time::Duration,
+    },
+    /// Read qBittorrent's version and preferences.
+    ConnectQbittorrent,
+    /// Read qBittorrent's changes since this position.
+    SyncQbittorrent {
+        /// The position from the previous update.
+        position: SyncPosition,
+    },
+    /// Read qBittorrent's preferences.
+    ReadQbittorrentPreferences,
+    /// Set the port qBittorrent listens on for peers.
+    SetQbittorrentListenPort {
+        /// The forwarded port.
+        port: Port,
+    },
 }
 
 mod history;
 mod machine;
 mod mam_pause;
+mod port_forwarding;
+mod qbittorrent;
 mod settings;
 mod startup;
+mod timer;
 
 pub use history::{HistoryEvent, HistoryState, Step, Trim};
 pub use machine::{Core, State};
@@ -90,8 +132,17 @@ pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,
     MamRequestMode, MamRequestsStatus,
 };
+pub use port_forwarding::{
+    LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, Port, PortForwarding, PortForwardingEvent,
+};
+pub use qbittorrent::{
+    Activity, ByteSize, ClientVersion, MamApproval, POLL_INTERVAL, Progress, Qbittorrent,
+    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Session, SyncPosition,
+    SyncUpdate, Torrent, TorrentHash, TorrentState, TorrentUpdate,
+};
 pub use settings::{
     ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, Setting,
     SettingPersistence, SettingStatus, Settings, SettingsEvent, SettingsState,
 };
 pub use startup::{StartupEvent, StartupMode};
+pub use timer::{Deadline, TimerId, TimerName};

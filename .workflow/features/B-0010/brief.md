@@ -43,7 +43,8 @@ Acceptance:
   its API and confirms the change. qBittorrent's own UPnP and NAT-PMP are off.
 - The dashboard shows the forwarded port, when it was last renewed, and whether
   qBittorrent uses it.
-- A failed renewal is retried and marks the tunnel as suspect (S3).
+- A failed renewal is retried after 5 seconds and marks the tunnel as suspect (S3).
+- Implemented, with the lease gateway passed as `--nat-pmp-gateway`.
 
 ### S3: Prove the tunnel works
 

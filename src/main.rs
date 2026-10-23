@@ -1,16 +1,23 @@
 //! Run Windlass: the web dashboard, or a minimal console for inspecting core
 //! and shell interactions.
 
-use std::{error::Error, ffi::OsString, io, net::SocketAddr, path::PathBuf};
+use std::{
+    error::Error,
+    ffi::OsString,
+    io,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::PathBuf,
+};
 
 use tokio::net::TcpListener;
 use windlass::{
     core::StartupMode,
-    shell::{console, web},
+    shell::{Integrations, console, web},
 };
 
 const USAGE: &str = "usage: windlass <initialise|resume> <database-path>\n       \
-windlass serve <initialise|resume> <database-path> --listen <address>... [--allowed-host <name>]...";
+windlass serve <initialise|resume> <database-path> --listen <address>... [--allowed-host <name>]... \
+[--qbittorrent <webui-url>] [--nat-pmp-gateway <address>]";
 
 type MainResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -62,6 +69,7 @@ async fn serve(mut arguments: impl Iterator<Item = OsString>) -> MainResult<()> 
         .ok_or_else(|| usage("missing database path"))?;
     let mut listen = Vec::new();
     let mut allowed_hosts = Vec::new();
+    let mut integrations = Integrations::default();
     while let Some(option) = arguments.next() {
         let value = arguments
             .next()
@@ -74,6 +82,16 @@ async fn serve(mut arguments: impl Iterator<Item = OsString>) -> MainResult<()> 
                     .map_err(|_| usage("invalid listen address"))?,
             ),
             Some("--allowed-host") => allowed_hosts.push(value),
+            Some("--qbittorrent") => {
+                integrations.qbittorrent = Some(
+                    value
+                        .parse()
+                        .map_err(|_| usage("invalid qBittorrent WebUI URL"))?,
+                );
+            }
+            Some("--nat-pmp-gateway") => {
+                integrations.nat_pmp_gateway = Some(nat_pmp_gateway(&value)?);
+            }
             _ => return Err(usage("unknown option")),
         }
     }
@@ -84,11 +102,30 @@ async fn serve(mut arguments: impl Iterator<Item = OsString>) -> MainResult<()> 
     for address in listen {
         listeners.push(TcpListener::bind(address).await?);
     }
-    let state = web::serve(database, mode, listeners, allowed_hosts, stop_signal()).await?;
+    let options = web::Serve {
+        database,
+        mode,
+        listeners,
+        allowed_hosts,
+        integrations,
+    };
+    let state = web::serve(options, stop_signal()).await?;
     if state.has_failed() {
         return Err(io::Error::other("startup or preference persistence failed").into());
     }
     Ok(())
+}
+
+/// An IPv4 gateway address, with NAT-PMP's port 5351 unless another is given.
+fn nat_pmp_gateway(value: &str) -> MainResult<SocketAddrV4> {
+    value
+        .parse::<SocketAddrV4>()
+        .or_else(|_| {
+            value
+                .parse::<Ipv4Addr>()
+                .map(|address| SocketAddrV4::new(address, 5351))
+        })
+        .map_err(|_| usage("invalid NAT-PMP gateway address"))
 }
 
 /// Complete on Ctrl-C or, from systemd, SIGTERM.

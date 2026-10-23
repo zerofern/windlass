@@ -160,3 +160,6 @@ details pre {
   padding: 8px 10px; border-radius: 6px; margin: 6px 0 0;
 }
 .pager { display: flex; justify-content: space-between; gap: 12px; }
+.check { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; }
+.check input { width: 18px; height: 18px; }
+.table-title { padding: 14px 16px 6px; }

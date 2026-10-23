@@ -3,12 +3,14 @@ use std::{error::Error, fs::OpenOptions, io, path::Path, time::Duration};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, types::Type};
 
 use crate::core::{
-    Action, ApiCookie, Event, HistoryEvent, HistoryLimit, MamPauseEvent, MamRequestMode,
-    SettingsEvent, StartupEvent, StartupMode,
+    ApiCookie, Event, HistoryLimit, MamPauseEvent, MamRequestMode, SettingsEvent, StartupEvent,
+    StartupMode,
 };
 
-/// The schema version written by this build. Version 1 held only the MAM preference.
-const SCHEMA_VERSION: i64 = 2;
+/// The schema version written by this build. Version 1 held only the MAM
+/// preference; version 2 added settings and history; version 3 marks routine
+/// history entries.
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "CREATE TABLE mam_configuration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -31,6 +33,8 @@ CREATE TABLE history (
 );
 CREATE INDEX history_processed_at ON history(processed_at_ms);";
 
+const SCHEMA_V3: &str = "ALTER TABLE history ADD COLUMN routine INTEGER NOT NULL DEFAULT 0;";
+
 type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug)]
@@ -39,35 +43,44 @@ pub(super) struct FailedAction {
     pub detail: String,
 }
 
-pub(super) fn execute(path: &Path, action: Action) -> Result<Event, FailedAction> {
-    let (result, failure) = match action {
-        Action::OpenStorage { mode } => (
+/// The core actions that read or write durable control state.
+#[derive(Debug)]
+pub(super) enum Operation {
+    OpenStorage(StartupMode),
+    ReadMamRequestMode,
+    WriteMamRequestMode(MamRequestMode),
+    DeleteMamRequestMode,
+    ReadSettings,
+    WriteHistoryLimit(HistoryLimit),
+    WriteApiCookie(Option<ApiCookie>),
+}
+
+pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, FailedAction> {
+    let (result, failure) = match operation {
+        Operation::OpenStorage(mode) => (
             open(path, mode),
             Event::Startup(StartupEvent::StorageOpenFailed),
         ),
-        Action::ReadMamRequestMode => (read(path), Event::MamPause(MamPauseEvent::ReadFailed)),
-        Action::WriteMamRequestMode { mode } => (
+        Operation::ReadMamRequestMode => (read(path), Event::MamPause(MamPauseEvent::ReadFailed)),
+        Operation::WriteMamRequestMode(mode) => (
             write(path, mode),
             Event::MamPause(MamPauseEvent::WriteFailed),
         ),
-        Action::DeleteMamRequestMode => {
+        Operation::DeleteMamRequestMode => {
             (delete(path), Event::MamPause(MamPauseEvent::DeleteFailed))
         }
-        Action::ReadSettings => (
+        Operation::ReadSettings => (
             read_settings(path),
             Event::Settings(SettingsEvent::ReadFailed),
         ),
-        Action::WriteHistoryLimit { limit } => (
+        Operation::WriteHistoryLimit(limit) => (
             write_history_limit(path, limit),
             Event::Settings(SettingsEvent::HistoryLimitWriteFailed),
         ),
-        Action::WriteApiCookie { cookie } => (
+        Operation::WriteApiCookie(cookie) => (
             write_api_cookie(path, cookie.as_ref()),
             Event::Settings(SettingsEvent::ApiCookieWriteFailed),
         ),
-        // The shell routes these to the history writer, which keeps entries in order.
-        Action::OpenHistory => (Err(misrouted()), Event::History(HistoryEvent::OpenFailed)),
-        Action::TrimHistory { .. } => (Err(misrouted()), Event::History(HistoryEvent::TrimFailed)),
     };
     result.map_err(|error| FailedAction {
         event: failure,
@@ -90,7 +103,7 @@ fn open(path: &Path, mode: StartupMode) -> StorageResult<Event> {
             let connection = connection(path)?;
             connection.pragma_update(None, "journal_mode", "WAL")?;
             connection.execute_batch(&format!(
-                "BEGIN; {SCHEMA_V1} {SCHEMA_V2} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                "BEGIN; {SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
             ))?;
         }
         StartupMode::Resume => {
@@ -98,15 +111,19 @@ fn open(path: &Path, mode: StartupMode) -> StorageResult<Event> {
             connection.prepare("SELECT request_mode FROM mam_configuration LIMIT 0")?;
             let version: i64 =
                 connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            match version {
+            let upgrade = match version {
                 0 | 1 => {
                     connection.pragma_update(None, "journal_mode", "WAL")?;
-                    connection.execute_batch(&format!(
-                        "BEGIN; {SCHEMA_V2} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
-                    ))?;
+                    Some(format!("{SCHEMA_V2} {SCHEMA_V3}"))
                 }
-                SCHEMA_VERSION => {}
+                2 => Some(String::from(SCHEMA_V3)),
+                SCHEMA_VERSION => None,
                 _ => return Err(invalid_data("storage was written by a newer Windlass").into()),
+            };
+            if let Some(upgrade) = upgrade {
+                connection.execute_batch(&format!(
+                    "BEGIN; {upgrade} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                ))?;
             }
         }
     }
@@ -155,10 +172,6 @@ fn delete(path: &Path) -> StorageResult<Event> {
     Ok(Event::MamPause(MamPauseEvent::Deleted))
 }
 
-fn misrouted() -> Box<dyn Error + Send + Sync> {
-    io::Error::other("history actions run on the history writer").into()
-}
-
 fn invalid_data(detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, detail)
 }
@@ -205,31 +218,4 @@ fn write_api_cookie(path: &Path, cookie: Option<&ApiCookie>) -> StorageResult<Ev
         [cookie.map(ApiCookie::expose_secret)],
     )?;
     Ok(Event::Settings(SettingsEvent::ApiCookieWritten))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use crate::core::{Action, EntryCount, Event, HistoryEvent};
-
-    use super::execute;
-
-    #[test]
-    fn history_actions_are_not_storage_operations() {
-        let path = Path::new("unused.sqlite");
-        for (action, failure) in [
-            (Action::OpenHistory, HistoryEvent::OpenFailed),
-            (
-                Action::TrimHistory {
-                    keep: EntryCount::new(1),
-                },
-                HistoryEvent::TrimFailed,
-            ),
-        ] {
-            let error = execute(path, action).err().map(|failed| failed.event);
-            assert_eq!(error, Some(Event::History(failure)));
-        }
-        assert!(!path.exists());
-    }
 }
