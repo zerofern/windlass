@@ -7,6 +7,27 @@
 - Unverified: The deployment version and MAM approval remain to be established. The API wiki uses `paused` for submission, whereas current controller source uses `stopped`; pin the contract to the chosen release and test it against that binary.
 - Related: [Deployment](direction.md#deployment), [qBittorrent Feature Brief](features/B-0007/brief.md).
 
+## ProtonVPN
+
+- Link: [Manual port forwarding setup](https://protonvpn.com/support/port-forwarding-manual-setup)
+- Relevance: Owner-selected VPN provider. Port forwarding needs a P2P server and a
+  WireGuard configuration generated with NAT-PMP enabled. Mappings are requested
+  from the gateway at `10.2.0.1` with a 60-second lifetime, for UDP and TCP, and
+  renewed about every 45 seconds. `natpmpc` versions before 20230423 may misread
+  the gateway's response.
+- Unverified: Whether all P2P servers share one ASN, and how often the forwarded
+  port changes across reconnects.
+- Related: [ADR-0003](decisions/adr/0003-vpn-namespace-confinement.md), [VPN Feature Brief](features/B-0010/brief.md).
+
+## VPN-Confinement
+
+- Link: [NixOS Discourse discussion](https://discourse.nixos.org/t/setting-up-wireguard-in-a-network-namespace-for-selectively-routing-traffic-through-vpn/10252), [example configuration](https://lemmy.mariusdavid.fr/post/420598)
+- Relevance: A community NixOS module that creates a WireGuard network namespace,
+  with DNS leak protection, and attaches systemd services to it. A candidate for
+  the namespace in ADR-0003.
+- Unverified: Its options for exposing ports to the host and LAN, and whether it
+  can switch WireGuard configurations without restarting attached services.
+
 ## MLM — Myanonamouse Library Manager
 
 - Link: [MLM](https://github.com/CampingAvocado/MLM)

@@ -13,7 +13,12 @@ contract. Windlass communicates through a configured private HTTP endpoint.
 
 The MAM pause control does not stop existing qBittorrent downloads or tracker
 communication. A new acquisition still requires the agreed admission checks.
-Client API requests do not consume MAM bucket tokens. NixOS enforces VPN isolation.
+Client API requests do not consume MAM bucket tokens. NixOS enforces VPN isolation:
+qBittorrent runs in the VPN namespace of
+[ADR-0003](../../decisions/adr/0003-vpn-namespace-confinement.md), is bound to the
+WireGuard interface, and has its WebUI on namespace-local loopback only. Its own
+UPnP and NAT-PMP are disabled; Windlass sets the listen port to the port forwarded
+by ProtonVPN ([B-0010](../B-0010/brief.md)) through `app/setPreferences`.
 
 Core tests exercise admission and reconciliation with events and actions. Shell
 integration tests use the pinned real qBittorrent binary and disposable local
@@ -110,7 +115,8 @@ cleanup. Shared acquisition policy belongs to the [MAM brief](../B-0005/brief.md
 
 ## Non-goals
 
-MAM API calls, WireGuard implementation, and library-copy deletion policy.
+MAM API calls, WireGuard implementation, port forwarding (B-0010), and library-copy
+deletion policy.
 
 ## Related records
 

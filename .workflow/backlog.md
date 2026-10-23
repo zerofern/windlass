@@ -68,6 +68,18 @@
 - Feature Brief: [Application foundation](features/B-0008/brief.md)
 - Relationships: Foundation for MAM initialization, acquisition, and qBittorrent integration.
 
+## B-0010: VPN confinement, port forwarding, and failover
+
+- Status: Ready for Shape
+- Value: Keep all BitTorrent and MAM traffic inside a ProtonVPN tunnel that fails
+  closed, keep the forwarded port current, verify the tunnel works, and fail over
+  between servers, while notifications and the dashboard stay available.
+- Direction: [VPN privacy](direction.md#vpn-privacy), [Deployment](direction.md#deployment)
+- Feature Brief: [VPN confinement, port forwarding, and failover](features/B-0010/brief.md)
+- Relationships: Supplies VPN protection and exit-IP facts to
+  [MAM initialization](#b-0004-mam-initialization-loop) and the forwarded port to
+  [qBittorrent integration](#b-0007-qbittorrent-integration).
+
 ## B-0009: Audiobookshelf integration
 
 - Status: Needs Direction

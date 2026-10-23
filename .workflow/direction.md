@@ -104,8 +104,9 @@ content. The files and torrent-client entries removed remain to be agreed.
 
 Windlass sends the user notifications about important events so they can stay
 informed without continually checking the system. The initial notification
-channel is hosted [ntfy.sh](references.md#ntfy). Notifications describe operational
-conditions, such as low disk space or failed MAM registration. They exclude book
+channel is hosted [ntfy.sh](references.md#ntfy). Notifications still reach ntfy.sh
+when the VPN is down, through a relay that can reach only ntfy.sh. Notifications
+describe operational conditions, such as low disk space or failed MAM registration. They exclude book
 titles and account details. The events that warrant notifications remain to be
 agreed.
 
@@ -122,6 +123,14 @@ pause: discard queued work, ignore new requests, and cancel outstanding requests
 where possible. Authentication is unverified and IP reporting is unconfirmed. VPN
 recovery must not clear an explicit user pause.
 
+The VPN provider is ProtonVPN over WireGuard. All BitTorrent traffic goes through
+the tunnel and fails when it fails. Windlass checks that the tunnel actually works
+with an external service, regularly and when problems are suspected, and fails
+over to another configured ProtonVPN server when it does not. MAM access uses an
+ASN-locked API session. The dashboard is reachable over Tailscale but not through
+the VPN. [ADR-0003](decisions/adr/0003-vpn-namespace-confinement.md) records the
+enforcement mechanism.
+
 ### Deployment
 
 NixOS owns VPN setup, operation, and recovery. Windlass coordinates its MAM
@@ -133,8 +142,10 @@ The intended deployment uses native NixOS systemd services, including headless
 qBittorrent. Windlass integrates through qBittorrent's HTTP API rather than
 container lifecycle control. Select and pin a MAM-approved client version.
 Docker is dropped from the intended deployment: Windlass and its supporting
-services run under systemd on NixOS. The mechanism for enforcing the privacy
-boundary remains to be designed.
+services run under systemd on NixOS. A NixOS network namespace whose only internet
+route is the WireGuard tunnel enforces the privacy boundary; qBittorrent and
+Windlass run inside it. Windlass decides on port-forwarding renewals and server
+failover; NixOS performs the privileged network changes.
 
 ### Local persistence
 
