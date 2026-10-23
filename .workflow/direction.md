@@ -68,7 +68,10 @@ Restart token balances remain to be agreed.
 ### Web dashboard
 
 Windlass provides a web dashboard showing current system status and allowing the
-user to configure Windlass. The dashboard also lets the user pause all of
+user to configure Windlass. It also shows a structured history of what Windlass
+received and did, including when each thing happened and when it was processed.
+The dashboard is served as server-rendered HTML and reached through the LAN and
+Tailscale. The dashboard also lets the user pause all of
 Windlass's own requests to MAM. This control does not pause torrent-client
 tracker communication. The pause persists across restarts until the user
 explicitly resumes requests.
