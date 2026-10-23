@@ -42,13 +42,21 @@ let
         *) echo "unknown VPN server: $server" >&2; exit 2 ;;
       esac
 
+      # wg-quick only strips files named after an interface. Write the result to
+      # a file so a failure stops this unit instead of configuring nothing.
+      umask 077
+      work="$(mktemp -d)"
+      trap 'rm -rf "$work"' EXIT
+      cp "$conf" "$work/wg0.conf"
+      wg-quick strip "$work/wg0.conf" > "$work/setconf"
+
       # Replace any previous tunnel; traffic fails until the new one is up.
       ip -n ${ns} link del wg0 2>/dev/null || true
       # Created in the host namespace so its UDP socket uses the host's uplink,
       # then moved so the namespace's only internet route is the tunnel.
       ip link add wg0 type wireguard
       ip link set wg0 netns ${ns}
-      ${nsExec} wg setconf wg0 <(wg-quick strip "$conf")
+      ${nsExec} wg setconf wg0 "$work/setconf"
       awk -F '=' '
         tolower($1) ~ /^[[:space:]]*address[[:space:]]*$/ {
           n = split($2, addresses, ",")
