@@ -35,3 +35,12 @@ check: build fmt-check clippy test prose workflow-check
 
 coverage:
     cargo llvm-cov --locked --all-targets --all-features --summary-only
+
+# Build and test the Nix package.
+nix-build:
+    nix build .#windlass
+
+# Boot the NixOS module with fake VPN servers and check the privacy boundary.
+vm-test:
+    nix build .#checks.x86_64-linux.vpn.driver -o result-vm-test
+    ./result-vm-test/bin/nixos-test-driver
