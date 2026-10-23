@@ -17,7 +17,8 @@ let
   hostVeth = "${ns}-host";
   nsVeth = "${ns}-ns";
   ip = "${pkgs.iproute2}/bin/ip";
-  nsExec = "${ip} netns exec ${ns}";
+  # nsenter, unlike `ip netns exec`, does not bind-mount /etc/netns over /etc.
+  nsExec = "${pkgs.util-linux}/bin/nsenter --net=/run/netns/${ns}";
   resolvConf = "netns/${ns}/resolv.conf";
 
   # Only the configured server names map to a configuration file; anything else
@@ -47,7 +48,7 @@ let
       # then moved so the namespace's only internet route is the tunnel.
       ip link add wg0 type wireguard
       ip link set wg0 netns ${ns}
-      ip netns exec ${ns} wg setconf wg0 <(wg-quick strip "$conf")
+      ${nsExec} wg setconf wg0 <(wg-quick strip "$conf")
       awk -F '=' '
         tolower($1) ~ /^[[:space:]]*address[[:space:]]*$/ {
           n = split($2, addresses, ",")
