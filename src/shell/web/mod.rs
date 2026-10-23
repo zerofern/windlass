@@ -281,6 +281,7 @@ async fn set_api_cookie(AppState(app): AppState<App>, Form(form): Form<CookieFor
         Err(error) => rejected(
             &app,
             &SettingsForm {
+                api_cookie: Some(form.cookie),
                 api_cookie_error: Some(error.to_string()),
                 ..SettingsForm::default()
             },

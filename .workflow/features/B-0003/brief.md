@@ -70,9 +70,8 @@ Acceptance:
   - SQLite, edited from the dashboard: operational settings such as the MAM API
     cookie, the ntfy topic, disk thresholds, and the history size bound. Later
     features add their own settings here.
-- Secrets, including the MAM API cookie, are write-only. The dashboard can set,
-  replace, or clear them and show whether one is configured, but never shows
-  their value.
+- The dashboard shows the MAM API cookie so the user can check it, and can set,
+  replace, or clear it. Secrets never appear in history or other logs.
 - Each change is acknowledged as saved only after the save succeeds, following
   [Application foundation S4](../B-0008/brief.md#s4-acknowledge-durable-changes-truthfully).
 - Invalid values are rejected with a reason and do not replace the saved value.

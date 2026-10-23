@@ -131,11 +131,11 @@ dd { margin: 0; overflow-wrap: anywhere; }
 dl.setting { display: grid; }
 .setting label { font-weight: 600; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-input[type="password"], input[type="text"], input[type="datetime-local"], select {
+input[type="text"], input[type="datetime-local"], select {
   min-height: 44px; padding: 0 12px; border: 1px solid var(--field); border-radius: 6px;
   font: inherit; background: var(--surface); color: var(--ink);
 }
-input[type="password"] { flex: 1 1 280px; font-family: var(--mono); }
+#cookie { flex: 1 1 280px; font-family: var(--mono); }
 input[aria-invalid="true"] { border: 2px solid var(--error); }
 .field-error { color: var(--error); font-size: 14px; }
 

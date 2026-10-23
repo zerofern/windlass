@@ -343,7 +343,10 @@ async fn settings_are_validated_saved_and_secrets_never_shown() -> TestResult {
         .await?;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body.contains("cookie-error"));
-    assert!(!body.contains("has space"));
+    assert!(
+        body.contains("value=\"has space\""),
+        "the rejected value is shown again"
+    );
     let (status, _, _) = dashboard
         .post("/settings/api-cookie", "cookie=secret-value%3D")
         .await?;
@@ -365,7 +368,10 @@ async fn settings_are_validated_saved_and_secrets_never_shown() -> TestResult {
     assert!(page.contains("Replace"));
     assert!(page.contains("Clear"));
     assert!(page.contains("windlass.example.ts.net"));
-    assert!(!page.contains("secret-value"));
+    assert!(
+        page.contains("value=\"secret-value=\""),
+        "the cookie is shown"
+    );
     let (_, status_page) = dashboard.get("/").await?;
     assert!(!status_page.contains("Set up MAM access"));
     let (_, history) = dashboard.get("/history?kind=settings").await?;

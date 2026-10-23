@@ -44,7 +44,7 @@ times; it works without the script, without live updates. It shows:
 - **History:** every event the core handled, with the actions it returned, when the
   event happened, and when it was processed. Filter by kind and time; page through
   older entries. Secrets are recorded as `[redacted]`.
-- **Settings:** the write-only MAM API cookie and the history size limit, each
+- **Settings:** the MAM API cookie and the history size limit, each
   confirmed only once saved, plus the read-only deployment settings.
 
 History lives in the same SQLite file. The core counts entries and asks the shell to

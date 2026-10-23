@@ -298,6 +298,7 @@ fn settings_live(observation: &Observation) -> Markup {
 pub(super) struct SettingsForm {
     pub(super) history_limit: Option<String>,
     pub(super) history_limit_error: Option<String>,
+    pub(super) api_cookie: Option<String>,
     pub(super) api_cookie_error: Option<String>,
 }
 
@@ -323,10 +324,13 @@ pub(super) fn settings(
                             label for="cookie" { "MAM API cookie" }
                             span class={ "tag " (cookie_tone) } data-live="api-cookie-status" { (cookie) }
                         }
-                        p.hint { "Paste the mam_id value of an IP- or ASN-locked session with seedbox permission. It is never shown after it is saved." }
+                        p.hint { "Paste the mam_id value of an IP- or ASN-locked session with seedbox permission." }
                         div.row {
-                            input #cookie type="password" name="cookie" autocomplete="off"
+                            input #cookie type="text" name="cookie" autocomplete="off" spellcheck="false"
                                 placeholder="mam_id value"
+                                value=[form.api_cookie.clone().or_else(|| {
+                                    settings.api_cookie.requested.as_ref().map(|cookie| cookie.expose_secret().to_owned())
+                                })]
                                 aria-invalid=[form.api_cookie_error.as_ref().map(|_| "true")]
                                 aria-describedby=[form.api_cookie_error.as_ref().map(|_| "cookie-error")];
                             button.primary type="submit" {
