@@ -6,9 +6,12 @@ Feature ID: B-0007
 ## Goal
 
 Native qbittorrent-nox on NixOS is the client. Windlass communicates with its
-web UI on loopback inside the VPN namespace. Windlass adds the torrents it
-acquires through MAM bookmarks and removes a torrent when its book is deleted to
-free disk space. Torrents Windlass did not add remain visible and untouched.
+web UI on loopback inside the VPN namespace. Windlass manages every torrent in
+qBittorrent; the owner does not add or remove torrents by hand. Windlass adds the
+torrents it acquires through MAM bookmarks and removes a torrent when its book is
+deleted to free disk space. A torrent already in qBittorrent without a Windlass
+record, such as one present before Windlass was installed, is adopted rather than
+ignored; how its MAM torrent ID and history are established remains to be agreed.
 
 MAM allows qBittorrent 5.0.1 to the latest 5.2.x and recommends 5.2.x; non-release
 versions are not allowed. nixos-26.05 provides 5.2.2. The NixOS module refuses a
@@ -145,6 +148,6 @@ Submission and cleanup (S1, S2) follow MAM acquisition.
   torrent-hash formats.
 - Whether to adopt stopped submission followed by explicit start.
 - Reconciliation deadlines and retry timing for submissions.
-- Save paths, ownership of existing torrents, category/tags, concurrent downloads,
-  and disk-space reservation.
+- Save paths, category/tags, concurrent downloads, and disk-space reservation.
+- How adopted torrents are matched to MAM torrent IDs and acquisition history.
 - Whether staged downloads may start while MAM contact is explicitly paused.
