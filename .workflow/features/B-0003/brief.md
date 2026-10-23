@@ -66,7 +66,7 @@ Acceptance:
   - NixOS module: deployment facts such as bind address, filesystem paths, and
     the qBittorrent endpoint. The dashboard may display these but cannot change them.
   - SQLite, edited from the dashboard: operational settings such as the MAM API
-    cookie, the ntfy topic, and disk thresholds. Later
+    cookie, the ntfy topic, disk thresholds, and the history size bound. Later
     features add their own settings here.
 - Secrets, including the MAM API cookie, are write-only. The dashboard can set,
   replace, or clear them and show whether one is configured, but never shows
@@ -97,9 +97,12 @@ Acceptance:
 - Secrets never appear in the log. A cookie change is recorded as "replaced",
   without the value.
 - The dashboard can filter history by kind and time range.
-- History is stored in SQLite and kept within a size bound. The core decides
-  when the bound is exceeded and which oldest entries to remove; the shell only
-  carries out the removal. Trimming is itself recorded in history.
+- History is stored in SQLite and kept within a maximum entry count, 10,000 by
+  default and changeable in the dashboard settings. The core decides when the
+  bound is exceeded and which oldest entries to remove; the shell only carries
+  out the removal. Trimming is itself recorded in history.
+- History is information for the user and for debugging. It is not the source
+  of truth: restart restores saved state and does not replay history.
 
 ## Feature-wide constraints and acceptance
 
@@ -128,8 +131,9 @@ history log and its viewer.
 ## Non-goals
 
 Feature-specific status panels and settings beyond those listed in S1 and S3
-belong to their own briefs. Remote access other than the LAN and Tailscale, user
-accounts, and multi-user access are excluded. Notifications belong to
+belong to their own briefs. History export, remote access other than the LAN and
+Tailscale, user accounts, and multi-user access are excluded. Notifications
+belong to
 [B-0002](../../backlog.md#b-0002-important-event-notifications).
 
 ## Related records
@@ -146,18 +150,16 @@ accounts, and multi-user access are excluded. Notifications belong to
 Agreed with the owner: server-rendered HTML without Node, the configuration
 split above, LAN and Tailscale access without a login, framework ownership in
 this brief with panels in feature briefs, a structured history of all events
-and actions stored in SQLite and trimmed by the core, and pause as the only way
-to disable MAM contact.
+and actions stored in SQLite and trimmed by the core to a configurable 10,000
+entries by default, history as information for the user and for debugging only
+with no export, and pause as the only way to disable MAM contact.
 
 Proposed, pending agreement:
 
-- History is a record for the user, not the source of truth. Restart restores
-  saved state and does not replay the log.
 - History entries carry wall-clock timestamps for display. Processing order is
   recorded separately, so clock changes cannot reorder entries.
-- The size bound is a maximum entry count set in the dashboard. Trimming removes
-  enough oldest entries to stay comfortably under it, rather than deleting one
-  entry per new write.
+- Trimming removes enough oldest entries to stay comfortably under the bound,
+  rather than deleting one entry per new write.
 - A fresh installation starts paused. The user configures the API cookie and
   then resumes to begin MAM contact.
 - A failed history write does not stop the core. The gap is recorded as an
@@ -165,8 +167,3 @@ Proposed, pending agreement:
   is not.
 - Routine status-publishing actions are recorded but hidden by default in the
   viewer, so that periodic work does not crowd out meaningful entries.
-
-Still open:
-
-- What is the default history size bound?
-- Should history be exportable, for example as JSON lines?
