@@ -46,6 +46,8 @@ pub enum Event {
     PortForwarding(PortForwardingEvent),
     /// qBittorrent commands and web UI API results.
     Qbittorrent(QbittorrentEvent),
+    /// Torrent registry storage results.
+    Registry(RegistryEvent),
 }
 
 /// An effect requested by the core for the shell to execute.
@@ -115,6 +117,18 @@ pub enum Action {
         /// The forwarded port.
         port: Port,
     },
+    /// Change qBittorrent to match the torrent registry.
+    QbittorrentCommand {
+        /// The change.
+        command: TorrentCommand,
+    },
+    /// Read every torrent registry row.
+    ReadTorrentRegistry,
+    /// Insert or replace these registry rows in one transaction.
+    SaveTorrents {
+        /// The rows as they are now.
+        records: Vec<TorrentRecord>,
+    },
 }
 
 mod history;
@@ -122,6 +136,7 @@ mod machine;
 mod mam_pause;
 mod port_forwarding;
 mod qbittorrent;
+mod registry;
 mod settings;
 mod startup;
 mod timer;
@@ -137,8 +152,12 @@ pub use port_forwarding::{
 };
 pub use qbittorrent::{
     Activity, ByteSize, ClientVersion, MamApproval, POLL_INTERVAL, Progress, Qbittorrent,
-    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Session, SyncPosition,
-    SyncUpdate, Torrent, TorrentHash, TorrentState, TorrentUpdate,
+    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Ratio, Session, SyncPosition,
+    SyncUpdate, Torrent, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
+};
+pub use registry::{
+    COUNTER_SAVE_INTERVAL, Desired, Identity, MamTorrentId, Observation, Origin, RecordId, Records,
+    Registry, RegistryEvent, TorrentRecord,
 };
 pub use settings::{
     ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, Setting,

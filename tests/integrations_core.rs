@@ -204,7 +204,15 @@ fn versions_follow_mams_client_list() {
         let parsed = ClientVersion::parse(version).map(ClientVersion::mam_approval);
         assert_eq!(parsed, Some(approval), "{version}");
     }
-    for invalid in ["v5.2.2beta1", "v5.2.2.1", "5", "latest"] {
+    for invalid in [
+        "v5.2.2beta1",
+        "v5.2.2.1",
+        "5",
+        "latest",
+        "x.2",
+        "5.x",
+        "5.x.1",
+    ] {
         assert_eq!(ClientVersion::parse(invalid), None, "{invalid}");
     }
     assert_eq!(
@@ -242,6 +250,7 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
                     state: Some(TorrentState::Downloading),
                     progress: Some(Progress::from_fraction(0.25)),
                     size: Some(ByteSize(100)),
+                    ..TorrentUpdate::default()
                 },
             ),
             (hash('b'), TorrentUpdate::default()),

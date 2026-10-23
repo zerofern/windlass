@@ -740,6 +740,7 @@ mod tests {
             history,
             port_forwarding: PortForwarding::Disabled,
             qbittorrent: Qbittorrent::Disabled,
+            registry: crate::core::Registry::Unread,
             last_event: None,
             storage_error: None,
         }
@@ -970,6 +971,7 @@ mod tests {
                         state: Some(TorrentState::Stopped { complete: false }),
                         progress: Some(Progress::from_fraction(0.5)),
                         size: Some(ByteSize(1536)),
+                        ..TorrentUpdate::default()
                     },
                 ),
                 (

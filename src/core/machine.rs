@@ -1,7 +1,7 @@
 use super::{
     Action, ClockReading, Event, HistoryState, MamPreferencePersistence, MamPreferenceState,
-    MamPreferenceUpdate, PortForwarding, Qbittorrent, SettingsState, Step, TimerName, mam_pause,
-    settings, startup, timer::Timers,
+    MamPreferenceUpdate, PortForwarding, Qbittorrent, Registry, SettingsState, Step, TimerName,
+    mam_pause, settings, startup, timer::Timers,
 };
 
 /// Owns application state and makes decisions without performing I/O.
@@ -12,6 +12,7 @@ pub struct Core {
     history: HistoryState,
     port_forwarding: PortForwarding,
     qbittorrent: Qbittorrent,
+    registry: Registry,
     timers: Timers,
     step: Step,
 }
@@ -63,6 +64,7 @@ impl Core {
             history: HistoryState::Closed,
             port_forwarding: PortForwarding::Disabled,
             qbittorrent: Qbittorrent::Disabled,
+            registry: Registry::Unread,
             timers: Timers::new(),
             step: Step::ZERO,
         }
@@ -82,6 +84,7 @@ impl Core {
                 if opening && matches!(self.state, State::ReadingMamPreference { .. }) {
                     actions.extend(self.settings.start_reading());
                     actions.extend(self.history.open(self.step));
+                    actions.extend(self.registry.start_reading());
                 }
                 actions
             }
@@ -93,25 +96,29 @@ impl Core {
             }
             Event::TimerExpired { name, id } => match name {
                 TimerName::PortLease => self.port_forwarding.timer_expired(id),
-                TimerName::QbittorrentPoll => self.qbittorrent.timer_expired(
-                    id,
-                    occurred_at,
-                    &mut self.timers,
-                    self.port_forwarding.forwarded_port(),
-                ),
+                TimerName::QbittorrentPoll => self.qbittorrent.timer_expired(id),
             },
             Event::PortForwarding(event) => {
                 self.port_forwarding
                     .handle(occurred_at, event, &mut self.timers)
             }
-            Event::Qbittorrent(event) => self.qbittorrent.handle(
-                occurred_at,
-                event,
-                &mut self.timers,
-                self.port_forwarding.forwarded_port(),
-            ),
+            Event::Qbittorrent(event) => {
+                self.qbittorrent
+                    .handle(occurred_at, event, &mut self.timers)
+            }
+            Event::Registry(event) => self.registry.handle(occurred_at.monotonic, event),
         };
         self.port_forwarding.expire(occurred_at.monotonic);
+        if let Some((session, true)) = self.qbittorrent.deciding() {
+            actions.extend(self.registry.observe(occurred_at, session));
+        }
+        let registry = &mut self.registry;
+        actions.extend(self.qbittorrent.decide(
+            occurred_at,
+            &mut self.timers,
+            self.port_forwarding.forwarded_port(),
+            |session| registry.command(occurred_at.monotonic, session),
+        ));
         actions.extend(
             self.qbittorrent
                 .follow_forwarded_port(self.port_forwarding.forwarded_port()),
@@ -145,6 +152,12 @@ impl Core {
     #[must_use]
     pub const fn qbittorrent(&self) -> &Qbittorrent {
         &self.qbittorrent
+    }
+
+    /// Inspect the torrent registry.
+    #[must_use]
+    pub const fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Inspect what the core knows about stored history.

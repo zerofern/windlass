@@ -580,24 +580,28 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
     assert!(matches!(observation.history, HistoryState::Open { .. }));
     dashboard.stop().await?;
 
-    // Version 2 storage gains the routine marker.
-    let version_two = tempfile::tempdir()?;
-    let version_two_path = version_two.path().join("windlass.sqlite");
-    Dashboard::start_at(None, version_two_path.clone(), StartupMode::Initialise)
-        .await?
-        .stop()
-        .await?;
-    Connection::open(&version_two_path)?
-        .execute_batch("ALTER TABLE history DROP COLUMN routine; PRAGMA user_version = 2;")?;
-    let dashboard =
-        Dashboard::start_at(Some(version_two), version_two_path, StartupMode::Resume).await?;
-    assert!(matches!(
-        dashboard.observations.borrow().history,
-        HistoryState::Open { .. }
-    ));
-    let (_, history) = dashboard.get("/history").await?;
-    assert!(history.contains("Startup requested (resume existing storage)"));
-    dashboard.stop().await?;
+    // Version 2 storage gains the routine marker, and versions 2 and 3 the registry.
+    for downgrade in [
+        "DROP TABLE torrents; DROP TABLE vpn_state; \
+         ALTER TABLE history DROP COLUMN routine; PRAGMA user_version = 2;",
+        "DROP TABLE torrents; DROP TABLE vpn_state; PRAGMA user_version = 3;",
+    ] {
+        let older = tempfile::tempdir()?;
+        let older_path = older.path().join("windlass.sqlite");
+        Dashboard::start_at(None, older_path.clone(), StartupMode::Initialise)
+            .await?
+            .stop()
+            .await?;
+        Connection::open(&older_path)?.execute_batch(downgrade)?;
+        let dashboard = Dashboard::start_at(Some(older), older_path, StartupMode::Resume).await?;
+        assert!(matches!(
+            dashboard.observations.borrow().history,
+            HistoryState::Open { .. }
+        ));
+        let (_, history) = dashboard.get("/history").await?;
+        assert!(history.contains("Startup requested (resume existing storage)"));
+        dashboard.stop().await?;
+    }
 
     let newer = tempfile::tempdir()?;
     let newer_path = newer.path().join("windlass.sqlite");

@@ -2,8 +2,10 @@
 //! gateway on loopback.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     net::{SocketAddr, SocketAddrV4},
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -19,8 +21,9 @@ use serde_json::{Value, json};
 use tokio::{net::UdpSocket, sync::watch};
 use windlass::{
     core::{
-        Event, MamApproval, MappingFailure, Port, PortForwarding, Qbittorrent, QbittorrentFailure,
-        StartupEvent, StartupMode, State as CoreState, TorrentState,
+        ByteSize, Desired, Event, MamApproval, MappingFailure, Port, PortForwarding, Qbittorrent,
+        QbittorrentFailure, Ratio, Registry, StartupEvent, StartupMode, State as CoreState,
+        TorrentHash, TorrentState,
     },
     runner::{Observation, Runner},
     shell::Integrations,
@@ -30,10 +33,40 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
+#[derive(Debug, Clone)]
+struct FakeTorrent {
+    state: &'static str,
+    size: u64,
+    total_size: u64,
+}
+
 #[derive(Debug, Default)]
 struct FakeQbittorrent {
     listen_port: u16,
     port_changes: Vec<u16>,
+    torrents: BTreeMap<String, FakeTorrent>,
+    commands: Vec<String>,
+}
+
+impl FakeQbittorrent {
+    fn with(torrents: &[(&str, FakeTorrent)]) -> Shared {
+        Arc::new(Mutex::new(Self {
+            listen_port: 6881,
+            torrents: torrents
+                .iter()
+                .map(|(hash, torrent)| ((*hash).to_owned(), torrent.clone()))
+                .collect(),
+            ..Self::default()
+        }))
+    }
+}
+
+const fn complete(state: &'static str) -> FakeTorrent {
+    FakeTorrent {
+        state,
+        size: 1_073_741_824,
+        total_size: 1_073_741_824,
+    }
 }
 
 type Shared = Arc<Mutex<FakeQbittorrent>>;
@@ -72,20 +105,97 @@ async fn set_preferences(State(fake): State<Shared>, Form(form): Form<Preference
     }
 }
 
-async fn maindata(Query(rid): Query<Rid>) -> Json<Value> {
-    Json(match rid.rid {
-        0 => json!({
-            "rid": 1,
-            "full_update": true,
-            "torrents": { HASH: {
+/// Every answer is a full list, which qBittorrent may send at any time.
+async fn maindata(State(fake): State<Shared>, Query(rid): Query<Rid>) -> Json<Value> {
+    let torrents = fake
+        .lock()
+        .map(|fake| fake.torrents.clone())
+        .unwrap_or_default();
+    let torrents: serde_json::Map<String, Value> = torrents
+        .into_iter()
+        .map(|(hash, torrent)| {
+            let fields = json!({
                 "name": "A Synthetic Audiobook",
-                "state": "stalledUP",
+                "state": torrent.state,
                 "progress": 1.0,
-                "size": 1_073_741_824_u64
-            } }
-        }),
-        rid => json!({ "rid": rid + 1 }),
-    })
+                "size": torrent.size,
+                "total_size": torrent.total_size,
+                "completed": torrent.size,
+                "uploaded": 2048,
+                "ratio": 1.5,
+                "seeding_time": 3600,
+                "added_on": 1_700_000_000,
+                "completion_on": -1,
+                "content_path": "/srv/books/A Synthetic Audiobook",
+                "save_path": "/srv/books"
+            });
+            (hash, fields)
+        })
+        .collect();
+    Json(json!({ "rid": rid.rid + 1, "full_update": true, "torrents": torrents }))
+}
+
+#[derive(Deserialize)]
+struct Hashes {
+    hashes: String,
+    #[serde(rename = "deleteFiles")]
+    delete_files: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FilePriority {
+    hash: String,
+    id: String,
+    priority: String,
+}
+
+#[derive(Deserialize)]
+struct Hash {
+    hash: String,
+}
+
+fn record(fake: &Shared, change: impl FnOnce(&mut FakeQbittorrent) -> String) {
+    if let Ok(mut fake) = fake.lock() {
+        let command = change(&mut fake);
+        fake.commands.push(command);
+    }
+}
+
+async fn start(State(fake): State<Shared>, Form(form): Form<Hashes>) {
+    record(&fake, |fake| {
+        for hash in form.hashes.split('|') {
+            if let Some(torrent) = fake.torrents.get_mut(hash) {
+                torrent.state = "downloading";
+            }
+        }
+        format!("start {}", form.hashes)
+    });
+}
+
+async fn delete(State(fake): State<Shared>, Form(form): Form<Hashes>) {
+    record(&fake, |fake| {
+        for hash in form.hashes.split('|') {
+            fake.torrents.remove(hash);
+        }
+        format!(
+            "delete {} {}",
+            form.hashes,
+            form.delete_files.unwrap_or_default()
+        )
+    });
+}
+
+async fn files(Query(hash): Query<Hash>) -> Json<Value> {
+    Json(json!([{ "index": 0, "name": hash.hash }, { "index": 1, "name": "cover.jpg" }]))
+}
+
+async fn file_priority(State(fake): State<Shared>, Form(form): Form<FilePriority>) {
+    record(&fake, |fake| {
+        if let Some(torrent) = fake.torrents.get_mut(&form.hash) {
+            torrent.size = torrent.total_size;
+        }
+        format!("filePrio {} {} {}", form.hash, form.id, form.priority)
+    });
 }
 
 async fn fake_qbittorrent(fake: Shared) -> TestResult<SocketAddr> {
@@ -96,6 +206,10 @@ async fn fake_qbittorrent(fake: Shared) -> TestResult<SocketAddr> {
         .route("/api/v2/app/preferences", get(preferences))
         .route("/api/v2/app/setPreferences", post(set_preferences))
         .route("/api/v2/sync/maindata", get(maindata))
+        .route("/api/v2/torrents/start", post(start))
+        .route("/api/v2/torrents/delete", post(delete))
+        .route("/api/v2/torrents/files", get(files))
+        .route("/api/v2/torrents/filePrio", post(file_priority))
         .with_state(fake);
     tokio::spawn(async move { axum::serve(listener, routes).await });
     Ok(address)
@@ -130,23 +244,32 @@ async fn fake_gateway(answer: Result<u16, u16>) -> TestResult<SocketAddrV4> {
     Ok(address)
 }
 
+fn database(directory: &Path) -> std::path::PathBuf {
+    directory.join("windlass.sqlite")
+}
+
 struct Running {
     events: windlass::shell::EventSender,
     observations: watch::Receiver<Observation>,
     runner: tokio::task::JoinHandle<Result<CoreState, Box<dyn Error + Send + Sync>>>,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
 }
 
 async fn run(integrations: Integrations) -> TestResult<Running> {
-    let directory = tempfile::tempdir()?;
+    run_in(tempfile::tempdir()?, StartupMode::Initialise, integrations).await
+}
+
+async fn run_in(
+    directory: tempfile::TempDir,
+    mode: StartupMode,
+    integrations: Integrations,
+) -> TestResult<Running> {
     let enable = integrations.enable_events();
     let (runner, events, observations) =
-        Runner::with_integrations(directory.path().join("windlass.sqlite"), integrations);
+        Runner::with_integrations(database(directory.path()), integrations);
     let runner = tokio::spawn(runner.run());
     events
-        .send(Event::Startup(StartupEvent::Start {
-            mode: StartupMode::Initialise,
-        }))
+        .send(Event::Startup(StartupEvent::Start { mode }))
         .await?;
     for event in enable {
         events.send(event).await?;
@@ -155,7 +278,7 @@ async fn run(integrations: Integrations) -> TestResult<Running> {
         events,
         observations,
         runner,
-        _directory: directory,
+        directory,
     })
 }
 
@@ -172,14 +295,18 @@ impl Running {
         self.events.shutdown().await?;
         tokio::time::timeout(Duration::from_secs(20), self.runner).await??
     }
+
+    /// Stop, keeping the storage directory.
+    async fn stop_keeping(self) -> TestResult<tempfile::TempDir> {
+        self.events.shutdown().await?;
+        let _ = tokio::time::timeout(Duration::from_secs(20), self.runner).await??;
+        Ok(self.directory)
+    }
 }
 
 #[tokio::test]
 async fn qbittorrent_listens_on_the_forwarded_port() -> TestResult {
-    let fake = Arc::new(Mutex::new(FakeQbittorrent {
-        listen_port: 6881,
-        port_changes: Vec::new(),
-    }));
+    let fake = FakeQbittorrent::with(&[(HASH, complete("stalledUP"))]);
     let webui = fake_qbittorrent(Arc::clone(&fake)).await?;
     let gateway = fake_gateway(Ok(41000)).await?;
     let running = run(Integrations {
@@ -332,5 +459,86 @@ async fn silent_gateways_time_out() -> TestResult {
         Qbittorrent::Disabled
     );
     running.stop().await?;
+    Ok(())
+}
+
+const PARTIAL: &str = "1111111111111111111111111111111111111111";
+const UNWANTED: &str = "2222222222222222222222222222222222222222";
+
+#[tokio::test]
+async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
+    // A first run adopts the unwanted torrent; the owner then marks it removed.
+    let fake = FakeQbittorrent::with(&[(UNWANTED, complete("stalledUP"))]);
+    let webui = fake_qbittorrent(Arc::clone(&fake)).await?;
+    let integrations = Integrations {
+        qbittorrent: Some(format!("http://{webui}/").parse()?),
+        nat_pmp_gateway: None,
+    };
+    let running = run(integrations.clone()).await?;
+    running
+        .wait(|observation| match &observation.registry {
+            Registry::Loaded(records) => records.records().count() == 1,
+            _ => false,
+        })
+        .await?;
+    let directory = running.stop_keeping().await?;
+    rusqlite::Connection::open(database(directory.path()))?
+        .execute_batch("UPDATE torrents SET desired = 'removed';")?;
+
+    if let Ok(mut fake) = fake.lock() {
+        fake.torrents.insert(
+            PARTIAL.to_owned(),
+            FakeTorrent {
+                state: "stoppedDL",
+                size: 5,
+                total_size: 10,
+            },
+        );
+    }
+    let running = run_in(directory, StartupMode::Resume, integrations).await?;
+    let partial = TorrentHash::parse(PARTIAL).ok_or("hash")?;
+    let observation = running
+        .wait(|observation| match &observation.qbittorrent {
+            Qbittorrent::Connected(session) => session
+                .torrents
+                .get(&partial)
+                .is_some_and(|torrent| torrent.state == TorrentState::Downloading),
+            _ => false,
+        })
+        .await?;
+    assert_eq!(
+        fake.lock().map(|fake| fake.commands.clone()).ok(),
+        Some(vec![
+            format!("delete {UNWANTED} true"),
+            format!("filePrio {PARTIAL} 0|1 1"),
+            format!("start {PARTIAL}"),
+        ])
+    );
+    let Registry::Loaded(records) = &observation.registry else {
+        return Err("registry not loaded".into());
+    };
+    let unwanted = TorrentHash::parse(UNWANTED).ok_or("hash")?;
+    assert_eq!(
+        records.find(&unwanted).map(|row| row.desired),
+        Some(Desired::Removed)
+    );
+    let seen = records
+        .find(&partial)
+        .and_then(|row| row.observation.clone())
+        .ok_or("partial torrent not observed")?;
+    assert_eq!(seen.torrent.total_size, ByteSize(10));
+    assert_eq!(seen.torrent.uploaded, ByteSize(2048));
+    assert_eq!(seen.torrent.ratio, Ratio(1500));
+    assert_eq!(seen.torrent.seeding_time, Duration::from_hours(1));
+    assert_eq!(seen.torrent.completed_at, None);
+    assert!(seen.torrent.added_at.is_some());
+    assert_eq!(seen.torrent.save_path.as_deref(), Some("/srv/books"));
+    let directory = running.stop_keeping().await?;
+    let rows: i64 = rusqlite::Connection::open(database(directory.path()))?.query_row(
+        "SELECT count(*) FROM torrents WHERE observed_save_path = '/srv/books'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(rows, 2, "both rows and their observations are saved");
     Ok(())
 }

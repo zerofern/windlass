@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use tokio::sync::watch;
 
 use crate::{
-    core::{Core, HistoryState, PortForwarding, Qbittorrent, SettingsState, State, TimedEvent},
+    core::{
+        Core, HistoryState, PortForwarding, Qbittorrent, Registry, SettingsState, State, TimedEvent,
+    },
     shell::{EventSender, Integrations, Shell, ShellResult, read_clock},
 };
 
@@ -22,10 +24,27 @@ pub struct Observation {
     pub port_forwarding: PortForwarding,
     /// What the core knows about qBittorrent.
     pub qbittorrent: Qbittorrent,
+    /// The torrent registry.
+    pub registry: Registry,
     /// The most recently handled event, absent before the first input.
     pub last_event: Option<TimedEvent>,
     /// The latest storage error, retained across subsequent state updates.
     pub storage_error: Option<String>,
+}
+
+impl Observation {
+    fn of(core: &Core, last_event: Option<TimedEvent>, storage_error: Option<String>) -> Self {
+        Self {
+            state: core.state().clone(),
+            settings: core.settings().clone(),
+            history: *core.history(),
+            port_forwarding: *core.port_forwarding(),
+            qbittorrent: core.qbittorrent().clone(),
+            registry: core.registry().clone(),
+            last_event,
+            storage_error,
+        }
+    }
 }
 
 /// Owns the core and consumes one event stream, independently of input sources.
@@ -56,15 +75,7 @@ impl Runner {
     ) -> (Self, EventSender, watch::Receiver<Observation>) {
         let core = Core::new();
         let (shell, events) = Shell::new(database, integrations);
-        let (observations, receiver) = watch::channel(Observation {
-            state: core.state().clone(),
-            settings: core.settings().clone(),
-            history: *core.history(),
-            port_forwarding: *core.port_forwarding(),
-            qbittorrent: core.qbittorrent().clone(),
-            last_event: None,
-            storage_error: None,
-        });
+        let (observations, receiver) = watch::channel(Observation::of(&core, None, None));
         (
             Self {
                 core,
@@ -97,15 +108,11 @@ impl Runner {
             for action in actions {
                 self.shell.dispatch(action);
             }
-            self.observations.send_replace(Observation {
-                state: self.core.state().clone(),
-                settings: self.core.settings().clone(),
-                history: *self.core.history(),
-                port_forwarding: *self.core.port_forwarding(),
-                qbittorrent: self.core.qbittorrent().clone(),
-                last_event: Some(event),
-                storage_error: self.shell.latest_storage_error().cloned(),
-            });
+            self.observations.send_replace(Observation::of(
+                &self.core,
+                Some(event),
+                self.shell.latest_storage_error().cloned(),
+            ));
         }
         self.shell.finish().await?;
         Ok(self.core.state().clone())

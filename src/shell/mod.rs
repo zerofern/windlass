@@ -200,6 +200,11 @@ impl Shell {
             Action::SetQbittorrentListenPort { port } => {
                 return self.qbittorrent(qbittorrent::Request::SetListenPort(port));
             }
+            Action::QbittorrentCommand { command } => {
+                return self.qbittorrent(qbittorrent::Request::Command(command));
+            }
+            Action::ReadTorrentRegistry => Operation::ReadTorrentRegistry,
+            Action::SaveTorrents { records } => Operation::SaveTorrents(records),
             Action::OpenStorage { mode } => Operation::OpenStorage(mode),
             Action::ReadMamRequestMode => Operation::ReadMamRequestMode,
             Action::WriteMamRequestMode { mode } => Operation::WriteMamRequestMode(mode),

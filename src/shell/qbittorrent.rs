@@ -3,36 +3,38 @@
 //! Windlass reaches the web UI on loopback inside the VPN namespace, where the
 //! NixOS module disables web UI authentication for local clients.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use reqwest::{Client as HttpClient, Response, Url};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::core::{
-    ByteSize, Port, Progress, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences,
-    SyncPosition, SyncUpdate, TorrentHash, TorrentState, TorrentUpdate,
+    ByteSize, Port, Progress, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Ratio,
+    SyncPosition, SyncUpdate, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The requests the core can make of qBittorrent.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) enum Request {
     Connect,
     Sync(SyncPosition),
     ReadPreferences,
     SetListenPort(Port),
+    Command(TorrentCommand),
 }
 
 impl Request {
     /// The core event reporting that this request failed.
-    const fn failed(self, reason: QbittorrentFailure) -> QbittorrentEvent {
+    const fn failed(&self, reason: QbittorrentFailure) -> QbittorrentEvent {
         match self {
             Self::Connect => QbittorrentEvent::ConnectFailed { reason },
             Self::Sync(_) => QbittorrentEvent::SyncFailed { reason },
             Self::ReadPreferences => QbittorrentEvent::PreferencesReadFailed { reason },
             Self::SetListenPort(_) => QbittorrentEvent::ListenPortSetFailed { reason },
+            Self::Command(_) => QbittorrentEvent::CommandFailed { reason },
         }
     }
 }
@@ -40,7 +42,7 @@ impl Request {
 /// Perform a request; without a configured web UI it fails as unreachable.
 pub(super) async fn execute(client: Option<&Client>, request: Request) -> QbittorrentEvent {
     let outcome = match client {
-        Some(client) => client.perform(request).await,
+        Some(client) => client.perform(&request).await,
         None => Err(QbittorrentFailure::Unreachable),
     };
     outcome.unwrap_or_else(|reason| request.failed(reason))
@@ -67,18 +69,22 @@ impl Client {
         Self { http, base }
     }
 
-    async fn perform(&self, request: Request) -> Outcome<QbittorrentEvent> {
+    async fn perform(&self, request: &Request) -> Outcome<QbittorrentEvent> {
         match request {
             Request::Connect => self.connect().await,
-            Request::Sync(position) => self.sync(position).await.map(QbittorrentEvent::Synced),
+            Request::Sync(position) => self.sync(*position).await.map(QbittorrentEvent::Synced),
             Request::ReadPreferences => self
                 .preferences()
                 .await
                 .map(QbittorrentEvent::PreferencesRead),
             Request::SetListenPort(port) => self
-                .set_listen_port(port)
+                .set_listen_port(*port)
                 .await
                 .map(|()| QbittorrentEvent::ListenPortSet),
+            Request::Command(command) => self
+                .command(command)
+                .await
+                .map(|()| QbittorrentEvent::CommandDone),
         }
     }
 
@@ -143,15 +149,53 @@ impl Client {
         raw.into_update()
     }
 
+    async fn post(&self, path: &str, form: &[(&str, String)]) -> Outcome<()> {
+        let response = self.http.post(self.url(path)?).form(form).send().await;
+        Self::checked(response).map(drop)
+    }
+
     async fn set_listen_port(&self, port: Port) -> Outcome<()> {
         let preferences = serde_json::json!({ "listen_port": port.get() }).to_string();
-        let response = self
-            .http
-            .post(self.url("api/v2/app/setPreferences")?)
-            .form(&[("json", preferences)])
-            .send()
-            .await;
-        Self::checked(response).map(drop)
+        self.post("api/v2/app/setPreferences", &[("json", preferences)])
+            .await
+    }
+
+    async fn command(&self, command: &TorrentCommand) -> Outcome<()> {
+        let hashes = |hashes: &[TorrentHash]| {
+            hashes
+                .iter()
+                .map(TorrentHash::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        match command {
+            TorrentCommand::Start(started) => {
+                self.post("api/v2/torrents/start", &[("hashes", hashes(started))])
+                    .await
+            }
+            TorrentCommand::Remove(removed) => {
+                let form = [
+                    ("hashes", hashes(removed)),
+                    ("deleteFiles", String::from("true")),
+                ];
+                self.post("api/v2/torrents/delete", &form).await
+            }
+            TorrentCommand::SelectAllFiles(hash) => {
+                let files: Vec<Value> = self
+                    .json(&format!("api/v2/torrents/files?hash={}", hash.as_str()))
+                    .await?;
+                let ids = (0..files.len())
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let form = [
+                    ("hash", hash.as_str().to_owned()),
+                    ("id", ids),
+                    ("priority", String::from("1")),
+                ];
+                self.post("api/v2/torrents/filePrio", &form).await
+            }
+        }
     }
 }
 
@@ -193,25 +237,46 @@ impl RawSync {
 }
 
 fn torrent_update(fields: &Value) -> TorrentUpdate {
+    let text = |name| fields.get(name).and_then(Value::as_str);
+    let bytes = |name| fields.get(name).and_then(Value::as_u64).map(ByteSize);
+    // Paths are empty, and times are zero, negative, or 2^32 - 1, when not known.
+    let path = |name| text(name).map(|path| Some(path.to_owned()).filter(|path| !path.is_empty()));
+    let time = |name| {
+        fields.get(name).and_then(Value::as_i64).map(|seconds| {
+            u64::try_from(seconds)
+                .ok()
+                .filter(|seconds| *seconds > 0 && *seconds != u64::from(u32::MAX))
+                .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+        })
+    };
     TorrentUpdate {
-        name: fields
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        state: fields
-            .get("state")
-            .and_then(Value::as_str)
-            .map(torrent_state),
+        name: text("name").map(str::to_owned),
+        state: text("state").map(torrent_state),
         progress: fields
             .get("progress")
             .and_then(Value::as_f64)
             .map(Progress::from_fraction),
-        size: fields.get("size").and_then(Value::as_u64).map(ByteSize),
+        size: bytes("size"),
+        total_size: bytes("total_size"),
+        downloaded: bytes("completed"),
+        uploaded: bytes("uploaded"),
+        ratio: fields
+            .get("ratio")
+            .and_then(Value::as_f64)
+            .map(Ratio::from_float),
+        seeding_time: fields
+            .get("seeding_time")
+            .and_then(Value::as_u64)
+            .map(Duration::from_secs),
+        added_at: time("added_on"),
+        completed_at: time("completion_on"),
+        content_path: path("content_path"),
+        save_path: path("save_path"),
     }
 }
 
 /// qBittorrent's state names, from 4.x `paused*` to 5.x `stopped*`.
-fn torrent_state(state: &str) -> TorrentState {
+pub(super) fn torrent_state(state: &str) -> TorrentState {
     match state {
         "metaDL" | "forcedMetaDL" => TorrentState::FetchingMetadata,
         "allocating" | "downloading" | "forcedDL" => TorrentState::Downloading,
@@ -238,7 +303,11 @@ mod tests {
 
     use crate::core::{Port, QbittorrentEvent, SyncPosition};
 
-    use super::{RawSync, Request, execute, torrent_state, torrent_update};
+    use std::error::Error;
+
+    use crate::core::{TorrentCommand, TorrentHash};
+
+    use super::{Client, RawSync, Request, execute, torrent_state, torrent_update};
 
     #[tokio::test]
     async fn requests_without_a_web_ui_fail_as_unreachable() -> Result<(), &'static str> {
@@ -258,10 +327,47 @@ mod tests {
                 Request::SetListenPort(port),
                 QbittorrentEvent::ListenPortSetFailed { reason },
             ),
+            (
+                Request::Command(TorrentCommand::Start(Vec::new())),
+                QbittorrentEvent::CommandFailed { reason },
+            ),
         ] {
             assert_eq!(execute(None, request).await, expected);
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn commands_to_a_closed_web_ui_fail_as_unreachable() -> Result<(), Box<dyn Error>> {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+        let client = Client::new(format!("http://{closed}/").parse()?);
+        let hash = TorrentHash::parse(&"a".repeat(40)).ok_or("hash")?;
+        for command in [
+            TorrentCommand::SelectAllFiles(hash.clone()),
+            TorrentCommand::Remove(vec![hash]),
+        ] {
+            assert_eq!(
+                execute(Some(&client), Request::Command(command)).await,
+                QbittorrentEvent::CommandFailed {
+                    reason: QbittorrentFailure::Unreachable
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_times_and_paths_are_absent() {
+        let update = torrent_update(&json!({
+            "added_on": 0,
+            "completion_on": 4_294_967_295_u64,
+            "content_path": "",
+            "save_path": "/srv/books"
+        }));
+        assert_eq!(update.added_at, Some(None));
+        assert_eq!(update.completed_at, Some(None));
+        assert_eq!(update.content_path, Some(None));
+        assert_eq!(update.save_path, Some(Some(String::from("/srv/books"))));
     }
 
     #[test]

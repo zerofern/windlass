@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{Duration, SystemTime},
+};
 
 use serde::Serialize;
 
@@ -153,6 +157,16 @@ impl Progress {
         Self((fraction.clamp(0.0, 1.0) * 1000.0).round() as u16)
     }
 
+    /// Progress from tenths of a percent; values above 1000 are refused.
+    #[must_use]
+    pub const fn from_permille(permille: u16) -> Option<Self> {
+        if permille <= 1000 {
+            Some(Self(permille))
+        } else {
+            None
+        }
+    }
+
     /// Progress in tenths of a percent, from 0 to 1000.
     #[must_use]
     pub const fn permille(self) -> u16 {
@@ -164,47 +178,86 @@ impl Progress {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ByteSize(pub u64);
 
-/// A torrent as qBittorrent last reported it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct Torrent {
-    /// The torrent's display name.
-    pub name: String,
-    /// What qBittorrent is doing with it.
-    pub state: TorrentState,
-    /// How much of the selected content is downloaded.
-    pub progress: Progress,
-    /// The size of the selected content.
-    pub size: ByteSize,
-}
+/// An upload ratio in thousandths, such as 1500 for 1.5.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Ratio(pub u64);
 
-/// Changed fields of one torrent; absent fields are unchanged.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct TorrentUpdate {
-    /// A new name.
-    pub name: Option<String>,
-    /// A new state.
-    pub state: Option<TorrentState>,
-    /// New progress.
-    pub progress: Option<Progress>,
-    /// A new size.
-    pub size: Option<ByteSize>,
-}
-
-impl Torrent {
-    fn apply(&mut self, update: TorrentUpdate) {
-        if let Some(name) = update.name {
-            self.name = name;
-        }
-        if let Some(state) = update.state {
-            self.state = state;
-        }
-        if let Some(progress) = update.progress {
-            self.progress = progress;
-        }
-        if let Some(size) = update.size {
-            self.size = size;
-        }
+impl Ratio {
+    /// A ratio from qBittorrent's floating-point value; negative values are zero.
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is clamped to be non-negative, and ratios far beyond u64 are not real"
+    )]
+    pub fn from_float(ratio: f64) -> Self {
+        Self((ratio.max(0.0) * 1000.0).round() as u64)
     }
+}
+
+/// Generates a torrent's fields and the matching partial update.
+macro_rules! torrent_fields {
+    ($($(#[$doc:meta])* $field:ident: $type:ty),* $(,)?) => {
+        /// A torrent as qBittorrent last reported it.
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+        pub struct Torrent {
+            $($(#[$doc])* pub $field: $type,)*
+        }
+
+        /// Changed fields of one torrent; absent fields are unchanged.
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+        pub struct TorrentUpdate {
+            $($(#[$doc])* pub $field: Option<$type>,)*
+        }
+
+        impl Torrent {
+            fn apply(&mut self, update: TorrentUpdate) {
+                $(if let Some(value) = update.$field {
+                    self.$field = value;
+                })*
+            }
+        }
+    };
+}
+
+torrent_fields! {
+    /// The torrent's display name.
+    name: String,
+    /// What qBittorrent is doing with it.
+    state: TorrentState,
+    /// How much of the selected content is downloaded.
+    progress: Progress,
+    /// The size of the selected files.
+    size: ByteSize,
+    /// The size of all files; larger than `size` when some are not selected.
+    total_size: ByteSize,
+    /// Bytes of selected content downloaded so far.
+    downloaded: ByteSize,
+    /// Bytes uploaded to peers in total.
+    uploaded: ByteSize,
+    /// Uploaded bytes divided by downloaded bytes.
+    ratio: Ratio,
+    /// Time spent seeding the complete torrent.
+    seeding_time: Duration,
+    /// When the torrent was added.
+    added_at: Option<SystemTime>,
+    /// When the download completed.
+    completed_at: Option<SystemTime>,
+    /// Where the torrent's content is stored.
+    content_path: Option<String>,
+    /// The directory the content is saved under.
+    save_path: Option<String>,
+}
+
+/// A change qBittorrent must make so that it matches the torrent registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum TorrentCommand {
+    /// Start these stopped torrents.
+    Start(Vec<TorrentHash>),
+    /// Select every file of this torrent; MAM does not allow partial sharing.
+    SelectAllFiles(TorrentHash),
+    /// Remove these torrents and their files.
+    Remove(Vec<TorrentHash>),
 }
 
 /// qBittorrent's position in its stream of incremental updates.
@@ -285,6 +338,13 @@ pub enum QbittorrentEvent {
         /// Why.
         reason: QbittorrentFailure,
     },
+    /// qBittorrent accepted a registry command.
+    CommandDone,
+    /// A registry command failed.
+    CommandFailed {
+        /// Why.
+        reason: QbittorrentFailure,
+    },
 }
 
 /// The single request outstanding with a connected qBittorrent.
@@ -298,6 +358,13 @@ pub enum Activity {
     ReadingPreferences,
     /// Setting the listen port.
     SettingListenPort(Port),
+    /// Applying a registry command.
+    Commanding,
+    /// Choosing the next request; never visible outside a step.
+    Deciding {
+        /// Whether a fresh update was just merged.
+        after_sync: bool,
+    },
 }
 
 /// A connected qBittorrent and what Windlass knows about it.
@@ -314,6 +381,7 @@ pub struct Session {
     /// The request outstanding now.
     pub activity: Activity,
     position: SyncPosition,
+    listed: bool,
     polls_since_preferences: u8,
 }
 
@@ -342,7 +410,6 @@ impl Qbittorrent {
         now: ClockReading,
         event: QbittorrentEvent,
         timers: &mut Timers,
-        forwarded_port: Option<Port>,
     ) -> Vec<Action> {
         match (&mut *self, event) {
             (Self::Disabled, QbittorrentEvent::Enable) => {
@@ -365,6 +432,7 @@ impl Qbittorrent {
                     torrents: BTreeMap::new(),
                     activity: Activity::Syncing,
                     position: SyncPosition::default(),
+                    listed: false,
                     polls_since_preferences: 0,
                 }));
                 vec![Action::SyncQbittorrent {
@@ -376,7 +444,15 @@ impl Qbittorrent {
             {
                 session.apply(update);
                 session.polls_since_preferences = session.polls_since_preferences.saturating_add(1);
-                session.next(now, timers, forwarded_port)
+                session.activity = Activity::Deciding { after_sync: true };
+                Vec::new()
+            }
+            (Self::Connected(session), QbittorrentEvent::CommandDone)
+                if session.activity == Activity::Commanding =>
+            {
+                // Read the result of the command at once.
+                session.activity = Activity::Deciding { after_sync: false };
+                Vec::new()
             }
             (Self::Connected(session), QbittorrentEvent::PreferencesRead(preferences))
                 if session.activity == Activity::ReadingPreferences =>
@@ -397,7 +473,8 @@ impl Qbittorrent {
                 Self::Connected(_),
                 QbittorrentEvent::SyncFailed { reason }
                 | QbittorrentEvent::PreferencesReadFailed { reason }
-                | QbittorrentEvent::ListenPortSetFailed { reason },
+                | QbittorrentEvent::ListenPortSetFailed { reason }
+                | QbittorrentEvent::CommandFailed { reason },
             ) => {
                 let (retry, deadline) = timers.schedule(now.monotonic, POLL_INTERVAL);
                 *self = Self::Unreachable { reason, retry };
@@ -412,23 +489,67 @@ impl Qbittorrent {
     }
 
     /// Poll or reconnect when this timer is the current one.
-    pub(super) fn timer_expired(
-        &mut self,
-        id: TimerId,
-        now: ClockReading,
-        timers: &mut Timers,
-        forwarded_port: Option<Port>,
-    ) -> Vec<Action> {
+    pub(super) fn timer_expired(&mut self, id: TimerId) -> Vec<Action> {
         match self {
             Self::Unreachable { retry, .. } if *retry == id => {
                 *self = Self::Connecting;
                 vec![Action::ConnectQbittorrent]
             }
             Self::Connected(session) if session.activity == Activity::Waiting(id) => {
-                session.next(now, timers, forwarded_port)
+                session.activity = Activity::Deciding { after_sync: false };
+                Vec::new()
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The session, while it is choosing its next request, and whether a fresh
+    /// update was just merged.
+    #[must_use]
+    pub fn deciding(&self) -> Option<(&Session, bool)> {
+        match self {
+            Self::Connected(session) => match session.activity {
+                Activity::Deciding { after_sync } => Some((session, after_sync)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Choose the next request: the listen port first, then an update, or after
+    /// one a registry command, preferences, or the next poll.
+    pub(super) fn decide(
+        &mut self,
+        now: ClockReading,
+        timers: &mut Timers,
+        forwarded_port: Option<Port>,
+        command: impl FnOnce(&Session) -> Option<TorrentCommand>,
+    ) -> Vec<Action> {
+        let Self::Connected(session) = self else {
+            return Vec::new();
+        };
+        let Activity::Deciding { after_sync } = session.activity else {
+            return Vec::new();
+        };
+        if let Some(actions) = session.set_listen_port(forwarded_port) {
+            return actions;
+        }
+        if !after_sync {
+            session.activity = Activity::Syncing;
+            return vec![Action::SyncQbittorrent {
+                position: session.position,
+            }];
+        }
+        // Commands follow only from a fresh update.
+        if let Some(command) = command(session) {
+            session.activity = Activity::Commanding;
+            return vec![Action::QbittorrentCommand { command }];
+        }
+        if session.polls_since_preferences >= POLLS_PER_PREFERENCES_READ {
+            session.activity = Activity::ReadingPreferences;
+            return vec![Action::ReadQbittorrentPreferences];
+        }
+        session.wait(now, timers)
     }
 
     /// Move qBittorrent to the forwarded port as soon as it is idle.
@@ -443,9 +564,16 @@ impl Qbittorrent {
 }
 
 impl Session {
+    /// Whether the torrent list is complete: the first full update has arrived.
+    #[must_use]
+    pub const fn listed(&self) -> bool {
+        self.listed
+    }
+
     fn apply(&mut self, update: SyncUpdate) {
         if update.full {
             self.torrents.clear();
+            self.listed = true;
         }
         for (hash, changes) in update.torrents {
             self.torrents.entry(hash).or_default().apply(changes);
@@ -460,28 +588,6 @@ impl Session {
         let port = forwarded_port.filter(|port| self.preferences.listen_port != Some(*port))?;
         self.activity = Activity::SettingListenPort(port);
         Some(vec![Action::SetQbittorrentListenPort { port }])
-    }
-
-    fn next(
-        &mut self,
-        now: ClockReading,
-        timers: &mut Timers,
-        forwarded_port: Option<Port>,
-    ) -> Vec<Action> {
-        if let Some(actions) = self.set_listen_port(forwarded_port) {
-            return actions;
-        }
-        if matches!(self.activity, Activity::Syncing) {
-            if self.polls_since_preferences >= POLLS_PER_PREFERENCES_READ {
-                self.activity = Activity::ReadingPreferences;
-                return vec![Action::ReadQbittorrentPreferences];
-            }
-            return self.wait(now, timers);
-        }
-        self.activity = Activity::Syncing;
-        vec![Action::SyncQbittorrent {
-            position: self.position,
-        }]
     }
 
     fn wait(&mut self, now: ClockReading, timers: &mut Timers) -> Vec<Action> {

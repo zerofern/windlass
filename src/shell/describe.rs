@@ -6,18 +6,19 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
     Action, Event, HistoryEvent, MamPauseEvent, MamRequestMode, MappingFailure,
-    PortForwardingEvent, QbittorrentEvent, QbittorrentFailure, SettingsEvent, StartupEvent,
-    StartupMode, TimerName,
+    PortForwardingEvent, QbittorrentEvent, QbittorrentFailure, RegistryEvent, SettingsEvent,
+    StartupEvent, StartupMode, TimerName, TorrentCommand,
 };
 
 /// History categories, used for filtering.
-pub(super) const CATEGORIES: [(&str, &str); 6] = [
+pub(super) const CATEGORIES: [(&str, &str); 7] = [
     ("startup", "Startup"),
     ("mam", "MAM requests"),
     ("settings", "Settings"),
     ("history", "History"),
     ("vpn", "VPN"),
     ("qbittorrent", "qBittorrent"),
+    ("torrents", "Torrent registry"),
 ];
 
 pub(super) const fn category(event: &Event) -> &'static str {
@@ -36,6 +37,7 @@ pub(super) const fn category(event: &Event) -> &'static str {
             name: TimerName::QbittorrentPoll,
             ..
         } => "qbittorrent",
+        Event::Registry(_) => "torrents",
     }
 }
 
@@ -44,7 +46,8 @@ pub(super) const fn is_routine(event: &Event) -> bool {
     match event {
         Event::TimerExpired { .. }
         | Event::PortForwarding(PortForwardingEvent::Mapped { .. })
-        | Event::Qbittorrent(QbittorrentEvent::PreferencesRead(_)) => true,
+        | Event::Qbittorrent(QbittorrentEvent::PreferencesRead(_))
+        | Event::Registry(RegistryEvent::Saved) => true,
         Event::Qbittorrent(QbittorrentEvent::Synced(update)) => {
             !update.full && update.torrents.is_empty() && update.removed.is_empty()
         }
@@ -118,6 +121,28 @@ pub(super) fn event(event: &Event) -> String {
         Event::TimerExpired { name, .. } => format!("Timer expired: {}", timer(*name)),
         Event::PortForwarding(event) => port_forwarding(*event),
         Event::Qbittorrent(event) => qbittorrent(event),
+        Event::Registry(event) => registry(event),
+    }
+}
+
+fn registry(event: &RegistryEvent) -> String {
+    match event {
+        RegistryEvent::Read(records) => format!("Torrent registry read: {} rows", records.len()),
+        RegistryEvent::ReadFailed => String::from("Torrent registry could not be read"),
+        RegistryEvent::Saved => String::from("Torrent registry saved"),
+        RegistryEvent::SaveFailed => String::from("Torrent registry could not be saved"),
+    }
+}
+
+fn torrent_command(command: &TorrentCommand) -> String {
+    match command {
+        TorrentCommand::Start(hashes) => format!("Start {} stopped torrents", hashes.len()),
+        TorrentCommand::SelectAllFiles(hash) => {
+            format!("Select every file of torrent {}", hash.as_str())
+        }
+        TorrentCommand::Remove(hashes) => {
+            format!("Remove {} torrents and their files", hashes.len())
+        }
     }
 }
 
@@ -171,6 +196,11 @@ fn qbittorrent(event: &QbittorrentEvent) -> String {
         QbittorrentEvent::ListenPortSet => String::from("qBittorrent accepted the new listen port"),
         QbittorrentEvent::ListenPortSetFailed { reason } => format!(
             "Setting qBittorrent's listen port failed: {}",
+            qbittorrent_failure(*reason)
+        ),
+        QbittorrentEvent::CommandDone => String::from("qBittorrent accepted the torrent change"),
+        QbittorrentEvent::CommandFailed { reason } => format!(
+            "Changing qBittorrent's torrents failed: {}",
             qbittorrent_failure(*reason)
         ),
     }
@@ -283,6 +313,11 @@ pub(super) fn action(action: &Action) -> String {
         Action::ReadQbittorrentPreferences => String::from("Read qBittorrent preferences"),
         Action::SetQbittorrentListenPort { port } => {
             format!("Set qBittorrent's listen port to {}", port.get())
+        }
+        Action::QbittorrentCommand { command } => torrent_command(command),
+        Action::ReadTorrentRegistry => String::from("Read the torrent registry"),
+        Action::SaveTorrents { records } => {
+            format!("Save {} torrent registry rows", records.len())
         }
     }
 }
@@ -518,11 +553,48 @@ mod tests {
                 QbittorrentEvent::SyncFailed { reason },
                 QbittorrentEvent::PreferencesReadFailed { reason },
                 QbittorrentEvent::ListenPortSetFailed { reason },
+                QbittorrentEvent::CommandFailed { reason },
             ] {
                 entries.push(qbittorrent(failure, false));
             }
         }
+        entries.push(qbittorrent(QbittorrentEvent::CommandDone, false));
         check(&entries);
+    }
+
+    #[test]
+    fn registry_events_and_commands_are_described() -> Result<(), &'static str> {
+        use crate::core::{RegistryEvent, TorrentCommand, TorrentHash};
+
+        let registry = |event, routine| (Event::Registry(event), "torrents", routine);
+        check(&[
+            registry(RegistryEvent::Read(Vec::new()), false),
+            registry(RegistryEvent::ReadFailed, false),
+            registry(RegistryEvent::Saved, true),
+            registry(RegistryEvent::SaveFailed, false),
+        ]);
+        let hash = TorrentHash::parse(&"a".repeat(40)).ok_or("hash")?;
+        let descriptions: Vec<String> = [
+            Action::ReadTorrentRegistry,
+            Action::SaveTorrents {
+                records: Vec::new(),
+            },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::Start(vec![hash.clone()]),
+            },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::Remove(vec![hash.clone()]),
+            },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::SelectAllFiles(hash),
+            },
+        ]
+        .iter()
+        .map(action)
+        .collect();
+        assert!(descriptions.contains(&String::from("Start 1 stopped torrents")));
+        assert!(descriptions.contains(&String::from("Remove 1 torrents and their files")));
+        Ok(())
     }
 
     #[test]
