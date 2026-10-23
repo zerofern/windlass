@@ -12,7 +12,7 @@ open. The owner uses a ProtonVPN subscription with WireGuard and port forwarding
 The proof of concept relied on application code choosing a proxy for MAM requests.
 A client built without that proxy silently used the host network. The owner also
 requires notifications to reach ntfy.sh while the VPN is down, and the dashboard
-to remain reachable over Tailscale but not through the VPN.
+to remain reachable over the LAN and Tailscale but not through the VPN.
 
 ## Decision
 
@@ -25,7 +25,7 @@ resolver through the tunnel.
 The namespace has one private link to the host. Only two kinds of traffic use it:
 
 - The dashboard listens on the namespace side of that link. The host forwards
-  its Tailscale address, and optionally a LAN address, to the dashboard.
+  its LAN and Tailscale addresses to the dashboard.
 - A notification relay on the host forwards connections only to ntfy.sh on port
   443. Windlass's TLS session ends at ntfy.sh, so the relay carries encrypted
   bytes it cannot read. Notifications therefore work while the VPN is down.

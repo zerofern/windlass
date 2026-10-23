@@ -15,8 +15,9 @@
   from the gateway at `10.2.0.1` with a 60-second lifetime, for UDP and TCP, and
   renewed about every 45 seconds. `natpmpc` versions before 20230423 may misread
   the gateway's response.
-- Unverified: Whether all P2P servers share one ASN, and how often the forwarded
-  port changes across reconnects.
+- Owner-reported: ProtonVPN servers belong to several ASNs, so changing servers
+  can change the ASN MAM sees.
+- Unverified: How often the forwarded port changes across reconnects.
 - Related: [ADR-0003](decisions/adr/0003-vpn-namespace-confinement.md), [VPN Feature Brief](features/B-0010/brief.md).
 
 ## VPN-Confinement
@@ -51,5 +52,7 @@
 
 - Link: Owner-supplied [rules](../docs/MAM/rules.txt), [search](../docs/MAM/loadSearchJSONbasic.txt), [torrent download](../docs/MAM/download.txt), [user data](../docs/MAM/jsonLoad.txt), [dynamic seedbox](../docs/MAM/dynamicSeedbox.txt), [IP lookup](../docs/MAM/jsonIp.txt), [bonus purchases](../docs/MAM/bonusBuy.txt), [bonus history](../docs/MAM/userBonusHistory.txt), and [form data](../docs/MAM/JSON+fast+fillout.txt).
 - Relevance: All nine supplied files were reviewed. Rule 1.7 limits automation to documented API functions or staff approval. Dynamic seedbox calls have a rolling hourly limit; IP lookup has a once-per-minute limit. Rule 1.2 requires a VPN IP that changes less than once an hour and notifying staff about VPN or seedbox use. Registration requires an IP- or ASN-locked API session with update permission.
+- Owner-reported: MAM staff approved the owner's VPN use. A session can hold several
+  ASNs, but each new one must be added manually.
 - Unverified: These local copies do not establish live conformance, Windlass's approval status, or complete rate limits for every endpoint. They do not specify retry timing, server-delay headers, or cookie-rotation headers.
 - Related: [API compliance](direction.md#mam-api-compliance)

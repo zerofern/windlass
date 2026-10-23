@@ -27,8 +27,8 @@ Acceptance:
 - The only exits besides the tunnel are the dashboard link and the ntfy.sh relay.
   The relay refuses any other destination.
 - Notifications reach ntfy.sh while the tunnel is down.
-- The dashboard is reachable over Tailscale whether or not the tunnel works, and
-  not through the tunnel.
+- The dashboard is reachable over the LAN and Tailscale whether or not the tunnel
+  works, and not through the tunnel.
 
 ### S2: Keep the forwarded port current
 
@@ -82,12 +82,29 @@ Acceptance:
   qBittorrent, and lets MAM initialization refresh seedbox registration.
 - Switches, their reasons, and outcomes appear in history and in notifications.
 
+### S5: Keep MAM's ASN list in step
+
+Story: ProtonVPN servers belong to different ASNs. MAM accepts several ASNs on one
+session, but the user must add each new one manually. The user learns when that is
+needed instead of discovering failed registrations.
+
+Acceptance:
+
+- Windlass keeps the list of ASNs the user has added to the MAM session, edited
+  on the settings page.
+- MAM's IP check reports the exit ASN as MAM sees it. When that ASN is not on the
+  list, Windlass notifies the user, shows which ASN to add, and does not spend a
+  registration attempt until the user confirms it was added.
+- Failover prefers servers whose last observed ASN is on the list. Windlass records
+  the ASN observed for each server so it can make that choice.
+
 ## Feature-wide constraints and acceptance
 
 - Follow the [VPN privacy boundary](../../decisions/pdr/0001-vpn-privacy-boundary.md)
   and [namespace confinement](../../decisions/adr/0003-vpn-namespace-confinement.md).
-- MAM access uses an ASN-locked API session, so registration survives exit IP
-  changes within ProtonVPN's ASN.
+- MAM access uses an ASN-locked API session. ProtonVPN servers use several ASNs;
+  each must be added to the session manually (S5).
+- MAM staff have approved the owner's VPN use.
 - Core tests drive lease timing, check scheduling, protection state, and failover
   decisions with supplied time and events.
 - Integration tests use a local namespace, a local WireGuard peer, a fake NAT-PMP
@@ -113,13 +130,20 @@ management (B-0007), and MAM registration requests (B-0004).
 
 ## Open questions and assumptions
 
-- Do all ProtonVPN P2P servers share one ASN? The ASN-locked session depends on it.
+Agreed with the owner: the dashboard is forwarded to both the LAN and Tailscale.
+MAM's IP check keeps running on its own schedule (B-0004) alongside this feature's
+neutral checks; the neutral checks verify the tunnel, and MAM's check reports the
+IP and ASN as MAM sees them.
+
+The NixOS machine is not available yet. Until it is, NixOS configuration is
+designed but not verified on hardware; core behaviour and shell integration are
+tested locally with namespaces and fakes.
+
+Still open:
+
 - Which NixOS mechanism builds the namespace, and can it swap WireGuard
   configurations without restarting qBittorrent?
 - Which exit-IP service, and how many failed checks trigger a switch?
-- MAM initialization also observes the exit IP through MAM's `jsonIp.php` every
-  five minutes. Should it rely on this feature's checks instead, keeping
-  `jsonIp.php` for the ASN as MAM sees it?
 - How is the failover unit permitted: a polkit rule, a socket, or another route?
-- Should the dashboard also be forwarded to the LAN, or only to Tailscale?
-- The user must tell MAM staff about VPN use, as MAM rule 1.2 requires.
+- Can the user confirm an added ASN in Windlass, or should Windlass wait for a
+  successful registration as confirmation?

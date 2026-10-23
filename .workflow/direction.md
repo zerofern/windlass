@@ -126,9 +126,11 @@ recovery must not clear an explicit user pause.
 The VPN provider is ProtonVPN over WireGuard. All BitTorrent traffic goes through
 the tunnel and fails when it fails. Windlass checks that the tunnel actually works
 with an external service, regularly and when problems are suspected, and fails
-over to another configured ProtonVPN server when it does not. MAM access uses an
-ASN-locked API session. The dashboard is reachable over Tailscale but not through
-the VPN. [ADR-0003](decisions/adr/0003-vpn-namespace-confinement.md) records the
+over to another configured ProtonVPN server when it does not. MAM staff have
+approved the owner's VPN use. MAM access uses an ASN-locked API session. ProtonVPN
+servers use several ASNs and each must be added to the session manually, so
+Windlass notifies the user when the exit ASN is not yet added. The dashboard is
+reachable over the LAN and Tailscale but not through the VPN. [ADR-0003](decisions/adr/0003-vpn-namespace-confinement.md) records the
 enforcement mechanism.
 
 ### Deployment

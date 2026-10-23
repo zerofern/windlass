@@ -112,8 +112,10 @@ Both requests use HTTPS on `t.myanonamouse.net`, with no query parameters or bod
 | Observe IP | `GET /json/jsonIp.php` | No cookie attached | [Official documentation](../../../docs/MAM/jsonIp.txt) |
 
 Registration requires an IP- or ASN-locked API cookie with update permission.
-The owner uses an ASN-locked session, so it survives ProtonVPN server failover
-([B-0010](../B-0010/brief.md)).
+The owner uses an ASN-locked session. ProtonVPN failover ([B-0010](../B-0010/brief.md))
+can move to a server in an ASN not yet added to the session; the ASN reported by
+`jsonIp.php` is compared with the user's list, and an unknown ASN is reported
+before any registration attempt.
 MAM observes the source IP; no IP or port is submitted. Rule 1.2 requires VPN
 IP changes less than once an hour. Staff notification is complete.
 
