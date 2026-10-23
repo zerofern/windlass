@@ -23,6 +23,8 @@ Acceptance:
 - Missing or unreadable saved state cannot silently become an unpaused instance.
 - Report startup/storage failure rather than claim successful restoration.
 - Fresh setup is explicit and cannot be confused with failed restoration.
+- An absent or deleted MAM request preference defaults to paused. A failed read
+  remains a reported failure, distinct from an absent preference.
 
 ### S2: Respond while operations are outstanding
 
@@ -66,6 +68,12 @@ Acceptance:
 - Confirm durable success only after the associated save succeeds.
 - A failed save returns failure and never a durable-success acknowledgement.
 - Restrictive controls can take effect immediately while persistence is pending.
+- Pausing MAM requests takes effect immediately. Enabling waits until the
+  preference is saved successfully; a failed enable save leaves requests blocked.
+- While a preference storage operation is outstanding, retain the latest requested
+  mode. After completion, save a newer requested preference if it differs from
+  storage. This does not introduce automatic retries for a failed write.
+  Completion of an older enable write cannot override a newer pause request.
 - Restart restores confirmed saved controls; persistence does not block unrelated
   event handling while I/O is outstanding.
 

@@ -16,10 +16,12 @@
 
 ## B-0003: Web dashboard and MAM pause control
 
-- Status: Needs Direction
-- Value: Show current system status, let the user configure Windlass, and provide
-  a control to pause all of Windlass's own requests to MAM.
+- Status: Ready for Shape
+- Value: Show current system status and history, let the user configure Windlass,
+  and provide a control to pause all of Windlass's own requests to MAM.
 - Direction: [Web dashboard](direction.md#web-dashboard)
+- Feature Brief: [Web dashboard and MAM pause control](features/B-0003/brief.md)
+- Relationships: Hosts status panels and settings owned by other feature briefs.
 
 ## B-0004: MAM initialization loop
 
