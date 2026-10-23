@@ -1,7 +1,9 @@
+use serde::Serialize;
+
 use super::{Action, ClockReading, State};
 
 /// The user's persistent choice about allowing Windlass to contact MAM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MamRequestMode {
     /// Block MAM requests; used for first-time setup and absent preferences.
     Paused,
@@ -10,7 +12,7 @@ pub enum MamRequestMode {
 }
 
 /// A command or storage result for the MAM pause preference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MamPauseEvent {
     /// Save a preference; pause applies immediately, enable waits for persistence.
     Set {
@@ -77,6 +79,55 @@ pub enum MamPreferencePersistence {
     Pending(MamPreferenceUpdate),
     /// The last storage update failed.
     Failed,
+}
+
+/// What the user should be told about Windlass's own MAM requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MamRequestsStatus {
+    /// Saved state is still loading; requests are blocked.
+    Starting,
+    /// Saved state could not be loaded; requests stay blocked.
+    StartupFailed,
+    /// Requests are allowed, subject to the other admission conditions.
+    Running,
+    /// The pause is saved and will survive a restart.
+    Paused,
+    /// Requests are already blocked while the pause is being saved.
+    PausePending,
+    /// Requests are blocked, but the pause was not saved.
+    PauseNotSaved,
+    /// Requests stay paused until resuming is saved.
+    ResumePending,
+    /// Resuming could not be saved, so requests stay paused.
+    ResumeNotSaved,
+}
+
+impl MamRequestsStatus {
+    /// The mode the user last asked for, once startup has loaded it.
+    #[must_use]
+    pub const fn requested(self) -> Option<MamRequestMode> {
+        match self {
+            Self::Starting | Self::StartupFailed => None,
+            Self::Running | Self::ResumePending | Self::ResumeNotSaved => {
+                Some(MamRequestMode::Enabled)
+            }
+            Self::Paused | Self::PausePending | Self::PauseNotSaved => Some(MamRequestMode::Paused),
+        }
+    }
+}
+
+impl State {
+    /// The user-facing status of Windlass's own MAM requests.
+    #[must_use]
+    pub const fn mam_requests(&self) -> MamRequestsStatus {
+        match self {
+            Self::NotStarted | Self::OpeningStorage { .. } | Self::ReadingMamPreference { .. } => {
+                MamRequestsStatus::Starting
+            }
+            Self::Failed => MamRequestsStatus::StartupFailed,
+            Self::Ready(preference) => preference.status(),
+        }
+    }
 }
 
 /// MAM preference data held directly in the core's ready state.
@@ -159,6 +210,29 @@ fn complete(state: &mut State, completion: MamPreferenceCompletion) -> Vec<Actio
 }
 
 impl MamPreferenceState {
+    /// The user-facing status, judged by the latest request.
+    #[must_use]
+    pub const fn status(&self) -> MamRequestsStatus {
+        match (self.requested.mode(), self.persistence) {
+            (MamRequestMode::Paused, MamPreferencePersistence::Pending(_)) => {
+                MamRequestsStatus::PausePending
+            }
+            (MamRequestMode::Paused, MamPreferencePersistence::Failed) => {
+                MamRequestsStatus::PauseNotSaved
+            }
+            (MamRequestMode::Enabled, MamPreferencePersistence::Pending(_)) => {
+                MamRequestsStatus::ResumePending
+            }
+            (MamRequestMode::Enabled, MamPreferencePersistence::Failed) => {
+                MamRequestsStatus::ResumeNotSaved
+            }
+            (_, MamPreferencePersistence::Idle) => match self.effective {
+                MamRequestMode::Paused => MamRequestsStatus::Paused,
+                MamRequestMode::Enabled => MamRequestsStatus::Running,
+            },
+        }
+    }
+
     fn update_mam_preference(&mut self, change: MamPreferenceUpdate) -> Vec<Action> {
         self.requested = change;
         if change.mode() == MamRequestMode::Paused {

@@ -8,16 +8,22 @@ use std::{
 
 use tokio::sync::{mpsc, watch};
 
-use crate::core::{Action, ClockReading, TimedEvent};
+use crate::core::{Action, ClockReading, Event, TimedEvent};
 
 pub mod console;
+mod describe;
+mod history;
 mod ingress;
 mod storage;
+pub mod web;
+
+use history::{Command, HistoryEntry, HistoryWriter};
 
 pub use ingress::EventSender;
 use ingress::{IngressState, Input};
 
-pub(crate) type ShellResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+pub(crate) type ShellError = Box<dyn Error + Send + Sync>;
+pub(crate) type ShellResult<T> = Result<T, ShellError>;
 
 const EVENT_QUEUE_CAPACITY: usize = 64;
 
@@ -35,11 +41,14 @@ pub(crate) struct Shell {
     ingress_state: watch::Sender<IngressState>,
     active_workers: usize,
     latest_storage_error: Option<String>,
+    history: HistoryWriter,
 }
 
 impl Shell {
+    /// Create the shell and start its history writer; requires a Tokio runtime.
     pub(crate) fn new(database: PathBuf) -> (Self, EventSender) {
         let (sender, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let history = HistoryWriter::start(database.clone(), sender.clone());
         let (ingress_state, _) = watch::channel(IngressState::Open);
         let events = EventSender {
             sender: sender.clone(),
@@ -53,6 +62,7 @@ impl Shell {
                 ingress_state,
                 active_workers: 0,
                 latest_storage_error: None,
+                history,
             },
             events,
         )
@@ -87,8 +97,34 @@ impl Shell {
         }
     }
 
+    /// Record a handled event and its actions before dispatching those actions.
+    pub(crate) fn record(
+        &self,
+        occurred_at: SystemTime,
+        processed_at: SystemTime,
+        event: Event,
+        actions: Vec<Action>,
+    ) {
+        self.history.send(Command::Record(HistoryEntry {
+            occurred_at,
+            processed_at,
+            event,
+            actions,
+        }));
+    }
+
+    /// Finish writing history after the event stream has ended.
+    pub(crate) async fn finish(self) -> ShellResult<()> {
+        Ok(self.history.finish().await?)
+    }
+
     pub(crate) fn dispatch(&mut self, action: Action) {
         self.active_workers += 1;
+        match action {
+            Action::OpenHistory => return self.history.send(Command::Open),
+            Action::TrimHistory { keep } => return self.history.send(Command::Trim(keep)),
+            _ => {}
+        }
         let path = self.database.clone();
         let sender = self.sender.clone();
         let _worker = tokio::spawn(async move {
@@ -115,7 +151,8 @@ impl Shell {
     }
 }
 
-fn read_clock() -> ClockReading {
+/// Read both clocks where an event occurs.
+pub(crate) fn read_clock() -> ClockReading {
     ClockReading {
         monotonic: Instant::now(),
         wall: SystemTime::now(),

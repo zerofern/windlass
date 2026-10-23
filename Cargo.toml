@@ -6,11 +6,21 @@ publish = false
 description = "A cohesive MAM acquisition and library service"
 
 [dependencies]
+axum = "0.8"
+maud = { version = "0.27", features = ["axum"] }
+nutype = { version = "0.6", features = ["serde"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "signal"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [dev-dependencies]
+http-body-util = "0.1"
 tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]
 warnings = "deny"

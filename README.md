@@ -22,6 +22,37 @@ The root Rust package contains a small executable core/shell slice. Run
 checks. Run `just coverage` for LLVM coverage and `just integration` for real
 SQLite integration tests. The foundation feature is still incomplete.
 
+## Run the dashboard
+
+```sh
+just run serve initialise /tmp/windlass.sqlite --listen 127.0.0.1:8740
+```
+
+Open `http://127.0.0.1:8740/`. Use `resume` instead of `initialise` to restart an
+existing instance. Repeat `--listen` for each LAN or Tailscale address, and add
+`--allowed-host <name>` for host names such as a Tailscale name. Requests naming
+any other host are refused, as are form submissions from other websites. Windlass
+has no login; reach it only through the LAN or Tailscale. Ctrl-C or SIGTERM
+finishes outstanding storage work and history before exiting.
+
+The dashboard is server-rendered HTML with a small script for live status and local
+times; it works without the script, without live updates. It shows:
+
+- **Status:** whether Windlass's own MAM requests are running, paused, or waiting
+  for a pause or resume to be saved, plus API cookie and history state. A fresh
+  instance starts paused and asks for the API cookie.
+- **History:** every event the core handled, with the actions it returned, when the
+  event happened, and when it was processed. Filter by kind and time; page through
+  older entries. Secrets are recorded as `[redacted]`.
+- **Settings:** the write-only MAM API cookie and the history size limit, each
+  confirmed only once saved, plus the read-only deployment settings.
+
+History lives in the same SQLite file. The core counts entries and asks the shell to
+remove the oldest when the limit (10000 by default) is exceeded. Entries that could
+not be saved are reported as a gap once saving works again. The API cookie is stored
+unencrypted in the SQLite file, so keep that file private. Windlass does not
+contact MAM yet, so authentication and registration remain unverified.
+
 ## Inspect the core and shell
 
 ```sh
@@ -60,7 +91,7 @@ blocking workers, outside the event loop. There are no operation identifiers,
 generic machine traits, or database connection pools.
 
 `Runner::new` returns the runner, an `EventSender`, and an observation subscription.
-Clone the sender for another input source, such as the planned HTTP API. Producers
+Clone the sender for another input source; the dashboard does this. Producers
 record occurrence time before enqueueing; `send_timed` preserves a timestamp
 already recorded by its producer. The queue holds 64 messages and applies
 backpressure. Events follow queue order even when their timestamps differ.
@@ -69,11 +100,12 @@ error. Slow observers retain the newest observation without blocking the runner.
 
 `EventSender::shutdown` rejects new submissions and drains accepted inputs and
 all resulting storage work. Sender clones can remain alive during shutdown.
-HTTP routes and the webpage remain to be implemented against this ingress.
+The runner records each handled event and its actions in history before
+dispatching the actions; a single writer keeps entries in processing order.
 
-Timers, task cancellation, shutdown signals, deployment units, and actual MAM
-and qBittorrent clients remain to be built. This console is for reviewing the
-operating model; it does not yet implement the full service.
+Timers, task cancellation, deployment units, and actual MAM and qBittorrent
+clients remain to be built. The console is for reviewing the operating model; it
+does not implement the full service.
 
 ## Development
 

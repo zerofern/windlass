@@ -4,6 +4,8 @@
 
 use std::time::{Instant, SystemTime};
 
+use serde::Serialize;
+
 /// Clock values recorded where an event occurs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockReading {
@@ -14,7 +16,7 @@ pub struct ClockReading {
 }
 
 /// An event paired with its occurrence time before it enters the event queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimedEvent {
     /// When the event occurred, independently of when the runner handles it.
     pub occurred_at: ClockReading,
@@ -23,19 +25,23 @@ pub struct TimedEvent {
 }
 
 /// An incoming command or observed result handled by the core.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Event {
     /// Startup commands and storage availability.
     Startup(StartupEvent),
     /// MAM pause commands and preference storage results.
     MamPause(MamPauseEvent),
+    /// Dashboard settings commands and their storage results.
+    Settings(SettingsEvent),
+    /// History storage results.
+    History(HistoryEvent),
 }
 
 /// An effect requested by the core for the shell to execute.
 ///
 /// The core permits only one outstanding storage operation for the MAM
 /// preference, so its completion is unambiguous without an operation identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Action {
     /// Open storage using an explicit startup mode.
     OpenStorage {
@@ -51,15 +57,41 @@ pub enum Action {
     },
     /// Remove the saved preference; absence defaults to paused in the core.
     DeleteMamRequestMode,
+    /// Read the saved dashboard settings, reporting absent values separately.
+    ReadSettings,
+    /// Persist the history limit.
+    WriteHistoryLimit {
+        /// The limit to store.
+        limit: HistoryLimit,
+    },
+    /// Persist the API cookie, or remove it when absent.
+    WriteApiCookie {
+        /// The cookie to store, if any.
+        cookie: Option<ApiCookie>,
+    },
+    /// Open history storage and record entries buffered until now.
+    OpenHistory,
+    /// Remove the oldest history entries, keeping the newest `keep`.
+    TrimHistory {
+        /// How many entries to keep.
+        keep: EntryCount,
+    },
 }
 
+mod history;
 mod machine;
 mod mam_pause;
+mod settings;
 mod startup;
 
+pub use history::{HistoryEvent, HistoryState, Step, Trim};
 pub use machine::{Core, State};
 pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,
-    MamRequestMode,
+    MamRequestMode, MamRequestsStatus,
+};
+pub use settings::{
+    ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, Setting,
+    SettingPersistence, SettingStatus, Settings, SettingsEvent, SettingsState,
 };
 pub use startup::{StartupEvent, StartupMode};

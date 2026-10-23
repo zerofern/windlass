@@ -19,7 +19,7 @@ test:
     cargo test --locked --doc --all-features
 
 integration:
-    cargo test --locked --all-features --test runner --test shell --test cli
+    cargo test --locked --all-features --test runner --test shell --test cli --test web
 
 run *args:
     cargo run --locked -- {{args}}

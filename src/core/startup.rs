@@ -1,7 +1,9 @@
+use serde::Serialize;
+
 use super::{Action, ClockReading, State};
 
 /// Whether startup initialises stored records or resumes an existing instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StartupMode {
     /// Create initial records explicitly, refusing to overwrite existing records.
     Initialise,
@@ -10,7 +12,7 @@ pub enum StartupMode {
 }
 
 /// A startup command or observed storage result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StartupEvent {
     /// Begin startup; the core decides which stored facts to request.
     Start {

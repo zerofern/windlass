@@ -49,7 +49,11 @@ fn ready(saved: Option<Mode>) -> Core {
     assert_eq!(core.state(), &State::OpeningStorage { requested: None });
     assert_eq!(
         send(&mut core, Event::Startup(StartupEvent::StorageOpened)),
-        vec![Action::ReadMamRequestMode]
+        vec![
+            Action::ReadMamRequestMode,
+            Action::ReadSettings,
+            Action::OpenHistory
+        ]
     );
     assert_eq!(
         core.state(),
@@ -252,7 +256,7 @@ fn deletion_completion_reconciles_with_confirmed_storage() {
             )
             .is_empty()
         );
-        let actions = send(&mut core, completion);
+        let actions = send(&mut core, completion.clone());
         if completion == Event::MamPause(MamPauseEvent::Deleted) {
             assert_eq!(
                 actions,

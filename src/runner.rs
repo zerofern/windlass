@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use tokio::sync::watch;
 
 use crate::{
-    core::{Core, State, TimedEvent},
-    shell::{EventSender, Shell, ShellResult},
+    core::{Core, HistoryState, SettingsState, State, TimedEvent},
+    shell::{EventSender, Shell, ShellResult, read_clock},
 };
 
 /// A read-only observation containing the actual core state and event metadata.
@@ -14,6 +14,10 @@ use crate::{
 pub struct Observation {
     /// The core's in-memory state after handling the event.
     pub state: State,
+    /// The core's dashboard settings.
+    pub settings: SettingsState,
+    /// What the core knows about stored history.
+    pub history: HistoryState,
     /// The most recently handled event, absent before the first input.
     pub last_event: Option<TimedEvent>,
     /// The latest storage error, retained across subsequent state updates.
@@ -39,6 +43,8 @@ impl Runner {
         let (shell, events) = Shell::new(database);
         let (observations, receiver) = watch::channel(Observation {
             state: core.state().clone(),
+            settings: core.settings().clone(),
+            history: *core.history(),
             last_event: None,
             storage_error: None,
         });
@@ -55,21 +61,34 @@ impl Runner {
 
     /// Handle events until shutdown finishes all accepted inputs and effects.
     ///
+    /// Each handled event and its actions are recorded in history, in processing
+    /// order, before the actions are dispatched.
+    ///
     /// # Errors
     /// Returns an error if a storage worker fails unexpectedly. Ordinary storage
     /// failures return as core events and remain visible in the observations.
     pub async fn run(mut self) -> ShellResult<State> {
         while let Some(event) = self.shell.next_event().await? {
-            let actions = self.core.handle(event.occurred_at, event.event);
+            let processed_at = read_clock().wall;
+            let actions = self.core.handle(event.occurred_at, event.event.clone());
+            self.shell.record(
+                event.occurred_at.wall,
+                processed_at,
+                event.event.clone(),
+                actions.clone(),
+            );
             for action in actions {
                 self.shell.dispatch(action);
             }
             self.observations.send_replace(Observation {
                 state: self.core.state().clone(),
+                settings: self.core.settings().clone(),
+                history: *self.core.history(),
                 last_event: Some(event),
                 storage_error: self.shell.latest_storage_error().cloned(),
             });
         }
+        self.shell.finish().await?;
         Ok(self.core.state().clone())
     }
 }

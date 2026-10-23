@@ -10,8 +10,8 @@ use rusqlite::Connection;
 use tokio::sync::watch;
 use windlass::{
     core::{
-        ClockReading, Event, MamPauseEvent, MamPreferencePersistence, MamPreferenceUpdate,
-        MamRequestMode, StartupEvent, StartupMode, State, TimedEvent,
+        ClockReading, Event, HistoryState, MamPauseEvent, MamPreferencePersistence,
+        MamPreferenceUpdate, MamRequestMode, StartupEvent, StartupMode, State, TimedEvent,
     },
     runner::{Observation, Runner},
 };
@@ -46,7 +46,7 @@ async fn queued_occurrence_time_is_preserved() -> TestResult {
             mode: MamRequestMode::Paused,
         }),
     };
-    events.send_timed(event).await?;
+    events.send_timed(event.clone()).await?;
     events.shutdown().await?;
     let state = tokio::time::timeout(Duration::from_secs(10), runner.run()).await??;
     assert_eq!(state, State::NotStarted);
@@ -64,10 +64,10 @@ async fn a_full_ingress_waits_for_the_runner_to_consume_events() -> TestResult {
         mode: MamRequestMode::Paused,
     });
     for _ in 0..64 {
-        events.send(event).await?;
+        events.send(event.clone()).await?;
     }
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), events.send(event))
+        tokio::time::timeout(Duration::from_millis(20), events.send(event.clone()))
             .await
             .is_err()
     );
@@ -79,7 +79,7 @@ async fn a_full_ingress_waits_for_the_runner_to_consume_events() -> TestResult {
         },
         event,
     };
-    events.send_timed(latest).await?;
+    events.send_timed(latest.clone()).await?;
     events.shutdown().await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), worker).await???,
@@ -103,6 +103,11 @@ async fn producers_share_one_runner_and_shutdown_drains_follow_up_writes() -> Te
         .await?;
     let worker = tokio::spawn(runner.run());
     observe(&mut console_observations, is_idle).await?;
+    // History results arrive independently; let opening finish before asserting order.
+    observe(&mut console_observations, |observation| {
+        matches!(observation.history, HistoryState::Open { .. })
+    })
+    .await?;
 
     let connection = Connection::open(&path)?;
     connection.execute_batch("BEGIN IMMEDIATE")?;
@@ -152,6 +157,7 @@ async fn producers_share_one_runner_and_shutdown_drains_follow_up_writes() -> Te
     assert_eq!(
         console_observations
             .borrow()
+            .clone()
             .last_event
             .map(|event| event.event),
         Some(Event::MamPause(MamPauseEvent::Written))

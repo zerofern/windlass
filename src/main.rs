@@ -1,31 +1,45 @@
-//! Run the minimal Windlass console for inspecting core and shell interactions.
+//! Run Windlass: the web dashboard, or a minimal console for inspecting core
+//! and shell interactions.
 
-use std::{error::Error, io, path::PathBuf};
+use std::{error::Error, ffi::OsString, io, net::SocketAddr, path::PathBuf};
 
-use windlass::{core::StartupMode, shell::console};
+use tokio::net::TcpListener;
+use windlass::{
+    core::StartupMode,
+    shell::{console, web},
+};
+
+const USAGE: &str = "usage: windlass <initialise|resume> <database-path>\n       \
+windlass serve <initialise|resume> <database-path> --listen <address>... [--allowed-host <name>]...";
+
+type MainResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+fn usage(detail: &str) -> Box<dyn Error + Send + Sync> {
+    io::Error::other(format!("{detail}\n{USAGE}")).into()
+}
+
+fn startup_mode(argument: Option<&std::ffi::OsStr>) -> MainResult<StartupMode> {
+    match argument.and_then(std::ffi::OsStr::to_str) {
+        Some("initialise") => Ok(StartupMode::Initialise),
+        Some("resume") => Ok(StartupMode::Resume),
+        _ => Err(usage("expected initialise or resume")),
+    }
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut arguments = std::env::args_os().skip(1);
-    let mode = match arguments
-        .next()
-        .as_deref()
-        .and_then(std::ffi::OsStr::to_str)
-    {
-        Some("initialise") => StartupMode::Initialise,
-        Some("resume") => StartupMode::Resume,
-        _ => {
-            return Err(
-                io::Error::other("usage: windlass <initialise|resume> <database-path>").into(),
-            );
-        }
-    };
+async fn main() -> MainResult<()> {
+    let mut arguments = std::env::args_os().skip(1).peekable();
+    if arguments.peek().is_some_and(|argument| argument == "serve") {
+        arguments.next();
+        return serve(arguments).await;
+    }
+    let mode = startup_mode(arguments.next().as_deref())?;
     let database = arguments
         .next()
         .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("missing database path"))?;
+        .ok_or_else(|| usage("missing database path"))?;
     if arguments.next().is_some() {
-        return Err(io::Error::other("unexpected extra argument").into());
+        return Err(usage("unexpected extra argument"));
     }
     let status = console::run(
         &database,
@@ -38,4 +52,65 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(io::Error::other("startup or preference persistence failed").into());
     }
     Ok(())
+}
+
+async fn serve(mut arguments: impl Iterator<Item = OsString>) -> MainResult<()> {
+    let mode = startup_mode(arguments.next().as_deref())?;
+    let database = arguments
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| usage("missing database path"))?;
+    let mut listen = Vec::new();
+    let mut allowed_hosts = Vec::new();
+    while let Some(option) = arguments.next() {
+        let value = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or_else(|| usage("missing option value"))?;
+        match option.to_str() {
+            Some("--listen") => listen.push(
+                value
+                    .parse::<SocketAddr>()
+                    .map_err(|_| usage("invalid listen address"))?,
+            ),
+            Some("--allowed-host") => allowed_hosts.push(value),
+            _ => return Err(usage("unknown option")),
+        }
+    }
+    if listen.is_empty() {
+        return Err(usage("at least one --listen address is required"));
+    }
+    let mut listeners = Vec::new();
+    for address in listen {
+        listeners.push(TcpListener::bind(address).await?);
+    }
+    let state = web::serve(database, mode, listeners, allowed_hosts, stop_signal()).await?;
+    if state.has_failed() {
+        return Err(io::Error::other("startup or preference persistence failed").into());
+    }
+    Ok(())
+}
+
+/// Complete on Ctrl-C or, from systemd, SIGTERM.
+async fn stop_signal() {
+    let interrupt = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(_) => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = interrupt => {}
+            () = terminate => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = interrupt.await;
+    }
 }
