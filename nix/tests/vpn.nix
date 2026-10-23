@@ -68,12 +68,21 @@ in
 {
   name = "windlass-vpn";
 
+  # Generous limits let the test also run, slowly, without KVM.
+  defaults =
+    { lib, ... }:
+    {
+      systemd.settings.Manager.DefaultDeviceTimeoutSec = lib.mkForce "1800s";
+      virtualisation.cores = 2;
+    };
+
   nodes = {
     # Reports the caller's address, standing in for an exit-IP service on port
-    # 80 and for ntfy.sh on port 443.
+    # 80 and for ntfy.sh on port 443. It also acts as a LAN client.
     web =
-      { ... }:
+      { pkgs, ... }:
       {
+        environment.systemPackages = [ pkgs.curl ];
         services.nginx = {
           enable = true;
           virtualHosts.default = {
@@ -129,11 +138,6 @@ in
         ];
       };
 
-    client =
-      { pkgs, ... }:
-      {
-        environment.systemPackages = [ pkgs.curl ];
-      };
   };
 
   testScript =
@@ -153,7 +157,7 @@ in
       machine.wait_for_unit("windlass-notification-relay.service")
 
       inside = "ip netns exec windlass "
-      exit_ip = inside + "curl -sf --max-time 10 http://web/ip"
+      exit_ip = inside + "curl -sf --max-time 60 http://web/ip"
 
       with subtest("Windlass and qBittorrent run inside the namespace"):
           for unit in ["windlass", "qbittorrent"]:
@@ -161,19 +165,19 @@ in
               assert machine.succeed(f"ip netns identify {pid}").strip() == "windlass", unit
 
       with subtest("Traffic from the namespace leaves through the VPN"):
-          machine.wait_until_succeeds(exit_ip, timeout=120)
+          machine.wait_until_succeeds(exit_ip, timeout=900)
           assert machine.succeed(exit_ip).strip() == "${ipOf "vpn1"}"
           machine.succeed(inside + "sysctl -n net.ipv6.conf.all.disable_ipv6 | grep -qx 1")
 
       with subtest("The dashboard is reachable from the LAN, not through the tunnel"):
-          client.wait_until_succeeds("curl -sf http://machine:8740/ | grep -q Windlass", timeout=120)
+          web.wait_until_succeeds("curl -sf http://machine:8740/ | grep -q Windlass", timeout=900)
           vpn1.fail("curl -sf --max-time 5 http://10.2.0.2:8740/")
           # The namespace cannot reach the host's other services through its link.
           machine.fail(inside + "curl -sf --max-time 5 http://10.200.0.1:8740/")
 
       with subtest("qBittorrent is bound to the tunnel with UPnP off"):
           machine.wait_until_succeeds(
-              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/version", timeout=120
+              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/version", timeout=900
           )
           preferences = machine.succeed(
               inside + "curl -sf http://127.0.0.1:8080/api/v2/app/preferences"
@@ -183,7 +187,7 @@ in
 
       with subtest("Windlass may fail over between configured servers only"):
           machine.succeed("runuser -u windlass -- systemctl start windlass-wireguard@two.service")
-          machine.wait_until_succeeds(exit_ip, timeout=60)
+          machine.wait_until_succeeds(exit_ip, timeout=900)
           assert machine.succeed(exit_ip).strip() == "${ipOf "vpn2"}"
           machine.fail("systemctl start windlass-wireguard@unknown.service")
           machine.fail("runuser -u windlass -- systemctl stop windlass.service")
@@ -195,13 +199,13 @@ in
           machine.fail(inside + "curl -sf --max-time 5 http://${ipOf "web"}/ip")
 
       with subtest("Notifications and the dashboard work while the VPN is down"):
-          relayed = machine.succeed(inside + "curl -sf --max-time 10 http://10.200.0.1:8443/ip").strip()
+          relayed = machine.succeed(inside + "curl -sf --max-time 60 http://10.200.0.1:8443/ip").strip()
           assert relayed == "${ipOf "machine"}", relayed
-          client.succeed("curl -sf http://machine:8740/ | grep -q Windlass")
+          web.succeed("curl -sf http://machine:8740/ | grep -q Windlass")
 
       with subtest("Recovery uses the tunnel again"):
           vpn2.succeed("systemctl start wireguard-wg0.service")
-          machine.wait_until_succeeds(exit_ip, timeout=60)
+          machine.wait_until_succeeds(exit_ip, timeout=900)
           assert machine.succeed(exit_ip).strip() == "${ipOf "vpn2"}"
     '';
 }
