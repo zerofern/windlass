@@ -70,7 +70,8 @@ for VIP and upload credit when they are needed.
 
 | ID | Source | Invariant | How Windlass keeps it |
 | --- | --- | --- | --- |
-| S1 | Owner | Bonus points never fall below the reserve set on the settings page. | Every purchase requires MAM's reported points, minus the price, to stay at or above the reserve. |
+| S1 | Owner | Bonus points never fall below the reserve set on the settings page, 20,000 by default. | Every purchase requires MAM's reported points, minus the price, to stay at or above the reserve. |
+| S5 | Owner | Upload credit stays at least 25 GiB above download, so VIP can be bought when downloads need it. | When MAM's uploaded minus downloaded falls below 25 GiB, Windlass buys upload credit in 50 GiB steps, within the points reserve. |
 | S2 | Download docs | A wedge is spent only on purpose. | Windlass adds `fl` only to a download its policy wedges, and never to a VIP torrent or a torrent MAM already reports as a personal freeleech. Search flags lag 5 to 20 minutes, so Windlass also records its own wedge use and never wedges a torrent twice. |
 | S3 | Store docs | Purchases use only documented amounts. | Upload credit in whole GiB of at least 50, or `Max Affordable `; VIP only as `max`, which fills to 90 days and buys at least 7 days. |
 | S4 | Owner | A purchase is never repeated after an uncertain result. | A purchase whose outcome is unknown, for example a timeout, is reconciled from Load User Data and User Bonus History before anything else is bought. |
@@ -173,6 +174,36 @@ New notification conditions, using B-0002's grace periods:
 | Wedges used and bought | User Bonus History, and Windlass's own records | Before spending |
 | Exit IP and ASN as MAM sees them | IP lookup, once a minute at most | B-0004 |
 
+## API calls to verify
+
+The owner runs these in a browser while logged in, or with the API cookie, and
+keeps the responses with personal details removed. They become the fake MAM
+server's fixtures. Read-only calls first; calls that spend only when a purchase
+is wanted anyway.
+
+| # | Call | What it settles | Cost |
+| --- | --- | --- | --- |
+| 1 | `GET /jsonLoad.php?pretty` | Field types: numbers or strings, units of `uploaded` and `downloaded`, `classname` values, `vip_until` format | None |
+| 2 | `GET /jsonLoad.php?snatch_summary&pretty` | The unsatisfied count, and whether satisfied status is given per torrent (A2, A3) | None |
+| 3 | `GET /jsonLoad.php?clientStats&pretty` | How clients, versions, and connectable status appear (A5, A6) | None |
+| 4 | `GET /jsonLoad.php?notif&pretty` | The notification shape; whether a wedge count or a download-disabled state appears (A10) | None |
+| 5 | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
+| 6 | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
+| 7 | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
+| 8 | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
+| 9 | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
+| 10 | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
+| 11 | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
+| 12 | `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` through the VPN | Registration responses, once an hour at most | None |
+| 13 | `GET /tor/download.php?tid=<id>` | A torrent file for a bookmarked torrent | Downloads it |
+| 14 | `GET /tor/download.php?tid=<id>&fl` | Wedge use; `personal_freeleech` and wedge history afterwards | One wedge |
+| 15 | `GET /json/bonusBuy.php?spendtype=wedges` | Wedge price; whether the response gives the new balance | Points |
+| 16 | `GET /json/bonusBuy.php?spendtype=upload&amount=50` | Price per GiB; the response | Points |
+| 17 | `GET /json/bonusBuy.php?spendtype=VIP&duration=max` | VIP price; `vip_until` afterwards | Points |
+
+For each call, also note whether GET or POST is accepted, and any rate-limit
+response.
+
 ## Feature-wide constraints and acceptance
 
 - Every gate is decided in the core from supplied events and time; the shell only
@@ -210,11 +241,9 @@ downloads need it; upload credit bought only to restore a ratio below 3.0; a
 fixed points reserve set on the settings page; MAM's view of connectability is
 checked, repaired where possible, and reported otherwise.
 
-Still to decide:
-
-- The points reserve's starting value.
-- The unsatisfied reserve. Proposed: 2 slots.
-- The seeding margin before removal. Proposed: 24 hours, so 96 hours in total.
+Agreed with the owner: a points reserve of 20,000; an upload buffer of 25 GiB;
+2 unsatisfied slots kept free; 24 hours of seeding beyond the 72 required before
+removal, so 96 hours in total.
 
 Facts the documentation does not settle, to confirm with MAM staff or from a
 response the owner captures in a browser. Until each is settled, the gates that
