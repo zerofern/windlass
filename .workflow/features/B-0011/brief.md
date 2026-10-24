@@ -49,11 +49,11 @@ upload credit when it is needed.
 | A2 | 2.8 | Unsatisfied torrents stay below the class limit: 20 for new members, 50 User, 100 Power User, 150 VIP, 200 above VIP. | Gate, watch | Load User Data `snatch_summary.unsat` `count` and `limit` | Admit only if MAM's unsatisfied count, plus torrents Windlass admitted since that reading, plus 1, stays at least the reserve of 2 below MAM's limit. A missing count or limit closes the gate. Crossing the limit blocks downloads for up to 24 hours. Notify at 80% of the limit. |
 | A3 | 2.5 | Every downloaded torrent seeds 72 hours within 30 days of completion. | Gate, watch | `snatch_summary` counts `seedUnsat`, `inactUnsat`, `seedHnr`, and `inactHnr`; MAM does not name the torrents (see the open questions) | Windlass never stops, pauses, or removes a torrent until qBittorrent shows 72 hours plus the 24-hour margin and MAM's counts agree. The watch notifies when a torrent completed 20 or more days ago has not yet seeded 72 hours, which happens if seeding is interrupted, for example while the VPN is down, and whenever `inactUnsat` or `inactHnr` is above 0: a torrent MAM counts as unsatisfied is not seeding. |
 | A4 | 2.7 | No partial torrents. | Gate, watch | `snatch_summary.partial` | Every file stays selected (implemented). If MAM reports `partial` true, Windlass notifies. |
-| A5 | 2.3 | Only approved, release versions of qBittorrent; no auto-update. | Gate, watch | Load User Data `clientStats=true`; `notifs.aboutToDropClient` | The NixOS module refuses other versions and pins the package (implemented). Windlass also checks that MAM lists the client it sees as the running qBittorrent and does not report it as unauthorized; otherwise downloads are held and the owner is notified. A nonzero `aboutToDropClient` is an urgent notice. |
+| A5 | 2.3 | Only approved, release versions of qBittorrent; no auto-update. | Gate, watch | Load User Data `clientStats=true`; `notifs.aboutToDropClient` | The NixOS module refuses other versions and pins the package (implemented). MAM announces approval changes on the site, such as a new release not to update to yet, and only the owner can act on them, so the weekly reminder (A9) asks the owner to read them. Windlass also checks that MAM lists the client it sees as the running qBittorrent and does not report it as unauthorized; otherwise downloads are held and the owner is notified. A nonzero `aboutToDropClient` is an urgent notice. |
 | A6 | Owner | MAM sees qBittorrent as connectable. | Watch | `snatch_summary.connectable` (`"offline"` while nothing seeds), and each `clientStats` entry, cached by MAM for 30 minutes | When MAM reports the client not connectable, Windlass repairs what it can (below) and notifies the owner if MAM still reports it not connectable after the repair and one fresh reading. |
 | A7 | 1.2 | The VPN IP changes less than once an hour. | Gate | (Windlass's own switch record) | Automatic failover is spaced at least an hour apart, and the spacing survives restarts (implemented). |
 | A8 | 1.2 | MAM knows the seedbox IP. | Gate | Dynamic Seedbox response, and IP lookup `ip` and `ASN` | Dynamic seedbox registration after each IP change, at most once per rolling hour (B-0004). No download is admitted until MAM confirms registration for the current exit IP. |
-| A9 | 1.6 | The account stays active. | Watch | (not reported by the API) | Windlass cannot log in for the owner (A12). It reminds the owner monthly to visit the site; see the open questions. |
+| A9 | 1.6, 2.3 | The account stays active, and the owner sees MAM's announcements. | Watch | (not reported by the API) | Windlass cannot log in for the owner (A12) or read site announcements (A11). Once a week it sends a reminder to visit MAM, linking to the main page, `https://www.myanonamouse.net/`, to keep the account active and to check announcements about approved clients (A5). The time of the last reminder is stored, so restarts neither repeat nor skip one. |
 | A10 | Download docs | Downloads are not disabled. | Gate | A refused download: HTTP 200 without a torrent file | A refused download closes the admission gate and notifies the owner, rather than being retried. |
 | A19 | 2.3 | The same torrent is never announced from two places. | Watch | `snatch_summary.duplicates` | A nonzero count is reported at once; it means another client, or another IP, announces a torrent Windlass seeds. |
 | A20 | Tracker | The tracker reports no errors for the account. | Watch | `snatch_summary.ite` `count` and `latest` | A nonzero count, or a newer `latest`, is reported. |
@@ -175,7 +175,7 @@ New notification conditions, using B-0002's grace periods:
 | A torrent MAM counts as unsatisfied is not seeding (`inactUnsat`, `inactHnr`) | 30 minutes |
 | A wedged download did not lower the wedge balance; the torrent is paused | Immediately |
 | The MAM session was rejected (expired cookie or ASN mismatch) | Immediately |
-| The account may need a visit to stay active (A9) | Monthly |
+| Visit MAM: keep the account active and check announcements (A9, A5); links to MAM's main page, not the dashboard | Weekly |
 
 ## Data each invariant needs
 
@@ -372,7 +372,8 @@ response.
 - Every gate is decided in the core from supplied events and time; the shell only
   makes the requests. Core tests cover each invariant at, just below, and just
   above its threshold, and with MAM's reading missing or stale.
-- Integration tests use a fake MAM server, never the real site.
+- Integration tests use the fake MAM server ([B-0012](../B-0012/brief.md)), never
+  the real site.
 - The dashboard shows every invariant's value as MAM reports it, its limit, and
   what it is holding back.
 

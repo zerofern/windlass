@@ -95,6 +95,17 @@
   and [cleanup](#b-0006-permission-based-disk-cleanup); adds conditions to
   [notifications](#b-0002-important-event-notifications).
 
+## B-0012: Fake MAM server
+
+- Status: Needs Direction
+- Value: Let integration tests prove Windlass keeps MAM's rules against a local
+  stand-in that answers as MAM was observed to, without contacting MAM.
+- Direction: [MAM API compliance](direction.md#mam-api-compliance)
+- Feature Brief: [Fake MAM server](features/B-0012/brief.md)
+- Relationships: Supports [MAM initialization](#b-0004-mam-initialization-loop),
+  [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop), and
+  [account safety](#b-0011-mam-account-safety-and-bonus-points).
+
 ## B-0009: Audiobookshelf integration
 
 - Status: Needs Direction
