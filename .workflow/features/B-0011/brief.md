@@ -142,8 +142,8 @@ priority:
    points are earned back by seeding. When `vip_until` is less than 14 days
    away, or the account is not VIP, Windlass buys VIP if the points left after
    the purchase stay above the reserve, judged by the price paid at the last VIP
-   purchase. The API buys VIP only as `max`, which fills to 90 days and buys at
-   least 7 days.
+   purchase (1,250 points a week when observed). The API buys VIP only as `max`,
+   which fills to 90 days from the purchase and buys at least 7 days.
 3. **Protect the ratio.** Downloads never cost ratio, so this should not happen.
    If the ratio is below the target of 3.0, buy upload credit in 50 GiB steps
    until it reaches 3.0 or only the reserve is left, and tell the owner.
@@ -305,6 +305,13 @@ details are not recorded here.
   balance as a fraction and the new totals in bytes; Load User Data showed
   `seedbonus` truncated to an integer. The ratio text is `"inf."` here and `"∞"`
   in Load User Data, which confirms that Windlass never parses it.
+- `GET /json/bonusBuy.php?spendtype=VIP&duration=max` (call 17) returned
+  `{"success":true,"type":"VIP","amount":6.34,"seedbonus":63094.99…}`.
+  `vip_until` moved from `2026-12-09 10:14:13` to `2027-01-22 18:45:04`, exactly
+  90 days after the purchase. `amount` is the number of weeks bought (44.35
+  days), and the purchase cost 7,925 points: 1,250 points per week. The
+  response gives the new balance but not the new expiry, so Windlass reads
+  `vip_until` again afterwards.
 - Every response so far set `mam_id` again with `Max-Age=1296000` (15 days),
   `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. The value is new
   each time, not the same value encoded differently, and the old value kept
@@ -346,7 +353,7 @@ is wanted anyway.
 | 14 ✓ | `GET /tor/download.php?tid=<id>&fl=1` | Wedge use; `personal_freeleech` and wedge history afterwards | One wedge |
 | 15 – | `GET /json/bonusBuy.php?spendtype=wedges` | Skipped: MLM reports that wedges are no longer sold through the API | Points |
 | 16 ✓ | `GET /json/bonusBuy.php?spendtype=upload&amount=50` | Price per GiB; the response | Points |
-| 17 | `GET /json/bonusBuy.php?spendtype=VIP&duration=max` | VIP price; `vip_until` afterwards | Points |
+| 17 ✓ | `GET /json/bonusBuy.php?spendtype=VIP&duration=max` | VIP price; `vip_until` afterwards | Points |
 
 For each call, also note whether GET or POST is accepted, and any rate-limit
 response.
