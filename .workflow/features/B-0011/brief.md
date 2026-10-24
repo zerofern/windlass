@@ -45,16 +45,20 @@ upload credit when it is needed.
 
 | ID | Rule | Invariant | Kind | Verified with MAM | How Windlass keeps it |
 | --- | --- | --- | --- | --- | --- |
-| A1 | 1.4, 2.4 | Global ratio stays at or above 1.0. | Watch | Load User Data `ratio`, `uploaded`, `downloaded` | Downloads never cost ratio (principle 2), so the ratio should only rise. If it falls below the target of 3.0, Windlass buys upload credit (spending policy). Below 2.0 it notifies and holds every download until it understands why; below 1.1 the notice is urgent. |
-| A2 | 2.8 | Unsatisfied torrents stay below the class limit: 20 for new members, 50 User, 100 Power User, 150 VIP, 200 above VIP. | Gate, watch | Load User Data `snatch_summary` for the count, `classname` for the limit | Admit only if MAM's unsatisfied count, plus torrents Windlass admitted since that reading, plus 1, stays at least the reserve below the limit for MAM's class. An unrecognised class or a missing count closes the gate. Crossing the limit blocks downloads for up to 24 hours. Notify at 80% of the limit. |
-| A3 | 2.5 | Every downloaded torrent seeds 72 hours within 30 days of completion. | Gate, watch | MAM's satisfied status for the torrent (see the open questions) | Windlass never stops, pauses, or removes a torrent until MAM shows it satisfied and qBittorrent shows 72 hours plus the margin. The watch notifies when a torrent completed 20 or more days ago has not yet seeded 72 hours, which happens if seeding is interrupted, for example while the VPN is down. |
-| A4 | 2.7 | No partial torrents. | Gate | (none needed) | Every file stays selected (implemented). |
-| A5 | 2.3 | Only approved, release versions of qBittorrent; no auto-update. | Gate, watch | Load User Data `clientStats` | The NixOS module refuses other versions and pins the package (implemented). Windlass also checks that MAM lists the client it sees as the running qBittorrent and does not report it as unauthorized; otherwise downloads are held and the owner is notified. |
-| A6 | Owner | MAM sees qBittorrent as connectable. | Watch | Load User Data `clientStats` connectable status, cached by MAM for 30 minutes | When MAM reports the client not connectable, Windlass repairs what it can (below) and notifies the owner if MAM still reports it not connectable after the repair and one fresh reading. |
+| A1 | 1.4, 2.4 | Global ratio stays at or above 1.0. | Watch | Load User Data `uploaded_bytes` and `downloaded_bytes`; the `ratio` text is never parsed | Downloads never cost ratio (principle 2), so the ratio should only rise. If it falls below the target of 3.0, Windlass buys upload credit (spending policy). Below 2.0 it notifies and holds every download until it understands why; below 1.1 the notice is urgent. |
+| A2 | 2.8 | Unsatisfied torrents stay below the class limit: 20 for new members, 50 User, 100 Power User, 150 VIP, 200 above VIP. | Gate, watch | Load User Data `snatch_summary.unsat` `count` and `limit` | Admit only if MAM's unsatisfied count, plus torrents Windlass admitted since that reading, plus 1, stays at least the reserve of 2 below MAM's limit. A missing count or limit closes the gate. Crossing the limit blocks downloads for up to 24 hours. Notify at 80% of the limit. |
+| A3 | 2.5 | Every downloaded torrent seeds 72 hours within 30 days of completion. | Gate, watch | `snatch_summary` counts `seedUnsat`, `inactUnsat`, `seedHnr`, and `inactHnr`; MAM does not name the torrents (see the open questions) | Windlass never stops, pauses, or removes a torrent until qBittorrent shows 72 hours plus the 24-hour margin and MAM's counts agree. The watch notifies when a torrent completed 20 or more days ago has not yet seeded 72 hours, which happens if seeding is interrupted, for example while the VPN is down, and whenever `inactUnsat` or `inactHnr` is above 0: a torrent MAM counts as unsatisfied is not seeding. |
+| A4 | 2.7 | No partial torrents. | Gate, watch | `snatch_summary.partial` | Every file stays selected (implemented). If MAM reports `partial` true, Windlass notifies. |
+| A5 | 2.3 | Only approved, release versions of qBittorrent; no auto-update. | Gate, watch | Load User Data `clientStats=true`; `notifs.aboutToDropClient` | The NixOS module refuses other versions and pins the package (implemented). Windlass also checks that MAM lists the client it sees as the running qBittorrent and does not report it as unauthorized; otherwise downloads are held and the owner is notified. A nonzero `aboutToDropClient` is an urgent notice. |
+| A6 | Owner | MAM sees qBittorrent as connectable. | Watch | `snatch_summary.connectable` (`"offline"` while nothing seeds), and each `clientStats` entry, cached by MAM for 30 minutes | When MAM reports the client not connectable, Windlass repairs what it can (below) and notifies the owner if MAM still reports it not connectable after the repair and one fresh reading. |
 | A7 | 1.2 | The VPN IP changes less than once an hour. | Gate | (Windlass's own switch record) | Automatic failover is spaced at least an hour apart, and the spacing survives restarts (implemented). |
-| A8 | 1.2 | MAM knows the seedbox IP. | Gate | Dynamic Seedbox response and IP lookup | Dynamic seedbox registration after each IP change, at most once per rolling hour (B-0004). No download is admitted until MAM confirms registration for the current exit IP. |
+| A8 | 1.2 | MAM knows the seedbox IP. | Gate | Dynamic Seedbox response, and IP lookup `ip` and `ASN` | Dynamic seedbox registration after each IP change, at most once per rolling hour (B-0004). No download is admitted until MAM confirms registration for the current exit IP. |
 | A9 | 1.6 | The account stays active. | Watch | (not reported by the API) | Windlass cannot log in for the owner (A12). It reminds the owner monthly to visit the site; see the open questions. |
-| A10 | Download docs | Downloads are not disabled. | Gate | Load User Data, if it reports the state; otherwise a refused download | A refused download closes the admission gate and notifies the owner, rather than being retried. |
+| A10 | Download docs | Downloads are not disabled. | Gate | A refused download: HTTP 200 without a torrent file | A refused download closes the admission gate and notifies the owner, rather than being retried. |
+| A19 | 2.3 | The same torrent is never announced from two places. | Watch | `snatch_summary.duplicates` | A nonzero count is reported at once; it means another client, or another IP, announces a torrent Windlass seeds. |
+| A20 | Tracker | The tracker reports no errors for the account. | Watch | `snatch_summary.ite` `count` and `latest` | A nonzero count, or a newer `latest`, is reported. |
+| A21 | MAM | Nothing MAM flags needs attention. | Watch | Every `snatch_summary` category marked `red` with a nonzero count, and the `notifs` counts | Each is reported as a count, without message text. |
+| A22 | Session | The API session stays valid and is used only from the VPN's provider. | Gate | Any response: `Invalid/missing cookie` or `Session ASN mismatch`, which arrive as text, not JSON | Every MAM request stops and the owner is told to create a new session from the VPN. Sessions are bound to an ASN; failover to a server in another ASN is reported as breaking the session. Regular polling keeps the 15-day cookie alive. |
 
 ### Automation boundaries
 
@@ -75,7 +79,7 @@ upload credit when it is needed.
 | --- | --- | --- | --- |
 | S1 | Owner | Bonus points never fall below the reserve set on the settings page, 20,000 by default. | Every purchase requires MAM's reported points, minus the price, to stay at or above the reserve. |
 | S5 | Owner | Upload credit stays at least 25 GiB above download, so VIP can be bought when downloads need it. | When MAM's uploaded minus downloaded falls below 25 GiB, Windlass buys upload credit in 50 GiB steps, within the points reserve. |
-| S2 | Download docs | A wedge is spent only on purpose. | Windlass adds `fl` only to a download its policy wedges, and never to a VIP torrent or a torrent MAM already reports as a personal freeleech. Search flags lag 5 to 20 minutes, so Windlass also records its own wedge use and never wedges a torrent twice. |
+| S2 | Download docs | A wedge is spent only on purpose. | Windlass adds `fl=1` only to a download its policy wedges, and never to a VIP torrent while the account is VIP or a torrent MAM already reports as a personal freeleech. Search flags lag up to about 20 minutes, so Windlass also records its own wedge use and never wedges a torrent twice. The next Load User Data reading must show `wedges` lower by the number spent; if not, the torrents are paused and the owner told. |
 | S3 | Store docs | Purchases use only documented amounts. | Upload credit in whole GiB of at least 50, or `Max Affordable `; VIP only as `max`, which fills to 90 days and buys at least 7 days. |
 | S4 | Owner | A purchase is never repeated after an uncertain result. | A purchase whose outcome is unknown, for example a timeout, is reconciled from Load User Data and User Bonus History before anything else is bought. |
 
@@ -166,19 +170,24 @@ New notification conditions, using B-0002's grace periods:
 | No wedge left, with torrents waiting for one | Immediately |
 | VIP expiring within 7 days and not renewed, and why | Immediately |
 | Bonus points below the reserve | Immediately |
-| MAM reports a notification for the account, as a count without its text | Immediately |
+| MAM reports a notification for the account, as a count without its text | Immediately; urgent for `aboutToDropClient` |
+| MAM reports a partial download, duplicate peers, tracker errors, or another red category | Immediately |
+| A torrent MAM counts as unsatisfied is not seeding (`inactUnsat`, `inactHnr`) | 30 minutes |
+| A wedged download did not lower the wedge balance; the torrent is paused | Immediately |
+| The MAM session was rejected (expired cookie or ASN mismatch) | Immediately |
 | The account may need a visit to stay active (A9) | Monthly |
 
 ## Data each invariant needs
 
 | Data | Source | Freshness |
 | --- | --- | --- |
-| Ratio, uploaded, downloaded, class, points, VIP expiry | Load User Data | 15 minutes; 5 minutes before admission or purchase |
-| Unsatisfied count and per-torrent satisfaction | Load User Data `snatch_summary` | As above |
-| Client list, versions, connectable status | Load User Data `clientStats`, cached by MAM for 30 minutes | 30 minutes |
+| Uploaded and downloaded bytes, class, points, wedges, VIP expiry | Load User Data | 15 minutes; 5 minutes before admission or purchase |
+| Unsatisfied count and limit, category counts, connectable, partial, duplicates, tracker errors | Load User Data `snatch_summary=true` | As above |
+| MAM notices, including `aboutToDropClient` | Load User Data `notif=true` | As above |
+| Client list, versions, connectable status | Load User Data `clientStats=true`, cached by MAM for 30 minutes | 30 minutes |
 | Bookmarks, freeleech, VIP, personal freeleech, snatched | Torrent Search | Each bookmark poll; flags lag 5 to 20 minutes |
 | Seeding time, completion, files | qBittorrent (implemented) | 10 seconds |
-| Wedges used and bought | User Bonus History, and Windlass's own records | Before spending |
+| Wedges spent | Load User Data `wedges`, User Bonus History, and Windlass's own records | After each wedged download |
 | Exit IP and ASN as MAM sees them | IP lookup, once a minute at most | B-0004 |
 
 ## Evidence from MLM
