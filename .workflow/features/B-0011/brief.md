@@ -263,6 +263,14 @@ details are not recorded here.
   integer, and the torrent's `title`. It gives no balance; the balance comes
   from Load User Data's `wedges`. The literal brackets in `type[]` must be sent
   as they are or encoded, so curl needs `-g`.
+- `GET /tor/download.php?tid=0` (call 9) returned HTTP 200 with
+  `content-type: text/html` and an empty body. A refused download is therefore
+  not an HTTP error: Windlass accepts a download only when the body parses as a
+  torrent file, and treats anything else as refused.
+- Every response so far set `mam_id` again with `Max-Age=1296000` (15 days),
+  `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. Whether the value
+  changes, or only its expiry, is still to be checked (A18). A session left
+  unused for 15 days would expire, so Windlass's regular polling keeps it alive.
 - The `red` flag is MAM's own marking of categories that need attention. Any red
   category with a nonzero count is reported, beside the specific gates.
 - The session was locked to the network provider (ASN). A request from another
@@ -289,7 +297,7 @@ is wanted anyway.
 | 6 ✓ | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
 | 7 ✓ | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
 | 8 ½ | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
-| 9 | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
+| 9 ✓ | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
 | 10 | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
 | 11 ✓ | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
 | 12 | `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` through the VPN | Registration responses, once an hour at most | None |
