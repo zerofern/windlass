@@ -276,11 +276,17 @@ details are not recorded here.
   filename="[<id>]_<title>.torrent"`, and a bencoded body beginning
   `d8:announce`. It spent one wedge: `wedges` went from 212 to 211 at once, and
   the site showed the torrent as freeleech. `seedbonus` did not change. Torrent
-  Search still reported `personal_freeleech` 0 just after, so the search flags
-  lag. Windlass confirms a wedge from the drop in `wedges` and from a `wedgePF`
-  entry for the torrent in the wedge history, not from search. Windlass sends
-  `fl=1`, since MAM ignored flags without a value elsewhere; MLM sends a bare
-  `fl`.
+  Search still reported `personal_freeleech` 0 just after; about 20 minutes
+  later it reported `personal_freeleech` 1 and `fl_vip` 1, so `fl_vip` reads as
+  "freeleech for this user", whether through VIP or a wedge. The wedge history
+  listed a `wedgePF` entry for the torrent at once. Windlass sends `fl=1`, since
+  MAM ignored flags without a value elsewhere; MLM sends a bare `fl`.
+- Agreed with the owner: Windlass does not wait to confirm a wedge. The wedge is
+  spent by the same request that returns the torrent file, so Windlass adds and
+  starts the torrent at once. The next Load User Data reading, which reflects
+  wedges immediately, must show `wedges` one lower for each wedged download
+  since the last reading. If it does not, Windlass pauses the torrents in
+  question and notifies, so a download that was not wedged cannot run on ratio.
 - Every response so far set `mam_id` again with `Max-Age=1296000` (15 days),
   `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. The value is new
   each time, not the same value encoded differently, and the old value kept
