@@ -268,9 +268,12 @@ details are not recorded here.
   not an HTTP error: Windlass accepts a download only when the body parses as a
   torrent file, and treats anything else as refused.
 - Every response so far set `mam_id` again with `Max-Age=1296000` (15 days),
-  `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. Whether the value
-  changes, or only its expiry, is still to be checked (A18). A session left
-  unused for 15 days would expire, so Windlass's regular polling keeps it alive.
+  `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. The value is new
+  each time, not the same value encoded differently, and the old value kept
+  working after the new one was issued. A18 stands: Windlass saves each new
+  value and sends the latest, but a save that fails is not an immediate
+  lockout. How long an old value stays valid is unknown. A session left unused
+  for 15 days would expire, so Windlass's regular polling keeps it alive.
 - The `red` flag is MAM's own marking of categories that need attention. Any red
   category with a nonzero count is reported, beside the specific gates.
 - The session was locked to the network provider (ASN). A request from another
