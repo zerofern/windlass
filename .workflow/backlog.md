@@ -81,6 +81,19 @@
   [MAM initialization](#b-0004-mam-initialization-loop) and the forwarded port to
   [qBittorrent integration](#b-0007-qbittorrent-integration).
 
+## B-0011: MAM account safety and bonus points
+
+- Status: Needs Direction
+- Value: Keep the account inside every MAM rule on ratio, unsatisfied torrents,
+  seeding, clients, IPs, and automation while Windlass acquires bookmarked
+  torrents unattended, and spend bonus points on upload credit, wedges, and VIP
+  when that keeps the account healthy.
+- Direction: [MAM API compliance](direction.md#mam-api-compliance)
+- Feature Brief: [MAM account safety and bonus points](features/B-0011/brief.md)
+- Relationships: Gates [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop)
+  and [cleanup](#b-0006-permission-based-disk-cleanup); adds conditions to
+  [notifications](#b-0002-important-event-notifications).
+
 ## B-0009: Audiobookshelf integration
 
 - Status: Needs Direction

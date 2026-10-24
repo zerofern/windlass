@@ -38,6 +38,8 @@ Acceptance:
 
 - Require confirmed MAM access and seedbox registration, client availability,
   account eligibility, sufficient space, and the duplicate/history checks.
+  Account eligibility is defined by the invariants and admission order of
+  [account safety](../B-0011/brief.md).
 - Insufficient space holds new downloads while existing torrents keep seeding
   under the VPN boundary. Follow the [cleanup policy](../../direction.md#disk-space).
 - Fetching torrent metadata is distinct from client acceptance and book completion.
@@ -101,7 +103,8 @@ blocks acquisition. `clientStats` has a 30-minute cache and cannot prove current
 client availability. No bonus purchases are implied.
 
 Torrent fetch must return valid metadata, not HTML/JSON with HTTP success.
-Proposed default: omit `fl`, which can spend a wedge even on VIP torrents.
+`fl` is used only as the [spending policy](../B-0011/brief.md) decides; it can
+spend a wedge even on VIP torrents.
 Prefer authenticated download by ID without requesting credential-bearing `dlLink`.
 Endpoint-specific limits and error contracts are incomplete in the supplied docs.
 
@@ -111,7 +114,8 @@ Bookmarks, admission, metadata acquisition, durable history, and client handoff.
 
 ## Non-goals
 
-General title searches, automatic content recommendations, spending policy,
+General title searches, automatic content recommendations, spending policy
+([B-0011](../B-0011/brief.md)),
 client API implementation, library organisation, and cleanup implementation.
 
 ## Related records
