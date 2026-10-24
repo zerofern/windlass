@@ -59,7 +59,7 @@ for VIP and upload credit when they are needed.
 
 | ID | Rule | Invariant | How Windlass keeps it |
 | --- | --- | --- | --- |
-| A11 | 1.7 | Only documented API functions are automated. | Windlass calls only the endpoints listed above. Undocumented parameter values, such as the bookmark filter of the search endpoint, are not guessed; they wait for documentation or staff confirmation. |
+| A11 | 1.7 | Only documented API functions are automated. | Windlass calls only the endpoints listed above. Undocumented parameter values are not guessed; they wait for documentation or staff confirmation. The owner accepted the bookmark filter `"searchIn": "bookmarks"`, observed working in a JSON POST, without waiting for confirmation. |
 | A12 | 1.7 | No scraping and no email/password login. | Windlass reads only JSON API responses and authenticates only with the owner's `mam_id` API cookie. |
 | A13 | Bonus store docs | `gift` and `sendWedge` are never automated. | Windlass can only express the purchases `upload`, `wedges`, and `VIP`. |
 | A14 | 2.2, 3.7, 3.15, 4.4 | No begging, requests, or sharing files or `.torrent` files. | Windlass has no function that posts, requests, gifts, or exports content or torrent files. |
@@ -257,6 +257,12 @@ details are not recorded here.
 - `GET /json/jsonIp.php` (call 8, on `www`) needs no cookie and returns `ip` as
   text, `ASN` as an integer, `AS` as the provider's name, and `time` as a Unix
   time. Through ProtonVPN it reported `"AS":"ProtonVPN Proton AG"`.
+- `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` (call 7)
+  returned a JSON array, newest first, of entries with `timestamp` (Unix time
+  with a fraction), `amount` (-1 per personal freeleech), `type`, `tid` as an
+  integer, and the torrent's `title`. It gives no balance; the balance comes
+  from Load User Data's `wedges`. The literal brackets in `type[]` must be sent
+  as they are or encoded, so curl needs `-g`.
 - The `red` flag is MAM's own marking of categories that need attention. Any red
   category with a nonzero count is reported, beside the specific gates.
 - The session was locked to the network provider (ASN). A request from another
@@ -281,7 +287,7 @@ is wanted anyway.
 | 4 ✓ | `GET /jsonLoad.php?notif=true&pretty` | The notification shape; whether a wedge count or a download-disabled state appears (A10) | None |
 | 5 ✓ | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
 | 6 ✓ | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
-| 7 | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
+| 7 ✓ | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
 | 8 ½ | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
 | 9 | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
 | 10 | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
@@ -337,13 +343,13 @@ Agreed with the owner: a points reserve of 20,000; an upload buffer of 25 GiB;
 2 unsatisfied slots kept free; 24 hours of seeding beyond the 72 required before
 removal, so 96 hours in total.
 
+Agreed with the owner: the bookmark filter `"searchIn": "bookmarks"` is used as
+observed, without waiting for staff confirmation.
+
 Facts the documentation does not settle, to confirm with MAM staff or from a
 response the owner captures in a browser. Until each is settled, the gates that
 depend on it stay closed:
 
-- Staff confirmation of the bookmark filter: `"searchIn": "bookmarks"` works in
-  a JSON POST, but the documentation still says "list to come". Blocks bookmark
-  polling (A11) until confirmed.
 - Which torrents are satisfied: `snatch_summary` gives the unsatisfied count but
   only counts per category. Without per-torrent status, A3 blocks automatic
   removal.
