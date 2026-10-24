@@ -195,6 +195,44 @@ each answer is a lead to confirm with the owner's own responses, not proof:
   `/json/checkCookie.php` and `cdn.myanonamouse.net/json/loadUserDetailsTorrents.php`.
   Neither is in the supplied documentation, so Windlass does not use them (A11).
 
+## Observed responses
+
+Captured by the owner on 2026-10-24 from the phone, with a test session; personal
+details are not recorded here.
+
+`GET /jsonLoad.php?snatch_summary=true` (calls 1 and 2) returned:
+
+- `uploaded_bytes` and `downloaded_bytes` as JSON integers. `ratio` is a display
+  string, `"∞"` when nothing has been downloaded, so Windlass computes the ratio
+  and the upload buffer from the byte counts and never parses `ratio`.
+- `wedges` as an integer, so Load User Data does report the wedge balance.
+- `seedbonus` as an integer, `classname` as text (`"VIP"` seen), and `vip_until`
+  as `"YYYY-MM-DD HH:MM:SS"` with no zone. `snatch_summary.created_at` uses the
+  same format and matches `created`, a Unix time, read as UTC, so MAM's times
+  are taken as UTC.
+- `snatch_summary` holds categories, each with `name`, `count`, `red`, and, for
+  most, `size`. `size` is `null`, not 0, when the category is empty.
+  - `unsat`: `count` and `limit` (150 for this VIP account). MAM supplies the
+    limit, so A2 needs no table of classes.
+  - `seedUnsat`, `inactUnsat`, `seedHnr`, `inactHnr`, `sSat`, `inactSat`,
+    `leeching`, `upAct`, `upInact`: counts by seeding and satisfaction state.
+    They do not name torrents, so per-torrent satisfaction is still open (A3).
+  - `duplicates`: duplicate peer entries, marked red.
+  - `ite`: important tracker errors, with `count` and `latest`.
+  - `reseed`: reseed requests, with `count` and `inactive`.
+  - `connectable`: a string; `"offline"` while nothing was seeding. Other values
+    still to be seen. `v6_connectable` was `null`.
+  - `partial`: a boolean, so MAM's view of partial downloads can confirm A4.
+  - `recently_deleted`, `ipv6_mac`.
+- The `red` flag is MAM's own marking of categories that need attention. Any red
+  category with a nonzero count is reported, beside the specific gates.
+- The session was locked to the network provider (ASN). A request from another
+  provider was refused with `Error, you are not signed in <br />Session ASN
+  mismatch`, and a request without a cookie with `... <br />Invalid/missing
+  cookie`. Both arrive as text, not JSON, and are classed as a rejected session.
+  An ASN-locked session for Windlass must be created from the VPN's provider,
+  and failover between servers of different providers would break it (B-0004).
+
 ## API calls to verify
 
 The owner runs these in a browser while logged in, or with the API cookie, and
@@ -204,8 +242,8 @@ is wanted anyway.
 
 | # | Call | What it settles | Cost |
 | --- | --- | --- | --- |
-| 1 | `GET /jsonLoad.php?pretty` | Field types: numbers or strings, units of `uploaded` and `downloaded`, `classname` values, `vip_until` format | None |
-| 2 | `GET /jsonLoad.php?snatch_summary&pretty` | The unsatisfied count, and whether satisfied status is given per torrent (A2, A3) | None |
+| 1 ✓ | `GET /jsonLoad.php?pretty` | Field types: numbers or strings, units of `uploaded` and `downloaded`, `classname` values, `vip_until` format | None |
+| 2 ✓ | `GET /jsonLoad.php?snatch_summary&pretty` | The unsatisfied count, and whether satisfied status is given per torrent (A2, A3) | None |
 | 3 | `GET /jsonLoad.php?clientStats&pretty` | How clients, versions, and connectable status appear (A5, A6) | None |
 | 4 | `GET /jsonLoad.php?notif&pretty` | The notification shape; whether a wedge count or a download-disabled state appears (A10) | None |
 | 5 | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
@@ -214,7 +252,7 @@ is wanted anyway.
 | 8 | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
 | 9 | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
 | 10 | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
-| 11 | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
+| 11 ✓ | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
 | 12 | `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` through the VPN | Registration responses, once an hour at most | None |
 | 13 | `GET /tor/download.php?tid=<id>` | A torrent file for a bookmarked torrent | Downloads it |
 | 14 | `GET /tor/download.php?tid=<id>&fl` | Wedge use; `personal_freeleech` and wedge history afterwards | One wedge |
@@ -272,13 +310,13 @@ depend on it stay closed:
 
 - The bookmark filter value for `searchIn`; the documentation says "list to
   come". Blocks bookmark polling (A11).
-- The shape of `snatch_summary`: whether it gives the unsatisfied count, and
-  whether it identifies which torrents are satisfied. Without the count, A2
-  closes admission; without per-torrent status, A3 blocks automatic removal.
+- Which torrents are satisfied: `snatch_summary` gives the unsatisfied count but
+  only counts per category. Without per-torrent status, A3 blocks automatic
+  removal.
+- The other values of `snatch_summary.connectable` besides `"offline"`.
 - The shape of `clientStats`: how clients, versions, and connectable status are
   reported (A5, A6).
 - Prices in the bonus store, and whether purchases report the new balance.
-- How many wedges the account holds; Load User Data does not document it.
 - Whether VIP torrents are freeleech for VIP members, as the API's warning about
   wedges on VIP torrents suggests. Until confirmed, VIP torrents wait.
 - Whether API use counts as activity for rule 1.6.
