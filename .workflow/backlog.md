@@ -85,9 +85,10 @@
 
 - Status: Needs Direction
 - Value: Keep the account inside every MAM rule on ratio, unsatisfied torrents,
-  seeding, clients, IPs, and automation while Windlass acquires bookmarked
-  torrents unattended, and spend bonus points on upload credit, wedges, and VIP
-  when that keeps the account healthy.
+  seeding, clients, IPs, and automation, as MAM itself reports them, while
+  Windlass acquires bookmarked torrents unattended without spending ratio; keep
+  qBittorrent connectable; and spend bonus points on wedges, VIP, and upload
+  credit when needed.
 - Direction: [MAM API compliance](direction.md#mam-api-compliance)
 - Feature Brief: [MAM account safety and bonus points](features/B-0011/brief.md)
 - Relationships: Gates [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop)
