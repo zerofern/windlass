@@ -224,6 +224,12 @@ details are not recorded here.
     still to be seen. `v6_connectable` was `null`.
   - `partial`: a boolean, so MAM's view of partial downloads can confirm A4.
   - `recently_deleted`, `ipv6_mac`.
+- Flag parameters need a value: `clientStats` alone was ignored, while
+  `clientStats=true` was honoured, as was `snatch_summary=true`. Windlass sends
+  every flag as `=true`.
+- `GET /jsonLoad.php?clientStats=true` (call 3) returned `"clientStats": []`
+  while nothing was seeding. The shape of an entry is still to be captured once
+  qBittorrent seeds through the VPN.
 - The `red` flag is MAM's own marking of categories that need attention. Any red
   category with a nonzero count is reported, beside the specific gates.
 - The session was locked to the network provider (ASN). A request from another
