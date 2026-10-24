@@ -65,6 +65,8 @@ for VIP and upload credit when they are needed.
 | A14 | 2.2, 3.7, 3.15, 4.4 | No begging, requests, or sharing files or `.torrent` files. | Windlass has no function that posts, requests, gifts, or exports content or torrent files. |
 | A15 | Direction | Request rates stay within the shared token bucket and every endpoint's own limit (IP lookup once a minute, dynamic seedbox once an hour). | Requests wait for tokens and cooldowns; identical requests are queued once. |
 | A16 | Direction | Pause and VPN protection stop MAM requests. | Applies to every MAM call, including purchases (implemented for the request path). |
+| A17 | MAM staff | Every request names the tool and its version, so MAM can block a faulty version. | Every MAM request sends `User-Agent: Windlass/<version>`, the release version of the running build. |
+| A18 | MAM practice | MAM may replace the `mam_id` cookie in a response. | Windlass saves a replaced cookie at once and uses it for every later request, as MLM and Mousehole do. A cookie that fails is never replaced by an older one without the owner. |
 
 ### Spending
 
@@ -173,6 +175,25 @@ New notification conditions, using B-0002's grace periods:
 | Seeding time, completion, files | qBittorrent (implemented) | 10 seconds |
 | Wedges used and bought | User Bonus History, and Windlass's own records | Before spending |
 | Exit IP and ASN as MAM sees them | IP lookup, once a minute at most | B-0004 |
+
+## Evidence from MLM
+
+MLM's MAM client (`mlm_mam/src/api.rs` and `user_data.rs`) suggests answers to
+several questions below. MLM was reportedly banned for breaking API rules, so
+each answer is a lead to confirm with the owner's own responses, not proof:
+
+- `GET /jsonLoad.php?snatch_summary=true` returns `uploaded_bytes` and
+  `downloaded_bytes` as numbers, `wedges` (the wedge count), and
+  `snatch_summary.unsat` with `count`, `limit`, and `size`, beside `seedUnsat`,
+  `inactUnsat`, and a `connectable` value. MAM supplies the unsatisfied limit
+  itself, so A2 need not map class names.
+- Bookmarks are listed with `"searchIn": "bookmarks"` in a JSON POST to the
+  search endpoint.
+- MLM spends wedges with `fl` on download, and notes that the bonus store no
+  longer sells wedges through the API.
+- MLM sends `User-Agent: MLM/<version>`, saves replaced cookies, and also calls
+  `/json/checkCookie.php` and `cdn.myanonamouse.net/json/loadUserDetailsTorrents.php`.
+  Neither is in the supplied documentation, so Windlass does not use them (A11).
 
 ## API calls to verify
 
