@@ -43,7 +43,8 @@ Acceptance:
   its API and confirms the change. qBittorrent's own UPnP and NAT-PMP are off.
 - The dashboard shows the forwarded port, when it was last renewed, and whether
   qBittorrent uses it.
-- A failed renewal is retried and marks the tunnel as suspect (S3).
+- A failed renewal is retried after 5 seconds and marks the tunnel as suspect (S3).
+- Implemented, with the lease gateway passed as `--nat-pmp-gateway`.
 
 ### S3: Prove the tunnel works
 
@@ -62,6 +63,11 @@ Acceptance:
 - The observed exit IP is shared with MAM initialization, which refreshes seedbox
   registration when it changes.
 - Checks, results, and the exit IP appear in history.
+- Implemented with a check at startup, every 15 minutes while it succeeds, a
+  minute after a failure, and at once when a lease renewal fails. The service is
+  `services.windlass.vpn.exitIpService`, by default `https://ipv4.icanhazip.com/`;
+  proxies are ignored so the check sees the tunnel itself. Sharing the exit IP
+  with MAM initialization follows B-0004.
 
 ### S4: Fail over to another server
 
@@ -82,6 +88,12 @@ Acceptance:
 - After a switch, Windlass rechecks the tunnel, renews the port mapping, updates
   qBittorrent, and lets MAM initialization refresh seedbox registration.
 - Switches, their reasons, and outcomes appear in history and in notifications.
+- Implemented: after three consecutive failed checks, Windlass switches to the
+  next server in name order. It saves the switch before starting it, so the
+  hour's spacing survives a restart, and it does not switch while the last switch
+  cannot be read. After a switch it checks again and asks the new gateway for a
+  port, which then reaches qBittorrent. The dashboard shows when the next switch
+  is allowed. Notifications follow B-0002.
 
 ### S5: Keep MAM's ASN list in step
 
@@ -132,6 +144,7 @@ management (B-0007), and MAM registration requests (B-0004).
 ## Open questions and assumptions
 
 Agreed with the owner: the dashboard is forwarded to both the LAN and Tailscale.
+The core starts failover itself whenever MAM's limits allow it.
 MAM's IP check keeps running on its own schedule (B-0004) alongside this feature's
 neutral checks; the neutral checks verify the tunnel, and MAM's check reports the
 IP and ASN as MAM sees them.
@@ -145,8 +158,8 @@ Still open:
 - The repository's NixOS module ([`nix/module.nix`](../../../nix/module.nix))
   builds the namespace directly rather than through VPN-Confinement, and swaps
   WireGuard configurations without restarting qBittorrent. Its VM test
-  ([`nix/tests/vpn.nix`](../../../nix/tests/vpn.nix)) checks S1 and the switch
-  mechanism of S4 against fake WireGuard servers.
-- Which exit-IP service, and how many failed checks trigger a switch?
+  ([`nix/tests/vpn.nix`](../../../nix/tests/vpn.nix)) checks S1, S2, S3, and
+  automatic failover (S4) against fake WireGuard servers and a fake exit-IP
+  service.
 - Can the user confirm an added ASN in Windlass, or should Windlass wait for a
   successful registration as confirmation?

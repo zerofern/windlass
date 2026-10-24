@@ -35,6 +35,23 @@ pub enum Event {
     Settings(SettingsEvent),
     /// History storage results.
     History(HistoryEvent),
+    /// A scheduled timer expired.
+    TimerExpired {
+        /// Which timer.
+        name: TimerName,
+        /// Which instance; obsolete instances are ignored.
+        id: TimerId,
+    },
+    /// Proton VPN port-forwarding commands and NAT-PMP results.
+    PortForwarding(PortForwardingEvent),
+    /// qBittorrent commands and web UI API results.
+    Qbittorrent(QbittorrentEvent),
+    /// Torrent registry storage results.
+    Registry(RegistryEvent),
+    /// VPN tunnel commands, checks, and switches.
+    Tunnel(TunnelEvent),
+    /// Notification commands and delivery results.
+    Notification(NotificationEvent),
 }
 
 /// An effect requested by the core for the shell to execute.
@@ -76,13 +93,85 @@ pub enum Action {
         /// How many entries to keep.
         keep: EntryCount,
     },
+    /// Start a timer, replacing any running timer with the same name.
+    StartTimer {
+        /// Which timer.
+        name: TimerName,
+        /// This instance's identity, reported back on expiry.
+        id: TimerId,
+        /// When it expires.
+        deadline: Deadline,
+    },
+    /// Ask the NAT-PMP gateway to map TCP and UDP ports for this long.
+    RequestPortMapping {
+        /// The requested lease lifetime.
+        lifetime: std::time::Duration,
+    },
+    /// Read qBittorrent's version and preferences.
+    ConnectQbittorrent,
+    /// Read qBittorrent's changes since this position.
+    SyncQbittorrent {
+        /// The position from the previous update.
+        position: SyncPosition,
+    },
+    /// Read qBittorrent's preferences.
+    ReadQbittorrentPreferences,
+    /// Set the port qBittorrent listens on for peers.
+    SetQbittorrentListenPort {
+        /// The forwarded port.
+        port: Port,
+    },
+    /// Change qBittorrent to match the torrent registry.
+    QbittorrentCommand {
+        /// The change.
+        command: TorrentCommand,
+    },
+    /// Read every torrent registry row.
+    ReadTorrentRegistry,
+    /// Insert or replace these registry rows in one transaction.
+    SaveTorrents {
+        /// The rows as they are now.
+        records: Vec<TorrentRecord>,
+    },
+    /// Ask a neutral service for the tunnel's public address.
+    CheckExitIp,
+    /// Read the last VPN server switch.
+    ReadLastVpnSwitch,
+    /// Save a VPN server switch before starting it.
+    SaveVpnSwitch {
+        /// The switch.
+        switch: VpnSwitch,
+    },
+    /// Start the NixOS unit that connects to this server.
+    SwitchVpnServer {
+        /// The server.
+        server: VpnServer,
+    },
+    /// Persist the ntfy topic, or remove it when absent.
+    WriteNtfyTopic {
+        /// The topic to store, if any.
+        topic: Option<NtfyTopic>,
+    },
+    /// Publish a notice to the ntfy topic.
+    SendNotification {
+        /// The topic.
+        topic: NtfyTopic,
+        /// What to tell the user.
+        notice: Notice,
+    },
 }
 
 mod history;
 mod machine;
 mod mam_pause;
+mod notifications;
+mod port_forwarding;
+mod qbittorrent;
+mod registry;
 mod settings;
 mod startup;
+mod timer;
+mod tunnel;
 
 pub use history::{HistoryEvent, HistoryState, Step, Trim};
 pub use machine::{Core, State};
@@ -90,8 +179,30 @@ pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,
     MamRequestMode, MamRequestsStatus,
 };
+pub use notifications::{
+    Condition, Delivery, DeliveryFailure, Notice, NotificationEvent, Notifications, OUTBOX_LIMIT,
+    Outcome, Phase, SettingName, SwitchBlock,
+};
+pub use port_forwarding::{
+    LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, Port, PortForwarding, PortForwardingEvent,
+};
+pub use qbittorrent::{
+    Activity, ByteSize, ClientVersion, MamApproval, POLL_INTERVAL, Progress, Qbittorrent,
+    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Ratio, Session, SyncPosition,
+    SyncUpdate, Torrent, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
+};
+pub use registry::{
+    COUNTER_SAVE_INTERVAL, Desired, Identity, MamTorrentId, Observation, Origin, RecordId, Records,
+    Registry, RegistryEvent, TorrentRecord,
+};
 pub use settings::{
-    ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, Setting,
-    SettingPersistence, SettingStatus, Settings, SettingsEvent, SettingsState,
+    ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, InvalidNtfyTopic,
+    NtfyTopic, Setting, SettingPersistence, SettingStatus, Settings, SettingsEvent, SettingsState,
 };
 pub use startup::{StartupEvent, StartupMode};
+pub use timer::{Deadline, TimerId, TimerName};
+pub use tunnel::{
+    CHECK_INTERVAL, Check, ExitIpFailure, FAILURES_BEFORE_SWITCH, Failover, LastSwitch, Protection,
+    RETRY_AFTER, SWITCH_SPACING, SwitchAllowance, Tunnel, TunnelEvent, VpnServer, VpnServerError,
+    VpnSwitch, Watch,
+};

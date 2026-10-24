@@ -59,7 +59,12 @@ impl Dashboard {
         path: PathBuf,
         mode: StartupMode,
     ) -> TestResult<Self> {
-        let (runner, events, observations) = Runner::new(path.clone());
+        // Notifications go to a closed local port, never to ntfy.sh.
+        let integrations = windlass::shell::Integrations {
+            ntfy_server: Some("http://127.0.0.1:9/".parse()?),
+            ..windlass::shell::Integrations::default()
+        };
+        let (runner, events, observations) = Runner::with_integrations(path.clone(), integrations);
         let runner = tokio::spawn(runner.run());
         events
             .send(Event::Startup(StartupEvent::Start { mode }))
@@ -71,6 +76,9 @@ impl Dashboard {
                 listen: vec![HOST.parse::<SocketAddr>()?],
                 allowed_hosts: vec![String::from("windlass.example.ts.net")],
                 database: path.clone(),
+                ntfy_server: String::from("https://ntfy.sh/"),
+                ntfy_relay: Some(SocketAddr::from(([10, 200, 0, 1], 8443))),
+                dashboard_url: Some(String::from("http://windlass.example.ts.net:8740/")),
             },
         );
         let dashboard = Self {
@@ -423,6 +431,8 @@ async fn history_records_every_step_and_pages_through_it() -> TestResult {
     assert!(older_page.contains("Startup requested (initialise new storage)"));
     assert!(older_page.contains("ACTION</span>Open storage (initialise new storage)"));
     assert!(older_page.contains("Newer"));
+    let (_, everything) = dashboard.get("/history?routine=on").await?;
+    assert!(everything.contains("name=\"routine\" checked"));
     let (_, newer_page) = dashboard.get("/history?after=1").await?;
     assert!(newer_page.contains("Storage opened"));
 
@@ -578,6 +588,31 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
     assert!(matches!(observation.history, HistoryState::Open { .. }));
     dashboard.stop().await?;
 
+    // Each older version gains what later versions added.
+    for downgrade in [
+        "ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
+         ALTER TABLE history DROP COLUMN routine; PRAGMA user_version = 2;",
+        "ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
+         PRAGMA user_version = 3;",
+        "ALTER TABLE settings DROP COLUMN ntfy_topic; PRAGMA user_version = 4;",
+    ] {
+        let older = tempfile::tempdir()?;
+        let older_path = older.path().join("windlass.sqlite");
+        Dashboard::start_at(None, older_path.clone(), StartupMode::Initialise)
+            .await?
+            .stop()
+            .await?;
+        Connection::open(&older_path)?.execute_batch(downgrade)?;
+        let dashboard = Dashboard::start_at(Some(older), older_path, StartupMode::Resume).await?;
+        assert!(matches!(
+            dashboard.observations.borrow().history,
+            HistoryState::Open { .. }
+        ));
+        let (_, history) = dashboard.get("/history").await?;
+        assert!(history.contains("Startup requested (resume existing storage)"));
+        dashboard.stop().await?;
+    }
+
     let newer = tempfile::tempdir()?;
     let newer_path = newer.path().join("windlass.sqlite");
     Connection::open(&newer_path)?.execute_batch(
@@ -677,10 +712,13 @@ async fn the_server_answers_over_tcp_and_shuts_down_cleanly() -> TestResult {
     let address = listener.local_addr()?;
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(web::serve(
-        path.clone(),
-        StartupMode::Initialise,
-        vec![listener],
-        Vec::new(),
+        web::Serve {
+            database: path.clone(),
+            mode: StartupMode::Initialise,
+            listeners: vec![listener],
+            allowed_hosts: Vec::new(),
+            integrations: windlass::shell::Integrations::default(),
+        },
         async move {
             let _ = stopped.await;
         },
@@ -768,6 +806,74 @@ async fn failed_settings_saves_are_reported() -> TestResult {
         body.contains("value=\"200\""),
         "the requested value is shown"
     );
+    dashboard.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn notification_topics_are_set_tested_and_cleared() -> TestResult {
+    let dashboard = Dashboard::start(StartupMode::Initialise).await?;
+    dashboard
+        .wait(|observation| observation.settings.loaded().is_some())
+        .await?;
+    let (_, status) = dashboard.get("/").await?;
+    assert!(status.contains("No ntfy topic is set"));
+    let (code, _, body) = dashboard
+        .post("/settings/ntfy-topic", "topic=not+valid")
+        .await?;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body.contains("Use up to 64 letters"));
+    let (code, _, _) = dashboard
+        .post("/settings/ntfy-topic", "topic=windlass-alerts")
+        .await?;
+    assert_eq!(code, StatusCode::SEE_OTHER);
+    dashboard
+        .wait(|observation| {
+            observation
+                .settings
+                .loaded()
+                .is_some_and(|settings| settings.ntfy_topic.saved.is_some())
+        })
+        .await?;
+    let (_, settings) = dashboard.get("/settings").await?;
+    for text in [
+        "Send test notification",
+        "windlass-alerts",
+        "https://ntfy.sh/",
+        "10.200.0.1:8443",
+        "http://windlass.example.ts.net:8740/",
+    ] {
+        assert!(settings.contains(text), "{text}");
+    }
+    let (code, _, _) = dashboard.post("/notifications/test", "").await?;
+    assert_eq!(code, StatusCode::SEE_OTHER);
+    dashboard
+        .wait(|observation| {
+            observation
+                .notifications
+                .last_outcome
+                .is_some_and(|outcome| outcome.result.is_err())
+        })
+        .await?;
+    let (_, status) = dashboard.get("/").await?;
+    assert!(status.contains("Delivery failing"), "{status}");
+    assert!(status.contains("ntfy did not answer"));
+    let (_, history) = dashboard.get("/history?kind=notifications").await?;
+    assert!(history.contains("Test notification requested"));
+    assert!(
+        !history.contains("windlass-alerts"),
+        "the topic is not recorded"
+    );
+    let (code, _, _) = dashboard.post("/settings/ntfy-topic/clear", "").await?;
+    assert_eq!(code, StatusCode::SEE_OTHER);
+    dashboard
+        .wait(|observation| {
+            observation
+                .settings
+                .loaded()
+                .is_some_and(|settings| settings.ntfy_topic.saved.is_none())
+        })
+        .await?;
     dashboard.stop().await?;
     Ok(())
 }

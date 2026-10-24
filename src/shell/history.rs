@@ -244,8 +244,8 @@ fn insert(connection: &Connection, entry: &HistoryEntry) -> HistoryResult<()> {
         })
         .collect::<Result<Vec<_>, serde_json::Error>>()?;
     connection.execute(
-        "INSERT INTO history(occurred_at_ms, processed_at_ms, category, summary, event, actions)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO history(occurred_at_ms, processed_at_ms, category, summary, event, actions, routine)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             millis(entry.occurred_at),
             millis(entry.processed_at),
@@ -253,6 +253,7 @@ fn insert(connection: &Connection, entry: &HistoryEntry) -> HistoryResult<()> {
             describe::event(&entry.event),
             serde_json::to_string(&entry.event)?,
             serde_json::to_string(&actions)?,
+            describe::is_routine(&entry.event),
         ],
     )?;
     Ok(())
@@ -263,6 +264,8 @@ fn insert(connection: &Connection, entry: &HistoryEntry) -> HistoryResult<()> {
 pub(super) struct HistoryQuery {
     /// Only entries of this category.
     pub(super) category: Option<&'static str>,
+    /// Whether to include routine entries.
+    pub(super) routine: bool,
     /// Only entries processed at or after this time.
     pub(super) from: Option<SystemTime>,
     /// Only entries processed at or before this time.
@@ -312,6 +315,9 @@ pub(super) fn read_page(database: &Path, query: &HistoryQuery) -> HistoryResult<
     let connection = storage::connection(database)?;
     let mut conditions = Vec::new();
     let mut values: Vec<Value> = Vec::new();
+    if !query.routine {
+        conditions.push("routine = 0");
+    }
     if let Some(category) = query.category {
         conditions.push("category = ?");
         values.push(Value::Text(category.to_owned()));

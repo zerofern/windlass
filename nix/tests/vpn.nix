@@ -2,6 +2,8 @@
 # boundary of ADR-0003: traffic leaves only through the tunnel and fails when it
 # fails, the dashboard is reachable from the LAN but not through the tunnel, and
 # notifications still reach their single destination while the VPN is down.
+# Windlass proves the tunnel works and fails over to the other server by itself,
+# and its notifications reach ntfy through the relay with a link to the dashboard.
 #
 # The keys below are throwaway test keys; never reuse them.
 { windlassModule }:
@@ -22,12 +24,44 @@ let
     };
   };
 
+  # The port each fake server's NAT-PMP gateway forwards.
+  forwardedPorts = {
+    vpn1 = 41000;
+    vpn2 = 42000;
+  };
+
   # A WireGuard server standing in for a ProtonVPN P2P server: it forwards the
-  # client's traffic to the "internet" with its own address as the exit IP.
+  # client's traffic to the "internet" with its own address as the exit IP, and
+  # grants a fixed forwarded port over NAT-PMP like Proton's gateway.
   vpnServer =
     name:
     { pkgs, ... }:
     {
+      systemd.services.fake-nat-pmp = {
+        wantedBy = [ "multi-user.target" ];
+        after = [ "wireguard-wg0.service" ];
+        requires = [ "wireguard-wg0.service" ];
+        serviceConfig.Restart = "on-failure";
+        script = "exec ${
+          pkgs.writers.writePython3 "fake-nat-pmp" { } ''
+            import socket
+            import struct
+
+            gateway = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            gateway.bind(("10.2.0.1", 5351))
+            while True:
+                request, client = gateway.recvfrom(64)
+                if len(request) != 12 or request[0] != 0 or request[1] not in (1, 2):
+                    continue
+                lifetime = struct.unpack("!I", request[8:12])[0]
+                reply = struct.pack(
+                    "!BBHIHHI", 0, request[1] + 128, 0, 1, 0, ${toString forwardedPorts.${name}}, lifetime
+                )
+                gateway.sendto(reply, client)
+          ''
+        }";
+      };
+      networking.firewall.interfaces.wg0.allowedUDPPorts = [ 5351 ];
       networking.wireguard.interfaces.wg0 = {
         ips = [ "10.2.0.1/24" ];
         listenPort = 51820;
@@ -85,6 +119,9 @@ in
         environment.systemPackages = [ pkgs.curl ];
         services.nginx = {
           enable = true;
+          commonHttpConfig = ''
+            log_format ntfy '$request_method $uri "$http_title" "$http_click"';
+          '';
           virtualHosts.default = {
             default = true;
             listen = [
@@ -100,6 +137,11 @@ in
             locations."/ip".extraConfig = ''
               default_type text/plain;
               return 200 "$remote_addr\n";
+            '';
+            # Stands in for an ntfy topic, logging each notification's title and link.
+            locations."= /windlass-vm".extraConfig = ''
+              access_log /var/log/nginx/ntfy.log ntfy;
+              return 200 "ok\n";
             '';
           };
         };
@@ -125,12 +167,17 @@ in
               two = protonConfig pkgs nodes "vpn2";
             };
             defaultServer = "one";
+            exitIpService = "http://web/ip";
           };
           dashboard = {
             interfaces = [ "eth1" ];
             allowedHosts = [ "machine" ];
+            url = "http://machine:8740/";
           };
-          notifications.relayTarget = "web:443";
+          notifications = {
+            server = "http://web/";
+            relayTarget = "web:443";
+          };
         };
         environment.systemPackages = [
           pkgs.curl
@@ -169,11 +216,37 @@ in
           assert machine.succeed(exit_ip).strip() == "${ipOf "vpn1"}"
           machine.succeed(inside + "sysctl -n net.ipv6.conf.all.disable_ipv6 | grep -qx 1")
 
+      with subtest("Windlass proves the tunnel works"):
+          web.wait_until_succeeds(
+              "curl -sf http://machine:8740/ | grep -q 'tag ok\">Protected'", timeout=900
+          )
+          web.succeed("curl -sf http://machine:8740/ | grep -q '${ipOf "vpn1"}'")
+
+      with subtest("Notifications reach ntfy through the relay with a dashboard link"):
+          ntfy_log = "/var/log/nginx/ntfy.log"
+          web.succeed("curl -sf -X POST -d topic=windlass-vm http://machine:8740/settings/ntfy-topic")
+          web.wait_until_succeeds(
+              "curl -sf http://machine:8740/settings | grep -q 'Send test notification'", timeout=900
+          )
+          web.succeed("curl -sf -X POST http://machine:8740/notifications/test")
+          web.wait_until_succeeds(
+              f"grep -q 'POST /windlass-vm \"Test notification\" \"http://machine:8740/settings\"' {ntfy_log}",
+              timeout=900,
+          )
+
       with subtest("The dashboard is reachable from the LAN, not through the tunnel"):
           web.wait_until_succeeds("curl -sf http://machine:8740/ | grep -q Windlass", timeout=900)
           vpn1.fail("curl -sf --max-time 5 http://10.2.0.2:8740/")
           # The namespace cannot reach the host's other services through its link.
           machine.fail(inside + "curl -sf --max-time 5 http://10.200.0.1:8740/")
+
+      with subtest("qBittorrent listens on the port Proton forwards"):
+          machine.wait_until_succeeds(
+              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/preferences"
+              + " | grep -q '\"listen_port\":${toString forwardedPorts.vpn1}'",
+              timeout=900,
+          )
+          web.succeed("curl -sf http://machine:8740/ | grep -q 'TCP ${toString forwardedPorts.vpn1}'")
 
       with subtest("qBittorrent is bound to the tunnel with UPnP off"):
           machine.wait_until_succeeds(
@@ -189,12 +262,25 @@ in
           machine.succeed("runuser -u windlass -- systemctl start windlass-wireguard@two.service")
           machine.wait_until_succeeds(exit_ip, timeout=900)
           assert machine.succeed(exit_ip).strip() == "${ipOf "vpn2"}"
+          # The next lease renewal reaches the new server's gateway.
+          machine.wait_until_succeeds(
+              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/preferences"
+              + " | grep -q '\"listen_port\":${toString forwardedPorts.vpn2}'",
+              timeout=900,
+          )
           machine.fail("systemctl start windlass-wireguard@unknown.service")
           machine.fail("runuser -u windlass -- systemctl stop windlass.service")
           machine.fail("runuser -u windlass -- systemctl start sshd.service")
+          # Back to the server Windlass connected to, before it fails over itself.
+          machine.succeed("runuser -u windlass -- systemctl start windlass-wireguard@one.service")
+          machine.wait_until_succeeds(
+              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/preferences"
+              + " | grep -q '\"listen_port\":${toString forwardedPorts.vpn1}'",
+              timeout=900,
+          )
 
       with subtest("Traffic fails when the VPN fails"):
-          vpn2.succeed("systemctl stop wireguard-wg0.service")
+          vpn1.succeed("systemctl stop wireguard-wg0.service")
           machine.fail(exit_ip)
           machine.fail(inside + "curl -sf --max-time 5 http://${ipOf "web"}/ip")
 
@@ -203,9 +289,25 @@ in
           assert relayed == "${ipOf "machine"}", relayed
           web.succeed("curl -sf http://machine:8740/ | grep -q Windlass")
 
-      with subtest("Recovery uses the tunnel again"):
-          vpn2.succeed("systemctl start wireguard-wg0.service")
+      with subtest("Windlass fails over to the other server by itself"):
+          # Three failed checks, a minute apart, start the switch.
+          machine.wait_until_succeeds(
+              "grep -qx two /run/windlass-vpn/current", timeout=900
+          )
           machine.wait_until_succeeds(exit_ip, timeout=900)
           assert machine.succeed(exit_ip).strip() == "${ipOf "vpn2"}"
+          machine.wait_until_succeeds(
+              inside + "curl -sf http://127.0.0.1:8080/api/v2/app/preferences"
+              + " | grep -q '\"listen_port\":${toString forwardedPorts.vpn2}'",
+              timeout=900,
+          )
+          web.wait_until_succeeds(
+              "curl -sf http://machine:8740/ | grep -q '${ipOf "vpn2"}'", timeout=900
+          )
+          # MAM allows one IP change an hour, so the next switch must wait.
+          web.succeed("curl -sf http://machine:8740/ | grep -q 'Not before'")
+          # Each step reached ntfy, even while the tunnel was down.
+          for title in ["VPN not working", "Switching VPN server", "VPN server switched"]:
+              web.wait_until_succeeds(f"grep -q '\"{title}\" \"http://machine:8740/#tunnel\"' {ntfy_log}", timeout=900)
     '';
 }

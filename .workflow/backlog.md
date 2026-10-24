@@ -9,10 +9,11 @@
 
 ## B-0002: Important-event notifications
 
-- Status: Needs Direction
+- Status: Ready for Shape
 - Value: Notify the user through hosted ntfy.sh about important events without requiring them to
   continually check Windlass.
 - Direction: [Notifications](direction.md#notifications)
+- Feature Brief: [Important-event notifications](features/B-0002/brief.md)
 
 ## B-0003: Web dashboard and MAM pause control
 

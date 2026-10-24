@@ -5,9 +5,23 @@ Feature ID: B-0007
 
 ## Goal
 
-Draft for discussion. Native qbittorrent-nox on NixOS is the intended client.
-The exact MAM-approved version must be selected before this becomes an executable
-contract. Windlass communicates through a configured private HTTP endpoint.
+Native qbittorrent-nox on NixOS is the client. Windlass communicates with its
+web UI on loopback inside the VPN namespace. Windlass manages every torrent in
+qBittorrent; the owner does not add or remove torrents by hand. Windlass adds the
+torrents it acquires through MAM bookmarks and removes a torrent when its book is
+deleted to free disk space. A torrent already in qBittorrent without a Windlass
+record, such as one present before Windlass was installed, is adopted rather than
+ignored; how its MAM torrent ID and history are established remains to be agreed.
+
+The [torrent registry](../../decisions/adr/0004-torrent-registry.md) in SQLite is
+the desired state, and Windlass reconciles qBittorrent with it. Torrents are
+shared whole: every file stays selected, because MAM does not allow partial
+sharing. Missing content is reported to the user rather than downloaded again.
+
+MAM allows qBittorrent 5.0.1 to the latest 5.2.x and recommends 5.2.x; non-release
+versions are not allowed. nixos-26.05 provides 5.2.2. The NixOS module refuses a
+version outside the allowed range, and the dashboard shows MAM's position on the
+running version.
 
 ## Feature-wide constraints and acceptance
 
@@ -126,10 +140,25 @@ deletion policy.
 
 ## Open questions and assumptions
 
-- Exact client version, stopped-submission parameter, and supported torrent-hash
-  formats.
+Agreed with the owner: the version range above, and reading qBittorrent's
+incremental updates (`sync/maindata`) every 10 seconds, with preferences re-read
+every sixth poll. A failed request makes qBittorrent unreachable and Windlass
+reconnects every 10 seconds.
+
+Implemented: connecting, version approval, polling, the torrent list, and keeping
+the listen port on ProtonVPN's forwarded port ([B-0010](../B-0010/brief.md) S2).
+The torrent registry is implemented for the rules that need no MAM requests:
+adopting unknown torrents, saving observations, starting stopped active torrents,
+selecting every file of partial ones, removing torrents marked removed with their
+files, and showing missing torrents and missing content on the dashboard. One
+command is sent at a time, only after a fresh update, and an unchanged command is
+repeated at most once a minute. Submission, re-adding missing torrents, and
+cleanup (S1, S2) follow MAM acquisition.
+
+- The stopped-submission parameter for the pinned release, and supported
+  torrent-hash formats.
 - Whether to adopt stopped submission followed by explicit start.
-- Polling cadence, session recovery, reconciliation deadlines, and retry timing.
-- Save paths, ownership of existing torrents, category/tags, concurrent downloads,
-  and disk-space reservation.
+- Reconciliation deadlines and retry timing for submissions.
+- Save paths, category/tags, concurrent downloads, and disk-space reservation.
+- How adopted torrents are matched to MAM torrent IDs and acquisition history.
 - Whether staged downloads may start while MAM contact is explicitly paused.

@@ -107,8 +107,8 @@ informed without continually checking the system. The initial notification
 channel is hosted [ntfy.sh](references.md#ntfy). Notifications still reach ntfy.sh
 when the VPN is down, through a relay that can reach only ntfy.sh. Notifications
 describe operational conditions, such as low disk space or failed MAM registration. They exclude book
-titles and account details. The events that warrant notifications remain to be
-agreed.
+titles and account details, and link to the dashboard page that explains them.
+The [notifications brief](features/B-0002/brief.md) lists the agreed events.
 
 ### VPN privacy
 

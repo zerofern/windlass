@@ -52,7 +52,9 @@ fn ready(saved: Option<Mode>) -> Core {
         vec![
             Action::ReadMamRequestMode,
             Action::ReadSettings,
-            Action::OpenHistory
+            Action::OpenHistory,
+            Action::ReadTorrentRegistry,
+            Action::ReadLastVpnSwitch
         ]
     );
     assert_eq!(

@@ -9,12 +9,13 @@ description = "A cohesive MAM acquisition and library service"
 axum = "0.8"
 maud = { version = "0.27", features = ["axum"] }
 nutype = { version = "0.6", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "signal"] }
+tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "process", "signal"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [dev-dependencies]
