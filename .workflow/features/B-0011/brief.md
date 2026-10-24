@@ -267,6 +267,9 @@ details are not recorded here.
   `content-type: text/html` and an empty body. A refused download is therefore
   not an HTTP error: Windlass accepts a download only when the body parses as a
   torrent file, and treats anything else as refused.
+- `GET /json/bonusBuy.php?spendtype=upload&amount=10` (call 10) returned
+  `{"success":false,"error":"Invalid amount specified"}` and bought nothing. A
+  purchase is judged by `success`; the error text is shown but not parsed.
 - Every response so far set `mam_id` again with `Max-Age=1296000` (15 days),
   `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. The value is new
   each time, not the same value encoded differently, and the old value kept
@@ -301,7 +304,7 @@ is wanted anyway.
 | 7 ✓ | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
 | 8 ½ | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
 | 9 ✓ | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
-| 10 | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
+| 10 ✓ | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
 | 11 ✓ | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
 | 12 | `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` through the VPN | Registration responses, once an hour at most | None |
 | 13 | `GET /tor/download.php?tid=<id>` | A torrent file for a bookmarked torrent | Downloads it |
