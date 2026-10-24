@@ -271,6 +271,16 @@ details are not recorded here.
 - `GET /json/bonusBuy.php?spendtype=upload&amount=10` (call 10) returned
   `{"success":false,"error":"Invalid amount specified"}` and bought nothing. A
   purchase is judged by `success`; the error text is shown but not parsed.
+- `GET /tor/download.php?tid=<id>&fl=1` (calls 13 and 14) returned HTTP 200,
+  `content-type: application/x-bittorrent`, `content-disposition: inline;
+  filename="[<id>]_<title>.torrent"`, and a bencoded body beginning
+  `d8:announce`. It spent one wedge: `wedges` went from 212 to 211 at once, and
+  the site showed the torrent as freeleech. `seedbonus` did not change. Torrent
+  Search still reported `personal_freeleech` 0 just after, so the search flags
+  lag. Windlass confirms a wedge from the drop in `wedges` and from a `wedgePF`
+  entry for the torrent in the wedge history, not from search. Windlass sends
+  `fl=1`, since MAM ignored flags without a value elsewhere; MLM sends a bare
+  `fl`.
 - Every response so far set `mam_id` again with `Max-Age=1296000` (15 days),
   `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. The value is new
   each time, not the same value encoded differently, and the old value kept
@@ -308,8 +318,8 @@ is wanted anyway.
 | 10 ✓ | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
 | 11 ✓ | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
 | 12 | `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` through the VPN | Registration responses, once an hour at most | None |
-| 13 | `GET /tor/download.php?tid=<id>` | A torrent file for a bookmarked torrent | Downloads it |
-| 14 | `GET /tor/download.php?tid=<id>&fl` | Wedge use; `personal_freeleech` and wedge history afterwards | One wedge |
+| 13 ✓ | `GET /tor/download.php?tid=<id>` | A torrent file for a bookmarked torrent | Downloads it |
+| 14 ✓ | `GET /tor/download.php?tid=<id>&fl=1` | Wedge use; `personal_freeleech` and wedge history afterwards | One wedge |
 | 15 | `GET /json/bonusBuy.php?spendtype=wedges` | Wedge price; whether the response gives the new balance | Points |
 | 16 | `GET /json/bonusBuy.php?spendtype=upload&amount=50` | Price per GiB; the response | Points |
 | 17 | `GET /json/bonusBuy.php?spendtype=VIP&duration=max` | VIP price; `vip_until` afterwards | Points |
