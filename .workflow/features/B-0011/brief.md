@@ -236,6 +236,19 @@ details are not recorded here.
   `aboutToDropClient` is urgent, since it suggests MAM is about to stop
   accepting a client. No disabled-download state appeared; it may only show
   when it applies.
+- Torrent Search (calls 5 and 6) accepts GET with `tor[...]` parameters:
+  `tor[id]=<id>` returned that one torrent. Each result gives `id` as an
+  integer; `free`, `vip`, `fl_vip`, and `personal_freeleech` as 0 or 1;
+  `vip_expire` as a Unix time, 0 when the torrent's VIP status does not end;
+  `added` as UTC text; `bookmarked` as `null` when not bookmarked; and `size`
+  only as display text such as `"375.8 MiB"`, so exact sizes come from the
+  torrent file or qBittorrent. `found` counts all matches and `total` the
+  results returned. VIP torrents seen had `fl_vip` 1, which suggests they are
+  freeleech for VIP members.
+- Bookmarks were not filtered by GET with `tor[searchIn]=bookmarks` (MLM's value,
+  which MLM sends as a JSON POST), with a top-level `bookmarks=true`, or with
+  `tor[bookmarked]=only` (the value the site's own search page uses): each
+  returned the whole site. A JSON POST of both values is still to be tried.
 - The `red` flag is MAM's own marking of categories that need attention. Any red
   category with a nonzero count is reported, beside the specific gates.
 - The session was locked to the network provider (ASN). A request from another
@@ -259,7 +272,7 @@ is wanted anyway.
 | 3 ½ | `GET /jsonLoad.php?clientStats=true&pretty` | How clients, versions, and connectable status appear (A5, A6) | None |
 | 4 ✓ | `GET /jsonLoad.php?notif=true&pretty` | The notification shape; whether a wedge count or a download-disabled state appears (A10) | None |
 | 5 | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
-| 6 | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
+| 6 ✓ | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
 | 7 | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
 | 8 | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
 | 9 | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
