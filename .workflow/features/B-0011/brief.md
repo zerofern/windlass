@@ -248,7 +248,15 @@ details are not recorded here.
 - Bookmarks were not filtered by GET with `tor[searchIn]=bookmarks` (MLM's value,
   which MLM sends as a JSON POST), with a top-level `bookmarks=true`, or with
   `tor[bookmarked]=only` (the value the site's own search page uses): each
-  returned the whole site. A JSON POST of both values is still to be tried.
+  returned the whole site. A JSON POST of
+  `{"perpage":5,"tor":{"searchIn":"bookmarks","sortType":"","startNumber":"0"}}`
+  did filter: `found` was the owner's bookmark count, and `bookmarked` came back
+  as a Unix time, not the datetime the documentation describes. A JSON POST of
+  `{"tor":{"bookmarked":"only"}}` returned the whole site. So `searchIn` is read
+  only from a JSON POST, and Windlass sends every search that way.
+- `GET /json/jsonIp.php` (call 8, on `www`) needs no cookie and returns `ip` as
+  text, `ASN` as an integer, `AS` as the provider's name, and `time` as a Unix
+  time. Through ProtonVPN it reported `"AS":"ProtonVPN Proton AG"`.
 - The `red` flag is MAM's own marking of categories that need attention. Any red
   category with a nonzero count is reported, beside the specific gates.
 - The session was locked to the network provider (ASN). A request from another
@@ -271,10 +279,10 @@ is wanted anyway.
 | 2 ✓ | `GET /jsonLoad.php?snatch_summary&pretty` | The unsatisfied count, and whether satisfied status is given per torrent (A2, A3) | None |
 | 3 ½ | `GET /jsonLoad.php?clientStats=true&pretty` | How clients, versions, and connectable status appear (A5, A6) | None |
 | 4 ✓ | `GET /jsonLoad.php?notif=true&pretty` | The notification shape; whether a wedge count or a download-disabled state appears (A10) | None |
-| 5 | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
+| 5 ✓ | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
 | 6 ✓ | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
 | 7 | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
-| 8 | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
+| 8 ½ | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
 | 9 | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
 | 10 | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
 | 11 ✓ | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
@@ -333,8 +341,9 @@ Facts the documentation does not settle, to confirm with MAM staff or from a
 response the owner captures in a browser. Until each is settled, the gates that
 depend on it stay closed:
 
-- The bookmark filter value for `searchIn`; the documentation says "list to
-  come". Blocks bookmark polling (A11).
+- Staff confirmation of the bookmark filter: `"searchIn": "bookmarks"` works in
+  a JSON POST, but the documentation still says "list to come". Blocks bookmark
+  polling (A11) until confirmed.
 - Which torrents are satisfied: `snatch_summary` gives the unsatisfied count but
   only counts per category. Without per-torrent status, A3 blocks automatic
   removal.
