@@ -7,8 +7,9 @@ Feature ID: B-0011
 
 The owner bookmarks torrents on MAM and Windlass does everything else: it
 downloads, seeds, and cleans up without ever putting the account outside MAM's
-rules. Downloads never cost ratio; bonus points pay for freeleech wedges, and
-for VIP and upload credit when they are needed.
+rules. Downloads never cost ratio; freeleech wedges cover torrents that are not
+free for the owner, and bonus points keep VIP, which spares wedges, and buy
+upload credit when it is needed.
 
 ## Principles
 
@@ -96,8 +97,8 @@ only when all of these hold:
    - a VIP torrent while MAM reports the account as VIP, without a wedge;
    - any other torrent, including one that is freeleech site-wide, with a
      wedge, so that freeleech cannot end mid-download.
-   If no wedge is available, the spending policy may buy one, or buy VIP for a
-   VIP torrent. Otherwise the torrent stays queued.
+   If no wedge is available, a VIP torrent may wait for VIP to be bought; any
+   other torrent stays queued and the owner is told.
 7. Disk space suffices for the full size (Direction, B-0001).
 
 The torrent is then downloaded, added to qBittorrent whole, and seeded
@@ -132,13 +133,17 @@ Agreed with the owner. Windlass reads the points balance, class, VIP expiry, and
 ratio from Load User Data, and never spends below the points reserve. In order of
 priority:
 
-1. **Wedge every download that is not a VIP torrent.** If none is left, buy
-   wedges when the points allow.
-2. **Buy VIP when downloads need it.** Buy VIP when queued torrents are held only
-   by the unsatisfied limit and VIP's limit of 150 would free a slot, or when a
-   queued torrent is VIP-only and the account is not VIP. The API buys VIP only
-   as `max`, which fills to 90 days and buys at least 7 days, so each purchase
-   can be large. Windlass does not renew VIP otherwise.
+1. **Wedge every download that is not freeleech for the owner.** A VIP torrent
+   while the account is VIP, a torrent MAM reports as a personal freeleech, and
+   a torrent Windlass has already wedged get no wedge. Wedges cannot be bought
+   through the API, so they are spent only here, and none left means the
+   torrent waits and the owner is told.
+2. **Keep VIP.** VIP makes VIP torrents freeleech and so saves wedges, while
+   points are earned back by seeding. When `vip_until` is less than 14 days
+   away, or the account is not VIP, Windlass buys VIP if the points left after
+   the purchase stay above the reserve, judged by the price paid at the last VIP
+   purchase. The API buys VIP only as `max`, which fills to 90 days and buys at
+   least 7 days.
 3. **Protect the ratio.** Downloads never cost ratio, so this should not happen.
    If the ratio is below the target of 3.0, buy upload credit in 50 GiB steps
    until it reaches 3.0 or only the reserve is left, and tell the owner.
@@ -158,8 +163,8 @@ New notification conditions, using B-0002's grace periods:
 | MAM does not list qBittorrent as an authorized client | Immediately |
 | Downloads held, and why (gate and MAM's value) | 30 minutes |
 | A purchase made, failed, or uncertain | Immediately |
-| No wedge available and not enough points to buy one | Immediately |
-| VIP expiring within 7 days while downloads depend on it | Immediately |
+| No wedge left, with torrents waiting for one | Immediately |
+| VIP expiring within 7 days and not renewed, and why | Immediately |
 | Bonus points below the reserve | Immediately |
 | MAM reports a notification for the account, as a count without its text | Immediately |
 | The account may need a visit to stay active (A9) | Monthly |
@@ -243,8 +248,8 @@ details are not recorded here.
   `added` as UTC text; `bookmarked` as `null` when not bookmarked; and `size`
   only as display text such as `"375.8 MiB"`, so exact sizes come from the
   torrent file or qBittorrent. `found` counts all matches and `total` the
-  results returned. VIP torrents seen had `fl_vip` 1, which suggests they are
-  freeleech for VIP members.
+  results returned. VIP torrents seen had `fl_vip` 1 for this VIP account, so VIP
+  torrents are freeleech for VIP members.
 - Bookmarks were not filtered by GET with `tor[searchIn]=bookmarks` (MLM's value,
   which MLM sends as a JSON POST), with a top-level `bookmarks=true`, or with
   `tor[bookmarked]=only` (the value the site's own search page uses): each
@@ -287,6 +292,19 @@ details are not recorded here.
   wedges immediately, must show `wedges` one lower for each wedged download
   since the last reading. If it does not, Windlass pauses the torrents in
   question and notifies, so a download that was not wedged cannot run on ratio.
+- A bookmark the owner remembered as wedged, snatched months before, showed
+  `my_snatched` 1 and `personal_freeleech` 0 and had no wedge entry in a history
+  reaching back to March 2026. The owner confirmed it was never wedged; it was
+  probably freeleech at the time. Search reported it correctly, and Windlass
+  wedges such a bookmark like any other.
+- `GET /json/bonusBuy.php?spendtype=upload&amount=50` (call 16) returned
+  `{"success":true,"type":"upload","amount":50,"seedbonus":71019.99…,
+  "uploaded":84269769796,"downloaded":0,"uploadFancy":"78.48 GiB",
+  "downloadFancy":"0.00 KiB","ratio":"inf."}`. 50 GiB cost 25,000 points (500
+  per GiB) and added exactly 53,687,091,200 bytes. The response gives the new
+  balance as a fraction and the new totals in bytes; Load User Data showed
+  `seedbonus` truncated to an integer. The ratio text is `"inf."` here and `"∞"`
+  in Load User Data, which confirms that Windlass never parses it.
 - Every response so far set `mam_id` again with `Max-Age=1296000` (15 days),
   `domain=.myanonamouse.net`, `secure`, and `SameSite=Lax`. The value is new
   each time, not the same value encoded differently, and the old value kept
@@ -326,8 +344,8 @@ is wanted anyway.
 | 12 | `GET https://t.myanonamouse.net/json/dynamicSeedbox.php` through the VPN | Registration responses, once an hour at most | None |
 | 13 ✓ | `GET /tor/download.php?tid=<id>` | A torrent file for a bookmarked torrent | Downloads it |
 | 14 ✓ | `GET /tor/download.php?tid=<id>&fl=1` | Wedge use; `personal_freeleech` and wedge history afterwards | One wedge |
-| 15 | `GET /json/bonusBuy.php?spendtype=wedges` | Wedge price; whether the response gives the new balance | Points |
-| 16 | `GET /json/bonusBuy.php?spendtype=upload&amount=50` | Price per GiB; the response | Points |
+| 15 – | `GET /json/bonusBuy.php?spendtype=wedges` | Skipped: MLM reports that wedges are no longer sold through the API | Points |
+| 16 ✓ | `GET /json/bonusBuy.php?spendtype=upload&amount=50` | Price per GiB; the response | Points |
 | 17 | `GET /json/bonusBuy.php?spendtype=VIP&duration=max` | VIP price; `vip_until` afterwards | Points |
 
 For each call, also note whether GET or POST is accepted, and any rate-limit
@@ -365,8 +383,8 @@ and anything outside the documented API.
 ## Open questions and assumptions
 
 Agreed with the owner: MAM's figures are authoritative; downloads never cost
-ratio, using a wedge on every torrent that is not VIP; VIP bought only when
-downloads need it; upload credit bought only to restore a ratio below 3.0; a
+ratio, using a wedge on every torrent that is not freeleech for the owner; VIP
+kept, since it saves wedges, which cannot be bought; upload credit bought only to restore a ratio below 3.0; a
 fixed points reserve set on the settings page; MAM's view of connectability is
 checked, repaired where possible, and reported otherwise.
 
@@ -388,7 +406,5 @@ depend on it stay closed:
 - The shape of `clientStats`: how clients, versions, and connectable status are
   reported (A5, A6).
 - Prices in the bonus store, and whether purchases report the new balance.
-- Whether VIP torrents are freeleech for VIP members, as the API's warning about
-  wedges on VIP torrents suggests. Until confirmed, VIP torrents wait.
 - Whether API use counts as activity for rule 1.6.
 - Whether Load User Data reports a disabled-download or seed-only state (A10).
