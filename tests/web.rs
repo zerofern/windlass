@@ -133,6 +133,19 @@ impl Dashboard {
         Ok((status, body))
     }
 
+    /// A history page once it shows `text`; entries are written in the background.
+    async fn history_with(&self, uri: &str, text: &str) -> TestResult<String> {
+        let mut page = String::new();
+        for _ in 0..100 {
+            page = self.get(uri).await?.1;
+            if page.contains(text) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(page)
+    }
+
     async fn post(&self, uri: &str, form: &str) -> TestResult<(StatusCode, String, String)> {
         let request = Request::post(uri)
             .header(header::HOST, HOST)
@@ -382,8 +395,11 @@ async fn settings_are_validated_saved_and_secrets_never_shown() -> TestResult {
     );
     let (_, status_page) = dashboard.get("/").await?;
     assert!(!status_page.contains("Set up MAM access"));
-    let (_, history) = dashboard.get("/history?kind=settings").await?;
-    assert!(history.contains("API cookie replaced from the dashboard (value not recorded)"));
+    let replaced = "API cookie replaced from the dashboard (value not recorded)";
+    let history = dashboard
+        .history_with("/history?kind=settings", replaced)
+        .await?;
+    assert!(history.contains(replaced), "{history}");
     assert!(!history.contains("secret-value"));
     let stored: String = Connection::open(&dashboard.path)?.query_row(
         "SELECT group_concat(event || actions) FROM history",
@@ -590,11 +606,19 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
 
     // Each older version gains what later versions added.
     for downgrade in [
-        "ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
+        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+         ALTER TABLE settings DROP COLUMN points_reserve; \
+         ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
          ALTER TABLE history DROP COLUMN routine; PRAGMA user_version = 2;",
-        "ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
+        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+         ALTER TABLE settings DROP COLUMN points_reserve; \
+         ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
          PRAGMA user_version = 3;",
-        "ALTER TABLE settings DROP COLUMN ntfy_topic; PRAGMA user_version = 4;",
+        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+         ALTER TABLE settings DROP COLUMN points_reserve; \
+         ALTER TABLE settings DROP COLUMN ntfy_topic; PRAGMA user_version = 4;",
+        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+         ALTER TABLE settings DROP COLUMN points_reserve; PRAGMA user_version = 5;",
     ] {
         let older = tempfile::tempdir()?;
         let older_path = older.path().join("windlass.sqlite");

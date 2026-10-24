@@ -314,6 +314,7 @@ async fn qbittorrent_listens_on_the_forwarded_port() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -357,6 +358,7 @@ async fn unavailable_services_are_reported_and_retried() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: Some(format!("http://{closed}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -429,6 +431,7 @@ async fn rejected_and_malformed_answers_are_distinguished() -> TestResult {
             ntfy_server: None,
             ntfy_relay: None,
             dashboard_url: None,
+            mam: None,
             qbittorrent: Some(format!("http://{webui}/").parse()?),
             nat_pmp_gateway: None,
         })
@@ -452,6 +455,7 @@ async fn silent_gateways_time_out() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: None,
         nat_pmp_gateway: Some(match silent.local_addr()? {
             SocketAddr::V4(address) => address,
@@ -491,6 +495,7 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: None,
     };

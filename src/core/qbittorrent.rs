@@ -6,7 +6,7 @@ use std::{
 
 use serde::Serialize;
 
-use super::{Action, ClockReading, Port, TimerId, TimerName, timer::Timers};
+use super::{Action, ClockReading, MamTorrentId, Port, TimerId, TimerName, timer::Timers};
 
 /// How often qBittorrent's state is read.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -258,6 +258,15 @@ pub enum TorrentCommand {
     SelectAllFiles(TorrentHash),
     /// Remove these torrents and their files.
     Remove(Vec<TorrentHash>),
+    /// Stop these torrents.
+    Stop(Vec<TorrentHash>),
+    /// Add this fetched torrent from its kept torrent file.
+    Add {
+        /// The torrent on MAM, whose file Windlass kept.
+        mam: MamTorrentId,
+        /// Its info hash.
+        hash: TorrentHash,
+    },
 }
 
 /// qBittorrent's position in its stream of incremental updates.

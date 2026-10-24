@@ -3,16 +3,25 @@
 //! Windlass reaches the web UI on loopback inside the VPN namespace, where the
 //! NixOS module disables web UI authentication for local clients.
 
-use std::time::{Duration, SystemTime};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
-use reqwest::{Client as HttpClient, Response, Url};
+use reqwest::{
+    Client as HttpClient, Response, Url,
+    multipart::{Form, Part},
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::core::{
-    ByteSize, Port, Progress, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Ratio,
-    SyncPosition, SyncUpdate, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
+    ByteSize, MamTorrentId, Port, Progress, QbittorrentEvent, QbittorrentFailure,
+    QbittorrentPreferences, Ratio, SyncPosition, SyncUpdate, TorrentCommand, TorrentHash,
+    TorrentState, TorrentUpdate,
 };
+
+use super::storage;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -53,12 +62,14 @@ pub(super) async fn execute(client: Option<&Client>, request: Request) -> Qbitto
 pub(super) struct Client {
     http: HttpClient,
     base: Url,
+    /// Where fetched torrent files are kept.
+    database: PathBuf,
 }
 
 type Outcome<T> = Result<T, QbittorrentFailure>;
 
 impl Client {
-    pub(super) fn new(base: Url) -> Self {
+    pub(super) fn new(base: Url, database: PathBuf) -> Self {
         // Building fails only if the TLS backend cannot initialise; plain HTTP
         // to loopback does not need it, so fall back to the default client.
         let http = HttpClient::builder()
@@ -66,7 +77,11 @@ impl Client {
             .no_proxy()
             .build()
             .unwrap_or_default();
-        Self { http, base }
+        Self {
+            http,
+            base,
+            database,
+        }
     }
 
     async fn perform(&self, request: &Request) -> Outcome<QbittorrentEvent> {
@@ -173,6 +188,11 @@ impl Client {
                 self.post("api/v2/torrents/start", &[("hashes", hashes(started))])
                     .await
             }
+            TorrentCommand::Stop(stopped) => {
+                self.post("api/v2/torrents/stop", &[("hashes", hashes(stopped))])
+                    .await
+            }
+            TorrentCommand::Add { mam, .. } => self.add(*mam).await,
             TorrentCommand::Remove(removed) => {
                 let form = [
                     ("hashes", hashes(removed)),
@@ -196,6 +216,30 @@ impl Client {
                 self.post("api/v2/torrents/filePrio", &form).await
             }
         }
+    }
+}
+
+impl Client {
+    /// Add a kept torrent file; qBittorrent starts it at once.
+    async fn add(&self, mam: MamTorrentId) -> Outcome<()> {
+        let database = self.database.clone();
+        let file = tokio::task::spawn_blocking(move || storage::kept_torrent_file(&database, mam))
+            .await
+            .ok()
+            .flatten()
+            .ok_or(QbittorrentFailure::Malformed)?;
+        let part = Part::bytes(file)
+            .file_name(format!("{}.torrent", mam.get()))
+            .mime_str("application/x-bittorrent")
+            .map_err(|_| QbittorrentFailure::Malformed)?;
+        let form = Form::new().part("torrents", part);
+        let response = self
+            .http
+            .post(self.url("api/v2/torrents/add")?)
+            .multipart(form)
+            .send()
+            .await;
+        Self::checked(response).map(drop)
     }
 }
 
@@ -337,14 +381,21 @@ mod tests {
         Ok(())
     }
 
+    /// A compile-time torrent ID: its unreachable branch is not run code.
+    const MAM: crate::core::MamTorrentId = match crate::core::MamTorrentId::new(7) {
+        Some(id) => id,
+        None => unreachable!(),
+    };
+
     #[tokio::test]
     async fn commands_to_a_closed_web_ui_fail_as_unreachable() -> Result<(), Box<dyn Error>> {
         // Nothing listens on the discard port.
-        let client = Client::new("http://127.0.0.1:9/".parse()?);
+        let client = Client::new("http://127.0.0.1:9/".parse()?, "/nonexistent".into());
         let hash = TorrentHash::parse(&"a".repeat(40)).ok_or("hash")?;
         for command in [
             TorrentCommand::SelectAllFiles(hash.clone()),
-            TorrentCommand::Remove(vec![hash]),
+            TorrentCommand::Remove(vec![hash.clone()]),
+            TorrentCommand::Stop(vec![hash.clone()]),
         ] {
             assert_eq!(
                 execute(Some(&client), Request::Command(command)).await,
@@ -353,6 +404,18 @@ mod tests {
                 }
             );
         }
+        // Without a kept file there is nothing to add.
+        let mam = MAM;
+        assert_eq!(
+            execute(
+                Some(&client),
+                Request::Command(TorrentCommand::Add { mam, hash })
+            )
+            .await,
+            QbittorrentEvent::CommandFailed {
+                reason: QbittorrentFailure::Malformed
+            }
+        );
         Ok(())
     }
 

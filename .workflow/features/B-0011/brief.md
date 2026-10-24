@@ -83,6 +83,23 @@ upload credit when it is needed.
 | S3 | Store docs | Purchases use only documented amounts. | Upload credit in whole GiB of at least 50, or `Max Affordable `; VIP only as `max`, which fills to 90 days and buys at least 7 days. |
 | S4 | Owner | A purchase is never repeated after an uncertain result. | A purchase whose outcome is unknown, for example a timeout, is reconciled from Load User Data and User Bonus History before anything else is bought. |
 
+### Implementation status
+
+Implemented: A1, A2, A3's watches, A4, A7 to A22, S1, S2, S3, and S5, with the
+notification conditions below, except as listed here. Not yet built:
+
+- A5's check that MAM lists the running qBittorrent as an authorized client;
+  only the client count is read.
+- A6's repair steps and the notice that follows them; connectability is shown
+  on the dashboard only.
+- S4's reconciliation from User Bonus History; an uncertain purchase blocks
+  buying until the next account reading instead.
+- Admission step 7, disk space, waiting for B-0001.
+
+Windlass records its own wedge use by linking the registry row to the fetched
+torrent, so a bookmark is never fetched twice. The wedge check runs on the next
+account reading; a balance that did not fall stops the torrent and holds it.
+
 ## Admission: from bookmark to download
 
 When a new bookmark appears, Windlass records it as *Queued* in the torrent

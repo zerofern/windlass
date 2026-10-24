@@ -12,7 +12,10 @@ use crate::core::{
     DeliveryFailure, Notice, NotificationEvent, NtfyTopic, SettingName, StartupMode, SwitchBlock,
 };
 
-use super::describe::{qbittorrent_failure, timestamp};
+use super::describe::{hold, purchase, qbittorrent_failure, rejection, timestamp};
+
+/// MAM's main page, where the visit reminder leads.
+const MAM_HOME: &str = "https://www.myanonamouse.net/";
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -90,11 +93,15 @@ async fn deliver(
         .header("Title", message.title)
         .header("Priority", message.priority.to_string())
         .header("Tags", message.tags);
-    if let Some(link) = channel
-        .dashboard
-        .as_ref()
-        .and_then(|dashboard| dashboard.join(message.page).ok())
-    {
+    let link = if message.page.starts_with("https://") {
+        Url::parse(message.page).ok()
+    } else {
+        channel
+            .dashboard
+            .as_ref()
+            .and_then(|dashboard| dashboard.join(message.page).ok())
+    };
+    if let Some(link) = link {
         request = request.header("Click", link.as_str());
     }
     let response = request
@@ -126,6 +133,7 @@ const fn setting(setting: SettingName) -> &'static str {
         SettingName::HistoryLimit => "The history limit",
         SettingName::ApiCookie => "The MAM API cookie",
         SettingName::NtfyTopic => "The notification topic",
+        SettingName::PointsReserve => "The bonus points reserve",
     }
 }
 
@@ -156,6 +164,7 @@ pub(super) fn message(notice: &Notice) -> Message {
         tags,
         page,
     };
+    let at_mam = |title, body, priority, tags| message(title, body, priority, tags, "/#mam");
     match notice {
         Notice::Started { mode } => message(
             "Windlass started",
@@ -370,7 +379,265 @@ pub(super) fn message(notice: &Notice) -> Message {
             "bell",
             "/settings",
         ),
+        Notice::MamSessionRejected { rejection: reason } => at_mam(
+            "MAM refused the API session",
+            format!(
+                "MAM requests that need the cookie have stopped: {}. Create a new session from the VPN and enter it on the settings page.",
+                rejection(*reason)
+            ),
+            5,
+            "rotating_light",
+        ),
+        Notice::MamSessionAccepted => at_mam(
+            "MAM session working",
+            String::from("MAM accepts the API session again."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::SeedboxNotRegistered => at_mam(
+            "Seedbox IP not registered",
+            String::from(
+                "MAM has not registered the VPN's IP as the seedbox, so new downloads wait. The dashboard shows why and when Windlass tries again.",
+            ),
+            4,
+            "warning",
+        ),
+        Notice::SeedboxRegistered { ip } => at_mam(
+            "Seedbox IP registered",
+            format!("MAM has {ip} as the seedbox IP."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::MamIpUnknown { failures } => at_mam(
+            "Cannot see MAM's view of the IP",
+            format!("The last {failures} IP lookups at MAM failed, so new downloads wait."),
+            3,
+            "warning",
+        ),
+        Notice::MamIpKnown => at_mam(
+            "MAM IP lookups working",
+            String::from("Windlass sees the IP MAM sees again."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::MamStateUnreadable => at_mam(
+            "MAM state unreadable",
+            String::from(
+                "Windlass could not read when it last registered the seedbox IP, so it will not register until restarted.",
+            ),
+            5,
+            "rotating_light",
+        ),
+        Notice::RatioLow {
+            ratio: value,
+            urgent,
+        } => at_mam(
+            "Ratio below 2.0",
+            format!(
+                "MAM reports a ratio of {}. Every download is held until you find out why.",
+                ratio(*value)
+            ),
+            if *urgent { 5 } else { 4 },
+            "rotating_light",
+        ),
+        Notice::RatioRestored => at_mam(
+            "Ratio back above 2.0",
+            String::from("MAM reports a ratio of 2.0 or more."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::UnsatisfiedNearLimit { count, limit } => at_mam(
+            "Unsatisfied torrents near the limit",
+            format!("MAM counts {count} unsatisfied torrents of a limit of {limit}."),
+            4,
+            "warning",
+        ),
+        Notice::UnsatisfiedBelowLimit => at_mam(
+            "Unsatisfied torrents below 80%",
+            String::from("MAM's unsatisfied count is below 80% of the limit again."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::UnsatisfiedNotSeeding { count } => at_mam(
+            "Unsatisfied torrents not seeding",
+            format!(
+                "MAM sees {count} unsatisfied torrents that are not seeding. They must seed 72 hours within 30 days."
+            ),
+            4,
+            "warning",
+        ),
+        Notice::UnsatisfiedSeeding => at_mam(
+            "Unsatisfied torrents seeding",
+            String::from("MAM sees every unsatisfied torrent seeding."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::MamFlagged {
+            partial,
+            tracker_errors,
+            flagged,
+        } => at_mam(
+            "MAM flags the account's torrents",
+            format!(
+                "MAM reports{}{}{}.",
+                if *partial { " a partial download;" } else { "" },
+                if *tracker_errors > 0 {
+                    format!(" {tracker_errors} tracker errors;")
+                } else {
+                    String::new()
+                },
+                if *flagged > 0 {
+                    format!(" {flagged} torrents in categories it marks red")
+                } else {
+                    String::new()
+                }
+            ),
+            4,
+            "warning",
+        ),
+        Notice::MamFlagsCleared => at_mam(
+            "MAM flags cleared",
+            String::from("MAM no longer flags any of the account's torrents."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::MamMessages {
+            count,
+            client_warning,
+        } => at_mam(
+            if *client_warning {
+                "MAM warns about a client"
+            } else {
+                "MAM has notifications"
+            },
+            format!(
+                "MAM has {count} notifications for you{}. Windlass does not read them.",
+                if *client_warning {
+                    ", including a warning that it is about to stop accepting a client"
+                } else {
+                    ""
+                }
+            ),
+            if *client_warning { 5 } else { 3 },
+            "envelope",
+        ),
+        Notice::DownloadsHeld { hold: reason } => at_mam(
+            "Downloads held",
+            format!(
+                "Bookmarked torrents wait for 30 minutes now: {}.",
+                hold(*reason)
+            ),
+            3,
+            "hourglass",
+        ),
+        Notice::DownloadsResumed => at_mam(
+            "Downloads resumed",
+            String::from("Bookmarked torrents download again."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::NoWedgesLeft => at_mam(
+            "No wedges left",
+            String::from(
+                "Torrents that are not freeleech for you wait, because no wedge is left and the store does not sell them through the API.",
+            ),
+            4,
+            "warning",
+        ),
+        Notice::PointsBelowReserve { points, reserve } => at_mam(
+            "Bonus points below the reserve",
+            format!(
+                "MAM reports {points} points, below the reserve of {reserve}. Windlass buys nothing."
+            ),
+            3,
+            "warning",
+        ),
+        Notice::VipEnding { until } => at_mam(
+            "VIP ending",
+            format!(
+                "VIP ends at {} and Windlass has not renewed it, usually because the points would fall below the reserve.",
+                timestamp(*until)
+            ),
+            4,
+            "warning",
+        ),
+        Notice::DownloadsRefused => at_mam(
+            "MAM refused a download",
+            String::from(
+                "MAM answered a download without a torrent file, so downloads are held until Windlass restarts or the cookie changes.",
+            ),
+            5,
+            "rotating_light",
+        ),
+        Notice::SeedingBehind { count } => at_mam(
+            "Torrents behind on seeding",
+            format!(
+                "{} completed 20 or more days ago {} not seeded 72 hours yet.",
+                torrents(*count),
+                if *count == 1 { "has" } else { "have" }
+            ),
+            4,
+            "warning",
+        ),
+        Notice::SeedingOnTrack => at_mam(
+            "Seeding on track",
+            String::from("Every torrent is on track to seed 72 hours within 30 days."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::PurchaseMade {
+            purchase: bought,
+            points,
+        } => at_mam(
+            "Bonus points spent",
+            format!(
+                "Windlass bought {}; {points} points are left.",
+                purchase(*bought)
+            ),
+            3,
+            "moneybag",
+        ),
+        Notice::PurchaseRefused { purchase: wanted } => at_mam(
+            "Purchase refused",
+            format!(
+                "MAM refused to sell {}. Windlass waits 6 hours before trying again.",
+                purchase(*wanted)
+            ),
+            4,
+            "warning",
+        ),
+        Notice::PurchaseUncertain { purchase: wanted } => at_mam(
+            "Purchase uncertain",
+            format!(
+                "Windlass does not know whether MAM sold {}, so it buys nothing until it reads MAM's figures again.",
+                purchase(*wanted)
+            ),
+            4,
+            "warning",
+        ),
+        Notice::WedgeNotSpent => at_mam(
+            "Wedge not spent",
+            String::from(
+                "MAM's wedge count did not drop after a wedged download, so Windlass stopped the torrent to protect the ratio.",
+            ),
+            5,
+            "rotating_light",
+        ),
+        Notice::MamVisitReminder => message(
+            "Visit MAM",
+            String::from(
+                "Your weekly reminder: visit MAM to keep the account active, and read its announcements about approved clients.",
+            ),
+            3,
+            "mouse",
+            MAM_HOME,
+        ),
     }
+}
+
+/// A ratio in thousandths, with two decimals.
+fn ratio(thousandths: u64) -> String {
+    format!("{}.{:02}", thousandths / 1000, thousandths % 1000 / 10)
 }
 
 #[cfg(test)]
@@ -388,8 +655,9 @@ mod tests {
     };
 
     use crate::core::{
-        DeliveryFailure, EntryCount, Notice, NotificationEvent, NtfyTopic, Port,
-        QbittorrentFailure, SettingName, StartupMode, SwitchBlock, VpnServer,
+        DeliveryFailure, EntryCount, Hold, Notice, NotificationEvent, NtfyTopic, Points, Port,
+        Purchase, QbittorrentFailure, SessionRejection, SettingName, StartupMode, SwitchBlock,
+        UploadCredit, VpnServer,
     };
 
     use super::{Channel, message, send};
@@ -469,8 +737,121 @@ mod tests {
                 SettingName::HistoryLimit,
                 SettingName::ApiCookie,
                 SettingName::NtfyTopic,
+                SettingName::PointsReserve,
             ]
             .map(|setting| Notice::SettingNotSaved { setting }),
+        );
+        notices.extend(mam_notices()?);
+        Ok(notices)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one list of every MAM notice reads best together"
+    )]
+    fn mam_notices() -> Result<Vec<Notice>, Box<dyn Error + Send + Sync>> {
+        let upload = Purchase::Upload(UploadCredit::try_new(50)?);
+        let mut notices = vec![
+            Notice::MamSessionAccepted,
+            Notice::SeedboxNotRegistered,
+            Notice::SeedboxRegistered {
+                ip: std::net::IpAddr::from([192, 0, 2, 10]),
+            },
+            Notice::MamIpUnknown { failures: 3 },
+            Notice::MamIpKnown,
+            Notice::MamStateUnreadable,
+            Notice::RatioLow {
+                ratio: 1500,
+                urgent: false,
+            },
+            Notice::RatioLow {
+                ratio: 1050,
+                urgent: true,
+            },
+            Notice::RatioRestored,
+            Notice::UnsatisfiedNearLimit {
+                count: 121,
+                limit: 150,
+            },
+            Notice::UnsatisfiedBelowLimit,
+            Notice::UnsatisfiedNotSeeding { count: 2 },
+            Notice::UnsatisfiedSeeding,
+            Notice::MamFlagged {
+                partial: true,
+                tracker_errors: 1,
+                flagged: 2,
+            },
+            Notice::MamFlagged {
+                partial: false,
+                tracker_errors: 0,
+                flagged: 1,
+            },
+            Notice::MamFlagged {
+                partial: false,
+                tracker_errors: 2,
+                flagged: 0,
+            },
+            Notice::MamFlagsCleared,
+            Notice::MamMessages {
+                count: 2,
+                client_warning: false,
+            },
+            Notice::MamMessages {
+                count: 1,
+                client_warning: true,
+            },
+            Notice::DownloadsResumed,
+            Notice::NoWedgesLeft,
+            Notice::PointsBelowReserve {
+                points: Points(10_000),
+                reserve: Points(20_000),
+            },
+            Notice::VipEnding {
+                until: SystemTime::UNIX_EPOCH,
+            },
+            Notice::DownloadsRefused,
+            Notice::SeedingBehind { count: 1 },
+            Notice::SeedingBehind { count: 3 },
+            Notice::SeedingOnTrack,
+            Notice::PurchaseMade {
+                purchase: upload,
+                points: Points(35_000),
+            },
+            Notice::PurchaseMade {
+                purchase: Purchase::Vip,
+                points: Points(35_000),
+            },
+            Notice::PurchaseRefused { purchase: upload },
+            Notice::PurchaseUncertain { purchase: upload },
+            Notice::WedgeNotSpent,
+            Notice::MamVisitReminder,
+        ];
+        notices.extend(
+            [
+                SessionRejection::InvalidCookie,
+                SessionRejection::IpMismatch,
+                SessionRejection::AsnMismatch,
+                SessionRejection::NotAllowed,
+                SessionRejection::Other,
+            ]
+            .map(|rejection| Notice::MamSessionRejected { rejection }),
+        );
+        notices.extend(
+            [
+                Hold::SeedboxUnconfirmed,
+                Hold::DownloadsRefused,
+                Hold::ClientUnavailable,
+                Hold::AccountUnknown,
+                Hold::RatioLow,
+                Hold::UnsatisfiedLimit {
+                    count: 148,
+                    limit: 150,
+                },
+                Hold::NoWedge,
+                Hold::NotBookmarked,
+                Hold::MamUnavailable,
+            ]
+            .map(|hold| Notice::DownloadsHeld { hold }),
         );
         Ok(notices)
     }
@@ -486,7 +867,10 @@ mod tests {
                 "{notice:?}"
             );
             assert!((1..=5).contains(&message.priority), "{notice:?}");
-            assert!(message.page.starts_with('/'), "{notice:?}");
+            assert!(
+                message.page.starts_with('/') || message.page == super::MAM_HOME,
+                "{notice:?}"
+            );
             bodies.insert(message.body);
         }
         assert_eq!(
@@ -546,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn notices_reach_ntfy_through_the_relay_with_a_dashboard_link() -> TestResult {
-        let (relay, received) = ntfy(StatusCode::OK).await?;
+        let (relay, recorded) = ntfy(StatusCode::OK).await?;
         let channel = Channel::new(
             Some("http://ntfy.test/".parse()?),
             Some(relay),
@@ -557,7 +941,7 @@ mod tests {
             send(&channel, &topic, &Notice::FilesMissing { count: 2 }).await,
             NotificationEvent::Delivered
         );
-        let received = std::mem::take(&mut *received.lock().map_err(|_| "poisoned")?);
+        let received = std::mem::take(&mut *recorded.lock().map_err(|_| "poisoned")?);
         assert_eq!(received.host.as_deref(), Some("ntfy.test"));
         assert_eq!(received.path, "windlass-alerts");
         let header = |name: &str| {
@@ -572,6 +956,18 @@ mod tests {
         assert_eq!(header("Tags"), Some("warning"));
         assert_eq!(header("Click"), Some("http://windlass.test:8740/#torrents"));
         assert!(received.body.starts_with("2 torrents have missing files"));
+
+        // The weekly reminder leads to MAM itself.
+        assert_eq!(
+            send(&channel, &topic, &Notice::MamVisitReminder).await,
+            NotificationEvent::Delivered
+        );
+        let received = std::mem::take(&mut *recorded.lock().map_err(|_| "poisoned")?);
+        assert!(
+            received
+                .headers
+                .contains(&(String::from("Click"), String::from(super::MAM_HOME)))
+        );
         Ok(())
     }
 

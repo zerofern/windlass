@@ -1,0 +1,1525 @@
+//! Scenario tests for Windlass's work with MAM: the request gate, seedbox
+//! registration, the account and spending, bookmark acquisition, and the
+//! weekly reminder. Time only moves when a test says so.
+
+use std::{
+    net::IpAddr,
+    time::{Duration, Instant, SystemTime},
+};
+
+use windlass::core::{
+    Action, ApiCookie, Asn, Bookmark, BookmarkPage, ByteSize, ClockReading, Connectable, Core,
+    Desired, Event, FetchedTorrent, Hold, IpObservation, MamEvent, MamFailure, MamNotices,
+    MamPauseEvent, MamReply, MamRequest, MamRequestMode, MamSession, MamTorrentId, Notice,
+    PersonalFreeleech, Points, Purchase, QbittorrentEvent, QbittorrentPreferences, Registration,
+    Registry, RegistryEvent, SeedboxStatus, SessionRejection, SettingsEvent, SnatchSummary,
+    StartupEvent, StartupMode, SyncPosition, SyncUpdate, TimerId, TimerName, TorrentCommand,
+    TorrentHash, TorrentRecord, TunnelEvent, UserData,
+};
+
+const GIB: u64 = 1 << 30;
+const DAY: Duration = Duration::from_hours(24);
+/// A wall clock in late 2026, so VIP expiries look real.
+const EPOCH: Duration = Duration::from_secs(1_790_000_000);
+
+fn ip(last: u8) -> IpAddr {
+    IpAddr::from([192, 0, 2, last])
+}
+
+fn torrent_id(id: u64) -> MamTorrentId {
+    MamTorrentId::new(id).unwrap_or_else(|| unreachable!("non-zero"))
+}
+
+fn hash(fill: char) -> TorrentHash {
+    TorrentHash::parse(&fill.to_string().repeat(40)).unwrap_or_else(|| unreachable!("valid hash"))
+}
+
+fn cookie(value: &str) -> ApiCookie {
+    ApiCookie::parse(value).unwrap_or_else(|_| unreachable!("valid cookie"))
+}
+
+/// A core with a clock that only moves when told to.
+struct Harness {
+    core: Core,
+    start: Instant,
+    elapsed: Duration,
+    position: u64,
+}
+
+/// What the harness starts from.
+struct Setup {
+    cookie: Option<&'static str>,
+    last_registration: Option<Duration>,
+    /// The registry's rows; `None` when it cannot be read.
+    rows: Option<Vec<TorrentRecord>>,
+    client: bool,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            cookie: Some("first-cookie"),
+            last_registration: None,
+            rows: Some(Vec::new()),
+            client: true,
+        }
+    }
+}
+
+impl Harness {
+    /// A started core with MAM requests running, VPN protection, a connected
+    /// qBittorrent, and MAM enabled. Returns the actions of the last step.
+    fn start(setup: Setup) -> (Self, Vec<Action>) {
+        let mut harness = Self {
+            core: Core::new(),
+            start: Instant::now(),
+            elapsed: Duration::ZERO,
+            position: 0,
+        };
+        let now = harness.wall();
+        for event in [
+            Event::Startup(StartupEvent::Start {
+                mode: StartupMode::Resume,
+            }),
+            Event::Startup(StartupEvent::StorageOpened),
+            Event::MamPause(MamPauseEvent::Read {
+                mode: Some(MamRequestMode::Enabled),
+            }),
+            Event::Settings(SettingsEvent::Read {
+                history_limit: None,
+                api_cookie: setup.cookie.map(cookie),
+                ntfy_topic: windlass::core::NtfyTopic::parse("test-topic").ok(),
+                points_reserve: None,
+            }),
+            Event::Registry(
+                setup
+                    .rows
+                    .map_or(RegistryEvent::ReadFailed, RegistryEvent::Read),
+            ),
+            Event::Tunnel(TunnelEvent::LastSwitchRead { last_switch: None }),
+            Event::Mam(MamEvent::StateRead {
+                last_registration: setup.last_registration.and_then(|ago| now.checked_sub(ago)),
+                last_reminder: Some(now),
+            }),
+            Event::Tunnel(TunnelEvent::Enable {
+                servers: Vec::new(),
+                current: None,
+            }),
+            Event::Tunnel(TunnelEvent::ExitIpObserved { ip: ip(10) }),
+        ] {
+            let _ = harness.send(event);
+        }
+        if setup.client {
+            for event in [
+                Event::Qbittorrent(QbittorrentEvent::Enable),
+                Event::Qbittorrent(QbittorrentEvent::Connected {
+                    version: String::from("v5.2.2"),
+                    preferences: QbittorrentPreferences::default(),
+                }),
+            ] {
+                let _ = harness.send(event);
+            }
+            let _ = harness.sync(Vec::new());
+        }
+        let actions = harness.send(Event::Mam(MamEvent::Enable));
+        (harness, actions)
+    }
+
+    fn wall(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + EPOCH + self.elapsed
+    }
+
+    fn advance(&mut self, by: Duration) {
+        self.elapsed += by;
+    }
+
+    fn send(&mut self, event: Event) -> Vec<Action> {
+        let now = ClockReading {
+            monotonic: self.start + self.elapsed,
+            wall: self.wall(),
+        };
+        let mut actions = self.core.handle(now, event);
+        actions.retain(|action| {
+            !matches!(
+                action,
+                Action::StartTimer {
+                    name: TimerName::NotificationGrace,
+                    ..
+                }
+            )
+        });
+        actions
+    }
+
+    fn answer(&mut self, result: Result<MamReply, MamFailure>) -> Vec<Action> {
+        self.send(Event::Mam(MamEvent::Answered {
+            result,
+            rotated: None,
+        }))
+    }
+
+    /// Deliver the next qBittorrent update; the first is the full list.
+    fn sync(&mut self, torrents: Vec<TorrentHash>) -> Vec<Action> {
+        self.position += 1;
+        self.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
+            position: SyncPosition(self.position),
+            full: self.position == 1,
+            torrents: torrents
+                .into_iter()
+                .map(|hash| (hash, windlass::core::TorrentUpdate::default()))
+                .collect(),
+            removed: Vec::new(),
+        })))
+    }
+
+    /// Wait out the MAM timer started by these actions, and let it expire.
+    fn wake(&mut self, actions: &[Action]) -> Vec<Action> {
+        let Some((id, after)) = timer(actions, TimerName::Mam) else {
+            unreachable!("no MAM timer in {actions:?}");
+        };
+        self.advance(after);
+        self.send(Event::TimerExpired {
+            name: TimerName::Mam,
+            id,
+        })
+    }
+
+    /// Observe the IP, then register: the attempt is saved before it is sent.
+    fn register(&mut self, actions: &[Action]) -> Vec<Action> {
+        assert_eq!(requests(actions), [MamRequest::LookUpIp]);
+        let actions = self.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. })),
+            "{actions:?}"
+        );
+        let actions = self.send(Event::Mam(MamEvent::RegistrationAttemptSaved));
+        assert_eq!(requests(&actions), [MamRequest::RegisterSeedbox]);
+        self.answer(Ok(MamReply::Registered {
+            registration: Registration::Completed,
+            ip: ip(10),
+        }))
+    }
+
+    /// Answer routine IP lookups with the same address until something else
+    /// is asked.
+    fn past_lookups(&mut self, mut actions: Vec<Action>) -> Vec<Action> {
+        while requests(&actions) == [MamRequest::LookUpIp] {
+            actions = self.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+        }
+        actions
+    }
+
+    /// Let time pass and let the core decide again.
+    fn later(&mut self, by: Duration) -> Vec<Action> {
+        self.advance(by);
+        let actions = self.send(Event::Mam(MamEvent::ReminderSaved));
+        self.past_lookups(actions)
+    }
+
+    /// Expire qBittorrent's poll timer and deliver the update it asks for.
+    fn poll(&mut self, torrents: Vec<TorrentHash>) -> Vec<Action> {
+        if let windlass::core::Qbittorrent::Connected(session) = self.core.qbittorrent()
+            && let windlass::core::Activity::Waiting(id) = session.activity
+        {
+            let _ = self.send(Event::TimerExpired {
+                name: TimerName::QbittorrentPoll,
+                id,
+            });
+        }
+        self.sync(torrents)
+    }
+
+    const fn mam(&self) -> &windlass::core::Mam {
+        self.core.mam()
+    }
+
+    /// Notices being sent or waiting; deliveries never complete here.
+    fn notices(&self) -> Vec<Notice> {
+        let notifications = self.core.notifications();
+        let sending = match &notifications.delivery {
+            windlass::core::Delivery::Sending(notice) => Some(notice.clone()),
+            _ => None,
+        };
+        sending
+            .into_iter()
+            .chain(notifications.outbox.iter().cloned())
+            .collect()
+    }
+
+    fn record(&self, id: u64) -> Option<TorrentRecord> {
+        match self.core.registry() {
+            Registry::Loaded(records) => records.find_mam(torrent_id(id)).cloned(),
+            _ => None,
+        }
+    }
+}
+
+fn observation(last: u8, asn: u32) -> IpObservation {
+    IpObservation {
+        ip: ip(last),
+        asn: Asn(asn),
+        provider: String::from("ProtonVPN Proton AG"),
+    }
+}
+
+/// The requests in an action list.
+fn requests(actions: &[Action]) -> Vec<MamRequest> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::MamRequest { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn cookie_sent(actions: &[Action]) -> Option<ApiCookie> {
+    actions.iter().find_map(|action| match action {
+        Action::MamRequest { cookie, .. } => cookie.clone(),
+        _ => None,
+    })
+}
+
+fn timer(actions: &[Action], name: TimerName) -> Option<(TimerId, Duration)> {
+    actions.iter().find_map(|action| match action {
+        Action::StartTimer {
+            name: started,
+            id,
+            deadline,
+        } if *started == name => Some((*id, deadline.after)),
+        _ => None,
+    })
+}
+
+/// A healthy VIP account.
+fn account(now: SystemTime) -> UserData {
+    UserData {
+        uploaded: ByteSize(80 * GIB),
+        downloaded: ByteSize(0),
+        points: Points(60_000),
+        wedges: 200,
+        class: String::from("VIP"),
+        vip_until: now.checked_add(60 * DAY),
+        summary: Some(SnatchSummary {
+            unsatisfied: 0,
+            unsatisfied_limit: 150,
+            connectable: Connectable::Yes,
+            ..SnatchSummary::default()
+        }),
+        notices: Some(MamNotices::default()),
+        clients: Some(1),
+    }
+}
+
+/// MAM's answer with this account; answers are results, as the shell sends them.
+#[expect(clippy::unnecessary_wraps, reason = "the harness answers with results")]
+fn read(data: UserData) -> Result<MamReply, MamFailure> {
+    Ok(MamReply::UserData(Box::new(data)))
+}
+
+fn bookmark(id: u64) -> Bookmark {
+    Bookmark {
+        id: torrent_id(id),
+        title: format!("Synthetic {id}"),
+        vip: false,
+        free: false,
+        personal: PersonalFreeleech::No,
+        snatched: false,
+        vip_expires: None,
+        bookmarked_at: None,
+    }
+}
+
+/// MAM's answer listing these bookmarks on one page.
+#[expect(clippy::unnecessary_wraps, reason = "the harness answers with results")]
+fn listed(bookmarks: Vec<Bookmark>) -> Result<MamReply, MamFailure> {
+    Ok(MamReply::Bookmarks(BookmarkPage {
+        found: u32::try_from(bookmarks.len()).unwrap_or(u32::MAX),
+        bookmarks,
+    }))
+}
+
+#[test]
+fn nothing_is_sent_until_mam_is_enabled_unpaused_and_protected() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    assert_eq!(cookie_sent(&actions), None, "the IP lookup sends no cookie");
+    assert!(harness.mam().available);
+
+    // Pausing stops requests and unconfirms what was known.
+    let actions = harness.send(Event::MamPause(MamPauseEvent::Set {
+        mode: MamRequestMode::Paused,
+    }));
+    assert!(requests(&actions).is_empty());
+    assert!(!harness.mam().available);
+    // The lookup sent before the pause answers late and is not applied.
+    let _ = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(harness.mam().network.observed.is_none());
+
+    // Lost protection keeps requests stopped after resuming.
+    let _ = harness.send(Event::MamPause(MamPauseEvent::Written));
+    let _ = harness.send(Event::Tunnel(TunnelEvent::Enable {
+        servers: Vec::new(),
+        current: None,
+    }));
+    let actions = harness.send(Event::MamPause(MamPauseEvent::Set {
+        mode: MamRequestMode::Enabled,
+    }));
+    assert!(requests(&actions).is_empty());
+    let actions = harness.send(Event::MamPause(MamPauseEvent::Written));
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+}
+
+#[test]
+fn without_a_cookie_only_the_ip_is_observed() {
+    let (mut harness, actions) = Harness::start(Setup {
+        cookie: None,
+        ..Setup::default()
+    });
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(requests(&actions).is_empty());
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. }))
+    );
+    // The next lookup is five minutes later.
+    let actions = harness.wake(&actions);
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+}
+
+#[test]
+fn registration_is_saved_before_it_is_sent_and_spaced_an_hour_apart() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(
+        harness.mam().seedbox.status,
+        SeedboxStatus::Confirmed {
+            ip: ip(10),
+            at: harness.wall()
+        }
+    );
+    assert!(matches!(harness.mam().session, MamSession::Verified { .. }));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    assert_eq!(cookie_sent(&actions), Some(cookie("first-cookie")));
+    let _ = harness.answer(read(account(harness.wall())));
+
+    let _ = harness.answer(listed(Vec::new()));
+
+    // Five minutes later MAM sees another IP; it is registered only once the
+    // hour has passed.
+    let actions = harness.later(Duration::from_mins(5));
+    assert!(requests(&actions).is_empty());
+    harness.advance(Duration::from_mins(5));
+    let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(11, 209_103))));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. }))
+    );
+    assert!(
+        !harness
+            .mam()
+            .seedbox
+            .confirms(harness.mam().network.current())
+    );
+    harness.advance(Duration::from_mins(50));
+    let mut actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    while requests(&actions) == [MamRequest::LookUpIp] {
+        actions = harness.answer(Ok(MamReply::Ip(observation(11, 209_103))));
+    }
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. })),
+        "{actions:?}"
+    );
+}
+
+#[test]
+fn a_saved_attempt_from_before_a_restart_still_spaces_the_next() {
+    let (mut harness, actions) = Harness::start(Setup {
+        last_registration: Some(Duration::from_mins(20)),
+        ..Setup::default()
+    });
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. }))
+    );
+    // The account is read meanwhile; registration waits 40 more minutes.
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let actions = harness.answer(read(account(harness.wall())));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let _ = harness.answer(listed(Vec::new()));
+    let actions = harness.later(Duration::from_mins(40));
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. })),
+        "{actions:?}"
+    );
+    // A failed save sends nothing and is reported.
+    let _ = harness.send(Event::Mam(MamEvent::RegistrationAttemptSaveFailed));
+    assert!(matches!(
+        harness.mam().seedbox.status,
+        SeedboxStatus::Failed { .. }
+    ));
+    assert!(harness.notices().contains(&Notice::SeedboxNotRegistered));
+}
+
+#[test]
+fn unreadable_state_blocks_registration() {
+    let mut harness = Harness {
+        core: Core::new(),
+        start: Instant::now(),
+        elapsed: Duration::ZERO,
+        position: 0,
+    };
+    for event in [
+        Event::Startup(StartupEvent::Start {
+            mode: StartupMode::Resume,
+        }),
+        Event::Startup(StartupEvent::StorageOpened),
+        Event::Mam(MamEvent::StateReadFailed),
+    ] {
+        let _ = harness.send(event);
+    }
+    assert_eq!(
+        harness.mam().seedbox.last_attempt,
+        windlass::core::LastAttempt::ReadFailed
+    );
+    assert!(harness.notices().contains(&Notice::MamStateUnreadable));
+    assert_eq!(
+        harness.mam().seedbox.allowance(harness.wall()),
+        windlass::core::RegistrationAllowance::Unknown
+    );
+}
+
+#[test]
+fn a_refused_session_stops_cookie_requests_until_the_cookie_changes() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let _ = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    let actions = harness.send(Event::Mam(MamEvent::RegistrationAttemptSaved));
+    assert_eq!(requests(&actions), [MamRequest::RegisterSeedbox]);
+    let actions = harness.answer(Err(MamFailure::Session(SessionRejection::InvalidCookie)));
+    assert!(requests(&actions).is_empty());
+    assert!(matches!(
+        harness.mam().session,
+        MamSession::Rejected {
+            rejection: SessionRejection::InvalidCookie,
+            ..
+        }
+    ));
+    assert!(harness.notices().contains(&Notice::MamSessionRejected {
+        rejection: SessionRejection::InvalidCookie
+    }));
+
+    // A replacement is saved before it is used, and starts a new session.
+    let actions = harness.send(Event::Settings(SettingsEvent::SetApiCookie {
+        cookie: cookie("second-cookie"),
+    }));
+    assert!(requests(&actions).is_empty());
+    let actions = harness.send(Event::Settings(SettingsEvent::ApiCookieWritten));
+    assert_eq!(harness.mam().session, MamSession::Unverified);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    assert_eq!(cookie_sent(&actions), Some(cookie("second-cookie")));
+}
+
+#[test]
+fn an_asn_mismatch_lifts_when_mam_sees_another_asn() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let actions = harness.answer(Err(MamFailure::Session(SessionRejection::AsnMismatch)));
+    assert!(requests(&actions).is_empty());
+    // The same ASN keeps the session refused; another lets it be tried again.
+    let actions = harness.wake(&actions);
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(requests(&actions).is_empty());
+    let actions = harness.wake(&actions);
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(12, 64_500))));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+}
+
+#[test]
+fn a_session_that_may_not_register_still_reads_the_account() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let _ = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    let _ = harness.send(Event::Mam(MamEvent::RegistrationAttemptSaved));
+    let actions = harness.answer(Err(MamFailure::Session(SessionRejection::NotAllowed)));
+    assert_eq!(harness.mam().session, MamSession::Unverified);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    assert!(harness.notices().contains(&Notice::SeedboxNotRegistered));
+}
+
+#[test]
+fn mam_asking_to_wait_delays_the_retry() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let start = harness.start + harness.elapsed;
+    let actions = harness.answer(Err(MamFailure::TooSoon {
+        retry_after: Some(Duration::from_mins(20)),
+    }));
+    assert_eq!(
+        harness.mam().network.next_lookup,
+        Some(start + Duration::from_mins(20))
+    );
+    assert_eq!(harness.mam().network.failures, 1);
+    // The account does not depend on the lookup.
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let _ = harness.answer(read(account(harness.wall())));
+    let _ = harness.answer(listed(Vec::new()));
+    harness.advance(Duration::from_mins(20));
+    let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let _ = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    let actions = harness.send(Event::Mam(MamEvent::RegistrationAttemptSaved));
+    assert_eq!(requests(&actions), [MamRequest::RegisterSeedbox]);
+    let _ = harness.answer(Err(MamFailure::TooSoon {
+        retry_after: Some(Duration::from_hours(3)),
+    }));
+    assert_eq!(
+        harness.mam().seedbox.allowance(harness.wall()),
+        windlass::core::RegistrationAllowance::After(harness.wall() + Duration::from_hours(3))
+    );
+    // Waiting is not a failure the owner needs to hear about.
+    assert!(!harness.notices().contains(&Notice::SeedboxNotRegistered));
+}
+
+#[test]
+fn a_cookie_mam_issues_is_saved_and_continues_the_session() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let actions = harness.send(Event::Mam(MamEvent::Answered {
+        result: read(account(harness.wall())),
+        rotated: Some(cookie("rotated-cookie")),
+    }));
+    assert!(actions.contains(&Action::WriteRotatedApiCookie {
+        cookie: cookie("rotated-cookie")
+    }));
+    let actions = harness.send(Event::Settings(SettingsEvent::RotatedApiCookieWritten));
+    assert!(matches!(harness.mam().session, MamSession::Verified { .. }));
+    assert!(matches!(
+        harness.mam().seedbox.status,
+        SeedboxStatus::Confirmed { .. }
+    ));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(cookie_sent(&actions), Some(cookie("rotated-cookie")));
+
+    // A rotation that cannot be saved leaves the saved cookie in use.
+    let actions = harness.send(Event::Mam(MamEvent::Answered {
+        result: listed(Vec::new()),
+        rotated: Some(cookie("another-cookie")),
+    }));
+    assert!(actions.contains(&Action::WriteRotatedApiCookie {
+        cookie: cookie("another-cookie")
+    }));
+    let _ = harness.send(Event::Settings(SettingsEvent::RotatedApiCookieWriteFailed));
+    let settings = harness.core.settings().loaded().cloned();
+    assert_eq!(
+        settings.and_then(|settings| settings.usable_api_cookie().cloned()),
+        Some(cookie("rotated-cookie"))
+    );
+    assert!(matches!(harness.mam().session, MamSession::Verified { .. }));
+}
+
+#[test]
+fn the_bucket_allows_five_requests_then_one_every_ten_seconds() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    // Three requests so far; the account read is the fourth, bookmarks the fifth.
+    assert_eq!(requests(&actions).len(), 1);
+    let actions = harness.answer(read(account(harness.wall())));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let page = BookmarkPage {
+        found: 250,
+        bookmarks: (1..=100).map(bookmark).collect(),
+    };
+    let actions = harness.answer(Ok(MamReply::Bookmarks(page)));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks { start: 100 }]
+    );
+    let page = BookmarkPage {
+        found: 250,
+        bookmarks: (101..=200).map(bookmark).collect(),
+    };
+    let actions = harness.answer(Ok(MamReply::Bookmarks(page)));
+    assert!(requests(&actions).is_empty(), "the bucket is empty");
+    assert_eq!(
+        timer(&actions, TimerName::Mam).map(|(_, after)| after),
+        Some(Duration::from_secs(10))
+    );
+    let actions = harness.wake(&actions);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks { start: 200 }]
+    );
+    let page = BookmarkPage {
+        found: 250,
+        bookmarks: (201..=250).map(bookmark).collect(),
+    };
+    let _ = harness.answer(Ok(MamReply::Bookmarks(page)));
+    assert_eq!(
+        harness
+            .mam()
+            .acquisition
+            .bookmarks
+            .latest
+            .as_ref()
+            .map(|listed| listed.bookmarks.len()),
+        Some(250)
+    );
+}
+
+/// Register, read the account, and list these bookmarks; the actions of the
+/// last step.
+fn listed_with(harness: &mut Harness, account: UserData, bookmarks: Vec<Bookmark>) -> Vec<Action> {
+    let (started, actions) = Harness::start(Setup::default());
+    *harness = started;
+    let actions = harness.register(&actions);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let actions = harness.answer(read(account));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    harness.answer(listed(bookmarks))
+}
+
+fn empty_harness() -> Harness {
+    Harness {
+        core: Core::new(),
+        start: Instant::now(),
+        elapsed: Duration::ZERO,
+        position: 0,
+    }
+}
+
+#[test]
+fn a_bookmark_is_queued_wedged_fetched_and_added() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let mut snatched = bookmark(2);
+    snatched.snatched = true;
+    let actions = listed_with(&mut harness, account(now), vec![bookmark(1), snatched]);
+    assert_eq!(
+        harness.record(1).map(|record| record.desired),
+        Some(Desired::Queued)
+    );
+    assert_eq!(harness.record(2), None, "snatched before, so not queued");
+    assert_eq!(harness.mam().acquisition.suppressed, [torrent_id(2)]);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveTorrents { .. }))
+    );
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::FetchTorrent {
+            id: torrent_id(1),
+            wedge: true
+        }]
+    );
+    let actions = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
+        hash: hash('a'),
+        size: ByteSize(GIB),
+    })));
+    assert_eq!(
+        harness
+            .record(1)
+            .map(|record| (record.desired, record.identity.hash().cloned())),
+        Some((Desired::Active, Some(hash('a'))))
+    );
+    assert!(requests(&actions).is_empty(), "no bucket token is left");
+
+    // The next qBittorrent update adds it from the kept file.
+    let actions = harness.poll(Vec::new());
+    assert!(actions.contains(&Action::QbittorrentCommand {
+        command: TorrentCommand::Add {
+            mam: torrent_id(1),
+            hash: hash('a')
+        }
+    }));
+
+    // The next reading must show the wedge spent; it does.
+    let actions = harness.later(Duration::from_mins(1));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData {
+            client_stats: false
+        }]
+    );
+    let mut after = account(harness.wall());
+    after.wedges = 199;
+    after.clients = None;
+    let _ = harness.answer(read(after));
+    assert_eq!(
+        harness.record(1).map(|record| record.desired),
+        Some(Desired::Active)
+    );
+    assert!(!harness.notices().contains(&Notice::WedgeNotSpent));
+}
+
+#[test]
+fn a_wedge_that_was_not_spent_holds_the_torrent() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let actions = listed_with(&mut harness, account(now), vec![bookmark(1)]);
+    assert_eq!(requests(&actions).len(), 1);
+    let _ = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
+        hash: hash('b'),
+        size: ByteSize(GIB),
+    })));
+    let actions = harness.later(Duration::from_mins(1));
+    assert!(matches!(
+        requests(&actions).first(),
+        Some(MamRequest::LoadUserData { .. })
+    ));
+    let _ = harness.answer(read(account(harness.wall())));
+    assert_eq!(
+        harness.record(1).map(|record| record.desired),
+        Some(Desired::Held)
+    );
+    assert!(harness.notices().contains(&Notice::WedgeNotSpent));
+    // Once qBittorrent lists it, it is stopped.
+    let actions = harness.poll(vec![hash('b')]);
+    assert!(actions.contains(&Action::QbittorrentCommand {
+        command: TorrentCommand::Stop(vec![hash('b')])
+    }));
+}
+
+#[test]
+fn vip_torrents_need_no_wedge_while_the_account_is_vip() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let mut vip = bookmark(3);
+    vip.vip = true;
+    let actions = listed_with(&mut harness, account(now), vec![vip.clone()]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::FetchTorrent {
+            id: torrent_id(3),
+            wedge: false
+        }]
+    );
+    // Not VIP any more: the same torrent needs a wedge.
+    let mut lapsed = account(now);
+    lapsed.vip_until = None;
+    lapsed.class = String::from("Power User");
+    lapsed.points = Points(1000);
+    let actions = listed_with(&mut harness, lapsed, vec![vip]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::FetchTorrent {
+            id: torrent_id(3),
+            wedge: true
+        }]
+    );
+    // A personal freeleech needs none.
+    let mut personal = bookmark(4);
+    personal.personal = PersonalFreeleech::ThroughWedge;
+    let actions = listed_with(&mut harness, account(now), vec![personal]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::FetchTorrent {
+            id: torrent_id(4),
+            wedge: false
+        }]
+    );
+}
+
+#[test]
+fn every_admission_rule_can_hold_a_download() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let check = |harness: &mut Harness, data: UserData, hold: Hold| {
+        let actions = listed_with(harness, data, vec![bookmark(5)]);
+        assert!(
+            !requests(&actions)
+                .iter()
+                .any(|request| matches!(request, MamRequest::FetchTorrent { .. })),
+            "{hold:?}"
+        );
+        assert_eq!(harness.mam().acquisition.hold, Some(hold));
+    };
+    let mut no_wedges = account(now);
+    no_wedges.wedges = 0;
+    no_wedges.vip_until = None;
+    no_wedges.points = Points(1000);
+    check(&mut harness, no_wedges, Hold::NoWedge);
+    let mut full = account(now);
+    if let Some(summary) = &mut full.summary {
+        summary.unsatisfied = 148;
+    }
+    check(
+        &mut harness,
+        full,
+        Hold::UnsatisfiedLimit {
+            count: 148,
+            limit: 150,
+        },
+    );
+    let mut low = account(now);
+    low.uploaded = ByteSize(GIB);
+    low.downloaded = ByteSize(GIB);
+    low.points = Points(0);
+    check(&mut harness, low, Hold::RatioLow);
+    let mut unknown = account(now);
+    unknown.summary = None;
+    check(&mut harness, unknown, Hold::AccountUnknown);
+}
+
+#[test]
+fn a_refused_download_holds_every_download() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let actions = listed_with(&mut harness, account(now), vec![bookmark(6), bookmark(7)]);
+    assert_eq!(requests(&actions).len(), 1);
+    let _ = harness.answer(Err(MamFailure::Refused { message: None }));
+    assert!(harness.mam().acquisition.refused.is_some());
+    assert!(harness.notices().contains(&Notice::DownloadsRefused));
+    let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    assert!(requests(&actions).is_empty());
+    assert_eq!(harness.mam().acquisition.hold, Some(Hold::DownloadsRefused));
+}
+
+#[test]
+fn vip_is_kept_within_the_reserve() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let mut ending = account(now);
+    ending.vip_until = now.checked_add(10 * DAY);
+    let (started, actions) = Harness::start(Setup::default());
+    harness = started;
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let actions = harness.answer(read(ending.clone()));
+    assert_eq!(requests(&actions), [MamRequest::Buy(Purchase::Vip)]);
+    // 80 days at 1,250 points a week cost 14,286 points; MAM charged 14,000.
+    let actions = harness.answer(Ok(MamReply::Purchased {
+        points: Points(46_000),
+    }));
+    assert!(harness.notices().contains(&Notice::PurchaseMade {
+        purchase: Purchase::Vip,
+        points: Points(46_000)
+    }));
+    assert_eq!(harness.mam().account.vip_price_per_week, 1225);
+    // Nothing more is bought until a new reading.
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::Buy(_)))
+    );
+
+    // Within the reserve, VIP is not renewed and the owner is told.
+    let mut poor = ending;
+    poor.points = Points(25_000);
+    poor.vip_until = now.checked_add(5 * DAY);
+    let actions = listed_with(&mut harness, poor, Vec::new());
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::Buy(_)))
+    );
+    assert!(
+        harness
+            .notices()
+            .iter()
+            .any(|notice| matches!(notice, Notice::VipEnding { .. }))
+    );
+}
+
+#[test]
+fn upload_credit_keeps_the_buffer_and_uncertain_purchases_wait() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let mut thin = account(harness.wall());
+    thin.uploaded = ByteSize(20 * GIB);
+    let actions = harness.answer(read(thin.clone()));
+    let Some(MamRequest::Buy(Purchase::Upload(amount))) = requests(&actions).first().cloned()
+    else {
+        unreachable!("no upload purchase in {actions:?}");
+    };
+    assert_eq!(amount.into_inner(), 50);
+    let actions = harness.answer(Err(MamFailure::Unreachable));
+    assert!(harness.notices().contains(&Notice::PurchaseUncertain {
+        purchase: Purchase::Upload(amount)
+    }));
+    // Nothing more is bought until the next reading decides from MAM's figures.
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let _ = harness.answer(listed(Vec::new()));
+    // A refusal is not retried for hours.
+    let actions = harness.later(Duration::from_mins(15));
+    assert!(
+        matches!(
+            requests(&actions).first(),
+            Some(MamRequest::LoadUserData { .. })
+        ),
+        "{actions:?}"
+    );
+    let actions = harness.answer(read(thin.clone()));
+    assert!(matches!(
+        requests(&actions).first(),
+        Some(MamRequest::Buy(Purchase::Upload(_)))
+    ));
+    let actions = harness.answer(Err(MamFailure::Refused {
+        message: Some(String::from("Not enough points")),
+    }));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let _ = harness.answer(listed(Vec::new()));
+    assert!(harness.notices().contains(&Notice::PurchaseRefused {
+        purchase: Purchase::Upload(amount)
+    }));
+    let actions = harness.later(Duration::from_mins(15));
+    assert!(matches!(
+        requests(&actions).first(),
+        Some(MamRequest::LoadUserData { .. })
+    ));
+    let actions = harness.answer(read(thin));
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::Buy(_))),
+        "{actions:?}"
+    );
+}
+
+#[test]
+fn the_owner_is_reminded_weekly_to_visit_mam() {
+    let mut harness = empty_harness();
+    for event in [
+        Event::Startup(StartupEvent::Start {
+            mode: StartupMode::Resume,
+        }),
+        Event::Startup(StartupEvent::StorageOpened),
+    ] {
+        let _ = harness.send(event);
+    }
+    // The first run starts the count without a reminder.
+    let actions = harness.send(Event::Mam(MamEvent::StateRead {
+        last_registration: None,
+        last_reminder: None,
+    }));
+    let started = harness.wall();
+    assert!(actions.contains(&Action::SaveReminder { at: started }));
+    assert!(!harness.notices().contains(&Notice::MamVisitReminder));
+    assert_eq!(
+        timer(&actions, TimerName::Mam).map(|(_, after)| after),
+        Some(7 * DAY)
+    );
+    // A timer that was replaced expires without effect.
+    let _ = harness.send(Event::TimerExpired {
+        name: TimerName::Mam,
+        id: timer(&actions, TimerName::Mam).map_or_else(|| unreachable!("timer"), |(id, _)| id),
+    });
+    let actions = harness.wake(&actions);
+    assert!(harness.notices().contains(&Notice::MamVisitReminder));
+    assert!(actions.contains(&Action::SaveReminder {
+        at: started + 7 * DAY
+    }));
+    let _ = harness.send(Event::Mam(MamEvent::ReminderSaveFailed));
+}
+
+#[test]
+fn the_account_watches_raise_notices() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let mut troubled = account(now);
+    troubled.notices = Some(MamNotices {
+        about_to_drop_client: 1,
+        ..MamNotices::default()
+    });
+    troubled.points = Points(10_000);
+    if let Some(summary) = &mut troubled.summary {
+        summary.unsatisfied = 130;
+        summary.unsatisfied_not_seeding = 2;
+        summary.partial = true;
+        summary.tracker_errors = 1;
+        summary.red = vec![windlass::core::RedCategory {
+            name: String::from("Duplicate peer entries"),
+            count: 1,
+        }];
+    }
+    troubled.uploaded = ByteSize(GIB);
+    troubled.downloaded = ByteSize(GIB);
+    let _ = listed_with(&mut harness, troubled, Vec::new());
+    let notices = harness.notices();
+    for expected in [
+        Notice::RatioLow {
+            ratio: 1000,
+            urgent: true,
+        },
+        Notice::UnsatisfiedNearLimit {
+            count: 130,
+            limit: 150,
+        },
+        Notice::MamFlagged {
+            partial: true,
+            tracker_errors: 1,
+            flagged: 1,
+        },
+        Notice::MamMessages {
+            count: 1,
+            client_warning: true,
+        },
+        Notice::PointsBelowReserve {
+            points: Points(10_000),
+            reserve: Points(20_000),
+        },
+    ] {
+        assert!(notices.contains(&expected), "{expected:?} in {notices:?}");
+    }
+    assert!(
+        harness
+            .core
+            .notifications()
+            .conditions
+            .contains_key(&windlass::core::Condition::UnsatisfiedNotSeeding)
+    );
+}
+
+fn queued_row(id: u64, mam: u64) -> TorrentRecord {
+    TorrentRecord {
+        id: windlass::core::RecordId::new(id).unwrap_or_else(|| unreachable!("non-zero")),
+        identity: windlass::core::Identity::Mam(torrent_id(mam)),
+        origin: windlass::core::Origin::Bookmark,
+        desired: Desired::Queued,
+        save_path: None,
+        deletion_allowed: false,
+        observation: None,
+    }
+}
+
+/// Register and read the account from a start with these settings; the
+/// actions of the last step.
+fn read_from(setup: Setup) -> (Harness, Vec<Action>) {
+    let (mut harness, actions) = Harness::start(setup);
+    let actions = harness.register(&actions);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let actions = harness.answer(read(account(harness.wall())));
+    (harness, actions)
+}
+
+#[test]
+fn stray_results_change_nothing() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    // Saves that were never asked for leave the outstanding lookup alone.
+    for event in [
+        MamEvent::RegistrationAttemptSaved,
+        MamEvent::RegistrationAttemptSaveFailed,
+    ] {
+        let actions = harness.send(Event::Mam(event));
+        assert!(requests(&actions).is_empty());
+    }
+    let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. }))
+    );
+    // An answer while the attempt is being saved is not the attempt's.
+    let actions = harness.answer(Err(MamFailure::Unreachable));
+    assert!(requests(&actions).is_empty());
+    let actions = harness.send(Event::Mam(MamEvent::RegistrationAttemptSaved));
+    assert_eq!(requests(&actions), [MamRequest::RegisterSeedbox]);
+}
+
+#[test]
+fn a_pause_while_saving_an_attempt_keeps_it_unsent_but_counted() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SaveRegistrationAttempt { .. }))
+    );
+    let _ = harness.send(Event::MamPause(MamPauseEvent::Set {
+        mode: MamRequestMode::Paused,
+    }));
+    let actions = harness.send(Event::Mam(MamEvent::RegistrationAttemptSaved));
+    assert!(requests(&actions).is_empty());
+    assert!(matches!(
+        harness.mam().seedbox.allowance(harness.wall()),
+        windlass::core::RegistrationAllowance::After(_)
+    ));
+}
+
+#[test]
+fn failed_readings_listings_and_lookups_are_retried_later() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let started = harness.start + harness.elapsed;
+    let actions = harness.answer(Err(MamFailure::Unreachable));
+    assert_eq!(
+        harness.mam().network.next_lookup,
+        Some(started + windlass::core::OBSERVE_EVERY)
+    );
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let actions = harness.answer(Err(MamFailure::TooSoon {
+        retry_after: Some(Duration::from_mins(9)),
+    }));
+    assert_eq!(
+        harness.mam().account.next_read,
+        Some(started + Duration::from_mins(9))
+    );
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let _ = harness.answer(Err(MamFailure::TooSoon {
+        retry_after: Some(Duration::from_mins(30)),
+    }));
+    let bookmarks = &harness.mam().acquisition.bookmarks;
+    assert_eq!(bookmarks.failures, 1);
+    assert_eq!(bookmarks.next, Some(started + Duration::from_mins(30)));
+    harness.advance(Duration::from_mins(30));
+    let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    let mut actions = harness.past_lookups(actions);
+    // Register and read the account, which come first, until bookmarks are listed.
+    while requests(&actions) != [MamRequest::ListBookmarks { start: 0 }] {
+        actions = match requests(&actions).first() {
+            Some(MamRequest::RegisterSeedbox) => harness.answer(Ok(MamReply::Registered {
+                registration: Registration::Completed,
+                ip: ip(10),
+            })),
+            Some(MamRequest::LoadUserData { .. }) => harness.answer(read(account(harness.wall()))),
+            _ => harness.send(Event::Mam(MamEvent::RegistrationAttemptSaved)),
+        };
+    }
+    let _ = harness.answer(Err(MamFailure::Unreachable));
+    let later = harness.start + harness.elapsed + Duration::from_mins(5);
+    assert_eq!(harness.mam().acquisition.bookmarks.next, Some(later));
+}
+
+#[test]
+fn upload_credit_restores_a_ratio_below_three() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let mut middling = account(harness.wall());
+    middling.uploaded = ByteSize(60 * GIB);
+    middling.downloaded = ByteSize(30 * GIB);
+    let actions = harness.answer(read(middling));
+    assert!(matches!(
+        requests(&actions).first(),
+        Some(MamRequest::Buy(Purchase::Upload(_)))
+    ));
+}
+
+#[test]
+fn a_failed_reading_leaves_queued_bookmarks_waiting_for_the_account() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let actions = harness.answer(Err(MamFailure::Unreachable));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let _ = harness.answer(listed(vec![bookmark(8)]));
+    assert_eq!(harness.mam().acquisition.hold, Some(Hold::AccountUnknown));
+}
+
+#[test]
+fn downloads_wait_for_the_seedbox_the_client_and_the_bookmark() {
+    // Registration failed, so the seedbox is not confirmed.
+    let (mut harness, actions) = Harness::start(Setup::default());
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let _ = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    let _ = harness.send(Event::Mam(MamEvent::RegistrationAttemptSaved));
+    let actions = harness.answer(Err(MamFailure::Unreachable));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    let _ = harness.answer(read(account(harness.wall())));
+    let _ = harness.answer(listed(vec![bookmark(9)]));
+    assert_eq!(
+        harness.mam().acquisition.hold,
+        Some(Hold::SeedboxUnconfirmed)
+    );
+    assert!(harness.notices().contains(&Notice::SeedboxNotRegistered));
+    let _ = harness.send(Event::MamPause(MamPauseEvent::Set {
+        mode: MamRequestMode::Paused,
+    }));
+    assert_eq!(harness.mam().acquisition.hold, Some(Hold::MamUnavailable));
+
+    // qBittorrent is not connected.
+    let (mut harness, actions) = read_from(Setup {
+        client: false,
+        ..Setup::default()
+    });
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let _ = harness.answer(listed(vec![bookmark(9)]));
+    assert_eq!(
+        harness.mam().acquisition.hold,
+        Some(Hold::ClientUnavailable)
+    );
+
+    // A queued torrent the owner no longer bookmarks waits.
+    let (mut harness, actions) = read_from(Setup {
+        rows: Some(vec![queued_row(1, 50)]),
+        ..Setup::default()
+    });
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let _ = harness.answer(listed(Vec::new()));
+    assert_eq!(harness.mam().acquisition.hold, Some(Hold::NotBookmarked));
+}
+
+#[test]
+fn without_the_registry_nothing_is_queued() {
+    let (mut harness, actions) = read_from(Setup {
+        rows: None,
+        ..Setup::default()
+    });
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let actions = harness.answer(listed(vec![bookmark(10)]));
+    assert!(requests(&actions).is_empty());
+    assert!(harness.mam().acquisition.bookmarks.latest.is_some());
+}
+
+#[test]
+fn a_fetched_torrent_already_in_qbittorrent_keeps_its_row() {
+    let adopted = TorrentRecord {
+        id: windlass::core::RecordId::new(1).unwrap_or_else(|| unreachable!("non-zero")),
+        identity: windlass::core::Identity::Client(hash('e')),
+        origin: windlass::core::Origin::Adopted,
+        desired: Desired::Active,
+        save_path: None,
+        deletion_allowed: false,
+        observation: None,
+    };
+    let (mut harness, actions) = read_from(Setup {
+        rows: Some(vec![adopted]),
+        ..Setup::default()
+    });
+    assert_eq!(requests(&actions).len(), 1);
+    // The same bookmark appears twice across shifting pages.
+    let actions = harness.answer(listed(vec![bookmark(11), bookmark(11)]));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::FetchTorrent {
+            id: torrent_id(11),
+            wedge: true
+        }]
+    );
+    let _ = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
+        hash: hash('e'),
+        size: ByteSize(GIB),
+    })));
+    let Registry::Loaded(records) = harness.core.registry() else {
+        unreachable!("loaded")
+    };
+    let rows: Vec<(windlass::core::Identity, Desired)> = records
+        .records()
+        .map(|record| (record.identity.clone(), record.desired))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                windlass::core::Identity::Linked {
+                    mam: torrent_id(11),
+                    hash: hash('e')
+                },
+                Desired::Active
+            ),
+            (
+                windlass::core::Identity::Mam(torrent_id(11)),
+                Desired::Removed
+            ),
+        ]
+    );
+}
+
+#[test]
+fn an_ip_mismatch_lifts_when_mam_sees_another_ip() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let actions = harness.answer(Err(MamFailure::Session(SessionRejection::IpMismatch)));
+    assert!(requests(&actions).is_empty());
+    let actions = harness.wake(&actions);
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(requests(&actions).is_empty());
+    let actions = harness.wake(&actions);
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(13, 209_103))));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+}
+
+#[test]
+fn unanswered_and_unexpected_results_are_retried() {
+    let mut harness = empty_harness();
+    let now = harness.wall();
+    let actions = listed_with(&mut harness, account(now), vec![bookmark(12)]);
+    assert_eq!(requests(&actions).len(), 1);
+    // A fetch that failed in transit is tried again with the next reading.
+    let _ = harness.answer(Err(MamFailure::Unreachable));
+    assert!(harness.mam().acquisition.fetching.is_none());
+    assert_eq!(
+        harness.record(12).map(|record| record.desired),
+        Some(Desired::Queued)
+    );
+    let mut ending = account(harness.wall());
+    ending.vip_until = harness.wall().checked_add(DAY);
+    let actions = harness.later(Duration::from_mins(1));
+    assert!(matches!(
+        requests(&actions).first(),
+        Some(MamRequest::LoadUserData { .. })
+    ));
+    let actions = harness.answer(read(ending));
+    assert_eq!(requests(&actions), [MamRequest::Buy(Purchase::Vip)]);
+    // MAM asking to wait refuses the purchase without the owner being told.
+    let _ = harness.answer(Err(MamFailure::TooSoon { retry_after: None }));
+    assert!(matches!(
+        harness
+            .mam()
+            .account
+            .last_purchase
+            .as_ref()
+            .and_then(|purchase| purchase.outcome.clone()),
+        Some(windlass::core::PurchaseOutcome::Refused(None))
+    ));
+}
+
+#[test]
+fn the_points_reserve_is_a_saved_setting() {
+    let (mut harness, _) = Harness::start(Setup::default());
+    let reserve = windlass::core::PointsReserve::try_new(30_000)
+        .unwrap_or_else(|_| unreachable!("valid reserve"));
+    let actions = harness.send(Event::Settings(SettingsEvent::SetPointsReserve { reserve }));
+    assert!(actions.contains(&Action::WritePointsReserve { reserve }));
+    let _ = harness.send(Event::Settings(SettingsEvent::PointsReserveWriteFailed));
+    assert!(harness.notices().contains(&Notice::SettingNotSaved {
+        setting: windlass::core::SettingName::PointsReserve
+    }));
+    let actions = harness.send(Event::Settings(SettingsEvent::SetPointsReserve { reserve }));
+    assert!(actions.contains(&Action::WritePointsReserve { reserve }));
+    let _ = harness.send(Event::Settings(SettingsEvent::PointsReserveWritten));
+    assert_eq!(
+        harness.core.settings().points_reserve(),
+        Some(Points(30_000))
+    );
+}
+
+#[test]
+fn a_cookie_change_by_the_owner_wins_over_one_mam_issues() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    // The owner's change is pending, so MAM's new cookie is not saved.
+    let _ = harness.send(Event::Settings(SettingsEvent::SetApiCookie {
+        cookie: cookie("owner-cookie"),
+    }));
+    let actions = harness.send(Event::Mam(MamEvent::Answered {
+        result: read(account(harness.wall())),
+        rotated: Some(cookie("rotated-cookie")),
+    }));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::WriteRotatedApiCookie { .. }))
+    );
+    // The reading answered meanwhile belonged to the old session, so the
+    // account is read again with the owner's cookie.
+    let actions = harness.send(Event::Settings(SettingsEvent::ApiCookieWritten));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData { client_stats: true }]
+    );
+    assert_eq!(cookie_sent(&actions), Some(cookie("owner-cookie")));
+
+    // A rotation being saved when the owner changes the cookie: the owner's
+    // cookie is saved next.
+    let actions = harness.send(Event::Mam(MamEvent::Answered {
+        result: read(account(harness.wall())),
+        rotated: Some(cookie("rotated-again")),
+    }));
+    assert!(actions.contains(&Action::WriteRotatedApiCookie {
+        cookie: cookie("rotated-again")
+    }));
+    let _ = harness.send(Event::Settings(SettingsEvent::SetApiCookie {
+        cookie: cookie("owner-again"),
+    }));
+    let actions = harness.send(Event::Settings(SettingsEvent::RotatedApiCookieWriteFailed));
+    assert!(actions.contains(&Action::WriteApiCookie {
+        cookie: Some(cookie("owner-again"))
+    }));
+}
+
+#[test]
+fn torrents_behind_on_seeding_are_reported() {
+    let completed = SystemTime::UNIX_EPOCH + EPOCH - 21 * DAY;
+    let mut row = queued_row(1, 70);
+    row.identity = windlass::core::Identity::Linked {
+        mam: torrent_id(70),
+        hash: hash('f'),
+    };
+    row.desired = Desired::Active;
+    row.observation = Some(windlass::core::Observation {
+        torrent: windlass::core::Torrent {
+            completed_at: Some(completed),
+            seeding_time: Duration::from_hours(10),
+            ..windlass::core::Torrent::default()
+        },
+        last_seen: completed,
+    });
+    let (harness, _) = Harness::start(Setup {
+        rows: Some(vec![row]),
+        ..Setup::default()
+    });
+    assert!(
+        harness
+            .notices()
+            .contains(&Notice::SeedingBehind { count: 1 })
+    );
+}

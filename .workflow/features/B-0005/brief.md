@@ -28,6 +28,10 @@ Acceptance:
   no free unsatisfied-torrent slot, is recorded as *Queued* in the
   [torrent registry](../../decisions/adr/0004-torrent-registry.md) and admitted
   when a slot frees.
+- Implemented: bookmarks are listed every 15 minutes, 100 to a page and at most
+  10 pages, with the accepted `"searchIn": "bookmarks"` JSON POST. Bookmarks MAM
+  reports as snatched are suppressed and those already in the registry are
+  skipped; the rest are saved as *Queued*. Explicit re-download is not built.
 
 ### S2: Admit and acquire a torrent
 
@@ -43,6 +47,14 @@ Acceptance:
 - Insufficient space holds new downloads while existing torrents keep seeding
   under the VPN boundary. Follow the [cleanup policy](../../direction.md#disk-space).
 - Fetching torrent metadata is distinct from client acceptance and book completion.
+- Implemented without the space check, which waits for
+  [B-0001](../../backlog.md#b-0001-disk-space-monitoring-and-download-holds).
+  The oldest queued bookmark is admitted when the gates of
+  [B-0011](../B-0011/brief.md#admission-from-bookmark-to-download) hold. Torrents
+  admitted in the last hour count against the unsatisfied limit until MAM's count
+  catches up. The fetched file must be a valid torrent; it is kept in SQLite, the
+  registry row is linked to its info hash as *Active*, and the file is then added
+  to qBittorrent. A refused download closes the gate until restart or a new cookie.
 
 Proposed ordering, pending agreement:
 

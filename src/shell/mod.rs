@@ -14,22 +14,28 @@ use tokio::{
 };
 
 use crate::core::{
-    Action, ClockReading, Event, PortForwardingEvent, QbittorrentEvent, TimedEvent, TimerName,
-    TunnelEvent, VpnServer,
+    Action, ClockReading, Event, MamEvent, MamFailure, MamReply, MamRequest, PortForwardingEvent,
+    QbittorrentEvent, TimedEvent, TimerName, TunnelEvent, VpnServer,
 };
 
 pub mod console;
 mod describe;
+#[cfg(test)]
+#[path = "../../tests/support/fake_mam.rs"]
+mod fake_mam;
 mod history;
 mod ingress;
+mod mam;
 mod natpmp;
 mod notify;
 mod qbittorrent;
 mod storage;
+mod torrent_file;
 mod tunnel;
 pub mod web;
 
 use history::{Command, HistoryEntry, HistoryWriter};
+pub use mam::MamHosts;
 use storage::Operation;
 
 /// External services the shell can reach. Absent services are not used.
@@ -48,6 +54,8 @@ pub struct Integrations {
     pub ntfy_relay: Option<SocketAddr>,
     /// The dashboard's address as the user opens it, for links in notices.
     pub dashboard_url: Option<reqwest::Url>,
+    /// MAM's hosts; Windlass does not contact MAM without them.
+    pub mam: Option<MamHosts>,
 }
 
 /// How the tunnel is checked and which servers it may switch between.
@@ -80,6 +88,9 @@ impl Integrations {
                 current: tunnel.current.clone(),
             }));
         }
+        if self.mam.is_some() {
+            events.push(Event::Mam(MamEvent::Enable));
+        }
         events
     }
 }
@@ -111,6 +122,7 @@ pub(crate) struct Shell {
     qbittorrent: Option<qbittorrent::Client>,
     nat_pmp_gateway: Option<SocketAddrV4>,
     tunnel: Option<tunnel::Client>,
+    mam: Option<mam::Client>,
     notifications: notify::Channel,
     timers: HashMap<TimerName, JoinHandle<()>>,
 }
@@ -125,6 +137,9 @@ impl Shell {
             sender: sender.clone(),
             state: ingress_state.clone(),
         };
+        let qbittorrent = integrations
+            .qbittorrent
+            .map(|base| qbittorrent::Client::new(base, database.clone()));
         (
             Self {
                 database,
@@ -134,11 +149,12 @@ impl Shell {
                 active_workers: 0,
                 latest_storage_error: None,
                 history,
-                qbittorrent: integrations.qbittorrent.map(qbittorrent::Client::new),
+                qbittorrent,
                 nat_pmp_gateway: integrations.nat_pmp_gateway,
                 tunnel: integrations
                     .tunnel
                     .map(|checks| tunnel::Client::new(checks.exit_ip_service, checks.unit_starter)),
+                mam: integrations.mam.as_ref().and_then(mam::Client::new),
                 notifications: notify::Channel::new(
                     integrations
                         .ntfy_server
@@ -257,6 +273,23 @@ impl Shell {
                     Event::Notification(notify::send(&channel, &topic, &notice).await)
                 });
             }
+            Action::MamRequest { request, cookie } => {
+                let client = self.mam.clone();
+                let database = self.database.clone();
+                return self.spawn(async move {
+                    let answer = mam::perform(client.as_ref(), &request, cookie.as_ref()).await;
+                    let result = keep(&database, &request, answer.result, answer.file).await;
+                    Event::Mam(MamEvent::Answered {
+                        result,
+                        rotated: answer.rotated,
+                    })
+                });
+            }
+            Action::WritePointsReserve { reserve } => Operation::WritePointsReserve(reserve),
+            Action::WriteRotatedApiCookie { cookie } => Operation::WriteRotatedApiCookie(cookie),
+            Action::ReadMamState => Operation::ReadMamState,
+            Action::SaveRegistrationAttempt { at } => Operation::SaveRegistrationAttempt(at),
+            Action::SaveReminder { at } => Operation::SaveReminder(at),
             Action::WriteNtfyTopic { topic } => Operation::WriteNtfyTopic(topic),
             Action::ReadLastVpnSwitch => Operation::ReadLastVpnSwitch,
             Action::SaveVpnSwitch { switch } => Operation::SaveVpnSwitch(switch),
@@ -336,6 +369,32 @@ impl Shell {
     }
 }
 
+/// Keep a fetched torrent file for qBittorrent; a file that cannot be kept
+/// makes the fetch fail.
+async fn keep(
+    database: &std::path::Path,
+    request: &MamRequest,
+    result: Result<MamReply, MamFailure>,
+    file: Option<Vec<u8>>,
+) -> Result<MamReply, MamFailure> {
+    let (MamRequest::FetchTorrent { id, .. }, Ok(MamReply::Fetched(fetched)), Some(file)) =
+        (request, &result, file)
+    else {
+        return result;
+    };
+    let (database, id, hash) = (database.to_path_buf(), *id, fetched.hash.clone());
+    let kept = tokio::task::spawn_blocking(move || {
+        storage::keep_torrent_file(&database, id, &hash, &file).is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if kept {
+        result
+    } else {
+        Err(MamFailure::NotKept)
+    }
+}
+
 /// Read both clocks where an event occurs.
 pub(crate) fn read_clock() -> ClockReading {
     ClockReading {
@@ -403,6 +462,91 @@ mod tests {
             shell.dispatch(action);
             let event = shell.next_event().await?.map(|event| event.event);
             assert_eq!(event, Some(expected));
+        }
+        shell.finish().await?;
+        Ok(())
+    }
+
+    /// A compile-time torrent ID: its unreachable branch is not run code.
+    const KEPT: crate::core::MamTorrentId = match crate::core::MamTorrentId::new(5) {
+        Some(id) => id,
+        None => unreachable!(),
+    };
+
+    #[tokio::test]
+    async fn mam_actions_report_their_outcome() -> Result<(), Box<dyn Error + Send + Sync>> {
+        use crate::core::{ApiCookie, MamEvent, MamFailure, MamRequest, PointsReserve};
+
+        let fake = super::fake_mam::FakeMam::start().await?;
+        fake.with(|world| {
+            world
+                .torrents
+                .insert(5, super::fake_mam::Torrent::bookmarked("Kept", 1024));
+        });
+        let cookie = ApiCookie::parse("fake-session")?;
+        // Storage is never opened, so saves fail and a fetched file cannot be kept.
+        let (mut shell, _events) = Shell::new(
+            PathBuf::from("/nonexistent/windlass.sqlite"),
+            Integrations {
+                mam: Some(super::MamHosts {
+                    site: fake.site.clone(),
+                    tracker: fake.tracker.clone(),
+                }),
+                ..Integrations::default()
+            },
+        );
+        let fetch = MamRequest::FetchTorrent {
+            id: KEPT,
+            wedge: false,
+        };
+        for (action, expected) in [
+            (
+                Action::MamRequest {
+                    request: fetch,
+                    cookie: Some(cookie.clone()),
+                },
+                MamEvent::Answered {
+                    result: Err(MamFailure::NotKept),
+                    rotated: fake
+                        .with(|world| world.newest_cookie())
+                        .flatten()
+                        .map(|_| ApiCookie::parse("fake-rotated-1"))
+                        .transpose()?,
+                },
+            ),
+            (Action::ReadMamState, MamEvent::StateReadFailed),
+            (
+                Action::SaveRegistrationAttempt {
+                    at: SystemTime::UNIX_EPOCH,
+                },
+                MamEvent::RegistrationAttemptSaveFailed,
+            ),
+            (
+                Action::SaveReminder {
+                    at: SystemTime::UNIX_EPOCH,
+                },
+                MamEvent::ReminderSaveFailed,
+            ),
+        ] {
+            shell.dispatch(action);
+            let event = shell.next_event().await?.map(|event| event.event);
+            assert_eq!(event, Some(Event::Mam(expected)));
+        }
+        for (action, expected) in [
+            (
+                Action::WritePointsReserve {
+                    reserve: PointsReserve::default(),
+                },
+                SettingsEvent::PointsReserveWriteFailed,
+            ),
+            (
+                Action::WriteRotatedApiCookie { cookie },
+                SettingsEvent::RotatedApiCookieWriteFailed,
+            ),
+        ] {
+            shell.dispatch(action);
+            let event = shell.next_event().await?.map(|event| event.event);
+            assert_eq!(event, Some(Event::Settings(expected)));
         }
         shell.finish().await?;
         Ok(())

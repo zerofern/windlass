@@ -31,7 +31,8 @@ use tokio_stream::{Stream, StreamExt, wrappers::WatchStream};
 use crate::{
     core::{
         ApiCookie, Event, HistoryLimit, HistoryState, MamPauseEvent, MamRequestMode,
-        NotificationEvent, NtfyTopic, SettingsEvent, StartupEvent, StartupMode, State,
+        NotificationEvent, NtfyTopic, PointsReserve, SettingsEvent, StartupEvent, StartupMode,
+        State,
     },
     runner::{Observation, Runner},
     shell::{
@@ -42,6 +43,7 @@ use crate::{
 };
 
 mod guard;
+mod mam_pages;
 mod pages;
 
 use pages::{Location, SettingsForm};
@@ -127,6 +129,7 @@ pub fn router(
         .route("/settings/api-cookie/clear", post(clear_api_cookie))
         .route("/settings/ntfy-topic", post(set_ntfy_topic))
         .route("/settings/ntfy-topic/clear", post(clear_ntfy_topic))
+        .route("/settings/points-reserve", post(set_points_reserve))
         .route("/notifications/test", post(send_test_notification))
         .route("/static/app.css", get(stylesheet))
         .route("/static/app.js", get(script))
@@ -272,6 +275,37 @@ async fn set_history_limit(AppState(app): AppState<App>, Form(form): Form<LimitF
                 history_limit: Some(form.limit),
                 history_limit_error: Some(String::from(
                     "Enter a whole number from 100 to 1000000. The saved limit is still in use.",
+                )),
+                ..SettingsForm::default()
+            },
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReserveForm {
+    reserve: String,
+}
+
+async fn set_points_reserve(
+    AppState(app): AppState<App>,
+    Form(form): Form<ReserveForm>,
+) -> Response {
+    let reserve = form
+        .reserve
+        .trim()
+        .replace([',', '_', ' '], "")
+        .parse::<u64>()
+        .ok()
+        .and_then(|reserve| PointsReserve::try_new(reserve).ok());
+    match reserve {
+        Some(reserve) => send_setting(&app, SettingsEvent::SetPointsReserve { reserve }).await,
+        None => rejected(
+            &app,
+            &SettingsForm {
+                points_reserve: Some(form.reserve),
+                points_reserve_error: Some(String::from(
+                    "Enter a whole number of points up to 100000000. The saved reserve is still in use.",
                 )),
                 ..SettingsForm::default()
             },

@@ -75,6 +75,10 @@ Acceptance:
   seedbox registration once an hour) and records any breach as a violation,
   using time the test controls rather than real waiting.
 - A reset returns the fake to its initial state between tests.
+- Implemented in process rather than as HTTP routes: a test changes the fake's
+  state through a closure and reads its journal and violations directly. Each
+  test starts its own fake, so no reset is needed. A dropped connection is not
+  yet offered as a fault.
 
 ### S3: Run where the tests run
 
@@ -90,6 +94,11 @@ Acceptance:
 - Windlass takes MAM's base URLs from configuration, defaulting to the real
   hosts, so tests can point it at the fake. No test build changes Windlass's
   code paths.
+- Implemented for integration tests (`tests/support/fake_mam.rs`) and through
+  `--mam-site` and `--mam-tracker`, which the NixOS module sets to MAM's hosts by
+  default. The VM test stands in for the IP lookup and seedbox registration with
+  nginx rather than the Rust fake, which is test code; that is enough to show
+  registration leaves through the tunnel with the VPN's exit IP.
 
 ## Feature-wide constraints and acceptance
 

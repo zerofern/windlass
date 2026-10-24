@@ -56,7 +56,7 @@ impl Location {
     }
 }
 
-fn time(time: SystemTime, style: &str) -> Markup {
+pub(super) fn time(time: SystemTime, style: &str) -> Markup {
     let stamp = timestamp(time);
     html! { time datetime=(stamp) data-style=(style) { (stamp) } }
 }
@@ -212,6 +212,20 @@ const fn condition(condition: Condition) -> &'static str {
         Condition::FilesMissing => "Files missing on disk",
         Condition::TorrentsMissing => "Torrents missing from qBittorrent",
         Condition::RegistrySave => "Torrent records not saved",
+        Condition::MamSession => "MAM refused the API session",
+        Condition::SeedboxRegistration => "Seedbox IP not registered",
+        Condition::MamIp => "IP lookups at MAM failing",
+        Condition::Ratio => "Ratio below 2.0",
+        Condition::UnsatisfiedLimit => "Unsatisfied torrents near the limit",
+        Condition::UnsatisfiedNotSeeding => "Unsatisfied torrents not seeding",
+        Condition::MamFlags => "MAM flags the account's torrents",
+        Condition::MamMessages => "MAM has notifications",
+        Condition::DownloadsHeld => "Downloads held",
+        Condition::Wedges => "No wedges left",
+        Condition::PointsReserve => "Bonus points below the reserve",
+        Condition::VipEnding => "VIP ending",
+        Condition::DownloadsRefused => "MAM refused a download",
+        Condition::SeedingBehind => "Torrents behind on seeding",
     }
 }
 
@@ -316,18 +330,14 @@ fn status_live(observation: &Observation) -> Markup {
                     div.panel-head { h2 #mam-requests { "MAM requests" } }
                     p { (mam_requests_explanation(status)) }
                 }
-                section.panel aria-labelledby="mam-access" {
+                section.panel aria-labelledby="mam-cookie" {
                     div.panel-head {
-                        h2 #mam-access { "MAM access" }
+                        h2 #mam-cookie { "API cookie" }
                         span class={ "tag " (cookie_tone) } { (cookie) }
                     }
-                    dl {
-                        dt { "API cookie" } dd { (cookie) }
-                        dt { "Authentication" } dd { "Unverified" }
-                        dt { "Seedbox registration" } dd { "Unconfirmed" }
-                    }
-                    p.note { "Windlass does not contact MAM yet, so these remain unverified." }
+                    p { "Windlass sends the cookie only to MAM, and records it only as redacted." }
                 }
+                (super::mam_pages::panels(&observation.mam, &observation.settings, SystemTime::now()))
                 section.panel aria-labelledby="history-panel" {
                     div.panel-head { h2 #history-panel { "History" } a href="/history" { "View history" } }
                     p { (history_status(observation.history, &observation.settings)) }
@@ -625,6 +635,7 @@ const fn wanted(record: &TorrentRecord) -> &'static str {
         (Desired::Queued, _) => "Queued",
         (Desired::Active, Origin::Adopted) => "Active, adopted",
         (Desired::Active, Origin::Bookmark | Origin::Redownload) => "Active",
+        (Desired::Held, _) => "Held: its wedge was not spent",
         (Desired::Removed, _) => "Removed",
     }
 }
@@ -641,7 +652,8 @@ fn registry_state(
             torrent.state == TorrentState::MissingFiles,
         ),
         (None, Desired::Active) if listed => ("Missing from qBittorrent", true),
-        (None, Desired::Queued) => ("Waiting for a MAM slot", false),
+        (None, Desired::Queued) => ("Waiting to download", false),
+        (None, Desired::Held) => ("Held, not in qBittorrent", true),
         (None, Desired::Removed) => ("Not in qBittorrent", false),
         (None, Desired::Active) => ("Unknown", false),
     }
@@ -746,15 +758,17 @@ const fn setting_label<T: Clone + PartialEq>(setting: &Setting<T>) -> (&'static 
 
 fn settings_live(observation: &Observation) -> Markup {
     let (cookie, cookie_tone) = cookie_status(&observation.settings);
-    let (limit, limit_tone) = observation
-        .settings
-        .loaded()
-        .map_or(("Loading…", "neutral"), |settings| {
-            setting_label(&settings.history_limit)
-        });
+    let loaded = observation.settings.loaded();
+    let (limit, limit_tone) = loaded.map_or(("Loading…", "neutral"), |settings| {
+        setting_label(&settings.history_limit)
+    });
+    let (reserve, reserve_tone) = loaded.map_or(("Loading…", "neutral"), |settings| {
+        setting_label(&settings.points_reserve)
+    });
     html! {
         span class={ "tag " (cookie_tone) } data-live="api-cookie-status" { (cookie) }
         span class={ "tag " (limit_tone) } data-live="history-limit-status" { (limit) }
+        span class={ "tag " (reserve_tone) } data-live="points-reserve-status" { (reserve) }
     }
 }
 
@@ -767,6 +781,32 @@ pub(super) struct SettingsForm {
     pub(super) api_cookie_error: Option<String>,
     pub(super) ntfy_topic: Option<String>,
     pub(super) ntfy_topic_error: Option<String>,
+    pub(super) points_reserve: Option<String>,
+    pub(super) points_reserve_error: Option<String>,
+}
+
+fn reserve_form(settings: &Settings, form: &SettingsForm) -> Markup {
+    html! {
+        form.setting #points-reserve method="post" action="/settings/points-reserve" {
+            div.setting-head {
+                label for="reserve" { "Bonus points reserve" }
+                @let (label, tone) = setting_label(&settings.points_reserve);
+                span class={ "tag " (tone) } data-live="points-reserve-status" { (label) }
+            }
+            p.hint { "Every VIP or upload credit purchase leaves at least this many points. Default 20000." }
+            div.row {
+                input #reserve type="text" inputmode="numeric" name="reserve"
+                    value=(form.points_reserve.clone().unwrap_or_else(|| settings.points_reserve.requested.to_string()))
+                    aria-invalid=[form.points_reserve_error.as_ref().map(|_| "true")]
+                    aria-describedby=[form.points_reserve_error.as_ref().map(|_| "reserve-error")];
+                span { "points" }
+                button.primary type="submit" { "Save" }
+            }
+            @if let Some(error) = &form.points_reserve_error {
+                p.field-error #reserve-error { (error) }
+            }
+        }
+    }
 }
 
 fn topic_form(settings: &Settings, form: &SettingsForm) -> Markup {
@@ -885,6 +925,7 @@ pub(super) fn settings(
                         }
                     }
                     (topic_form(settings, form))
+                    (reserve_form(settings, form))
                     form.setting method="post" action="/settings/history-limit" {
                         div.setting-head {
                             label for="history-limit" { "History size limit" }
@@ -1088,6 +1129,7 @@ mod tests {
             registry: crate::core::Registry::Unread,
             tunnel: crate::core::Tunnel::default(),
             notifications: crate::core::Notifications::default(),
+            mam: crate::core::Mam::default(),
             last_event: None,
             storage_error: None,
         }
@@ -1120,6 +1162,11 @@ mod tests {
             ntfy_topic: Setting {
                 saved: None,
                 requested: None,
+                persistence: SettingPersistence::Idle,
+            },
+            points_reserve: Setting {
+                saved: crate::core::PointsReserve::default(),
+                requested: crate::core::PointsReserve::default(),
                 persistence: SettingPersistence::Idle,
             },
         })
@@ -1626,6 +1673,36 @@ mod tests {
     }
 
     #[test]
+    fn held_rows_have_words() {
+        use crate::core::{Desired, Identity, MamTorrentId, Origin, RecordId, TorrentRecord};
+
+        use super::{registry_state, wanted};
+
+        const ROW: RecordId = match RecordId::new(1) {
+            Some(id) => id,
+            None => unreachable!(),
+        };
+        const MAM: MamTorrentId = match MamTorrentId::new(2) {
+            Some(id) => id,
+            None => unreachable!(),
+        };
+        let record = TorrentRecord {
+            id: ROW,
+            identity: Identity::Mam(MAM),
+            origin: Origin::Bookmark,
+            desired: Desired::Held,
+            save_path: None,
+            deletion_allowed: false,
+            observation: None,
+        };
+        assert_eq!(wanted(&record), "Held: its wedge was not spent");
+        assert_eq!(
+            registry_state(&record, None, true),
+            ("Held, not in qBittorrent", true)
+        );
+    }
+
+    #[test]
     fn registry_rows_have_words() -> Result<(), &'static str> {
         use crate::core::{
             ByteSize, Event, Progress, QbittorrentEvent, QbittorrentPreferences, Ratio, Registry,
@@ -1677,7 +1754,7 @@ mod tests {
             "Active, adopted",
             "Missing from qBittorrent",
             "MAM torrent 77",
-            "Waiting for a MAM slot",
+            "Waiting to download",
             "Not in qBittorrent",
             "class=\"attention\">Files missing",
             "4.0 KiB · ratio 1.50",
@@ -1790,6 +1867,20 @@ mod tests {
             Condition::FilesMissing,
             Condition::TorrentsMissing,
             Condition::RegistrySave,
+            Condition::MamSession,
+            Condition::SeedboxRegistration,
+            Condition::MamIp,
+            Condition::Ratio,
+            Condition::UnsatisfiedLimit,
+            Condition::UnsatisfiedNotSeeding,
+            Condition::MamFlags,
+            Condition::MamMessages,
+            Condition::DownloadsHeld,
+            Condition::Wedges,
+            Condition::PointsReserve,
+            Condition::VipEnding,
+            Condition::DownloadsRefused,
+            Condition::SeedingBehind,
         ];
         let words: std::collections::BTreeSet<_> = all.into_iter().map(condition).collect();
         assert_eq!(words.len(), all.len());

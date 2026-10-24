@@ -127,6 +127,8 @@ pub enum Desired {
     Queued,
     /// In qBittorrent, whole, and running.
     Active,
+    /// In qBittorrent and stopped, because a download's wedge was not spent.
+    Held,
     /// Not in qBittorrent; the row stays as download history.
     Removed,
 }
@@ -191,6 +193,7 @@ pub enum Registry {
 pub struct Records {
     entries: BTreeMap<RecordId, Entry>,
     by_hash: BTreeMap<TorrentHash, RecordId>,
+    by_mam: BTreeMap<MamTorrentId, RecordId>,
     next_id: RecordId,
     unsaved: BTreeSet<RecordId>,
     saving: Option<BTreeSet<RecordId>>,
@@ -253,6 +256,14 @@ impl Registry {
             _ => None,
         }
     }
+
+    /// The rows, once they are loaded.
+    pub(super) const fn records_mut(&mut self) -> Option<&mut Records> {
+        match self {
+            Self::Loaded(records) => Some(records),
+            Self::Unread | Self::Reading | Self::ReadFailed => None,
+        }
+    }
 }
 
 impl Records {
@@ -265,6 +276,10 @@ impl Records {
         let by_hash = records
             .iter()
             .filter_map(|record| Some((record.identity.hash()?.clone(), record.id)))
+            .collect();
+        let by_mam = records
+            .iter()
+            .filter_map(|record| Some((record.identity.mam_id()?, record.id)))
             .collect();
         let entries = records
             .into_iter()
@@ -282,6 +297,7 @@ impl Records {
         Self {
             entries,
             by_hash,
+            by_mam,
             next_id,
             unsaved: BTreeSet::new(),
             saving: None,
@@ -300,6 +316,20 @@ impl Records {
     pub fn find(&self, hash: &TorrentHash) -> Option<&TorrentRecord> {
         let id = self.by_hash.get(hash)?;
         self.entries.get(id).map(|entry| &entry.record)
+    }
+
+    /// The row for this MAM torrent.
+    #[must_use]
+    pub fn find_mam(&self, id: MamTorrentId) -> Option<&TorrentRecord> {
+        let id = self.by_mam.get(&id)?;
+        self.entries.get(id).map(|entry| &entry.record)
+    }
+
+    /// Queued torrents, oldest first.
+    pub fn queued(&self) -> impl Iterator<Item = MamTorrentId> + '_ {
+        self.records()
+            .filter(|record| record.desired == Desired::Queued)
+            .filter_map(|record| record.identity.mam_id())
     }
 
     /// Whether the last save failed; it is retried with the next update.
@@ -325,25 +355,109 @@ impl Records {
         self.save(now.monotonic)
     }
 
-    fn adopt(&mut self, hash: &TorrentHash, torrent: &Torrent) -> RecordId {
+    /// Whether a row exists for this MAM torrent.
+    pub(super) fn knows(&self, id: MamTorrentId) -> bool {
+        self.by_mam.contains_key(&id)
+    }
+
+    /// Queue these bookmarked torrents.
+    pub(super) fn queue(&mut self, now: Instant, ids: &[MamTorrentId]) -> Vec<Action> {
+        for &mam in ids {
+            if self.by_mam.contains_key(&mam) {
+                continue;
+            }
+            let id = self.allocate();
+            self.by_mam.insert(mam, id);
+            self.entries.insert(
+                id,
+                Entry::new(TorrentRecord {
+                    id,
+                    identity: Identity::Mam(mam),
+                    origin: Origin::Bookmark,
+                    desired: Desired::Queued,
+                    save_path: None,
+                    deletion_allowed: false,
+                    observation: None,
+                }),
+            );
+            self.unsaved.insert(id);
+        }
+        self.save(now)
+    }
+
+    /// A queued torrent's file was fetched: it becomes active under its hash.
+    pub(super) fn fetched(
+        &mut self,
+        now: Instant,
+        mam: MamTorrentId,
+        hash: TorrentHash,
+    ) -> Vec<Action> {
+        // Only a queued row is fetched, so the MAM ID has a row.
+        if let Some(&id) = self.by_mam.get(&mam) {
+            self.link(id, mam, hash);
+        }
+        self.save(now)
+    }
+
+    /// Stop this torrent and keep it stopped.
+    pub(super) fn hold(&mut self, now: Instant, hash: &TorrentHash) -> Vec<Action> {
+        // Only a fetched torrent is held, so the hash has a row.
+        if let Some(&id) = self.by_hash.get(hash) {
+            self.set_desired(id, Desired::Held);
+        }
+        self.save(now)
+    }
+
+    /// Link a fetched row to its hash and make it active. A torrent already in
+    /// qBittorrent keeps its row, which gains the MAM ID; the queued row stays
+    /// as history.
+    fn link(&mut self, id: RecordId, mam: MamTorrentId, hash: TorrentHash) {
+        let target = match self.by_hash.get(&hash) {
+            Some(&existing) if existing != id => {
+                self.set_desired(id, Desired::Removed);
+                self.by_mam.insert(mam, existing);
+                existing
+            }
+            _ => id,
+        };
+        let identity = Identity::Linked {
+            mam,
+            hash: hash.clone(),
+        };
+        self.entries
+            .entry(target)
+            .and_modify(|entry| entry.record.identity = identity);
+        self.set_desired(target, Desired::Active);
+        self.by_hash.insert(hash, target);
+    }
+
+    fn set_desired(&mut self, id: RecordId, desired: Desired) {
+        self.entries
+            .entry(id)
+            .and_modify(|entry| entry.record.desired = desired);
+        self.unsaved.insert(id);
+    }
+
+    const fn allocate(&mut self) -> RecordId {
         let id = self.next_id;
         self.next_id = id.after();
+        id
+    }
+
+    fn adopt(&mut self, hash: &TorrentHash, torrent: &Torrent) -> RecordId {
+        let id = self.allocate();
         self.by_hash.insert(hash.clone(), id);
         self.entries.insert(
             id,
-            Entry {
-                record: TorrentRecord {
-                    id,
-                    identity: Identity::Client(hash.clone()),
-                    origin: Origin::Adopted,
-                    desired: Desired::Active,
-                    save_path: torrent.save_path.clone(),
-                    deletion_allowed: false,
-                    observation: None,
-                },
-                saved_at: None,
-                counters_unsaved: false,
-            },
+            Entry::new(TorrentRecord {
+                id,
+                identity: Identity::Client(hash.clone()),
+                origin: Origin::Adopted,
+                desired: Desired::Active,
+                save_path: torrent.save_path.clone(),
+                deletion_allowed: false,
+                observation: None,
+            }),
         );
         id
     }
@@ -380,7 +494,8 @@ impl Records {
         Some(command)
     }
 
-    /// The first change needed: removals, then whole content, then starts.
+    /// The first change needed: removals, whole content, held torrents
+    /// stopped, fetched torrents added, then starts.
     fn reconcile(&self, session: &Session) -> Option<TorrentCommand> {
         let present = |desired: Desired| {
             self.records()
@@ -399,6 +514,29 @@ impl Records {
         if let Some((hash, _)) = present(Desired::Active).find(|(_, torrent)| partial(torrent)) {
             return Some(TorrentCommand::SelectAllFiles(hash.clone()));
         }
+        let running: Vec<TorrentHash> = present(Desired::Held)
+            .filter(|(_, torrent)| !matches!(torrent.state, TorrentState::Stopped { .. }))
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        if !running.is_empty() {
+            return Some(TorrentCommand::Stop(running));
+        }
+        let missing = self.records().find_map(|record| match &record.identity {
+            Identity::Linked { mam, hash }
+                if record.desired == Desired::Active
+                    && record.origin != Origin::Adopted
+                    && !session.torrents.contains_key(hash) =>
+            {
+                Some(TorrentCommand::Add {
+                    mam: *mam,
+                    hash: hash.clone(),
+                })
+            }
+            _ => None,
+        });
+        if missing.is_some() {
+            return missing;
+        }
         let stopped: Vec<TorrentHash> = present(Desired::Active)
             .filter(|(_, torrent)| matches!(torrent.state, TorrentState::Stopped { .. }))
             .map(|(hash, _)| hash.clone())
@@ -408,6 +546,14 @@ impl Records {
 }
 
 impl Entry {
+    const fn new(record: TorrentRecord) -> Self {
+        Self {
+            record,
+            saved_at: None,
+            counters_unsaved: false,
+        }
+    }
+
     /// Record a new observation; whether the row must be saved now.
     fn observe(&mut self, now: Instant, observation: Observation) -> bool {
         let current = observation.torrent.clone();

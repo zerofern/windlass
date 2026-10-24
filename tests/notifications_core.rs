@@ -48,6 +48,7 @@ impl Harness {
             api_cookie: None,
             ntfy_topic: topic
                 .map(|topic| NtfyTopic::parse(topic).unwrap_or_else(|_| unreachable!())),
+            points_reserve: None,
         }));
         if topic.is_some() {
             assert_eq!(

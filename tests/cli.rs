@@ -146,6 +146,23 @@ fn invalid_serve_arguments_are_refused() -> Result<(), Box<dyn Error>> {
             "--dashboard-url",
             "not a url",
         ],
+        vec!["serve", "initialise", database, "--mam-site", "not a url"],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--mam-tracker",
+            "not a url",
+        ],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--listen",
+            "127.0.0.1:0",
+            "--mam-site",
+            "http://127.0.0.1:9/",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_windlass"))
             .args(&arguments)
@@ -184,6 +201,10 @@ fn serve_until_terminated(
             "127.0.0.1:9",
             "--dashboard-url",
             "http://localhost:8740/",
+            "--mam-site",
+            "http://127.0.0.1:9/",
+            "--mam-tracker",
+            "http://127.0.0.1:9/",
             "--vpn-current-file",
         ])
         .arg(database.with_extension("current"))

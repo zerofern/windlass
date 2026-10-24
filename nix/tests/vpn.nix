@@ -4,6 +4,7 @@
 # notifications still reach their single destination while the VPN is down.
 # Windlass proves the tunnel works and fails over to the other server by itself,
 # and its notifications reach ntfy through the relay with a link to the dashboard.
+# MAM's IP lookup and seedbox registration see the VPN's exit IP, never the host's.
 #
 # The keys below are throwaway test keys; never reuse them.
 { windlassModule }:
@@ -121,6 +122,7 @@ in
           enable = true;
           commonHttpConfig = ''
             log_format ntfy '$request_method $uri "$http_title" "$http_click"';
+            log_format mam '$remote_addr $uri $cookie_mam_id';
           '';
           virtualHosts.default = {
             default = true;
@@ -137,6 +139,17 @@ in
             locations."/ip".extraConfig = ''
               default_type text/plain;
               return 200 "$remote_addr\n";
+            '';
+            # Stand in for MAM's tracker host, answering with the caller's address
+            # and logging which address each registration came from.
+            locations."= /json/jsonIp.php".extraConfig = ''
+              default_type application/json;
+              return 200 '{"ip":"$remote_addr","ASN":64500,"AS":"Fake VPN"}';
+            '';
+            locations."= /json/dynamicSeedbox.php".extraConfig = ''
+              access_log /var/log/nginx/mam.log mam;
+              default_type application/json;
+              return 200 '{"Success":true,"msg":"Completed","ip":"$remote_addr","ASN":64500,"AS":"Fake VPN"}';
             '';
             # Stands in for an ntfy topic, logging each notification's title and link.
             locations."= /windlass-vm".extraConfig = ''
@@ -177,6 +190,10 @@ in
           notifications = {
             server = "http://web/";
             relayTarget = "web:443";
+          };
+          mam = {
+            site = "http://web/";
+            tracker = "http://web/";
           };
         };
         environment.systemPackages = [
@@ -233,6 +250,17 @@ in
               f"grep -q 'POST /windlass-vm \"Test notification\" \"http://machine:8740/settings\"' {ntfy_log}",
               timeout=900,
           )
+
+      with subtest("MAM sees the VPN's exit IP and registers it as the seedbox"):
+          mam_log = "/var/log/nginx/mam.log"
+          web.succeed("curl -sf -X POST -d cookie=vm-test-session http://machine:8740/settings/api-cookie")
+          web.succeed("curl -sf -X POST -d next=%2F http://machine:8740/mam/resume")
+          web.wait_until_succeeds(
+              "curl -sf http://machine:8740/ | grep -q 'Confirmed for <span class=\"mono\">${ipOf "vpn1"}'",
+              timeout=900,
+          )
+          web.succeed(f"grep -qx '${ipOf "vpn1"} /json/dynamicSeedbox.php vm-test-session' {mam_log}")
+          web.fail(f"grep -v '^${ipOf "vpn1"} ' {mam_log}")
 
       with subtest("The dashboard is reachable from the LAN, not through the tunnel"):
           web.wait_until_succeeds("curl -sf http://machine:8740/ | grep -q Windlass", timeout=900)

@@ -52,6 +52,8 @@ pub enum Event {
     Tunnel(TunnelEvent),
     /// Notification commands and delivery results.
     Notification(NotificationEvent),
+    /// MAM answers and MAM state storage results.
+    Mam(MamEvent),
 }
 
 /// An effect requested by the core for the shell to execute.
@@ -159,10 +161,40 @@ pub enum Action {
         /// What to tell the user.
         notice: Notice,
     },
+    /// Persist the points reserve.
+    WritePointsReserve {
+        /// The reserve to store.
+        reserve: PointsReserve,
+    },
+    /// Persist a cookie MAM issued in place of the saved one.
+    WriteRotatedApiCookie {
+        /// The cookie.
+        cookie: ApiCookie,
+    },
+    /// Read the saved MAM state: the last registration attempt and reminder.
+    ReadMamState,
+    /// Save a seedbox registration attempt before sending it.
+    SaveRegistrationAttempt {
+        /// When it is made.
+        at: SystemTime,
+    },
+    /// Save when the owner was last reminded to visit MAM.
+    SaveReminder {
+        /// When.
+        at: SystemTime,
+    },
+    /// Send a request to MAM. A fetched torrent file is kept for qBittorrent.
+    MamRequest {
+        /// The request.
+        request: MamRequest,
+        /// The cookie to send, for requests that need one.
+        cookie: Option<ApiCookie>,
+    },
 }
 
 mod history;
 mod machine;
+mod mam;
 mod mam_pause;
 mod notifications;
 mod port_forwarding;
@@ -175,6 +207,19 @@ mod tunnel;
 
 pub use history::{HistoryEvent, HistoryState, Step, Trim};
 pub use machine::{Core, State};
+pub use mam::{
+    ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Acquisition, Asn, Attention, BOOKMARKS_EVERY,
+    Bookmark, BookmarkPage, Bookmarks, Budget, CLIENT_STATS_EVERY, Connectable, FetchedTorrent,
+    Hold, IpObservation, LastAttempt, LastReminder, Listed, MAX_BOOKMARK_PAGES, Mam, MamEvent,
+    MamFailure, MamNotices, MamReply, MamRequest, Network, OBSERVE_EVERY, Observed, Outstanding,
+    PersonalFreeleech, Points, Purchase, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR,
+    RATIO_TARGET, RATIO_URGENT, RECENT_ADMISSION, REGISTRATION_SPACING, REMINDER_EVERY,
+    REQUEST_BURST, REQUEST_REFILL, Reading, RedCategory, Registration, RegistrationAllowance,
+    RegistrationFailure, Seedbox, SeedboxStatus, Session as MamSession, SessionRejection,
+    SnatchSummary, UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB, UPLOAD_STEP,
+    UploadCredit, UploadCreditError, UserData, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN,
+    VIP_WARN_WITHIN, WedgeCheck,
+};
 pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,
     MamRequestMode, MamRequestsStatus,
@@ -197,7 +242,8 @@ pub use registry::{
 };
 pub use settings::{
     ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, InvalidNtfyTopic,
-    NtfyTopic, Setting, SettingPersistence, SettingStatus, Settings, SettingsEvent, SettingsState,
+    NtfyTopic, PointsReserve, PointsReserveError, Setting, SettingPersistence, SettingStatus,
+    Settings, SettingsEvent, SettingsState,
 };
 pub use startup::{StartupEvent, StartupMode};
 pub use timer::{Deadline, TimerId, TimerName};

@@ -35,6 +35,8 @@ the VPN carries traffic, with `--vpn-server <name>` for each server Windlass may
 fail over to and `--vpn-current-file <path>` naming the one connected now. Use
 `--ntfy-server <url>`, `--ntfy-relay <address>`, and `--dashboard-url <url>` set
 where notifications go, the relay that reaches it, and the dashboard link they carry.
+Add `--mam-site https://www.myanonamouse.net/ --mam-tracker https://t.myanonamouse.net/`
+to let Windlass work with MAM; without them it never contacts MAM.
 Use `resume` instead of `initialise` to restart an
 existing instance. Repeat `--listen` for each LAN or Tailscale address, and add
 `--allowed-host <name>` for host names such as a Tailscale name. Requests naming
@@ -60,25 +62,65 @@ times; it works without the script, without live updates. It shows:
   state, progress, size, upload, and completion, marking torrents missing from
   qBittorrent and content missing on disk. Windlass adopts torrents it finds,
   starts stopped ones, selects every file, and removes those marked removed.
+- **MAM:** whether the API session works, the IP and ASN MAM sees, the seedbox
+  registration and when it may next be renewed; the account as MAM last reported
+  it (ratio, upload buffer, points, wedges, VIP, unsatisfied torrents, and flagged
+  categories as counts); the last purchase; and the bookmark list, with why the
+  next queued torrent is held.
 - **Notifications:** whether the last delivery succeeded, notices waiting, and
   problems reported but not yet resolved.
-- **Settings:** the MAM API cookie, the ntfy topic with a test button, and the
-  history size limit, each confirmed only once saved, plus the read-only
+- **Settings:** the MAM API cookie, the ntfy topic with a test button, the bonus
+  points reserve, and the history size limit, each confirmed only once saved, plus the read-only
   deployment settings.
 
 Windlass sends notifications to an ntfy topic set on the settings page: when it
 starts, when VPN protection is lost or restored, when it switches servers or cannot,
 when qBittorrent stops responding or runs a version MAM does not allow, when
 torrents have errors, missing files, or are missing from qBittorrent, and when
-storage fails. Lasting problems notify only after a grace period, from immediately
+storage fails. For MAM it reports a refused session, an unregistered seedbox, a low
+ratio, unsatisfied torrents near the limit or not seeding, flagged categories and
+MAM notifications as counts, held or refused downloads, no wedges left, points
+below the reserve, VIP ending, purchases, and a wedge that was not spent. Once a
+week it reminds you to visit MAM, linking to MAM's main page, to keep the account
+active and read announcements about allowed clients. Lasting problems notify only after a grace period, from immediately
 to 10 minutes, and again when they clear. Each notification links to the dashboard
 page that explains it and never names books.
 
 History lives in the same SQLite file. The core counts entries and asks the shell to
 remove the oldest when the limit (10000 by default) is exceeded. Entries that could
 not be saved are reported as a gap once saving works again. The API cookie is stored
-unencrypted in the SQLite file, so keep that file private. Windlass does not
-contact MAM yet, so authentication and registration remain unverified.
+unencrypted in the SQLite file, so keep that file private.
+
+## Working with MAM
+
+Windlass contacts MAM only while MAM requests are resumed, the VPN tunnel is
+proven to work, and, for everything but the IP lookup, an API cookie is saved.
+Requests share a small token bucket, wait for one another, and name
+`Windlass/<version>` as their User-Agent. When MAM sends a replacement cookie,
+Windlass saves it and uses it from then on.
+
+- It looks up the IP and ASN MAM sees every five minutes and registers that IP as
+  the seedbox when it changes, at most once an hour, counting every attempt across
+  restarts.
+- It reads the account every 15 minutes, and its client list every 30.
+- It keeps VIP, renewing it within 14 days of expiry, and buys upload credit in
+  50 GiB steps when the upload buffer falls below 25 GiB or the ratio below 3.0.
+  Purchases never take points below the reserve set on the settings page, 20,000
+  by default, and an uncertain purchase stops further buying until MAM is read again.
+- It lists your bookmarks every 15 minutes and queues those not snatched. It admits
+  the oldest queued torrent once the seedbox is confirmed, qBittorrent is ready,
+  the account was read in the last five minutes, the ratio is at least 2.0, and an
+  unsatisfied slot is free after a reserve of two. A torrent is downloaded with a
+  freeleech wedge unless it is already a personal freeleech, or a VIP torrent while
+  the account is VIP. The next account reading must show the wedge spent; if not,
+  the torrent is stopped and you are told.
+
+MAM's rules come first: Windlass calls only documented API functions, never logs
+in with a password, and never gifts points or wedges. The feature briefs for
+[MAM initialization](.workflow/features/B-0004/brief.md),
+[acquisition](.workflow/features/B-0005/brief.md), and
+[account safety](.workflow/features/B-0011/brief.md) record the rules and what
+remains open.
 
 ## Deploy on NixOS
 
@@ -119,9 +161,12 @@ interfaces, the ntfy.sh relay, and qBittorrent bound to the tunnel. Windlass che
 the tunnel through `vpn.exitIpService` (by default `https://ipv4.icanhazip.com/`)
 and, after three failed checks, starts `windlass-wireguard@<server>.service` for
 the next server in name order, at most once an hour; polkit allows nothing else.
+Windlass works with MAM's real hosts unless `mam.enable` is false; `mam.site` and
+`mam.tracker` point it elsewhere.
 
 `nix build` builds and tests the package. `just vm-test` boots the module with fake
-WireGuard servers and checks the privacy boundary and automatic failover. It needs KVM for reasonable
+WireGuard servers and checks the privacy boundary, automatic failover, and that MAM sees the VPN's
+exit IP when Windlass registers the seedbox. It needs KVM for reasonable
 speed; without it, the test driver falls back to software emulation.
 
 ## Inspect the core and shell
@@ -177,7 +222,7 @@ The core schedules named timers with deadlines from supplied time. The shell
 sleeps until each deadline and reports the expiry; a replaced timer's expiry is
 recognised by its identity and ignored.
 
-Task cancellation, MAM requests, and torrent submission remain to be built. The
+Task cancellation remains to be built. The
 console is for reviewing the operating model; it does not implement the full
 service.
 

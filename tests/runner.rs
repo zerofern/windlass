@@ -154,13 +154,22 @@ async fn producers_share_one_runner_and_shutdown_drains_follow_up_writes() -> Te
             row.get(0)
         })?;
     assert_eq!(saved, "paused");
-    assert_eq!(
-        console_observations
-            .borrow()
-            .clone()
-            .last_event
-            .map(|event| event.event),
-        Some(Event::MamPause(MamPauseEvent::Written))
+    // Shutdown drained the follow-up writes: the pause, and the MAM visit
+    // reminder count started at the first run, in either order.
+    let last = console_observations
+        .borrow()
+        .clone()
+        .last_event
+        .map(|event| event.event);
+    assert!(
+        matches!(
+            last,
+            Some(
+                Event::MamPause(MamPauseEvent::Written)
+                    | Event::Mam(windlass::core::MamEvent::ReminderSaved)
+            )
+        ),
+        "{last:?}"
     );
     let rejected = api_events
         .send(Event::MamPause(MamPauseEvent::Delete))

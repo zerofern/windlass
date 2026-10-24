@@ -5,10 +5,11 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
-    Action, DeliveryFailure, Event, ExitIpFailure, HistoryEvent, MamPauseEvent, MamRequestMode,
-    MappingFailure, NotificationEvent, PortForwardingEvent, QbittorrentEvent, QbittorrentFailure,
-    RegistryEvent, SettingsEvent, StartupEvent, StartupMode, TimerName, TorrentCommand,
-    TunnelEvent,
+    Action, ByteSize, DeliveryFailure, Event, ExitIpFailure, HistoryEvent, Hold, MamEvent,
+    MamFailure, MamPauseEvent, MamReply, MamRequest, MamRequestMode, MappingFailure,
+    NotificationEvent, PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure,
+    Registration, RegistryEvent, SessionRejection, SettingsEvent, StartupEvent, StartupMode,
+    TimerName, TorrentCommand, TunnelEvent,
 };
 
 /// History categories, used for filtering.
@@ -26,7 +27,12 @@ pub(super) const CATEGORIES: [(&str, &str); 8] = [
 pub(super) const fn category(event: &Event) -> &'static str {
     match event {
         Event::Startup(_) => "startup",
-        Event::MamPause(_) => "mam",
+        Event::MamPause(_)
+        | Event::Mam(_)
+        | Event::TimerExpired {
+            name: TimerName::Mam,
+            ..
+        } => "mam",
         Event::Settings(_) => "settings",
         Event::History(_) => "history",
         Event::PortForwarding(_)
@@ -56,7 +62,14 @@ pub(super) const fn is_routine(event: &Event) -> bool {
         | Event::PortForwarding(PortForwardingEvent::Mapped { .. })
         | Event::Qbittorrent(QbittorrentEvent::PreferencesRead(_))
         | Event::Registry(RegistryEvent::Saved)
-        | Event::Tunnel(TunnelEvent::ExitIpObserved { .. }) => true,
+        | Event::Tunnel(TunnelEvent::ExitIpObserved { .. })
+        | Event::Mam(
+            MamEvent::ReminderSaved
+            | MamEvent::Answered {
+                result: Ok(MamReply::Ip(_) | MamReply::UserData(_) | MamReply::Bookmarks(_)),
+                ..
+            },
+        ) => true,
         Event::Qbittorrent(QbittorrentEvent::Synced(update)) => {
             !update.full && update.torrents.is_empty() && update.removed.is_empty()
         }
@@ -71,6 +84,176 @@ const fn timer(name: TimerName) -> &'static str {
         TimerName::TunnelCheck => "tunnel check",
         TimerName::NotificationGrace => "notification grace period",
         TimerName::NotificationRetry => "notification retry",
+        TimerName::Mam => "MAM work",
+    }
+}
+
+/// A size in GiB with one decimal.
+pub(super) fn gib(size: ByteSize) -> String {
+    let tenths = u128::from(size.0) * 10 / (1 << 30);
+    format!("{}.{} GiB", tenths / 10, tenths % 10)
+}
+
+pub(super) const fn rejection(rejection: SessionRejection) -> &'static str {
+    match rejection {
+        SessionRejection::InvalidCookie => "the API cookie is missing, invalid, or expired",
+        SessionRejection::IpMismatch => "the session is locked to another IP",
+        SessionRejection::AsnMismatch => "the session is locked to another network (ASN)",
+        SessionRejection::NotAllowed => "the session may not set the dynamic seedbox IP",
+        SessionRejection::Other => "MAM refused the session",
+    }
+}
+
+pub(super) fn mam_failure(failure: &MamFailure) -> String {
+    match failure {
+        MamFailure::Session(reason) => format!("MAM refused the session: {}", rejection(*reason)),
+        MamFailure::TooSoon {
+            retry_after: Some(after),
+        } => format!("MAM asked Windlass to wait {} seconds", after.as_secs()),
+        MamFailure::TooSoon { retry_after: None } => String::from("MAM asked Windlass to wait"),
+        MamFailure::Refused {
+            message: Some(message),
+        } => format!("MAM refused: {message}"),
+        MamFailure::Refused { message: None } => {
+            String::from("MAM refused without a torrent file or reason")
+        }
+        MamFailure::NotKept => String::from("the torrent file could not be kept in storage"),
+        MamFailure::Unreachable => String::from("MAM did not answer"),
+        MamFailure::Rejected { status } => format!("MAM answered with HTTP status {status}"),
+        MamFailure::Malformed => String::from("MAM's answer was not understood"),
+    }
+}
+
+/// Why the next bookmarked torrent waits.
+pub(super) fn hold(hold: Hold) -> String {
+    match hold {
+        Hold::MamUnavailable => {
+            String::from("MAM requests are paused, the VPN is down, or MAM refused the session")
+        }
+        Hold::SeedboxUnconfirmed => {
+            String::from("MAM has not confirmed the seedbox for the current IP")
+        }
+        Hold::DownloadsRefused => String::from(
+            "MAM refused a download; downloads stay held until Windlass restarts or the cookie changes",
+        ),
+        Hold::ClientUnavailable => {
+            String::from("qBittorrent is not connected, or MAM does not allow its version")
+        }
+        Hold::AccountUnknown => String::from("the account has not been read from MAM yet"),
+        Hold::RatioLow => String::from("the ratio is below 2.0"),
+        Hold::UnsatisfiedLimit { count, limit } => format!(
+            "{count} unsatisfied torrents of MAM's limit of {limit} leave no slot after the reserve of 2"
+        ),
+        Hold::NoWedge => String::from("the torrent needs a wedge and none is left"),
+        Hold::NotBookmarked => String::from("the queued torrents are no longer bookmarked"),
+    }
+}
+
+pub(super) fn purchase(purchase: Purchase) -> String {
+    match purchase {
+        Purchase::Upload(amount) => format!("{amount} GiB of upload credit"),
+        Purchase::Vip => String::from("VIP, filled to 90 days"),
+    }
+}
+
+fn mam_request(request: &MamRequest) -> String {
+    match request {
+        MamRequest::LookUpIp => String::from("Ask MAM which IP it sees"),
+        MamRequest::RegisterSeedbox => String::from("Register the seedbox IP with MAM"),
+        MamRequest::LoadUserData { client_stats } => format!(
+            "Read the account from MAM{}",
+            if *client_stats {
+                ", with the client list"
+            } else {
+                ""
+            }
+        ),
+        MamRequest::ListBookmarks { start } => format!("List bookmarks from number {start}"),
+        MamRequest::FetchTorrent { id, wedge } => format!(
+            "Download the torrent file of MAM torrent {}, {}",
+            id.get(),
+            if *wedge {
+                "spending a wedge"
+            } else {
+                "without a wedge"
+            }
+        ),
+        MamRequest::Buy(bought) => format!("Buy {}", purchase(*bought)),
+    }
+}
+
+fn optional_time(time: Option<SystemTime>) -> String {
+    time.map_or_else(|| String::from("none"), timestamp)
+}
+
+fn mam(event: &MamEvent) -> String {
+    match event {
+        MamEvent::Enable => String::from("MAM work started"),
+        MamEvent::Answered { result, rotated } => {
+            let answer = match result {
+                Ok(MamReply::Ip(observed)) => format!(
+                    "MAM sees IP {} in {} ({})",
+                    observed.ip, observed.asn, observed.provider
+                ),
+                Ok(MamReply::Registered {
+                    registration: Registration::Completed,
+                    ip,
+                }) => format!("MAM registered {ip} as the seedbox IP"),
+                Ok(MamReply::Registered {
+                    registration: Registration::NoChange,
+                    ip,
+                }) => format!("MAM already had {ip} as the seedbox IP"),
+                Ok(MamReply::UserData(data)) => format!(
+                    "Account read: {} points, {} wedges, {} uploaded beyond downloads{}",
+                    data.points,
+                    data.wedges,
+                    gib(data.buffer()),
+                    data.summary
+                        .as_ref()
+                        .map(|summary| format!(
+                            ", {} of {} unsatisfied",
+                            summary.unsatisfied, summary.unsatisfied_limit
+                        ))
+                        .unwrap_or_default()
+                ),
+                Ok(MamReply::Bookmarks(page)) => format!(
+                    "Bookmarks listed: {} on this page of {}",
+                    page.bookmarks.len(),
+                    page.found
+                ),
+                Ok(MamReply::Fetched(fetched)) => format!(
+                    "Torrent file fetched and kept: {}, {}",
+                    fetched.hash.as_str(),
+                    gib(fetched.size)
+                ),
+                Ok(MamReply::Purchased { points }) => {
+                    format!("Purchase made; {points} points left")
+                }
+                Err(failure) => format!("MAM request failed: {}", mam_failure(failure)),
+            };
+            if rotated.is_some() {
+                format!("{answer} (MAM issued a new cookie, not recorded)")
+            } else {
+                answer
+            }
+        }
+        MamEvent::StateRead {
+            last_registration,
+            last_reminder,
+        } => format!(
+            "MAM state read: last seedbox registration {}, last visit reminder {}",
+            optional_time(*last_registration),
+            optional_time(*last_reminder)
+        ),
+        MamEvent::StateReadFailed => {
+            String::from("MAM state could not be read; seedbox registration waits")
+        }
+        MamEvent::RegistrationAttemptSaved => String::from("Seedbox registration attempt recorded"),
+        MamEvent::RegistrationAttemptSaveFailed => {
+            String::from("Seedbox registration attempt could not be recorded, so it was not sent")
+        }
+        MamEvent::ReminderSaved => String::from("MAM visit reminder time saved"),
+        MamEvent::ReminderSaveFailed => String::from("MAM visit reminder time could not be saved"),
     }
 }
 
@@ -136,6 +319,7 @@ pub(super) fn event(event: &Event) -> String {
         Event::Registry(event) => registry(event),
         Event::Tunnel(event) => tunnel(event),
         Event::Notification(event) => notification(event),
+        Event::Mam(event) => mam(event),
     }
 }
 
@@ -219,6 +403,12 @@ fn torrent_command(command: &TorrentCommand) -> String {
         TorrentCommand::Remove(hashes) => {
             format!("Remove {} torrents and their files", hashes.len())
         }
+        TorrentCommand::Stop(hashes) => format!("Stop {} held torrents", hashes.len()),
+        TorrentCommand::Add { mam, hash } => format!(
+            "Add MAM torrent {} ({}) from its kept torrent file",
+            mam.get(),
+            hash.as_str()
+        ),
     }
 }
 
@@ -314,13 +504,16 @@ fn settings(event: &SettingsEvent) -> String {
             history_limit,
             api_cookie,
             ntfy_topic,
+            points_reserve,
         } => {
             let configured = |set: bool| if set { "configured" } else { "not configured" };
             format!(
-                "Settings read: history limit {}, API cookie {}, notification topic {}",
+                "Settings read: history limit {}, API cookie {}, notification topic {}, \
+                 points reserve {}",
                 history_limit.unwrap_or_default(),
                 configured(api_cookie.is_some()),
-                configured(ntfy_topic.is_some())
+                configured(ntfy_topic.is_some()),
+                points_reserve.unwrap_or_default()
             )
         }
         SettingsEvent::ReadFailed => String::from("Settings could not be read"),
@@ -343,6 +536,19 @@ fn settings(event: &SettingsEvent) -> String {
         SettingsEvent::NtfyTopicWriteFailed => {
             String::from("Notification topic change could not be saved")
         }
+        SettingsEvent::SetPointsReserve { reserve } => {
+            format!("Points reserve change to {reserve} requested")
+        }
+        SettingsEvent::PointsReserveWritten => String::from("Points reserve saved"),
+        SettingsEvent::PointsReserveWriteFailed => {
+            String::from("Points reserve could not be saved")
+        }
+        SettingsEvent::RotatedApiCookieWritten => {
+            String::from("The new API cookie MAM issued was saved")
+        }
+        SettingsEvent::RotatedApiCookieWriteFailed => String::from(
+            "The new API cookie MAM issued could not be saved; the saved one stays in use",
+        ),
     }
 }
 
@@ -417,6 +623,21 @@ pub(super) fn action(action: &Action) -> String {
         Action::SendNotification { notice, .. } => {
             format!("Notify: {}", super::notify::message(notice).title)
         }
+        Action::WritePointsReserve { reserve } => format!("Save points reserve: {reserve}"),
+        Action::WriteRotatedApiCookie { .. } => {
+            String::from("Save the new API cookie MAM issued (value not recorded)")
+        }
+        Action::ReadMamState => String::from("Read saved MAM state"),
+        Action::SaveRegistrationAttempt { at } => {
+            format!(
+                "Record a seedbox registration attempt at {}",
+                timestamp(*at)
+            )
+        }
+        Action::SaveReminder { at } => {
+            format!("Record the MAM visit reminder at {}", timestamp(*at))
+        }
+        Action::MamRequest { request, .. } => mam_request(request),
     }
 }
 
@@ -459,6 +680,7 @@ mod tests {
                 history_limit: Some(limit),
                 api_cookie: cookie.clone(),
                 ntfy_topic: None,
+                points_reserve: None,
             }),
             Event::Settings(SettingsEvent::ReadFailed),
             Event::Settings(SettingsEvent::HistoryLimitWritten),
@@ -834,6 +1056,7 @@ mod tests {
             history_limit: None,
             api_cookie: None,
             ntfy_topic: NtfyTopic::parse("alerts").ok(),
+            points_reserve: None,
         });
         assert!(event(&secret).contains("notification topic configured"));
         let id = timer_actions().into_iter().find_map(|action| match action {
@@ -908,5 +1131,218 @@ mod tests {
         {
             assert!(!action(entry).is_empty());
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one list of every MAM event, failure, and action reads best together"
+    )]
+    fn mam_events_and_actions_are_described_and_classified()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::{net::IpAddr, time::Duration};
+
+        use crate::core::{
+            Asn, BookmarkPage, ByteSize, FetchedTorrent, Hold, IpObservation, MamEvent, MamFailure,
+            MamReply, MamRequest, MamTorrentId, Points, PointsReserve, Purchase, Registration,
+            SessionRejection, TimerName, TorrentCommand, TorrentHash, UploadCredit, UserData,
+        };
+
+        let id = timer_actions()
+            .iter()
+            .find_map(|action| match action {
+                Action::StartTimer { id, .. } => Some(*id),
+                _ => None,
+            })
+            .ok_or("no timer")?;
+        let ip = IpAddr::from([192, 0, 2, 10]);
+        let hash = TorrentHash::parse(&"c".repeat(40)).ok_or("hash")?;
+        let torrent = MamTorrentId::new(9).ok_or("id")?;
+        let data = UserData {
+            uploaded: ByteSize(3 << 30),
+            downloaded: ByteSize(1 << 30),
+            points: Points(1),
+            wedges: 2,
+            class: String::from("VIP"),
+            vip_until: None,
+            summary: Some(crate::core::SnatchSummary::default()),
+            notices: None,
+            clients: None,
+        };
+        let mut without_summary = data.clone();
+        without_summary.summary = None;
+        let answered = |result| MamEvent::Answered {
+            result,
+            rotated: None,
+        };
+        let routine = |reply| (Event::Mam(answered(Ok(reply))), "mam", true);
+        let mut entries = vec![
+            (
+                Event::TimerExpired {
+                    name: TimerName::Mam,
+                    id,
+                },
+                "mam",
+                true,
+            ),
+            (Event::Mam(MamEvent::Enable), "mam", false),
+            routine(MamReply::Ip(IpObservation {
+                ip,
+                asn: Asn(1),
+                provider: String::from("Provider"),
+            })),
+            routine(MamReply::UserData(Box::new(data))),
+            routine(MamReply::UserData(Box::new(without_summary))),
+            routine(MamReply::Bookmarks(BookmarkPage {
+                found: 0,
+                bookmarks: Vec::new(),
+            })),
+            (Event::Mam(MamEvent::ReminderSaved), "mam", true),
+        ];
+        entries.extend(
+            [
+                answered(Ok(MamReply::Registered {
+                    registration: Registration::Completed,
+                    ip,
+                })),
+                answered(Ok(MamReply::Registered {
+                    registration: Registration::NoChange,
+                    ip,
+                })),
+                answered(Ok(MamReply::Fetched(FetchedTorrent {
+                    hash: hash.clone(),
+                    size: ByteSize(1 << 20),
+                }))),
+                answered(Ok(MamReply::Purchased { points: Points(2) })),
+                MamEvent::Answered {
+                    result: Err(MamFailure::Unreachable),
+                    rotated: ApiCookie::parse("rotated").ok(),
+                },
+                MamEvent::StateRead {
+                    last_registration: None,
+                    last_reminder: Some(SystemTime::UNIX_EPOCH),
+                },
+                MamEvent::StateReadFailed,
+                MamEvent::RegistrationAttemptSaved,
+                MamEvent::RegistrationAttemptSaveFailed,
+                MamEvent::ReminderSaveFailed,
+            ]
+            .map(|event| (Event::Mam(event), "mam", false)),
+        );
+        entries.extend(
+            [
+                MamFailure::TooSoon { retry_after: None },
+                MamFailure::TooSoon {
+                    retry_after: Some(Duration::from_mins(1)),
+                },
+                MamFailure::Refused { message: None },
+                MamFailure::Refused {
+                    message: Some(String::from("No")),
+                },
+                MamFailure::NotKept,
+                MamFailure::Rejected { status: 500 },
+                MamFailure::Malformed,
+            ]
+            .into_iter()
+            .chain(
+                [
+                    SessionRejection::InvalidCookie,
+                    SessionRejection::IpMismatch,
+                    SessionRejection::AsnMismatch,
+                    SessionRejection::NotAllowed,
+                    SessionRejection::Other,
+                ]
+                .map(MamFailure::Session),
+            )
+            .map(|failure| (Event::Mam(answered(Err(failure))), "mam", false)),
+        );
+        entries.extend(
+            [
+                SettingsEvent::SetPointsReserve {
+                    reserve: PointsReserve::default(),
+                },
+                SettingsEvent::PointsReserveWritten,
+                SettingsEvent::PointsReserveWriteFailed,
+                SettingsEvent::RotatedApiCookieWritten,
+                SettingsEvent::RotatedApiCookieWriteFailed,
+            ]
+            .map(|event| (Event::Settings(event), "settings", false)),
+        );
+        check(&entries);
+        let rotated = event(&Event::Mam(MamEvent::Answered {
+            result: Err(MamFailure::Unreachable),
+            rotated: ApiCookie::parse("rotated").ok(),
+        }));
+        assert!(rotated.contains("new cookie") && !rotated.contains("rotated"));
+
+        let upload = Purchase::Upload(UploadCredit::try_new(50)?);
+        for entry in [
+            Action::WritePointsReserve {
+                reserve: PointsReserve::default(),
+            },
+            Action::WriteRotatedApiCookie {
+                cookie: ApiCookie::parse("secret-rotated")?,
+            },
+            Action::ReadMamState,
+            Action::SaveRegistrationAttempt {
+                at: SystemTime::UNIX_EPOCH,
+            },
+            Action::SaveReminder {
+                at: SystemTime::UNIX_EPOCH,
+            },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::Stop(vec![hash.clone()]),
+            },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::Add { mam: torrent, hash },
+            },
+        ]
+        .into_iter()
+        .chain(
+            [
+                MamRequest::LookUpIp,
+                MamRequest::RegisterSeedbox,
+                MamRequest::LoadUserData { client_stats: true },
+                MamRequest::LoadUserData {
+                    client_stats: false,
+                },
+                MamRequest::ListBookmarks { start: 100 },
+                MamRequest::FetchTorrent {
+                    id: torrent,
+                    wedge: true,
+                },
+                MamRequest::FetchTorrent {
+                    id: torrent,
+                    wedge: false,
+                },
+                MamRequest::Buy(upload),
+                MamRequest::Buy(Purchase::Vip),
+            ]
+            .map(|request| Action::MamRequest {
+                request,
+                cookie: ApiCookie::parse("secret-cookie").ok(),
+            }),
+        ) {
+            let described = action(&entry);
+            assert!(
+                !described.is_empty() && !described.contains("secret"),
+                "{entry:?}"
+            );
+        }
+        for hold in [
+            Hold::MamUnavailable,
+            Hold::SeedboxUnconfirmed,
+            Hold::DownloadsRefused,
+            Hold::ClientUnavailable,
+            Hold::AccountUnknown,
+            Hold::RatioLow,
+            Hold::UnsatisfiedLimit { count: 1, limit: 2 },
+            Hold::NoWedge,
+            Hold::NotBookmarked,
+        ] {
+            assert!(!super::hold(hold).is_empty());
+        }
+        assert_eq!(super::gib(ByteSize(3 << 29)), "1.5 GiB");
+        Ok(())
     }
 }
