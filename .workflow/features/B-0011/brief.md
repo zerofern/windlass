@@ -230,6 +230,12 @@ details are not recorded here.
 - `GET /jsonLoad.php?clientStats=true` (call 3) returned `"clientStats": []`
   while nothing was seeding. The shape of an entry is still to be captured once
   qBittorrent seeds through the VPN.
+- `GET /jsonLoad.php?notif=true` (call 4) added `notifs`, an object of integer
+  counts: `pms`, `tickets`, `waiting_tickets`, `requests`, `topics`, and
+  `aboutToDropClient`. A10 reports the counts without any text; a nonzero
+  `aboutToDropClient` is urgent, since it suggests MAM is about to stop
+  accepting a client. No disabled-download state appeared; it may only show
+  when it applies.
 - The `red` flag is MAM's own marking of categories that need attention. Any red
   category with a nonzero count is reported, beside the specific gates.
 - The session was locked to the network provider (ASN). A request from another
@@ -250,8 +256,8 @@ is wanted anyway.
 | --- | --- | --- | --- |
 | 1 ✓ | `GET /jsonLoad.php?pretty` | Field types: numbers or strings, units of `uploaded` and `downloaded`, `classname` values, `vip_until` format | None |
 | 2 ✓ | `GET /jsonLoad.php?snatch_summary&pretty` | The unsatisfied count, and whether satisfied status is given per torrent (A2, A3) | None |
-| 3 | `GET /jsonLoad.php?clientStats&pretty` | How clients, versions, and connectable status appear (A5, A6) | None |
-| 4 | `GET /jsonLoad.php?notif&pretty` | The notification shape; whether a wedge count or a download-disabled state appears (A10) | None |
+| 3 ½ | `GET /jsonLoad.php?clientStats=true&pretty` | How clients, versions, and connectable status appear (A5, A6) | None |
+| 4 ✓ | `GET /jsonLoad.php?notif=true&pretty` | The notification shape; whether a wedge count or a download-disabled state appears (A10) | None |
 | 5 | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
 | 6 | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
 | 7 | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
