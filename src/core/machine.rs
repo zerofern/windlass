@@ -1,7 +1,10 @@
 use super::{
     Action, ClockReading, Event, HistoryState, MamPreferencePersistence, MamPreferenceState,
-    MamPreferenceUpdate, PortForwarding, PortForwardingEvent, Qbittorrent, Registry, SettingsState,
-    Step, TimerName, Tunnel, TunnelEvent, mam_pause, settings, startup, timer::Timers,
+    MamPreferenceUpdate, Notifications, PortForwarding, PortForwardingEvent, Qbittorrent, Registry,
+    SettingsState, Step, TimerName, Tunnel, TunnelEvent, mam_pause,
+    notifications::{Facts, Glance},
+    settings, startup,
+    timer::Timers,
 };
 
 /// Owns application state and makes decisions without performing I/O.
@@ -14,6 +17,7 @@ pub struct Core {
     qbittorrent: Qbittorrent,
     registry: Registry,
     tunnel: Tunnel,
+    notifications: Notifications,
     timers: Timers,
     step: Step,
 }
@@ -67,6 +71,7 @@ impl Core {
             qbittorrent: Qbittorrent::Disabled,
             registry: Registry::Unread,
             tunnel: Tunnel::new(),
+            notifications: Notifications::new(),
             timers: Timers::new(),
             step: Step::ZERO,
         }
@@ -79,6 +84,8 @@ impl Core {
     #[must_use]
     pub fn handle(&mut self, occurred_at: ClockReading, event: Event) -> Vec<Action> {
         self.step = self.step.next();
+        let mut notices = self.notifications.reported(&event);
+        let before = self.glance();
         let mut actions = match event {
             Event::Startup(event) => {
                 let opening = matches!(self.state, State::OpeningStorage { .. });
@@ -101,6 +108,10 @@ impl Core {
                 TimerName::PortLease => self.port_forwarding.timer_expired(id),
                 TimerName::QbittorrentPoll => self.qbittorrent.timer_expired(id),
                 TimerName::TunnelCheck => self.tunnel.timer_expired(occurred_at, id),
+                TimerName::NotificationGrace | TimerName::NotificationRetry => {
+                    self.notifications.timer_expired(id);
+                    Vec::new()
+                }
             },
             Event::PortForwarding(event) => {
                 let failed = matches!(event, PortForwardingEvent::MappingFailed { .. });
@@ -119,13 +130,17 @@ impl Core {
             Event::Registry(event) => self.registry.handle(occurred_at.monotonic, event),
             Event::Tunnel(event) => {
                 let switched = matches!(event, TunnelEvent::Switched);
-                let before = self.tunnel.current().cloned();
+                let previous = self.tunnel.current().cloned();
                 let mut actions = self.tunnel.handle(occurred_at, event, &mut self.timers);
                 // A new server has a new gateway and forwarded port.
-                if switched && self.tunnel.current() != before.as_ref() {
+                if switched && self.tunnel.current() != previous.as_ref() {
                     actions.extend(self.port_forwarding.renew());
                 }
                 actions
+            }
+            Event::Notification(event) => {
+                self.notifications
+                    .handle(occurred_at, &event, &mut self.timers)
             }
         };
         self.port_forwarding.expire(occurred_at.monotonic);
@@ -147,7 +162,35 @@ impl Core {
             self.history
                 .after_step(self.step, self.settings.history_limit()),
         );
+        notices.extend(self.notifications.changed(&before, &self.glance()));
+        let facts = Facts {
+            tunnel: &self.tunnel,
+            port_forwarding: &self.port_forwarding,
+            qbittorrent: &self.qbittorrent,
+            registry: &self.registry,
+        };
+        actions.extend(self.notifications.after_step(
+            occurred_at,
+            notices,
+            facts,
+            &self.settings,
+            &mut self.timers,
+        ));
         actions
+    }
+
+    fn glance(&self) -> Glance {
+        Glance::of(
+            &self.tunnel,
+            matches!(self.state, State::Failed),
+            matches!(self.state, State::Ready(_)),
+        )
+    }
+
+    /// Inspect notifications and their delivery.
+    #[must_use]
+    pub const fn notifications(&self) -> &Notifications {
+        &self.notifications
     }
 
     /// Inspect the actual state without allowing mutation outside event handling.

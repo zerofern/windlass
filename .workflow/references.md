@@ -46,12 +46,15 @@
 ## ntfy
 
 - Link: [ntfy](https://ntfy.sh/), [Publishing documentation](https://docs.ntfy.sh/publish/)
-- Relevance: Owner-selected initial notification channel, using hosted ntfy.sh. Supports publishing messages to topics over HTTP, with titles and priorities.
+- Relevance: Owner-selected initial notification channel, using hosted ntfy.sh. Supports publishing messages to topics over HTTP, with titles, priorities, tags, and a click link (`Title`, `Priority`, `Tags`, and `Click` headers).
 - Related: [Notifications](direction.md#notifications)
 
 ## MAM rules and API documentation
 
 - Link: Owner-supplied [rules](../docs/MAM/rules.txt), [search](../docs/MAM/loadSearchJSONbasic.txt), [torrent download](../docs/MAM/download.txt), [user data](../docs/MAM/jsonLoad.txt), [dynamic seedbox](../docs/MAM/dynamicSeedbox.txt), [IP lookup](../docs/MAM/jsonIp.txt), [bonus purchases](../docs/MAM/bonusBuy.txt), [bonus history](../docs/MAM/userBonusHistory.txt), and [form data](../docs/MAM/JSON+fast+fillout.txt).
+- Private copy: the owner's endpoint pages are kept in a private claude.ai artifact,
+  "Windlass MAM API Notes" (https://claude.ai/artifact/MTLGGwEkQDvZEuu8no93AQ), and
+  are not committed here. Only the owner can open it.
 - Relevance: All nine supplied files were reviewed. Rule 1.7 limits automation to documented API functions or staff approval. Dynamic seedbox calls have a rolling hourly limit; IP lookup has a once-per-minute limit. Rule 1.2 requires a VPN IP that changes less than once an hour and notifying staff about VPN or seedbox use. Registration requires an IP- or ASN-locked API session with update permission.
 - Owner-reported: MAM staff approved the owner's VPN use. A session can hold several
   ASNs, but each new one must be added manually.

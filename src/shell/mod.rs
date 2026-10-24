@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     error::Error,
-    net::SocketAddrV4,
+    net::{SocketAddr, SocketAddrV4},
     path::PathBuf,
     time::{Instant, SystemTime},
 };
@@ -23,6 +23,7 @@ mod describe;
 mod history;
 mod ingress;
 mod natpmp;
+mod notify;
 mod qbittorrent;
 mod storage;
 mod tunnel;
@@ -40,6 +41,13 @@ pub struct Integrations {
     pub nat_pmp_gateway: Option<SocketAddrV4>,
     /// Tunnel checks and server failover.
     pub tunnel: Option<TunnelChecks>,
+    /// The ntfy server notices are published to; ntfy.sh when absent.
+    pub ntfy_server: Option<reqwest::Url>,
+    /// A relay that forwards connections to the ntfy server, used in place of
+    /// the server's own address.
+    pub ntfy_relay: Option<SocketAddr>,
+    /// The dashboard's address as the user opens it, for links in notices.
+    pub dashboard_url: Option<reqwest::Url>,
 }
 
 /// How the tunnel is checked and which servers it may switch between.
@@ -103,6 +111,7 @@ pub(crate) struct Shell {
     qbittorrent: Option<qbittorrent::Client>,
     nat_pmp_gateway: Option<SocketAddrV4>,
     tunnel: Option<tunnel::Client>,
+    notifications: notify::Channel,
     timers: HashMap<TimerName, JoinHandle<()>>,
 }
 
@@ -130,6 +139,13 @@ impl Shell {
                 tunnel: integrations
                     .tunnel
                     .map(|checks| tunnel::Client::new(checks.exit_ip_service, checks.unit_starter)),
+                notifications: notify::Channel::new(
+                    integrations
+                        .ntfy_server
+                        .or_else(|| reqwest::Url::parse(notify::NTFY_SH).ok()),
+                    integrations.ntfy_relay,
+                    integrations.dashboard_url,
+                ),
                 timers: HashMap::new(),
             },
             events,
@@ -235,6 +251,13 @@ impl Shell {
             Action::SwitchVpnServer { server } => {
                 return self.tunnel(tunnel::Request::Switch(server));
             }
+            Action::SendNotification { topic, notice } => {
+                let channel = self.notifications.clone();
+                return self.spawn(async move {
+                    Event::Notification(notify::send(&channel, &topic, &notice).await)
+                });
+            }
+            Action::WriteNtfyTopic { topic } => Operation::WriteNtfyTopic(topic),
             Action::ReadLastVpnSwitch => Operation::ReadLastVpnSwitch,
             Action::SaveVpnSwitch { switch } => Operation::SaveVpnSwitch(switch),
             Action::ReadTorrentRegistry => Operation::ReadTorrentRegistry,
@@ -325,14 +348,19 @@ pub(crate) fn read_clock() -> ClockReading {
 mod tests {
     use std::{error::Error, path::PathBuf, time::SystemTime};
 
-    use crate::core::{Action, Event, TunnelEvent, VpnServer, VpnSwitch};
+    use crate::core::{
+        Action, DeliveryFailure, Event, Notice, NotificationEvent, NtfyTopic, SettingsEvent,
+        TunnelEvent, VpnServer, VpnSwitch,
+    };
 
     use super::{Integrations, Shell, TunnelChecks};
 
     #[tokio::test]
-    async fn switch_actions_report_their_outcome() -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn switch_and_notification_actions_report_their_outcome()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
         let server = VpnServer::try_new("two")?;
-        // Storage is never opened, so saving the switch fails.
+        let topic = NtfyTopic::parse("alerts")?;
+        // Storage is never opened, so saves fail, and nothing listens for notices.
         let (mut shell, _events) = Shell::new(
             PathBuf::from("/nonexistent/windlass.sqlite"),
             Integrations {
@@ -342,6 +370,7 @@ mod tests {
                     current: None,
                     unit_starter: "true".into(),
                 }),
+                ntfy_server: Some("http://127.0.0.1:9/".parse()?),
                 ..Integrations::default()
             },
         );
@@ -352,12 +381,28 @@ mod tests {
             },
         };
         for (action, expected) in [
-            (Action::SwitchVpnServer { server }, TunnelEvent::Switched),
-            (save, TunnelEvent::SwitchSaveFailed),
+            (
+                Action::SwitchVpnServer { server },
+                Event::Tunnel(TunnelEvent::Switched),
+            ),
+            (save, Event::Tunnel(TunnelEvent::SwitchSaveFailed)),
+            (
+                Action::SendNotification {
+                    topic: topic.clone(),
+                    notice: Notice::Test,
+                },
+                Event::Notification(NotificationEvent::DeliveryFailed {
+                    reason: DeliveryFailure::Unreachable,
+                }),
+            ),
+            (
+                Action::WriteNtfyTopic { topic: Some(topic) },
+                Event::Settings(SettingsEvent::NtfyTopicWriteFailed),
+            ),
         ] {
             shell.dispatch(action);
             let event = shell.next_event().await?.map(|event| event.event);
-            assert_eq!(event, Some(Event::Tunnel(expected)));
+            assert_eq!(event, Some(expected));
         }
         shell.finish().await?;
         Ok(())

@@ -311,6 +311,9 @@ async fn qbittorrent_listens_on_the_forwarded_port() -> TestResult {
     let gateway = fake_gateway(Ok(41000)).await?;
     let running = run(Integrations {
         tunnel: None,
+        ntfy_server: None,
+        ntfy_relay: None,
+        dashboard_url: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -351,6 +354,9 @@ async fn unavailable_services_are_reported_and_retried() -> TestResult {
     let gateway = fake_gateway(Err(3)).await?;
     let running = run(Integrations {
         tunnel: None,
+        ntfy_server: None,
+        ntfy_relay: None,
+        dashboard_url: None,
         qbittorrent: Some(format!("http://{closed}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -420,6 +426,9 @@ async fn rejected_and_malformed_answers_are_distinguished() -> TestResult {
         let webui = broken_qbittorrent(preferences, maindata).await?;
         let running = run(Integrations {
             tunnel: None,
+            ntfy_server: None,
+            ntfy_relay: None,
+            dashboard_url: None,
             qbittorrent: Some(format!("http://{webui}/").parse()?),
             nat_pmp_gateway: None,
         })
@@ -440,6 +449,9 @@ async fn silent_gateways_time_out() -> TestResult {
     let silent = UdpSocket::bind("127.0.0.1:0").await?;
     let running = run(Integrations {
         tunnel: None,
+        ntfy_server: None,
+        ntfy_relay: None,
+        dashboard_url: None,
         qbittorrent: None,
         nat_pmp_gateway: Some(match silent.local_addr()? {
             SocketAddr::V4(address) => address,
@@ -476,6 +488,9 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
     let webui = fake_qbittorrent(Arc::clone(&fake)).await?;
     let integrations = Integrations {
         tunnel: None,
+        ntfy_server: None,
+        ntfy_relay: None,
+        dashboard_url: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: None,
     };

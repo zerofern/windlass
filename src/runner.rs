@@ -6,8 +6,8 @@ use tokio::sync::watch;
 
 use crate::{
     core::{
-        Core, HistoryState, PortForwarding, Qbittorrent, Registry, SettingsState, State,
-        TimedEvent, Tunnel,
+        Core, HistoryState, Notifications, PortForwarding, Qbittorrent, Registry, SettingsState,
+        State, TimedEvent, Tunnel,
     },
     shell::{EventSender, Integrations, Shell, ShellResult, read_clock},
 };
@@ -29,6 +29,8 @@ pub struct Observation {
     pub registry: Registry,
     /// The VPN tunnel.
     pub tunnel: Tunnel,
+    /// Notifications and their delivery.
+    pub notifications: Notifications,
     /// The most recently handled event, absent before the first input.
     pub last_event: Option<TimedEvent>,
     /// The latest storage error, retained across subsequent state updates.
@@ -45,6 +47,7 @@ impl Observation {
             qbittorrent: core.qbittorrent().clone(),
             registry: core.registry().clone(),
             tunnel: core.tunnel().clone(),
+            notifications: core.notifications().clone(),
             last_event,
             storage_error,
         }

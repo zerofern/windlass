@@ -7,14 +7,15 @@ use maud::{DOCTYPE, Markup, html};
 
 use crate::{
     core::{
-        Activity, ByteSize, Desired, EntryCount, Failover, HistoryState, MamApproval,
-        MamRequestsStatus, MappingFailure, Origin, POLL_INTERVAL, Port, PortForwarding, Protection,
-        Qbittorrent, Ratio, Records, Registry, Session, Setting, SettingStatus, Settings,
-        SettingsState, SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
+        Activity, ByteSize, Condition, Delivery, Desired, EntryCount, Failover, HistoryState,
+        MamApproval, MamRequestsStatus, MappingFailure, Notifications, NtfyTopic, Origin, Outcome,
+        POLL_INTERVAL, Phase, Port, PortForwarding, Protection, Qbittorrent, Ratio, Records,
+        Registry, Session, Setting, SettingStatus, Settings, SettingsState, SwitchAllowance,
+        Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
     },
     runner::Observation,
     shell::{
-        describe::{CATEGORIES, exit_ip_failure, qbittorrent_failure, timestamp},
+        describe::{CATEGORIES, delivery_failure, exit_ip_failure, qbittorrent_failure, timestamp},
         history::{HistoryPage, HistoryQuery, Page},
     },
 };
@@ -191,6 +192,86 @@ const fn cookie_status(settings: &SettingsState) -> (&'static str, &'static str)
     }
 }
 
+const fn topic_status(topic: &Setting<Option<NtfyTopic>>) -> (&'static str, &'static str) {
+    match topic.status() {
+        SettingStatus::Saving => ("Saving…", "pending"),
+        SettingStatus::NotSaved => ("Change not saved", "error"),
+        SettingStatus::Saved if topic.saved.is_some() => ("Configured", "ok"),
+        SettingStatus::Saved => ("Not configured", "warning"),
+    }
+}
+
+const fn condition(condition: Condition) -> &'static str {
+    match condition {
+        Condition::VpnProtection => "VPN not working",
+        Condition::FailoverBlocked => "VPN switch blocked",
+        Condition::ForwardedPort => "No forwarded port",
+        Condition::QbittorrentReachable => "qBittorrent not responding",
+        Condition::QbittorrentVersion => "qBittorrent version not allowed",
+        Condition::TorrentErrors => "Torrents with errors",
+        Condition::FilesMissing => "Files missing on disk",
+        Condition::TorrentsMissing => "Torrents missing from qBittorrent",
+        Condition::RegistrySave => "Torrent records not saved",
+    }
+}
+
+fn notifications_panel(notifications: &Notifications, settings: &SettingsState) -> Markup {
+    let configured = settings
+        .loaded()
+        .is_some_and(|settings| settings.ntfy_topic.saved.is_some());
+    let failing = matches!(notifications.delivery, Delivery::Retrying { .. })
+        || matches!(
+            notifications.last_outcome,
+            Some(Outcome { result: Err(_), .. })
+        );
+    let (tag, tone) = match &notifications.delivery {
+        _ if !configured => ("Not configured", "warning"),
+        _ if failing => ("Delivery failing", "error"),
+        Delivery::Sending(_) => ("Sending…", "pending"),
+        Delivery::Idle | Delivery::Retrying { .. } => ("Working", "ok"),
+    };
+    let raised: Vec<&str> = notifications
+        .conditions
+        .iter()
+        .filter(|(_, phase)| **phase == Phase::Raised)
+        .map(|(raised, _)| condition(*raised))
+        .collect();
+    html! {
+        section.panel aria-labelledby="notifications" {
+            div.panel-head {
+                h2 #notifications { "Notifications" }
+                span class={ "tag " (tone) } { (tag) }
+            }
+            @if configured {
+                dl {
+                    dt { "Last delivery" }
+                    dd {
+                        @match notifications.last_outcome {
+                            Some(Outcome { at, result: Ok(()) }) => { "Delivered " (time(at, "full")) }
+                            Some(Outcome { at, result: Err(reason) }) => {
+                                "Failed " (time(at, "full")) ": " (delivery_failure(reason))
+                            }
+                            None => "None yet",
+                        }
+                    }
+                    @if notifications.failures > 0 {
+                        dt { "Failed attempts" } dd { (notifications.failures) ", retrying" }
+                    }
+                    dt { "Waiting to send" } dd { (notifications.outbox.len()) }
+                    @if notifications.dropped > 0 {
+                        dt { "Dropped" } dd { (notifications.dropped) " oldest, while delivery failed" }
+                    }
+                }
+            } @else {
+                p { "No ntfy topic is set, so nothing is sent. " a href="/settings#notifications" { "Set a topic" } "." }
+            }
+            @if !raised.is_empty() {
+                p.note { "Reported and not yet resolved: " (raised.join(", ")) "." }
+            }
+        }
+    }
+}
+
 fn history_status(history: HistoryState, settings: &SettingsState) -> String {
     let limit = settings.history_limit();
     match history {
@@ -251,6 +332,7 @@ fn status_live(observation: &Observation) -> Markup {
                     div.panel-head { h2 #history-panel { "History" } a href="/history" { "View history" } }
                     p { (history_status(observation.history, &observation.settings)) }
                 }
+                (notifications_panel(&observation.notifications, &observation.settings))
                 (tunnel_panel(&observation.tunnel, SystemTime::now()))
                 (port_forwarding_panel(&observation.port_forwarding))
                 (qbittorrent_panel(&observation.qbittorrent, observation.port_forwarding.forwarded_port()))
@@ -683,6 +765,81 @@ pub(super) struct SettingsForm {
     pub(super) history_limit_error: Option<String>,
     pub(super) api_cookie: Option<String>,
     pub(super) api_cookie_error: Option<String>,
+    pub(super) ntfy_topic: Option<String>,
+    pub(super) ntfy_topic_error: Option<String>,
+}
+
+fn topic_form(settings: &Settings, form: &SettingsForm) -> Markup {
+    html! {
+        form.setting #notifications method="post" action="/settings/ntfy-topic" {
+            div.setting-head {
+                label for="topic" { "Notification topic" }
+                @let (label, tone) = topic_status(&settings.ntfy_topic);
+                span class={ "tag " (tone) } data-live="ntfy-topic-status" { (label) }
+            }
+            p.hint {
+                "Windlass publishes notifications to this ntfy topic. Anyone who knows the name can read them, so choose one that is hard to guess, and subscribe to it in the ntfy app."
+            }
+            div.row {
+                input #topic type="text" name="topic" autocomplete="off" spellcheck="false"
+                    placeholder="topic name"
+                    value=[form.ntfy_topic.clone().or_else(|| {
+                        settings.ntfy_topic.requested.as_ref().map(|topic| topic.expose_secret().to_owned())
+                    })]
+                    aria-invalid=[form.ntfy_topic_error.as_ref().map(|_| "true")]
+                    aria-describedby=[form.ntfy_topic_error.as_ref().map(|_| "topic-error")];
+                button.primary type="submit" {
+                    @if settings.ntfy_topic.saved.is_some() { "Replace" } @else { "Save" }
+                }
+                @if settings.ntfy_topic.saved.is_some() || settings.ntfy_topic.requested.is_some() {
+                    button.secondary type="submit" formaction="/settings/ntfy-topic/clear" { "Clear" }
+                }
+            }
+            @if settings.ntfy_topic.saved.is_some() {
+                div.row {
+                    button.secondary type="submit" formaction="/notifications/test" { "Send test notification" }
+                }
+            }
+            @if let Some(error) = &form.ntfy_topic_error {
+                p.field-error #topic-error { (error) }
+            }
+        }
+    }
+}
+
+fn deployment_section(deployment: &Deployment) -> Markup {
+    html! {
+        section.panel.flush aria-labelledby="deployment" {
+            div.section-head {
+                h2 #deployment { "Deployment settings" }
+                p { "Set in your NixOS configuration. Change them there and rebuild." }
+            }
+            dl.setting {
+                dt { "Listen addresses" }
+                dd.mono { (deployment.listen.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")) }
+                dt { "Allowed host names" }
+                @if deployment.allowed_hosts.is_empty() {
+                    dd { "None; only the listen addresses" }
+                } @else {
+                    dd.mono { (deployment.allowed_hosts.join(", ")) }
+                }
+                dt { "Database" }
+                dd.mono { (deployment.database.display()) }
+                dt { "Notification server" }
+                dd.mono { (deployment.ntfy_server) }
+                dt { "Notifications reach it through" }
+                @match deployment.ntfy_relay {
+                    Some(relay) => dd.mono { (relay) },
+                    None => dd { "A direct connection" },
+                }
+                dt { "Dashboard link in notifications" }
+                @match &deployment.dashboard_url {
+                    Some(url) => dd.mono { (url) },
+                    None => dd { "None; notifications carry no link" },
+                }
+            }
+        }
+    }
 }
 
 /// The settings page.
@@ -727,6 +884,7 @@ pub(super) fn settings(
                             p.field-error #cookie-error { (error) }
                         }
                     }
+                    (topic_form(settings, form))
                     form.setting method="post" action="/settings/history-limit" {
                         div.setting-head {
                             label for="history-limit" { "History size limit" }
@@ -750,24 +908,7 @@ pub(super) fn settings(
                     p.setting { (cookie) }
                 }
             }
-            section.panel.flush aria-labelledby="deployment" {
-                div.section-head {
-                    h2 #deployment { "Deployment settings" }
-                    p { "Set in your NixOS configuration. Change them there and rebuild." }
-                }
-                dl.setting {
-                    dt { "Listen addresses" }
-                    dd.mono { (deployment.listen.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")) }
-                    dt { "Allowed host names" }
-                    @if deployment.allowed_hosts.is_empty() {
-                        dd { "None; only the listen addresses" }
-                    } @else {
-                        dd.mono { (deployment.allowed_hosts.join(", ")) }
-                    }
-                    dt { "Database" }
-                    dd.mono { (deployment.database.display()) }
-                }
-            }
+            (deployment_section(deployment))
         }
     };
     layout(Location::Settings, observation, &body)
@@ -946,6 +1087,7 @@ mod tests {
             qbittorrent: Qbittorrent::Disabled,
             registry: crate::core::Registry::Unread,
             tunnel: crate::core::Tunnel::default(),
+            notifications: crate::core::Notifications::default(),
             last_event: None,
             storage_error: None,
         }
@@ -974,6 +1116,11 @@ mod tests {
                 saved: api_cookie.clone(),
                 requested: api_cookie,
                 persistence,
+            },
+            ntfy_topic: Setting {
+                saved: None,
+                requested: None,
+                persistence: SettingPersistence::Idle,
             },
         })
     }
@@ -1575,6 +1722,88 @@ mod tests {
                 .into_string()
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn notification_states_have_words() -> Result<(), crate::core::InvalidNtfyTopic> {
+        use crate::core::{
+            Condition, Delivery, DeliveryFailure, Notice, Notifications, NtfyTopic, Outcome, Phase,
+            Setting, SettingPersistence, SettingsState,
+        };
+
+        use super::{condition, notifications_panel, topic_status};
+
+        let topic = NtfyTopic::parse("windlass-alerts")?;
+        let with_topic = |saved: Option<NtfyTopic>| {
+            let mut state = settings(None, SettingPersistence::Idle);
+            if let SettingsState::Loaded(settings) = &mut state {
+                settings.ntfy_topic = Setting {
+                    saved: saved.clone(),
+                    requested: saved,
+                    persistence: SettingPersistence::Idle,
+                };
+            }
+            state
+        };
+        let render = |notifications: &Notifications, settings: &SettingsState| {
+            notifications_panel(notifications, settings).into_string()
+        };
+        let mut notifications = Notifications::default();
+        assert!(render(&notifications, &with_topic(None)).contains("No ntfy topic is set"));
+        let configured = with_topic(Some(topic.clone()));
+        assert!(render(&notifications, &configured).contains("None yet"));
+        notifications.delivery = Delivery::Sending(Notice::Test);
+        assert!(render(&notifications, &configured).contains("Sending…"));
+        notifications.delivery = Delivery::Idle;
+        notifications.last_outcome = Some(Outcome {
+            at: SystemTime::UNIX_EPOCH,
+            result: Ok(()),
+        });
+        assert!(render(&notifications, &configured).contains("Working"));
+        notifications.last_outcome = Some(Outcome {
+            at: SystemTime::UNIX_EPOCH,
+            result: Err(DeliveryFailure::Rejected { status: 429 }),
+        });
+        notifications.failures = 2;
+        notifications.dropped = 3;
+        notifications
+            .conditions
+            .insert(Condition::FilesMissing, Phase::Raised);
+        let html = render(&notifications, &configured);
+        for text in [
+            "Delivery failing",
+            "HTTP status 429",
+            "2, retrying",
+            "3 oldest",
+            "Reported and not yet resolved: Files missing on disk",
+        ] {
+            assert!(html.contains(text), "{text}: {html}");
+        }
+        let all = [
+            Condition::VpnProtection,
+            Condition::FailoverBlocked,
+            Condition::ForwardedPort,
+            Condition::QbittorrentReachable,
+            Condition::QbittorrentVersion,
+            Condition::TorrentErrors,
+            Condition::FilesMissing,
+            Condition::TorrentsMissing,
+            Condition::RegistrySave,
+        ];
+        let words: std::collections::BTreeSet<_> = all.into_iter().map(condition).collect();
+        assert_eq!(words.len(), all.len());
+        for (persistence, expected) in [
+            (SettingPersistence::Pending(Some(topic.clone())), "Saving…"),
+            (SettingPersistence::Failed, "Change not saved"),
+        ] {
+            let setting = Setting {
+                saved: None,
+                requested: Some(topic.clone()),
+                persistence,
+            };
+            assert_eq!(topic_status(&setting).0, expected);
+        }
         Ok(())
     }
 }

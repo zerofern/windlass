@@ -58,7 +58,18 @@ impl Harness {
             monotonic: self.start + self.elapsed,
             wall: SystemTime::UNIX_EPOCH + self.elapsed,
         };
-        self.core.handle(now, event)
+        let mut actions = self.core.handle(now, event);
+        // Notification timers have their own tests.
+        actions.retain(|action| {
+            !matches!(
+                action,
+                Action::StartTimer {
+                    name: TimerName::NotificationGrace,
+                    ..
+                }
+            )
+        });
+        actions
     }
 
     /// Deliver the next update; the first is the full list.

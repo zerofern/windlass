@@ -50,6 +50,8 @@ pub enum Event {
     Registry(RegistryEvent),
     /// VPN tunnel commands, checks, and switches.
     Tunnel(TunnelEvent),
+    /// Notification commands and delivery results.
+    Notification(NotificationEvent),
 }
 
 /// An effect requested by the core for the shell to execute.
@@ -145,11 +147,24 @@ pub enum Action {
         /// The server.
         server: VpnServer,
     },
+    /// Persist the ntfy topic, or remove it when absent.
+    WriteNtfyTopic {
+        /// The topic to store, if any.
+        topic: Option<NtfyTopic>,
+    },
+    /// Publish a notice to the ntfy topic.
+    SendNotification {
+        /// The topic.
+        topic: NtfyTopic,
+        /// What to tell the user.
+        notice: Notice,
+    },
 }
 
 mod history;
 mod machine;
 mod mam_pause;
+mod notifications;
 mod port_forwarding;
 mod qbittorrent;
 mod registry;
@@ -164,6 +179,10 @@ pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,
     MamRequestMode, MamRequestsStatus,
 };
+pub use notifications::{
+    Condition, Delivery, DeliveryFailure, Notice, NotificationEvent, Notifications, OUTBOX_LIMIT,
+    Outcome, Phase, SettingName, SwitchBlock,
+};
 pub use port_forwarding::{
     LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, Port, PortForwarding, PortForwardingEvent,
 };
@@ -177,8 +196,8 @@ pub use registry::{
     Registry, RegistryEvent, TorrentRecord,
 };
 pub use settings::{
-    ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, Setting,
-    SettingPersistence, SettingStatus, Settings, SettingsEvent, SettingsState,
+    ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, InvalidNtfyTopic,
+    NtfyTopic, Setting, SettingPersistence, SettingStatus, Settings, SettingsEvent, SettingsState,
 };
 pub use startup::{StartupEvent, StartupMode};
 pub use timer::{Deadline, TimerId, TimerName};

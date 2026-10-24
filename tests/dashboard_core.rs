@@ -51,6 +51,7 @@ fn started(history_limit: Option<HistoryLimit>, api_cookie: Option<ApiCookie>) -
             SettingsEvent::Read {
                 history_limit,
                 api_cookie,
+                ntfy_topic: None,
             },
         )
         .is_empty()
@@ -81,6 +82,11 @@ fn absent_settings_use_defaults_and_mam_requests_start_paused() {
                 requested: None,
                 persistence: SettingPersistence::Idle,
             },
+            ntfy_topic: Setting {
+                saved: None,
+                requested: None,
+                persistence: SettingPersistence::Idle,
+            },
         })
     );
     assert_eq!(HistoryLimit::default().into_inner(), 10_000);
@@ -105,7 +111,8 @@ fn settings_changes_before_loading_or_after_a_failed_read_are_ignored() {
             &mut core,
             SettingsEvent::Read {
                 history_limit: None,
-                api_cookie: None
+                api_cookie: None,
+                ntfy_topic: None
             }
         )
         .is_empty()
@@ -246,7 +253,8 @@ fn one_setting_save_is_outstanding_and_the_latest_request_is_saved_next() {
             &mut core,
             SettingsEvent::Read {
                 history_limit: Some(limit(100)),
-                api_cookie: None
+                api_cookie: None,
+                ntfy_topic: None
             }
         )
         .is_empty()
@@ -382,7 +390,8 @@ fn history_waits_for_settings_before_trimming_and_reports_open_failure() {
             &mut core,
             SettingsEvent::Read {
                 history_limit: None,
-                api_cookie: None
+                api_cookie: None,
+                ntfy_topic: None
             }
         ),
         vec![Action::TrimHistory {

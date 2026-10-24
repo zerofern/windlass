@@ -87,6 +87,13 @@ let
       --nat-pmp-gateway ${cfg.vpn.natPmpGateway} \
       --exit-ip-service ${lib.escapeShellArg cfg.vpn.exitIpService} \
       --vpn-current-file /run/windlass-vpn/current \
+      --ntfy-server ${lib.escapeShellArg cfg.notifications.server} \
+      --ntfy-relay ${cfg.namespace.hostAddress}:${toString cfg.notifications.relayPort} \
+      ${
+        lib.optionalString (
+          cfg.dashboard.url != null
+        ) "--dashboard-url ${lib.escapeShellArg cfg.dashboard.url}"
+      } \
       ${
         lib.concatMapStringsSep " " (server: "--vpn-server ${lib.escapeShellArg server}") (
           lib.attrNames cfg.vpn.servers
@@ -177,6 +184,12 @@ in
         ];
         description = "Host names and addresses browsers use to reach the dashboard.";
       };
+      url = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "http://nuc.example.ts.net:8740/";
+        description = "The dashboard address you open, which notifications link to.";
+      };
     };
 
     vpn = {
@@ -214,6 +227,15 @@ in
     };
 
     notifications = {
+      server = lib.mkOption {
+        type = lib.types.str;
+        default = "https://ntfy.sh/";
+        description = ''
+          The ntfy server notifications are published to. Windlass reaches it
+          through the relay, so `relayTarget` must name the same host. The topic
+          is set on the dashboard's settings page.
+        '';
+      };
       relayPort = lib.mkOption {
         type = lib.types.port;
         default = 8443;

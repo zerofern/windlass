@@ -131,6 +131,21 @@ fn invalid_serve_arguments_are_refused() -> Result<(), Box<dyn Error>> {
             "not/a/unit",
         ],
         vec!["serve", "initialise", database, "--vpn-server", "one"],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--ntfy-server",
+            "not a url",
+        ],
+        vec!["serve", "initialise", database, "--ntfy-relay", "nowhere"],
+        vec![
+            "serve",
+            "initialise",
+            database,
+            "--dashboard-url",
+            "not a url",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_windlass"))
             .args(&arguments)
@@ -163,6 +178,12 @@ fn serve_until_terminated(
             "one",
             "--vpn-server",
             "two",
+            "--ntfy-server",
+            "http://ntfy.invalid/",
+            "--ntfy-relay",
+            "127.0.0.1:9",
+            "--dashboard-url",
+            "http://localhost:8740/",
             "--vpn-current-file",
         ])
         .arg(database.with_extension("current"))

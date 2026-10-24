@@ -30,8 +30,8 @@ use tokio_stream::{Stream, StreamExt, wrappers::WatchStream};
 
 use crate::{
     core::{
-        ApiCookie, Event, HistoryLimit, HistoryState, MamPauseEvent, MamRequestMode, SettingsEvent,
-        StartupEvent, StartupMode, State,
+        ApiCookie, Event, HistoryLimit, HistoryState, MamPauseEvent, MamRequestMode,
+        NotificationEvent, NtfyTopic, SettingsEvent, StartupEvent, StartupMode, State,
     },
     runner::{Observation, Runner},
     shell::{
@@ -60,6 +60,12 @@ pub struct Deployment {
     pub allowed_hosts: Vec<String>,
     /// The `SQLite` database holding Windlass's durable state and history.
     pub database: PathBuf,
+    /// Where notifications are published, such as `https://ntfy.sh/`.
+    pub ntfy_server: String,
+    /// The relay that reaches the ntfy server while the VPN is down, if any.
+    pub ntfy_relay: Option<SocketAddr>,
+    /// The dashboard address notifications link to, if configured.
+    pub dashboard_url: Option<String>,
 }
 
 impl Deployment {
@@ -119,6 +125,9 @@ pub fn router(
         .route("/settings/history-limit", post(set_history_limit))
         .route("/settings/api-cookie", post(set_api_cookie))
         .route("/settings/api-cookie/clear", post(clear_api_cookie))
+        .route("/settings/ntfy-topic", post(set_ntfy_topic))
+        .route("/settings/ntfy-topic/clear", post(clear_ntfy_topic))
+        .route("/notifications/test", post(send_test_notification))
         .route("/static/app.css", get(stylesheet))
         .route("/static/app.js", get(script))
         .route("/favicon.ico", get(StatusCode::NO_CONTENT))
@@ -293,6 +302,39 @@ async fn clear_api_cookie(AppState(app): AppState<App>) -> Response {
     send_setting(&app, SettingsEvent::ClearApiCookie).await
 }
 
+#[derive(Debug, Deserialize)]
+struct TopicForm {
+    topic: String,
+}
+
+async fn set_ntfy_topic(AppState(app): AppState<App>, Form(form): Form<TopicForm>) -> Response {
+    match NtfyTopic::parse(&form.topic) {
+        Ok(topic) => send_setting(&app, SettingsEvent::SetNtfyTopic { topic }).await,
+        Err(error) => rejected(
+            &app,
+            &SettingsForm {
+                ntfy_topic: Some(form.topic),
+                ntfy_topic_error: Some(error.to_string()),
+                ..SettingsForm::default()
+            },
+        ),
+    }
+}
+
+async fn clear_ntfy_topic(AppState(app): AppState<App>) -> Response {
+    send_setting(&app, SettingsEvent::ClearNtfyTopic).await
+}
+
+async fn send_test_notification(AppState(app): AppState<App>) -> Response {
+    match app
+        .send(Event::Notification(NotificationEvent::SendTest))
+        .await
+    {
+        Ok(()) => back(Some(Location::Settings.path())).into_response(),
+        Err(response) => response,
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct HistoryParameters {
     kind: Option<String>,
@@ -402,6 +444,12 @@ pub async fn serve(
             .collect::<Result<_, _>>()?,
         allowed_hosts,
         database: database.clone(),
+        ntfy_server: integrations
+            .ntfy_server
+            .as_ref()
+            .map_or_else(|| String::from(super::notify::NTFY_SH), ToString::to_string),
+        ntfy_relay: integrations.ntfy_relay,
+        dashboard_url: integrations.dashboard_url.as_ref().map(ToString::to_string),
     };
     let enable = integrations.enable_events();
     let (runner, events, observations) = Runner::with_integrations(database, integrations);

@@ -10,17 +10,18 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Typ
 
 use crate::core::{
     ApiCookie, ByteSize, Desired, Event, HistoryLimit, Identity, MamPauseEvent, MamRequestMode,
-    MamTorrentId, Observation, Origin, Progress, Ratio, RecordId, RegistryEvent, SettingsEvent,
-    StartupEvent, StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState, TunnelEvent,
-    VpnServer, VpnSwitch,
+    MamTorrentId, NtfyTopic, Observation, Origin, Progress, Ratio, RecordId, RegistryEvent,
+    SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState,
+    TunnelEvent, VpnServer, VpnSwitch,
 };
 
 use super::qbittorrent::torrent_state;
 
 /// The schema version written by this build. Version 1 held only the MAM
 /// preference; version 2 added settings and history; version 3 marks routine
-/// history entries; version 4 adds the torrent registry and VPN state.
-const SCHEMA_VERSION: i64 = 4;
+/// history entries; version 4 adds the torrent registry and VPN state; version 5
+/// adds the ntfy topic.
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &str = "CREATE TABLE mam_configuration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -77,6 +78,11 @@ CREATE TABLE vpn_state (
     last_switch_at INTEGER NOT NULL
 );";
 
+const SCHEMA_V5: &str = "ALTER TABLE settings ADD COLUMN ntfy_topic TEXT;";
+
+/// The changes from each version to the next, starting from version 1.
+const UPGRADES: [&str; 4] = [SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+
 type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug)]
@@ -95,6 +101,7 @@ pub(super) enum Operation {
     ReadSettings,
     WriteHistoryLimit(HistoryLimit),
     WriteApiCookie(Option<ApiCookie>),
+    WriteNtfyTopic(Option<NtfyTopic>),
     ReadTorrentRegistry,
     SaveTorrents(Vec<TorrentRecord>),
     ReadLastVpnSwitch,
@@ -126,6 +133,10 @@ pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, Failed
         Operation::WriteApiCookie(cookie) => (
             write_api_cookie(path, cookie.as_ref()),
             Event::Settings(SettingsEvent::ApiCookieWriteFailed),
+        ),
+        Operation::WriteNtfyTopic(topic) => (
+            write_ntfy_topic(path, topic.as_ref()),
+            Event::Settings(SettingsEvent::NtfyTopicWriteFailed),
         ),
         Operation::ReadTorrentRegistry => (
             read_registry(path),
@@ -164,8 +175,9 @@ fn open(path: &Path, mode: StartupMode) -> StorageResult<Event> {
             OpenOptions::new().write(true).create_new(true).open(path)?;
             let connection = connection(path)?;
             connection.pragma_update(None, "journal_mode", "WAL")?;
+            let schema = UPGRADES.join(" ");
             connection.execute_batch(&format!(
-                "BEGIN; {SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} {SCHEMA_V4} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                "BEGIN; {SCHEMA_V1} {schema} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
             ))?;
         }
         StartupMode::Resume => {
@@ -173,21 +185,18 @@ fn open(path: &Path, mode: StartupMode) -> StorageResult<Event> {
             connection.prepare("SELECT request_mode FROM mam_configuration LIMIT 0")?;
             let version: i64 =
                 connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            let upgrade = match version {
-                0 | 1 => {
-                    connection.pragma_update(None, "journal_mode", "WAL")?;
-                    Some(format!("{SCHEMA_V2} {SCHEMA_V3} {SCHEMA_V4}"))
-                }
-                2 => Some(format!("{SCHEMA_V3} {SCHEMA_V4}")),
-                3 => Some(String::from(SCHEMA_V4)),
-                SCHEMA_VERSION => None,
-                _ => return Err(invalid_data("storage was written by a newer Windlass").into()),
-            };
-            if let Some(upgrade) = upgrade {
-                connection.execute_batch(&format!(
-                    "BEGIN; {upgrade} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
-                ))?;
+            if version > SCHEMA_VERSION {
+                return Err(invalid_data("storage was written by a newer Windlass").into());
             }
+            if version <= 1 {
+                connection.pragma_update(None, "journal_mode", "WAL")?;
+            }
+            // Version 0 is version 1 written before versions were recorded.
+            let applied = usize::try_from(version.max(1) - 1).unwrap_or_default();
+            let upgrade = UPGRADES.get(applied..).unwrap_or_default().join(" ");
+            connection.execute_batch(&format!(
+                "BEGIN; {upgrade} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+            ))?;
         }
     }
     Ok(Event::Startup(StartupEvent::StorageOpened))
@@ -240,14 +249,15 @@ fn invalid_data(detail: &'static str) -> io::Error {
 }
 
 fn read_settings(path: &Path) -> StorageResult<Event> {
-    let stored: Option<(Option<i64>, Option<String>)> = connection(path)?
+    type Stored = (Option<i64>, Option<String>, Option<String>);
+    let stored: Option<Stored> = connection(path)?
         .query_row(
-            "SELECT history_limit, api_cookie FROM settings WHERE singleton = 1",
+            "SELECT history_limit, api_cookie, ntfy_topic FROM settings WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let (limit, cookie) = stored.unwrap_or_default();
+    let (limit, cookie, topic) = stored.unwrap_or_default();
     let history_limit = limit
         .map(|limit| {
             u32::try_from(limit)
@@ -259,10 +269,23 @@ fn read_settings(path: &Path) -> StorageResult<Event> {
     let api_cookie = cookie
         .map(|cookie| ApiCookie::parse(&cookie).map_err(|_| invalid_data("invalid API cookie")))
         .transpose()?;
+    let ntfy_topic = topic
+        .map(|topic| NtfyTopic::parse(&topic).map_err(|_| invalid_data("invalid ntfy topic")))
+        .transpose()?;
     Ok(Event::Settings(SettingsEvent::Read {
         history_limit,
         api_cookie,
+        ntfy_topic,
     }))
+}
+
+fn write_ntfy_topic(path: &Path, topic: Option<&NtfyTopic>) -> StorageResult<Event> {
+    connection(path)?.execute(
+        "INSERT INTO settings(singleton, ntfy_topic) VALUES (1, ?1)
+         ON CONFLICT(singleton) DO UPDATE SET ntfy_topic = excluded.ntfy_topic",
+        [topic.map(NtfyTopic::expose_secret)],
+    )?;
+    Ok(Event::Settings(SettingsEvent::NtfyTopicWritten))
 }
 
 fn write_history_limit(path: &Path, limit: HistoryLimit) -> StorageResult<Event> {
@@ -746,6 +769,12 @@ mod tests {
                 })
             );
         }
+        let topic = "INSERT INTO settings(singleton, ntfy_topic) VALUES (1, 'not a topic')";
+        storage.connection.execute_batch(topic)?;
+        assert_eq!(
+            outcome(path, Operation::ReadSettings),
+            Event::Settings(crate::core::SettingsEvent::ReadFailed)
+        );
         for corruption in [
             "last_switch_server = 'a b'",
             "last_switch_server = x'00'",
@@ -775,6 +804,7 @@ mod tests {
         let storage = storage()?;
         let path = &storage.path;
         let cookie = ApiCookie::parse("cookie").ok();
+        let topic = crate::core::NtfyTopic::parse("alerts").ok();
         for (operation, expected) in [
             (
                 Operation::OpenStorage(StartupMode::Resume),
@@ -803,10 +833,15 @@ mod tests {
                 Event::Settings(SettingsEvent::ApiCookieWritten),
             ),
             (
+                Operation::WriteNtfyTopic(topic.clone()),
+                Event::Settings(SettingsEvent::NtfyTopicWritten),
+            ),
+            (
                 Operation::ReadSettings,
                 Event::Settings(SettingsEvent::Read {
                     history_limit: Some(HistoryLimit::default()),
                     api_cookie: cookie,
+                    ntfy_topic: topic,
                 }),
             ),
             (

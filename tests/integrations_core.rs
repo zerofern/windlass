@@ -29,12 +29,24 @@ impl Harness {
         self.elapsed += by;
     }
 
+    /// Handle an event; notification timers are left out, as notifications
+    /// have their own tests.
     fn send(&mut self, event: Event) -> Vec<Action> {
         let now = ClockReading {
             monotonic: self.start + self.elapsed,
             wall: SystemTime::UNIX_EPOCH + self.elapsed,
         };
-        self.core.handle(now, event)
+        let mut actions = self.core.handle(now, event);
+        actions.retain(|action| {
+            !matches!(
+                action,
+                Action::StartTimer {
+                    name: TimerName::NotificationGrace,
+                    ..
+                }
+            )
+        });
+        actions
     }
 
     fn forwarding(&mut self, event: PortForwardingEvent) -> Vec<Action> {

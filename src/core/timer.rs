@@ -11,6 +11,10 @@ pub enum TimerName {
     PortLease,
     /// Check the VPN tunnel again.
     TunnelCheck,
+    /// A lasting condition's grace period ends.
+    NotificationGrace,
+    /// Send a notice whose delivery failed again.
+    NotificationRetry,
 }
 
 /// One scheduled instance of a timer. Replacing a timer gives it a new

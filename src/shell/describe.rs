@@ -5,13 +5,14 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
-    Action, Event, ExitIpFailure, HistoryEvent, MamPauseEvent, MamRequestMode, MappingFailure,
-    PortForwardingEvent, QbittorrentEvent, QbittorrentFailure, RegistryEvent, SettingsEvent,
-    StartupEvent, StartupMode, TimerName, TorrentCommand, TunnelEvent,
+    Action, DeliveryFailure, Event, ExitIpFailure, HistoryEvent, MamPauseEvent, MamRequestMode,
+    MappingFailure, NotificationEvent, PortForwardingEvent, QbittorrentEvent, QbittorrentFailure,
+    RegistryEvent, SettingsEvent, StartupEvent, StartupMode, TimerName, TorrentCommand,
+    TunnelEvent,
 };
 
 /// History categories, used for filtering.
-pub(super) const CATEGORIES: [(&str, &str); 7] = [
+pub(super) const CATEGORIES: [(&str, &str); 8] = [
     ("startup", "Startup"),
     ("mam", "MAM requests"),
     ("settings", "Settings"),
@@ -19,6 +20,7 @@ pub(super) const CATEGORIES: [(&str, &str); 7] = [
     ("vpn", "VPN"),
     ("qbittorrent", "qBittorrent"),
     ("torrents", "Torrent registry"),
+    ("notifications", "Notifications"),
 ];
 
 pub(super) const fn category(event: &Event) -> &'static str {
@@ -39,6 +41,11 @@ pub(super) const fn category(event: &Event) -> &'static str {
             ..
         } => "qbittorrent",
         Event::Registry(_) => "torrents",
+        Event::Notification(_)
+        | Event::TimerExpired {
+            name: TimerName::NotificationGrace | TimerName::NotificationRetry,
+            ..
+        } => "notifications",
     }
 }
 
@@ -62,6 +69,8 @@ const fn timer(name: TimerName) -> &'static str {
         TimerName::QbittorrentPoll => "qBittorrent poll",
         TimerName::PortLease => "forwarded-port lease",
         TimerName::TunnelCheck => "tunnel check",
+        TimerName::NotificationGrace => "notification grace period",
+        TimerName::NotificationRetry => "notification retry",
     }
 }
 
@@ -126,6 +135,26 @@ pub(super) fn event(event: &Event) -> String {
         Event::Qbittorrent(event) => qbittorrent(event),
         Event::Registry(event) => registry(event),
         Event::Tunnel(event) => tunnel(event),
+        Event::Notification(event) => notification(event),
+    }
+}
+
+fn notification(event: &NotificationEvent) -> String {
+    match event {
+        NotificationEvent::SendTest => String::from("Test notification requested"),
+        NotificationEvent::Delivered => String::from("Notification delivered"),
+        NotificationEvent::DeliveryFailed { reason } => {
+            format!("Notification not delivered: {}", delivery_failure(*reason))
+        }
+    }
+}
+
+pub(super) fn delivery_failure(reason: DeliveryFailure) -> String {
+    match reason {
+        DeliveryFailure::Unreachable => String::from("ntfy did not answer"),
+        DeliveryFailure::Rejected { status } => {
+            format!("ntfy answered with HTTP status {status}")
+        }
     }
 }
 
@@ -284,15 +313,16 @@ fn settings(event: &SettingsEvent) -> String {
         SettingsEvent::Read {
             history_limit,
             api_cookie,
-        } => format!(
-            "Settings read: history limit {}, API cookie {}",
-            history_limit.unwrap_or_default(),
-            if api_cookie.is_some() {
-                "configured"
-            } else {
-                "not configured"
-            }
-        ),
+            ntfy_topic,
+        } => {
+            let configured = |set: bool| if set { "configured" } else { "not configured" };
+            format!(
+                "Settings read: history limit {}, API cookie {}, notification topic {}",
+                history_limit.unwrap_or_default(),
+                configured(api_cookie.is_some()),
+                configured(ntfy_topic.is_some())
+            )
+        }
         SettingsEvent::ReadFailed => String::from("Settings could not be read"),
         SettingsEvent::SetHistoryLimit { limit } => {
             format!("History limit change to {limit} entries requested")
@@ -305,6 +335,14 @@ fn settings(event: &SettingsEvent) -> String {
         SettingsEvent::ClearApiCookie => String::from("API cookie removal requested"),
         SettingsEvent::ApiCookieWritten => String::from("API cookie change saved"),
         SettingsEvent::ApiCookieWriteFailed => String::from("API cookie change could not be saved"),
+        SettingsEvent::SetNtfyTopic { .. } => {
+            String::from("Notification topic replaced from the dashboard (value not recorded)")
+        }
+        SettingsEvent::ClearNtfyTopic => String::from("Notification topic removal requested"),
+        SettingsEvent::NtfyTopicWritten => String::from("Notification topic change saved"),
+        SettingsEvent::NtfyTopicWriteFailed => {
+            String::from("Notification topic change could not be saved")
+        }
     }
 }
 
@@ -372,6 +410,13 @@ pub(super) fn action(action: &Action) -> String {
             format!("Record a switch to VPN server {}", switch.server)
         }
         Action::SwitchVpnServer { server } => format!("Switch to VPN server {server}"),
+        Action::WriteNtfyTopic { topic: Some(_) } => {
+            String::from("Save notification topic (value not recorded)")
+        }
+        Action::WriteNtfyTopic { topic: None } => String::from("Remove the notification topic"),
+        Action::SendNotification { notice, .. } => {
+            format!("Notify: {}", super::notify::message(notice).title)
+        }
     }
 }
 
@@ -413,6 +458,7 @@ mod tests {
             Event::Settings(SettingsEvent::Read {
                 history_limit: Some(limit),
                 api_cookie: cookie.clone(),
+                ntfy_topic: None,
             }),
             Event::Settings(SettingsEvent::ReadFailed),
             Event::Settings(SettingsEvent::HistoryLimitWritten),
@@ -667,7 +713,17 @@ mod tests {
                 },
             },
             Action::SwitchVpnServer { server },
+            Action::WriteNtfyTopic {
+                topic: crate::core::NtfyTopic::parse("alerts").ok(),
+            },
+            Action::WriteNtfyTopic { topic: None },
         ];
+        actions.extend(crate::core::NtfyTopic::parse("alerts").map(|topic| {
+            Action::SendNotification {
+                topic,
+                notice: crate::core::Notice::Test,
+            }
+        }));
         actions.extend(timer_actions());
         for described in &actions {
             assert!(!action(described).is_empty(), "{described:?}");
@@ -744,6 +800,55 @@ mod tests {
             entries.iter().map(|entry| event(&entry.0)).collect();
         assert_eq!(unique.len(), entries.len(), "descriptions are distinct");
         Ok(())
+    }
+
+    #[test]
+    fn notification_events_are_described_and_classified() {
+        use crate::core::{DeliveryFailure, NotificationEvent, NtfyTopic, TimerId, TimerName};
+
+        let entries: Vec<(Event, &str, bool)> = [
+            NotificationEvent::SendTest,
+            NotificationEvent::Delivered,
+            NotificationEvent::DeliveryFailed {
+                reason: DeliveryFailure::Unreachable,
+            },
+            NotificationEvent::DeliveryFailed {
+                reason: DeliveryFailure::Rejected { status: 429 },
+            },
+        ]
+        .into_iter()
+        .map(|event| (Event::Notification(event), "notifications", false))
+        .chain(
+            [
+                SettingsEvent::ClearNtfyTopic,
+                SettingsEvent::NtfyTopicWritten,
+                SettingsEvent::NtfyTopicWriteFailed,
+            ]
+            .into_iter()
+            .chain(NtfyTopic::parse("alerts").map(|topic| SettingsEvent::SetNtfyTopic { topic }))
+            .map(|event| (Event::Settings(event), "settings", false)),
+        )
+        .collect();
+        check(&entries);
+        let secret = Event::Settings(SettingsEvent::Read {
+            history_limit: None,
+            api_cookie: None,
+            ntfy_topic: NtfyTopic::parse("alerts").ok(),
+        });
+        assert!(event(&secret).contains("notification topic configured"));
+        let id = timer_actions().into_iter().find_map(|action| match action {
+            Action::StartTimer { id, .. } => Some(id),
+            _ => None,
+        });
+        let timers: Vec<(Event, &str, bool)> = id
+            .into_iter()
+            .flat_map(|id: TimerId| {
+                [TimerName::NotificationGrace, TimerName::NotificationRetry]
+                    .map(|name| (Event::TimerExpired { name, id }, "notifications", true))
+            })
+            .collect();
+        assert_eq!(timers.len(), 2);
+        check(&timers);
     }
 
     #[test]

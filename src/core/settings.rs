@@ -128,6 +128,78 @@ impl Serialize for ApiCookie {
     }
 }
 
+/// The ntfy topic notifications are published to. Anyone who knows it can read
+/// them, so it is recorded only as `[redacted]`.
+#[derive(Clone)]
+pub struct NtfyTopic(SecretString);
+
+/// Why a submitted ntfy topic was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidNtfyTopic {
+    /// Nothing was submitted.
+    Empty,
+    /// The topic is longer than 64 characters or uses characters ntfy refuses.
+    Invalid,
+}
+
+impl fmt::Display for InvalidNtfyTopic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "Enter a topic name.",
+            Self::Invalid => "Use up to 64 letters, digits, hyphens, and underscores.",
+        })
+    }
+}
+
+impl Error for InvalidNtfyTopic {}
+
+impl NtfyTopic {
+    /// Validate a topic name, ignoring surrounding whitespace.
+    ///
+    /// # Errors
+    /// Returns why the value cannot be an ntfy topic.
+    pub fn parse(value: &str) -> Result<Self, InvalidNtfyTopic> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(InvalidNtfyTopic::Empty);
+        }
+        if value.len() > 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(InvalidNtfyTopic::Invalid);
+        }
+        Ok(Self(SecretString::from(value)))
+    }
+
+    /// The topic, for the shell to store or publish to.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for NtfyTopic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NtfyTopic([redacted])")
+    }
+}
+
+impl PartialEq for NtfyTopic {
+    fn eq(&self, other: &Self) -> bool {
+        self.expose_secret() == other.expose_secret()
+    }
+}
+
+impl Eq for NtfyTopic {}
+
+impl Serialize for NtfyTopic {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("[redacted]")
+    }
+}
+
 /// Whether a setting's latest requested value is durably saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingStatus {
@@ -224,6 +296,8 @@ pub struct Settings {
     pub history_limit: Setting<HistoryLimit>,
     /// The MAM API cookie, if one is configured.
     pub api_cookie: Setting<Option<ApiCookie>>,
+    /// The ntfy topic for notifications, if one is configured.
+    pub ntfy_topic: Setting<Option<NtfyTopic>>,
 }
 
 impl Settings {
@@ -285,6 +359,8 @@ pub enum SettingsEvent {
         history_limit: Option<HistoryLimit>,
         /// The saved API cookie, if any.
         api_cookie: Option<ApiCookie>,
+        /// The saved ntfy topic, if any.
+        ntfy_topic: Option<NtfyTopic>,
     },
     /// Saved settings could not be read.
     ReadFailed,
@@ -308,21 +384,35 @@ pub enum SettingsEvent {
     ApiCookieWritten,
     /// Saving the API cookie change failed.
     ApiCookieWriteFailed,
+    /// The user set the ntfy topic.
+    SetNtfyTopic {
+        /// The topic.
+        topic: NtfyTopic,
+    },
+    /// The user removed the ntfy topic, stopping notifications.
+    ClearNtfyTopic,
+    /// The ntfy topic change was saved.
+    NtfyTopicWritten,
+    /// Saving the ntfy topic change failed.
+    NtfyTopicWriteFailed,
 }
 
 pub(super) fn handle(state: &mut SettingsState, event: SettingsEvent) -> Vec<Action> {
     let write_limit = |limit| Action::WriteHistoryLimit { limit };
     let write_cookie = |cookie| Action::WriteApiCookie { cookie };
+    let write_topic = |topic| Action::WriteNtfyTopic { topic };
     match event {
         SettingsEvent::Read {
             history_limit,
             api_cookie,
+            ntfy_topic,
         } => {
             if matches!(state, SettingsState::Reading) {
                 let limit = history_limit.unwrap_or_default();
                 *state = SettingsState::Loaded(Settings {
                     history_limit: Setting::loaded(limit, limit),
                     api_cookie: Setting::loaded(api_cookie.clone(), api_cookie),
+                    ntfy_topic: Setting::loaded(ntfy_topic.clone(), ntfy_topic),
                 });
             }
             Vec::new()
@@ -353,6 +443,18 @@ pub(super) fn handle(state: &mut SettingsState, event: SettingsEvent) -> Vec<Act
         }),
         SettingsEvent::ApiCookieWriteFailed => change(state, |settings| {
             settings.api_cookie.complete(false).map(write_cookie)
+        }),
+        SettingsEvent::SetNtfyTopic { topic } => change(state, |settings| {
+            settings.ntfy_topic.request(Some(topic)).map(write_topic)
+        }),
+        SettingsEvent::ClearNtfyTopic => change(state, |settings| {
+            settings.ntfy_topic.request(None).map(write_topic)
+        }),
+        SettingsEvent::NtfyTopicWritten => change(state, |settings| {
+            settings.ntfy_topic.complete(true).map(write_topic)
+        }),
+        SettingsEvent::NtfyTopicWriteFailed => change(state, |settings| {
+            settings.ntfy_topic.complete(false).map(write_topic)
         }),
     }
 }

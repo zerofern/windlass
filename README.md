@@ -33,7 +33,9 @@ qBittorrent web UI, and `--nat-pmp-gateway 10.2.0.1` to keep a ProtonVPN forward
 port and make qBittorrent listen on it. Add `--exit-ip-service <url>` to check that
 the VPN carries traffic, with `--vpn-server <name>` for each server Windlass may
 fail over to and `--vpn-current-file <path>` naming the one connected now. Use
-`resume` instead of `initialise` to restart an
+`--ntfy-server <url>`, `--ntfy-relay <address>`, and `--dashboard-url <url>` set
+where notifications go, the relay that reaches it, and the dashboard link they carry.
+Use `resume` instead of `initialise` to restart an
 existing instance. Repeat `--listen` for each LAN or Tailscale address, and add
 `--allowed-host <name>` for host names such as a Tailscale name. Requests naming
 any other host are refused, as are form submissions from other websites. Windlass
@@ -58,8 +60,19 @@ times; it works without the script, without live updates. It shows:
   state, progress, size, upload, and completion, marking torrents missing from
   qBittorrent and content missing on disk. Windlass adopts torrents it finds,
   starts stopped ones, selects every file, and removes those marked removed.
-- **Settings:** the MAM API cookie and the history size limit, each
-  confirmed only once saved, plus the read-only deployment settings.
+- **Notifications:** whether the last delivery succeeded, notices waiting, and
+  problems reported but not yet resolved.
+- **Settings:** the MAM API cookie, the ntfy topic with a test button, and the
+  history size limit, each confirmed only once saved, plus the read-only
+  deployment settings.
+
+Windlass sends notifications to an ntfy topic set on the settings page: when it
+starts, when VPN protection is lost or restored, when it switches servers or cannot,
+when qBittorrent stops responding or runs a version MAM does not allow, when
+torrents have errors, missing files, or are missing from qBittorrent, and when
+storage fails. Lasting problems notify only after a grace period, from immediately
+to 10 minutes, and again when they clear. Each notification links to the dashboard
+page that explains it and never names books.
 
 History lives in the same SQLite file. The core counts entries and asks the shell to
 remove the oldest when the limit (10000 by default) is exceeded. Entries that could
@@ -90,6 +103,7 @@ ProtonVPN WireGuard tunnel ([ADR-0003](.workflow/decisions/adr/0003-vpn-namespac
             vpn.defaultServer = "nl-1";
             dashboard.interfaces = [ "enp3s0" "tailscale0" ];
             dashboard.allowedHosts = [ "192.168.1.20" "nuc.example.ts.net" ];
+            dashboard.url = "http://nuc.example.ts.net:8740/";
           };
         }
       ];

@@ -1,0 +1,724 @@
+//! Decide what the user is told through ntfy, and when.
+//!
+//! Lasting conditions notify once they have held for their grace period and
+//! again when they clear. One-off events notify as they happen. Notices wait in
+//! a bounded outbox and are delivered one at a time, with retries.
+
+use std::{
+    collections::{BTreeMap, VecDeque},
+    net::IpAddr,
+    time::{Duration, Instant, SystemTime},
+};
+
+use serde::Serialize;
+
+use super::{
+    Action, ClockReading, Desired, EntryCount, Failover, Port, PortForwarding, Protection,
+    Qbittorrent, QbittorrentFailure, Registry, SettingsState, StartupMode, SwitchAllowance,
+    TimerId, TimerName, TorrentState, Tunnel, VpnServer, timer::Timers,
+};
+
+/// How many notices wait for delivery before the oldest are dropped.
+pub const OUTBOX_LIMIT: usize = 50;
+/// The first retry delay after a failed delivery; it doubles up to the maximum.
+const RETRY_FIRST: Duration = Duration::from_secs(30);
+/// The longest retry delay.
+const RETRY_MAX: Duration = Duration::from_mins(10);
+
+/// A setting the user changed that may fail to save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SettingName {
+    /// Whether Windlass's MAM requests are paused.
+    MamRequests,
+    /// The history size limit.
+    HistoryLimit,
+    /// The MAM API cookie.
+    ApiCookie,
+    /// The ntfy topic.
+    NtfyTopic,
+}
+
+/// Why an automatic VPN server switch cannot start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SwitchBlock {
+    /// MAM allows one IP change an hour; the next is allowed at this time.
+    Until(SystemTime),
+    /// The last switch could not be read.
+    LastSwitchUnknown,
+    /// No other server is configured.
+    NoOtherServer,
+}
+
+/// Something the user is told. Notices name conditions and counts, never book
+/// titles or account details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum Notice {
+    /// Windlass started.
+    Started {
+        /// Whether storage was created or resumed.
+        mode: StartupMode,
+    },
+    /// Startup failed; Windlass does nothing until restarted.
+    StartupFailed,
+    /// Tunnel checks keep failing.
+    VpnProtectionLost {
+        /// Consecutive failed checks.
+        failures: u32,
+    },
+    /// A tunnel check succeeded again.
+    VpnProtectionRestored {
+        /// The tunnel's public address.
+        exit_ip: IpAddr,
+        /// The connected server, if known.
+        server: Option<VpnServer>,
+    },
+    /// Windlass started switching to another server.
+    FailoverStarted {
+        /// The server switched to.
+        server: VpnServer,
+    },
+    /// The switch completed.
+    FailoverSucceeded {
+        /// The server now connected.
+        server: VpnServer,
+    },
+    /// The switch failed.
+    FailoverFailed {
+        /// The server Windlass tried to switch to.
+        server: VpnServer,
+    },
+    /// A switch is needed but cannot start.
+    FailoverBlocked {
+        /// Why not.
+        reason: SwitchBlock,
+    },
+    /// No forwarded port, so peers cannot connect in.
+    ForwardedPortLost,
+    /// A forwarded port was granted again.
+    ForwardedPortRestored {
+        /// The port.
+        port: Port,
+    },
+    /// qBittorrent does not answer.
+    QbittorrentUnreachable {
+        /// Why the last request failed.
+        reason: QbittorrentFailure,
+    },
+    /// qBittorrent answers again.
+    QbittorrentReachable,
+    /// MAM does not allow the running qBittorrent version.
+    QbittorrentVersionNotAllowed {
+        /// The version.
+        version: String,
+    },
+    /// The running qBittorrent version is allowed again.
+    QbittorrentVersionAllowed {
+        /// The version.
+        version: String,
+    },
+    /// qBittorrent reports errors for some torrents.
+    TorrentErrors {
+        /// How many torrents.
+        count: usize,
+    },
+    /// No torrent reports an error.
+    TorrentErrorsCleared,
+    /// Some torrents' files are missing on disk.
+    FilesMissing {
+        /// How many torrents.
+        count: usize,
+    },
+    /// No torrent's files are missing.
+    FilesMissingCleared,
+    /// Some torrents Windlass wants are missing from qBittorrent.
+    TorrentsMissing {
+        /// How many torrents.
+        count: usize,
+    },
+    /// Every torrent Windlass wants is in qBittorrent.
+    TorrentsMissingCleared,
+    /// The torrent registry keeps failing to save.
+    RegistryNotSaved,
+    /// The torrent registry saved again.
+    RegistrySaved,
+    /// The torrent registry could not be read, so torrents are not managed.
+    RegistryUnreadable,
+    /// A setting the user changed could not be saved.
+    SettingNotSaved {
+        /// Which setting.
+        setting: SettingName,
+    },
+    /// History storage could not be opened.
+    HistoryUnavailable,
+    /// History entries could not be saved.
+    HistoryEntriesLost {
+        /// How many.
+        count: EntryCount,
+    },
+    /// The user asked for a test notification.
+    Test,
+}
+
+/// Why a delivery failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DeliveryFailure {
+    /// No connection, or no answer in time.
+    Unreachable,
+    /// ntfy answered with an unexpected HTTP status.
+    Rejected {
+        /// The HTTP status code.
+        status: u16,
+    },
+}
+
+/// A notification command or a delivery result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum NotificationEvent {
+    /// The user asked for a test notification.
+    SendTest,
+    /// ntfy accepted the notice being sent.
+    Delivered,
+    /// Sending the notice failed.
+    DeliveryFailed {
+        /// Why.
+        reason: DeliveryFailure,
+    },
+}
+
+/// A lasting condition worth telling the user about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum Condition {
+    /// Tunnel checks keep failing.
+    VpnProtection,
+    /// A needed server switch cannot start.
+    FailoverBlocked,
+    /// No forwarded port.
+    ForwardedPort,
+    /// qBittorrent does not answer.
+    QbittorrentReachable,
+    /// MAM does not allow the qBittorrent version.
+    QbittorrentVersion,
+    /// Torrents in an error state.
+    TorrentErrors,
+    /// Torrents whose files are missing.
+    FilesMissing,
+    /// Wanted torrents missing from qBittorrent.
+    TorrentsMissing,
+    /// The registry keeps failing to save.
+    RegistrySave,
+}
+
+impl Condition {
+    /// How long the condition must hold before the user is told.
+    #[must_use]
+    pub const fn grace(self) -> Duration {
+        match self {
+            Self::VpnProtection | Self::FailoverBlocked | Self::QbittorrentVersion => {
+                Duration::ZERO
+            }
+            Self::RegistrySave => Duration::from_mins(2),
+            Self::ForwardedPort | Self::QbittorrentReachable | Self::TorrentErrors => {
+                Duration::from_mins(5)
+            }
+            Self::FilesMissing | Self::TorrentsMissing => Duration::from_mins(10),
+        }
+    }
+}
+
+/// A condition's state in this step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Status {
+    /// It holds; this notice describes it.
+    Active(Notice),
+    /// It does not hold; tell the user with this notice if they were told it did.
+    Clear(Option<Notice>),
+    /// Nothing new is known.
+    Unchanged,
+}
+
+/// How far a condition has progressed toward notifying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Holding, but within its grace period.
+    Pending {
+        /// When it started holding.
+        since: Instant,
+    },
+    /// The user was told.
+    Raised,
+}
+
+/// The notice being delivered, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Delivery {
+    /// Nothing is being sent.
+    #[default]
+    Idle,
+    /// The shell is sending this notice.
+    Sending(Notice),
+    /// Sending failed; it is sent again when the timer expires.
+    Retrying {
+        /// The notice.
+        notice: Notice,
+        /// The retry timer.
+        timer: TimerId,
+    },
+}
+
+/// The result of the latest delivery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outcome {
+    /// When it finished.
+    pub at: SystemTime,
+    /// Whether ntfy accepted it, or why not.
+    pub result: Result<(), DeliveryFailure>,
+}
+
+/// What the core is telling the user, and how delivery is going.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Notifications {
+    /// Conditions holding now, by how far they have progressed.
+    pub conditions: BTreeMap<Condition, Phase>,
+    /// Notices waiting to be sent, oldest first.
+    pub outbox: VecDeque<Notice>,
+    /// The notice being sent.
+    pub delivery: Delivery,
+    /// The latest delivery result.
+    pub last_outcome: Option<Outcome>,
+    /// Notices dropped because the outbox was full.
+    pub dropped: u64,
+    /// Deliveries that failed since the last success.
+    pub failures: u32,
+    grace_timer: Option<(TimerId, Instant)>,
+    mode: Option<StartupMode>,
+}
+
+/// The parts of core state that one-off notices compare across a step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Glance {
+    pub(super) failover: Option<Failover>,
+    pub(super) current: Option<VpnServer>,
+    pub(super) failed: bool,
+    pub(super) ready: bool,
+}
+
+impl Glance {
+    pub(super) fn of(tunnel: &Tunnel, failed: bool, ready: bool) -> Self {
+        Self {
+            failover: tunnel
+                .watch
+                .as_ref()
+                .and_then(|watch| watch.failover.clone()),
+            current: tunnel.current().cloned(),
+            failed,
+            ready,
+        }
+    }
+}
+
+/// The core state that lasting conditions are read from.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Facts<'a> {
+    pub(super) tunnel: &'a Tunnel,
+    pub(super) port_forwarding: &'a PortForwarding,
+    pub(super) qbittorrent: &'a Qbittorrent,
+    pub(super) registry: &'a Registry,
+}
+
+impl Notifications {
+    pub(super) const fn new() -> Self {
+        Self {
+            conditions: BTreeMap::new(),
+            outbox: VecDeque::new(),
+            delivery: Delivery::Idle,
+            last_outcome: None,
+            dropped: 0,
+            failures: 0,
+            grace_timer: None,
+            mode: None,
+        }
+    }
+
+    /// Notices for what an event reports, taken before it is handled.
+    pub(super) fn reported(&mut self, event: &super::Event) -> Vec<Notice> {
+        use super::{
+            Event, HistoryEvent, MamPauseEvent, RegistryEvent, SettingsEvent, StartupEvent,
+        };
+
+        let notice = match event {
+            Event::Startup(StartupEvent::Start { mode }) => {
+                self.mode = Some(*mode);
+                None
+            }
+            Event::MamPause(MamPauseEvent::WriteFailed | MamPauseEvent::DeleteFailed) => {
+                Some(Notice::SettingNotSaved {
+                    setting: SettingName::MamRequests,
+                })
+            }
+            Event::Settings(SettingsEvent::HistoryLimitWriteFailed) => {
+                Some(Notice::SettingNotSaved {
+                    setting: SettingName::HistoryLimit,
+                })
+            }
+            Event::Settings(SettingsEvent::ApiCookieWriteFailed) => Some(Notice::SettingNotSaved {
+                setting: SettingName::ApiCookie,
+            }),
+            Event::Settings(SettingsEvent::NtfyTopicWriteFailed) => Some(Notice::SettingNotSaved {
+                setting: SettingName::NtfyTopic,
+            }),
+            Event::History(HistoryEvent::OpenFailed) => Some(Notice::HistoryUnavailable),
+            Event::History(HistoryEvent::EntriesLost { count, .. }) => {
+                Some(Notice::HistoryEntriesLost { count: *count })
+            }
+            Event::Registry(RegistryEvent::ReadFailed) => Some(Notice::RegistryUnreadable),
+            Event::Notification(NotificationEvent::SendTest) => Some(Notice::Test),
+            _ => None,
+        };
+        notice.into_iter().collect()
+    }
+
+    /// Notices for what changed in this step.
+    pub(super) fn changed(&self, before: &Glance, after: &Glance) -> Vec<Notice> {
+        let mut notices = Vec::new();
+        if after.ready
+            && !before.ready
+            && let Some(mode) = self.mode
+        {
+            notices.push(Notice::Started { mode });
+        }
+        if after.failed && !before.failed {
+            notices.push(Notice::StartupFailed);
+        }
+        if let (None, Some(Failover::Saving(switch))) = (&before.failover, &after.failover) {
+            notices.push(Notice::FailoverStarted {
+                server: switch.server.clone(),
+            });
+        }
+        let ended = match (&before.failover, &after.failover) {
+            (Some(Failover::Saving(switch)), None) => Some(&switch.server),
+            (Some(Failover::Switching(server)), None) => Some(server),
+            _ => None,
+        };
+        if let Some(server) = ended {
+            let server = server.clone();
+            notices.push(if after.current.as_ref() == Some(&server) {
+                Notice::FailoverSucceeded { server }
+            } else {
+                Notice::FailoverFailed { server }
+            });
+        }
+        notices
+    }
+
+    /// Track lasting conditions, queue notices, and start the next delivery.
+    pub(super) fn after_step(
+        &mut self,
+        now: ClockReading,
+        happened: Vec<Notice>,
+        facts: Facts<'_>,
+        settings: &SettingsState,
+        timers: &mut Timers,
+    ) -> Vec<Action> {
+        for (condition, status) in assess(now.wall, facts) {
+            self.track(now.monotonic, condition, status);
+        }
+        for notice in happened {
+            self.enqueue(notice);
+        }
+        let mut actions = self.schedule_grace(now.monotonic, timers);
+        actions.extend(self.send(settings));
+        actions
+    }
+
+    pub(super) fn handle(
+        &mut self,
+        now: ClockReading,
+        event: &NotificationEvent,
+        timers: &mut Timers,
+    ) -> Vec<Action> {
+        let Delivery::Sending(notice) = &self.delivery else {
+            return Vec::new();
+        };
+        match event {
+            NotificationEvent::SendTest => Vec::new(),
+            NotificationEvent::Delivered => {
+                self.delivery = Delivery::Idle;
+                self.failures = 0;
+                self.last_outcome = Some(Outcome {
+                    at: now.wall,
+                    result: Ok(()),
+                });
+                Vec::new()
+            }
+            NotificationEvent::DeliveryFailed { reason } => {
+                let notice = notice.clone();
+                self.failures = self.failures.saturating_add(1);
+                self.last_outcome = Some(Outcome {
+                    at: now.wall,
+                    result: Err(*reason),
+                });
+                // Waits of 30 seconds, then 1, 2, 4, and 8 minutes, then 10.
+                let after = RETRY_FIRST
+                    .saturating_mul(2_u32.saturating_pow(self.failures - 1))
+                    .min(RETRY_MAX);
+                let (timer, deadline) = timers.schedule(now.monotonic, after);
+                self.delivery = Delivery::Retrying { notice, timer };
+                vec![Action::StartTimer {
+                    name: TimerName::NotificationRetry,
+                    id: timer,
+                    deadline,
+                }]
+            }
+        }
+    }
+
+    /// A failed delivery whose retry is due is sent again.
+    pub(super) fn timer_expired(&mut self, id: TimerId) {
+        if self.grace_timer.is_some_and(|(timer, _)| timer == id) {
+            self.grace_timer = None;
+        }
+        if let Delivery::Retrying { notice, timer, .. } = &self.delivery
+            && *timer == id
+        {
+            self.outbox.push_front(notice.clone());
+            self.delivery = Delivery::Idle;
+        }
+    }
+
+    fn enqueue(&mut self, notice: Notice) {
+        if self.outbox.len() >= OUTBOX_LIMIT {
+            self.outbox.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.outbox.push_back(notice);
+    }
+
+    fn track(&mut self, now: Instant, condition: Condition, status: Status) {
+        match (self.conditions.get(&condition).copied(), status) {
+            (None, Status::Active(notice)) => {
+                if condition.grace().is_zero() {
+                    self.conditions.insert(condition, Phase::Raised);
+                    self.enqueue(notice);
+                } else {
+                    self.conditions
+                        .insert(condition, Phase::Pending { since: now });
+                }
+            }
+            (Some(Phase::Pending { since }), Status::Active(notice))
+                if now.duration_since(since) >= condition.grace() =>
+            {
+                self.conditions.insert(condition, Phase::Raised);
+                self.enqueue(notice);
+            }
+            (Some(Phase::Pending { .. }), Status::Clear(_)) => {
+                self.conditions.remove(&condition);
+            }
+            (Some(Phase::Raised), Status::Clear(notice)) => {
+                self.conditions.remove(&condition);
+                if let Some(notice) = notice {
+                    self.enqueue(notice);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Wake the core when the earliest pending condition's grace ends.
+    fn schedule_grace(&mut self, now: Instant, timers: &mut Timers) -> Vec<Action> {
+        let due = self
+            .conditions
+            .iter()
+            .filter_map(|(condition, phase)| match phase {
+                Phase::Pending { since } => since.checked_add(condition.grace()),
+                Phase::Raised => None,
+            })
+            .min();
+        let Some(due) = due else {
+            return Vec::new();
+        };
+        if self.grace_timer.is_some_and(|(_, at)| at == due) {
+            return Vec::new();
+        }
+        let (id, deadline) = timers.schedule(now, due.saturating_duration_since(now));
+        self.grace_timer = Some((id, due));
+        vec![Action::StartTimer {
+            name: TimerName::NotificationGrace,
+            id,
+            deadline,
+        }]
+    }
+
+    /// Send the oldest notice once settings name a topic; without one, notices
+    /// are discarded.
+    fn send(&mut self, settings: &SettingsState) -> Vec<Action> {
+        let topic = match settings {
+            SettingsState::Unread | SettingsState::Reading => return Vec::new(),
+            SettingsState::ReadFailed => None,
+            SettingsState::Loaded(settings) => settings.ntfy_topic.saved.clone(),
+        };
+        let Some(topic) = topic else {
+            self.outbox.clear();
+            if matches!(self.delivery, Delivery::Retrying { .. }) {
+                self.delivery = Delivery::Idle;
+            }
+            return Vec::new();
+        };
+        if self.delivery != Delivery::Idle {
+            return Vec::new();
+        }
+        let Some(notice) = self.outbox.pop_front() else {
+            return Vec::new();
+        };
+        self.delivery = Delivery::Sending(notice.clone());
+        vec![Action::SendNotification { topic, notice }]
+    }
+}
+
+/// Read every lasting condition from core state.
+fn assess(now: SystemTime, facts: Facts<'_>) -> [(Condition, Status); 9] {
+    let session = match facts.qbittorrent {
+        Qbittorrent::Connected(session) => Some(&**session),
+        _ => None,
+    };
+    let listed = session.filter(|session| session.listed());
+    let count = |state: TorrentState| {
+        listed.map(|session| {
+            session
+                .torrents
+                .values()
+                .filter(|torrent| torrent.state == state)
+                .count()
+        })
+    };
+    let missing = match facts.registry {
+        Registry::Loaded(records) => listed.map(|session| {
+            records
+                .records()
+                .filter(|record| record.desired == Desired::Active)
+                .filter_map(|record| record.identity.hash())
+                .filter(|hash| !session.torrents.contains_key(*hash))
+                .count()
+        }),
+        _ => None,
+    };
+    let counted = |count: Option<usize>, raised: fn(usize) -> Notice, cleared: Notice| match count {
+        Some(0) => Status::Clear(Some(cleared)),
+        Some(count) => Status::Active(raised(count)),
+        None => Status::Unchanged,
+    };
+    let (vpn, blocked) = vpn(now, facts.tunnel);
+    [
+        (Condition::VpnProtection, vpn),
+        (Condition::FailoverBlocked, blocked),
+        (
+            Condition::ForwardedPort,
+            forwarded_port(facts.port_forwarding, facts.tunnel),
+        ),
+        (
+            Condition::QbittorrentReachable,
+            match facts.qbittorrent {
+                Qbittorrent::Disabled => Status::Clear(None),
+                Qbittorrent::Connecting => Status::Unchanged,
+                Qbittorrent::Unreachable { reason, .. } => {
+                    Status::Active(Notice::QbittorrentUnreachable { reason: *reason })
+                }
+                Qbittorrent::Connected(_) => Status::Clear(Some(Notice::QbittorrentReachable)),
+            },
+        ),
+        (
+            Condition::QbittorrentVersion,
+            session.map_or(Status::Unchanged, |session| {
+                let version = session.version.clone();
+                if session.approval == super::MamApproval::NotAllowed {
+                    Status::Active(Notice::QbittorrentVersionNotAllowed { version })
+                } else {
+                    Status::Clear(Some(Notice::QbittorrentVersionAllowed { version }))
+                }
+            }),
+        ),
+        (
+            Condition::TorrentErrors,
+            counted(
+                count(TorrentState::Error),
+                |count| Notice::TorrentErrors { count },
+                Notice::TorrentErrorsCleared,
+            ),
+        ),
+        (
+            Condition::FilesMissing,
+            counted(
+                count(TorrentState::MissingFiles),
+                |count| Notice::FilesMissing { count },
+                Notice::FilesMissingCleared,
+            ),
+        ),
+        (
+            Condition::TorrentsMissing,
+            counted(
+                missing,
+                |count| Notice::TorrentsMissing { count },
+                Notice::TorrentsMissingCleared,
+            ),
+        ),
+        (
+            Condition::RegistrySave,
+            match facts.registry {
+                Registry::Loaded(records) if records.save_failed() => {
+                    Status::Active(Notice::RegistryNotSaved)
+                }
+                Registry::Loaded(_) => Status::Clear(Some(Notice::RegistrySaved)),
+                _ => Status::Unchanged,
+            },
+        ),
+    ]
+}
+
+/// VPN protection, which clears only on a successful check, and blocked
+/// failover, whose end other notices already announce.
+fn vpn(now: SystemTime, tunnel: &Tunnel) -> (Status, Status) {
+    let Some(watch) = &tunnel.watch else {
+        return (Status::Clear(None), Status::Clear(None));
+    };
+    let failing = watch.failures >= super::FAILURES_BEFORE_SWITCH;
+    let protection = match watch.protection {
+        _ if failing => Status::Active(Notice::VpnProtectionLost {
+            failures: watch.failures,
+        }),
+        Protection::Available { exit_ip, .. } => {
+            Status::Clear(Some(Notice::VpnProtectionRestored {
+                exit_ip,
+                server: watch.current.clone(),
+            }))
+        }
+        Protection::Unknown | Protection::Unavailable { .. } => Status::Unchanged,
+    };
+    let reason = match tunnel.switch_allowance(now) {
+        SwitchAllowance::Now => None,
+        SwitchAllowance::After(at) => Some(SwitchBlock::Until(at)),
+        SwitchAllowance::Unknown => Some(SwitchBlock::LastSwitchUnknown),
+        SwitchAllowance::NoAlternative => Some(SwitchBlock::NoOtherServer),
+    };
+    let blocked = match reason {
+        Some(reason) if failing && watch.failover.is_none() => {
+            Status::Active(Notice::FailoverBlocked { reason })
+        }
+        _ => Status::Clear(None),
+    };
+    (protection, blocked)
+}
+
+/// A switch drops the lease on purpose, so a missing port then changes nothing.
+fn forwarded_port(forwarding: &PortForwarding, tunnel: &Tunnel) -> Status {
+    let switching = tunnel
+        .watch
+        .as_ref()
+        .is_some_and(|watch| watch.failover.is_some());
+    match forwarding {
+        PortForwarding::Disabled => Status::Clear(None),
+        PortForwarding::Enabled {
+            lease: Some(lease), ..
+        } => Status::Clear(Some(Notice::ForwardedPortRestored { port: lease.tcp })),
+        PortForwarding::Enabled { lease: None, .. } if switching => Status::Unchanged,
+        PortForwarding::Enabled { lease: None, .. } => Status::Active(Notice::ForwardedPortLost),
+    }
+}

@@ -18,7 +18,8 @@ use windlass::{
 const USAGE: &str = "usage: windlass <initialise|resume> <database-path>\n       \
 windlass serve <initialise|resume> <database-path> --listen <address>... [--allowed-host <name>]... \
 [--qbittorrent <webui-url>] [--nat-pmp-gateway <address>] \
-[--exit-ip-service <url> [--vpn-server <name>]... [--vpn-current-file <path>]]";
+[--exit-ip-service <url> [--vpn-server <name>]... [--vpn-current-file <path>]] \
+[--ntfy-server <url>] [--ntfy-relay <address>] [--dashboard-url <url>]";
 
 type MainResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -106,6 +107,24 @@ async fn serve(mut arguments: impl Iterator<Item = OsString>) -> MainResult<()> 
             Some("--vpn-server") => servers
                 .push(VpnServer::try_new(value).map_err(|_| usage("invalid VPN server name"))?),
             Some("--vpn-current-file") => current_file = Some(PathBuf::from(value)),
+            Some("--ntfy-server") => {
+                integrations.ntfy_server = Some(
+                    value
+                        .parse()
+                        .map_err(|_| usage("invalid ntfy server URL"))?,
+                );
+            }
+            Some("--ntfy-relay") => {
+                integrations.ntfy_relay = Some(
+                    value
+                        .parse()
+                        .map_err(|_| usage("invalid ntfy relay address"))?,
+                );
+            }
+            Some("--dashboard-url") => {
+                integrations.dashboard_url =
+                    Some(value.parse().map_err(|_| usage("invalid dashboard URL"))?);
+            }
             _ => return Err(usage("unknown option")),
         }
     }

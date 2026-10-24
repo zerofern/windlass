@@ -2,7 +2,8 @@
 # boundary of ADR-0003: traffic leaves only through the tunnel and fails when it
 # fails, the dashboard is reachable from the LAN but not through the tunnel, and
 # notifications still reach their single destination while the VPN is down.
-# Windlass proves the tunnel works and fails over to the other server by itself.
+# Windlass proves the tunnel works and fails over to the other server by itself,
+# and its notifications reach ntfy through the relay with a link to the dashboard.
 #
 # The keys below are throwaway test keys; never reuse them.
 { windlassModule }:
@@ -118,6 +119,9 @@ in
         environment.systemPackages = [ pkgs.curl ];
         services.nginx = {
           enable = true;
+          commonHttpConfig = ''
+            log_format ntfy '$request_method $uri "$http_title" "$http_click"';
+          '';
           virtualHosts.default = {
             default = true;
             listen = [
@@ -133,6 +137,11 @@ in
             locations."/ip".extraConfig = ''
               default_type text/plain;
               return 200 "$remote_addr\n";
+            '';
+            # Stands in for an ntfy topic, logging each notification's title and link.
+            locations."= /windlass-vm".extraConfig = ''
+              access_log /var/log/nginx/ntfy.log ntfy;
+              return 200 "ok\n";
             '';
           };
         };
@@ -163,8 +172,12 @@ in
           dashboard = {
             interfaces = [ "eth1" ];
             allowedHosts = [ "machine" ];
+            url = "http://machine:8740/";
           };
-          notifications.relayTarget = "web:443";
+          notifications = {
+            server = "http://web/";
+            relayTarget = "web:443";
+          };
         };
         environment.systemPackages = [
           pkgs.curl
@@ -208,6 +221,18 @@ in
               "curl -sf http://machine:8740/ | grep -q 'tag ok\">Protected'", timeout=900
           )
           web.succeed("curl -sf http://machine:8740/ | grep -q '${ipOf "vpn1"}'")
+
+      with subtest("Notifications reach ntfy through the relay with a dashboard link"):
+          ntfy_log = "/var/log/nginx/ntfy.log"
+          web.succeed("curl -sf -X POST -d topic=windlass-vm http://machine:8740/settings/ntfy-topic")
+          web.wait_until_succeeds(
+              "curl -sf http://machine:8740/settings | grep -q 'Send test notification'", timeout=900
+          )
+          web.succeed("curl -sf -X POST http://machine:8740/notifications/test")
+          web.wait_until_succeeds(
+              f"grep -q 'POST /windlass-vm \"Test notification\" \"http://machine:8740/settings\"' {ntfy_log}",
+              timeout=900,
+          )
 
       with subtest("The dashboard is reachable from the LAN, not through the tunnel"):
           web.wait_until_succeeds("curl -sf http://machine:8740/ | grep -q Windlass", timeout=900)
@@ -281,5 +306,8 @@ in
           )
           # MAM allows one IP change an hour, so the next switch must wait.
           web.succeed("curl -sf http://machine:8740/ | grep -q 'Not before'")
+          # Each step reached ntfy, even while the tunnel was down.
+          for title in ["VPN not working", "Switching VPN server", "VPN server switched"]:
+              web.wait_until_succeeds(f"grep -q '\"{title}\" \"http://machine:8740/#tunnel\"' {ntfy_log}", timeout=900)
     '';
 }
