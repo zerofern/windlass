@@ -35,7 +35,7 @@ does not take it.
 
 | ID | Rule | Invariant | Kind | How Windlass keeps it |
 | --- | --- | --- | --- | --- |
-| A1 | 1.4, 2.4 | Global ratio stays at or above 1.0. | Gate, watch | A download is admitted only if the projected ratio after it stays at or above the ratio floor (A2). The watch notifies below the warning level and urgently below 1.1, and holds every new download until it recovers. |
+| A1 | 1.4, 2.4 | Global ratio stays at or above 1.0. | Gate, watch | A download is admitted only if the projected ratio after it stays at or above the ratio floor of 2.0 (A2). The watch notifies when the ratio is below 2.0, which holds new paid downloads, and urgently below 1.1. |
 | A2 | 1.4 | A safety margin above 1.0 absorbs rounding, lag, and downloads in flight. | Gate | Projected ratio = uploaded ÷ (downloaded + every admitted, incomplete, non-freeleech torrent's full size + the candidate's size). Formatted totals are rounded against Windlass: uploaded down, downloaded up. |
 | A3 | 2.8 | Unsatisfied torrents stay below the class limit: 20 for new members, 50 User, 100 Power User, 150 VIP, 200 above VIP. | Gate, watch | A download is admitted only if unsatisfied + admitted-but-not-yet-counted + 1 stays at least the reserve below the limit. The count is the larger of MAM's and Windlass's own. An unrecognised class uses 20. Crossing the limit blocks downloads for up to 24 hours. |
 | A4 | 2.5 | Every downloaded torrent seeds 72 hours within 30 days of completion. | Gate, watch | Windlass never stops, pauses, or removes a torrent until it has seeded 72 hours plus a margin. The watch notifies when a torrent completed 20 or more days ago has not yet seeded 72 hours, which happens if seeding is interrupted, for example while the VPN is down. |
@@ -82,27 +82,34 @@ only when all of these hold:
 6. The ratio allows it (A1, A2). Freeleech and personal-freeleech torrents cost
    no ratio, but are admitted only if the account would still be at or above
    1.0 if counted in full, in case freeleech ends mid-download.
-7. If the ratio does not allow it, the spending policy may make it fit, by
-   using a wedge or buying upload credit. Otherwise the torrent stays queued
-   and the dashboard says why.
-8. Disk space suffices for the full size (Direction, B-0001).
+7. A VIP-only torrent needs the account to be VIP; the spending policy may buy
+   VIP for it.
+8. If the ratio does not allow it, the spending policy may make it fit, by
+   buying upload credit. Otherwise the torrent stays queued and the dashboard
+   says why.
+9. Disk space suffices for the full size (Direction, B-0001).
 
 The torrent is then downloaded, added to qBittorrent whole, and seeded
 indefinitely. It is removed only by the owner's cleanup permission, after A4 is
 satisfied with margin and space is needed.
 
-## Spending policy (proposed)
+## Spending policy
 
-Windlass reads the points balance, VIP expiry, and ratio from Load User Data.
-In order of priority:
+Agreed with the owner. Windlass reads the points balance, VIP expiry, and ratio
+from Load User Data, and never spends below the points reserve, a fixed number
+of points set on the settings page. In order of priority:
 
-1. **Protect the ratio.** When the ratio falls below its target, buy upload
-   credit in 50 GiB steps until it reaches the target or the reserve is reached.
-2. **Keep VIP.** If the owner wants VIP, top it up with `max` whenever at least
-   7 days can be added, so it never lapses. VIP raises the unsatisfied limit
-   from 50 or 100 to 150.
-3. **Make room for downloads.** When a queued torrent is blocked only by ratio,
-   use a wedge on it if one is available, or buy one if the points allow.
+1. **Protect the ratio.** When the ratio is below the target of 3.0, buy upload
+   credit in 50 GiB steps until it reaches 3.0 or only the reserve is left.
+2. **Wedge every paid download.** Download every torrent that is not freeleech,
+   not VIP, and not already a personal freeleech with `fl`, spending a wedge.
+   When none is left, buy one if the points allow; otherwise the download costs
+   ratio and must pass the ratio floor.
+3. **Buy VIP when downloads need it.** Buy VIP when queued torrents are held only
+   by the unsatisfied limit and VIP's limit of 150 would free a slot, or when a
+   queued torrent is VIP-only and the account is not VIP. The API buys VIP only
+   as `max`, which fills to 90 days and buys at least 7 days, so each purchase
+   can be large. Windlass does not renew VIP otherwise.
 
 Points above the reserve that no rule needs are kept, not spent.
 
@@ -112,12 +119,12 @@ New notification conditions, using B-0002's grace periods:
 
 | Condition | Notify after |
 | --- | --- |
-| Ratio below the warning level | Immediately; urgent below 1.1 |
+| Ratio below 2.0, holding paid downloads | Immediately; urgent below 1.1 |
 | Unsatisfied torrents at 80% of the limit | Immediately |
 | A torrent at day 20 with less than 72 hours seeded | Immediately |
 | Downloads held, and why (ratio, slots, registration, space) | 30 minutes |
 | A purchase made, failed, or uncertain | Immediately |
-| VIP expiring within 7 days with too few points to renew | Immediately |
+| VIP expiring within 7 days while downloads depend on it | Immediately |
 | Bonus points below the reserve | Immediately |
 | MAM reports a notification for the account, as a count without its text | Immediately |
 | The account may need a visit to stay active (A9) | Monthly |
@@ -163,13 +170,15 @@ and anything outside the documented API.
 
 ## Open questions and assumptions
 
-Decisions for the owner:
+Agreed with the owner: a ratio floor of 2.0 for admission and a target of 3.0
+for buying upload credit; a wedge on every paid download; VIP bought only when
+downloads need it; a fixed points reserve set on the settings page.
 
-- The ratio floor for admission, the ratio target for buying upload credit, and
-  the warning level. Proposed: floor 1.5, target 2.0, warning 1.5.
+Still to decide:
+
+- The points reserve's starting value.
 - The unsatisfied reserve. Proposed: 2 slots.
 - The seeding margin before removal. Proposed: 24 hours, so 96 hours in total.
-- The points reserve, whether to keep VIP, and when to use wedges.
 
 Facts the documentation does not settle, to confirm with MAM staff or from a
 response the owner captures in a browser:
@@ -180,9 +189,9 @@ response the owner captures in a browser:
   Until it is known, A3 uses only Windlass's own count, which cannot see
   downloads made outside Windlass.
 - Prices in the bonus store, and whether purchases report the new balance.
-- Whether VIP torrents are freeleech for VIP members and downloadable by others.
-  Until confirmed, Windlass treats VIP torrents as costing ratio and never
-  wedges them.
+- Whether VIP torrents are freeleech for VIP members. The owner reports that
+  VIP-only torrents need a VIP account. Until confirmed, Windlass treats VIP
+  torrents as costing ratio and never wedges them.
 - How many wedges the account holds; Load User Data does not document it.
 - Whether API use counts as activity for rule 1.6.
 - Whether Load User Data reports a disabled-download or seed-only state.
