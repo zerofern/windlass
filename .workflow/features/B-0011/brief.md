@@ -256,7 +256,8 @@ details are not recorded here.
   only from a JSON POST, and Windlass sends every search that way.
 - `GET /json/jsonIp.php` (call 8, on `www`) needs no cookie and returns `ip` as
   text, `ASN` as an integer, `AS` as the provider's name, and `time` as a Unix
-  time. Through ProtonVPN it reported `"AS":"ProtonVPN Proton AG"`.
+  time. Through ProtonVPN it reported `"AS":"ProtonVPN Proton AG"`. The same
+  call on `t.myanonamouse.net` reported the same address and ASN.
 - `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` (call 7)
   returned a JSON array, newest first, of entries with `timestamp` (Unix time
   with a fraction), `amount` (-1 per personal freeleech), `type`, `tid` as an
@@ -302,7 +303,7 @@ is wanted anyway.
 | 5 ✓ | `POST /tor/js/loadSearchJSONbasic.php` listing bookmarks | The `searchIn` value for bookmarks, which only staff can confirm (A11); then `bookmarked`, `free`, `vip`, `personal_freeleech`, `my_snatched`, and `size` | None |
 | 6 ✓ | Torrent Search with `tor[id]` for one torrent | Flags for a single torrent before download | None |
 | 7 ✓ | `GET /json/userBonusHistory.php?type[]=wedgePF&type[]=wedgeGFL` | Wedge use; whether a wedge balance appears | None |
-| 8 ½ | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
+| 8 ✓ | `GET /json/jsonIp.php` on `www` and `t` | IP and ASN as MAM sees them, once a minute at most | None |
 | 9 ✓ | `GET /tor/download.php?tid=<invalid>` | What a refused download returns instead of a torrent file | None |
 | 10 ✓ | `GET /json/bonusBuy.php?spendtype=upload&amount=10` | The error shape, without buying: under 50 GiB is refused | None |
 | 11 ✓ | Any call with an invalid `mam_id` | The error for a rejected cookie | None |
