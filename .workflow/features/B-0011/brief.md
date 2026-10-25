@@ -359,6 +359,15 @@ details are not recorded here.
   "freeleech for this user", whether through VIP or a wedge. The wedge history
   listed a `wedgePF` entry for the torrent at once. Windlass sends `fl=1`, since
   MAM ignored flags without a value elsewhere; MLM sends a bare `fl`.
+- `GET /tor/js/loadSearchJSONbasic.php?tor[id]=<id>` for a torrent on MAM's
+  site-wide freeleech list (2026-10-25) returned `free` 1, `vip` 0,
+  `personal_freeleech` 0, and `fl_vip` 1, so `fl_vip` also covers site-wide
+  freeleech. No field says when the freeleech ends (`vip_expire` covers VIP
+  status only), so Windlass looks running free downloads up again every 5
+  minutes. The result also carries `w` (1), whose meaning is unknown; Windlass
+  does not use it. A misspelt `tor[...]` parameter is ignored and the search
+  returns the newest torrents on the site instead, so Windlass takes only the
+  result whose `id` is the one it asked for.
 - Agreed with the owner: Windlass does not wait to confirm a wedge. The wedge is
   spent by the same request that returns the torrent file, so Windlass adds and
   starts the torrent at once. The next Load User Data reading, which reflects

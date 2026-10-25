@@ -714,7 +714,8 @@ fn search(world: &World, request: &Request, query: &Query) -> Value {
                 "vip": u8::from(torrent.vip),
                 "free": u8::from(torrent.free),
                 "personal_freeleech": u8::from(torrent.wedged_visible),
-                "fl_vip": u8::from(torrent.wedged_visible || (torrent.vip && vip)),
+                // Free for this user, for any reason, as observed.
+                "fl_vip": u8::from(torrent.wedged_visible || torrent.free || (torrent.vip && vip)),
                 "my_snatched": u8::from(torrent.snatched),
                 "bookmarked": torrent.bookmarked.map(seconds),
                 "vip_expire": torrent.vip_expire.map_or(0, seconds),
