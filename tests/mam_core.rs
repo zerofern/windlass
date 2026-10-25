@@ -12,11 +12,11 @@ use windlass::core::{
     ClockReading, Connectability, Connectable, Core, Desired, DownloadWatch, Event, FetchedTorrent,
     Findings, Hold, IpFinding, IpObservation, LEASE_LIFETIME, ListedClient, MamEvent, MamFailure,
     MamNotices, MamPauseEvent, MamReply, MamRequest, MamRequestMode, MamSession, MamTorrentId,
-    Notice, PersonalFreeleech, Points, Port, PortFinding, PortForwardingEvent, Purchase,
-    QbittorrentEvent, QbittorrentPreferences, Registration, Registry, RegistryEvent, SeedboxStatus,
-    SessionRejection, SettingsEvent, SnatchSummary, StartupEvent, StartupMode, SyncPosition,
-    SyncUpdate, TimerId, TimerName, TorrentCommand, TorrentHash, TorrentRecord, TunnelEvent,
-    UserData, WedgeSpent,
+    Notice, NotificationEvent, PersonalFreeleech, Points, Port, PortFinding, PortForwardingEvent,
+    Purchase, QbittorrentEvent, QbittorrentPreferences, Registration, Registry, RegistryEvent,
+    SeedboxStatus, SessionRejection, SettingsEvent, SnatchSummary, StartupEvent, StartupMode,
+    SyncPosition, SyncUpdate, TimerId, TimerName, TorrentCommand, TorrentHash, TorrentRecord,
+    TunnelEvent, UserData, WedgeSpent,
 };
 
 const GIB: u64 = 1 << 30;
@@ -46,6 +46,8 @@ struct Harness {
     start: Instant,
     elapsed: Duration,
     position: u64,
+    /// Every notice the core saved to its log, oldest first.
+    logged: Vec<Notice>,
 }
 
 /// What the harness starts from.
@@ -77,6 +79,7 @@ impl Harness {
             start: Instant::now(),
             elapsed: Duration::ZERO,
             position: 0,
+            logged: Vec::new(),
         };
         let now = harness.wall();
         for event in [
@@ -84,6 +87,7 @@ impl Harness {
                 mode: StartupMode::Resume,
             }),
             Event::Startup(StartupEvent::StorageOpened),
+            Event::Notification(NotificationEvent::LogRead { last: None }),
             Event::MamPause(MamPauseEvent::Read {
                 mode: Some(MamRequestMode::Enabled),
             }),
@@ -150,6 +154,11 @@ impl Harness {
             wall: self.wall(),
         };
         let mut actions = self.core.handle(now, event);
+        self.logged
+            .extend(actions.iter().filter_map(|action| match action {
+                Action::SaveNotice { entry, .. } => Some(entry.notice.clone()),
+                _ => None,
+            }));
         actions.retain(|action| {
             !matches!(
                 action,
@@ -299,17 +308,9 @@ impl Harness {
         self.core.mam()
     }
 
-    /// Notices being sent or waiting; deliveries never complete here.
+    /// Every notice given so far.
     fn notices(&self) -> Vec<Notice> {
-        let notifications = self.core.notifications();
-        let sending = match &notifications.delivery {
-            windlass::core::Delivery::Sending(notice) => Some(notice.clone()),
-            _ => None,
-        };
-        sending
-            .into_iter()
-            .chain(notifications.outbox.iter().cloned())
-            .collect()
+        self.logged.clone()
     }
 
     fn record(&self, id: u64) -> Option<TorrentRecord> {
@@ -564,12 +565,14 @@ fn unreadable_state_blocks_registration() {
         start: Instant::now(),
         elapsed: Duration::ZERO,
         position: 0,
+        logged: Vec::new(),
     };
     for event in [
         Event::Startup(StartupEvent::Start {
             mode: StartupMode::Resume,
         }),
         Event::Startup(StartupEvent::StorageOpened),
+        Event::Notification(NotificationEvent::LogRead { last: None }),
         Event::Mam(MamEvent::StateReadFailed),
     ] {
         let _ = harness.send(event);
@@ -854,6 +857,7 @@ fn empty_harness() -> Harness {
         start: Instant::now(),
         elapsed: Duration::ZERO,
         position: 0,
+        logged: Vec::new(),
     }
 }
 
@@ -2021,6 +2025,7 @@ fn the_owner_is_reminded_weekly_to_visit_mam() {
             mode: StartupMode::Resume,
         }),
         Event::Startup(StartupEvent::StorageOpened),
+        Event::Notification(NotificationEvent::LogRead { last: None }),
     ] {
         let _ = harness.send(event);
     }

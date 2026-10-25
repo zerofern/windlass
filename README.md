@@ -71,7 +71,8 @@ times; it works without the script, without live updates. It shows:
   categories as counts); the last purchase; and the bookmark list, with why the
   next queued torrent is held.
 - **Notifications:** whether the last delivery succeeded, notices waiting, and
-  problems reported but not yet resolved.
+  problems reported but not yet resolved. The notifications page lists every
+  notice, newest first.
 - **Settings:** the MAM API cookie, the ntfy topic with a test button, the bonus
   points reserve, and the history size limit, each confirmed only once saved, plus the read-only
   deployment settings.
@@ -86,8 +87,13 @@ MAM notifications as counts, held or refused downloads, no wedges left, points
 below the reserve, VIP ending, purchases, and a wedge that was not spent. Once a
 week it reminds you to visit MAM, linking to MAM's main page, to keep the account
 active and read announcements about allowed clients. Lasting problems notify only after a grace period, from immediately
-to 10 minutes, and again when they clear. Each notification links to the dashboard
-page that explains it and never names books.
+to 10 minutes, and again when they clear.
+
+Every notice is kept on the dashboard's notifications page, which keeps the last
+1000. Urgent ones are also pushed, but a push says only "Windlass has a new notice"
+and links to that notice's entry, so nothing about your account or torrents goes
+to ntfy. Notices that something went back to normal or went as planned, such as
+a start, a recovery, or a settled purchase, are only on the page.
 
 History lives in the same SQLite file. The core counts entries and asks the shell to
 remove the oldest when the limit (10000 by default) is exceeded. Entries that could

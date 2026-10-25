@@ -165,3 +165,10 @@ details pre {
 .check { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; }
 .check input { width: 18px; height: 18px; }
 .table-title { padding: 14px 16px 6px; }
+
+/* Notifications: one entry per notice; a push links to its entry. */
+ol.notices { list-style: none; margin: 0; padding: 0; display: grid; gap: .75rem; }
+li.notice { scroll-margin-top: 5rem; }
+li.notice:target { border-color: var(--warning-line); background: var(--warning-soft); }
+.notice-head { display: flex; flex-wrap: wrap; gap: .25rem 1rem; align-items: baseline; justify-content: space-between; }
+.notice-head h2 { margin: 0; font-size: 1.05rem; }

@@ -63,6 +63,7 @@ pub(super) const fn is_routine(event: &Event) -> bool {
         | Event::PortForwarding(PortForwardingEvent::Mapped { .. })
         | Event::Qbittorrent(QbittorrentEvent::PreferencesRead(_))
         | Event::Registry(RegistryEvent::Saved)
+        | Event::Notification(NotificationEvent::Saved)
         | Event::Tunnel(TunnelEvent::ExitIpObserved { .. })
         | Event::Mam(
             MamEvent::ReminderSaved
@@ -426,6 +427,13 @@ fn notification(event: &NotificationEvent) -> String {
         NotificationEvent::DeliveryFailed { reason } => {
             format!("Notification not delivered: {}", delivery_failure(*reason))
         }
+        NotificationEvent::LogRead { last: Some(last) } => {
+            format!("Notifications log read; newest notice {}", last.get())
+        }
+        NotificationEvent::LogRead { last: None } => String::from("Notifications log read; empty"),
+        NotificationEvent::LogReadFailed => String::from("Notifications log could not be read"),
+        NotificationEvent::Saved => String::from("Notice saved"),
+        NotificationEvent::SaveFailed => String::from("Notice could not be saved"),
     }
 }
 
@@ -722,9 +730,15 @@ pub(super) fn action(action: &Action) -> String {
             String::from("Save notification topic (value not recorded)")
         }
         Action::WriteNtfyTopic { topic: None } => String::from("Remove the notification topic"),
-        Action::SendNotification { notice, .. } => {
-            format!("Notify: {}", super::notify::message(notice).title)
+        Action::SendNotification { push, .. } => {
+            format!("Push: {}", super::notify::message(&push.notice).title)
         }
+        Action::ReadNoticeLog => String::from("Read the notifications log"),
+        Action::SaveNotice { entry, .. } => format!(
+            "Save notice {}: {}",
+            entry.id.get(),
+            super::notify::message(&entry.notice).title
+        ),
         Action::WritePointsReserve { reserve } => format!("Save points reserve: {reserve}"),
         Action::WriteRotatedApiCookie { .. } => {
             String::from("Save the new API cookie MAM issued (value not recorded)")
@@ -1045,9 +1059,24 @@ mod tests {
         actions.extend(crate::core::NtfyTopic::parse("alerts").map(|topic| {
             Action::SendNotification {
                 topic,
-                notice: crate::core::Notice::Test,
+                push: crate::core::Push {
+                    entry: None,
+                    notice: crate::core::Notice::Test,
+                },
             }
         }));
+        actions.extend([
+            Action::ReadNoticeLog,
+            Action::SaveNotice {
+                entry: crate::core::Logged {
+                    id: crate::core::NoticeId::new(7),
+                    at: SystemTime::UNIX_EPOCH,
+                    notice: crate::core::Notice::Test,
+                    reach: crate::core::Reach::Push,
+                },
+                forget_through: None,
+            },
+        ]);
         actions.extend(timer_actions());
         for described in &actions {
             assert!(!action(described).is_empty(), "{described:?}");
@@ -1139,9 +1168,20 @@ mod tests {
             NotificationEvent::DeliveryFailed {
                 reason: DeliveryFailure::Rejected { status: 429 },
             },
+            NotificationEvent::LogRead { last: None },
+            NotificationEvent::LogRead {
+                last: Some(crate::core::NoticeId::new(3)),
+            },
+            NotificationEvent::LogReadFailed,
+            NotificationEvent::SaveFailed,
         ]
         .into_iter()
         .map(|event| (Event::Notification(event), "notifications", false))
+        .chain([(
+            Event::Notification(NotificationEvent::Saved),
+            "notifications",
+            true,
+        )])
         .chain(
             [
                 SettingsEvent::ClearNtfyTopic,

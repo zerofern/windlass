@@ -301,6 +301,19 @@ impl Windlass {
         Ok(self.request(request).await?.1)
     }
 
+    /// Whether the notifications page shows a notice with this title; the
+    /// log is written just after the step that gives the notice.
+    async fn noticed(&self, title: &str) -> TestResult<bool> {
+        let heading = format!("<h2>{title}</h2>");
+        for _ in 0..50 {
+            if self.get("/notifications").await?.contains(&heading) {
+                return Ok(true);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(false)
+    }
+
     async fn post(&self, uri: &str, form: &str) -> TestResult<StatusCode> {
         let request = Request::post(uri)
             .header(header::HOST, HOST)
@@ -539,13 +552,6 @@ fn record(observation: &Observation, mam: u64) -> Option<windlass::core::Torrent
     }
 }
 
-/// Whether a notice is waiting to be sent; ntfy is unreachable in these tests.
-fn noticed(observation: &Observation, notice: &windlass::core::Notice) -> bool {
-    let notifications = &observation.notifications;
-    notifications.outbox.contains(notice)
-        || matches!(&notifications.delivery, windlass::core::Delivery::Sending(sending) if sending == notice)
-}
-
 /// Requests Windlass sent to MAM for this path, with their query strings.
 fn sent(mam: &FakeMam, path: &str) -> Vec<String> {
     mam.journal()
@@ -635,15 +641,10 @@ async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
         .await?;
     // MAM took points but shows no credit, so the next reading cannot tell.
     mam.with(|world| world.account.points -= 25_000.0);
-    let observation = windlass
+    let _ = windlass
         .wait(|observation| outcome(observation) == Some(PurchaseOutcome::Unresolved))
         .await?;
-    assert!(noticed(
-        &observation,
-        &windlass::core::Notice::PurchaseNeedsChecking {
-            purchase: windlass::core::Purchase::Upload(windlass::core::UploadCredit::try_new(50)?),
-        }
-    ));
+    assert!(windlass.noticed("Check a purchase on MAM").await?);
     let status = windlass.get("/").await?;
     assert!(status.contains("It went through"), "{status}");
     assert_eq!(sent(&mam, "/json/bonusBuy.php").len(), 1);
@@ -699,10 +700,11 @@ async fn a_download_whose_freeleech_ends_is_wedged_after_a_restart() -> TestResu
                 .any(|(_, watch)| *watch == windlass::core::DownloadWatch::Wedged)
         })
         .await?;
-    assert!(noticed(
-        &observation,
-        &windlass::core::Notice::WedgedMidDownload
-    ));
+    assert!(
+        windlass
+            .noticed("Wedge spent on a running download")
+            .await?
+    );
     assert_eq!(
         sent(&mam, "/tor/download.php"),
         [format!("tid={BOOK}"), format!("tid={BOOK}&fl=1")]
@@ -754,15 +756,12 @@ async fn a_download_that_cannot_be_wedged_stops_and_resumes_when_free() -> TestR
     };
     set_free(false);
     let windlass = windlass.restart(&mam, webui).await?;
-    let observation = windlass
+    let _ = windlass
         .wait(|observation| {
             record(observation, BOOK).is_some_and(|row| row.desired == Desired::Held)
         })
         .await?;
-    assert!(noticed(
-        &observation,
-        &windlass::core::Notice::DownloadNotFree { stopped: true }
-    ));
+    assert!(windlass.noticed("Download stopped").await?);
     let searches = sent(&mam, "/tor/js/loadSearchJSONbasic.php");
     assert!(
         searches

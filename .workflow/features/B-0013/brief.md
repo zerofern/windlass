@@ -87,6 +87,14 @@ Acceptance:
 - Each notice is either urgent or quiet. Urgent ones are pushed; quiet ones
   (a torrent finished, a purchase settled, a repair that worked) are only on the
   notifications page.
+- Implemented: the core numbers every notice, continuing from the newest id
+  read at startup, and saves it with its words to the `notices` table (schema
+  8), which keeps the last 1000. Notices given before the log is read wait for
+  it. `Notice::reach` sorts each notice into pushed or dashboard only. A push is
+  the title "Windlass", one fixed sentence, the notice's priority, and a link to
+  `/notifications#notice-<id>`; without a readable log, urgent notices are still
+  pushed, linking to `/notifications`. Narrated notices with titles come with
+  S5 and the freeleech flow.
 
 ### S5: Never a hit-and-run
 

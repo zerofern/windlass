@@ -39,6 +39,7 @@ use crate::{
         EventSender, Integrations, ShellError, ShellResult,
         describe::CATEGORIES,
         history::{self, HistoryQuery, Page},
+        storage,
     },
 };
 
@@ -119,6 +120,7 @@ pub fn router(
     };
     Router::new()
         .route("/", get(status_page))
+        .route("/notifications", get(notifications_page))
         .route("/history", get(history_page))
         .route("/settings", get(settings_page))
         .route("/live", get(live))
@@ -475,6 +477,20 @@ async fn history_page(
         HistoryState::Closed | HistoryState::Opening(_) | HistoryState::Unavailable => None,
     };
     pages::history(&observation, &query, &result, retained)
+}
+
+/// How many notices the notifications page shows.
+const NOTICES_SHOWN: u32 = 200;
+
+async fn notifications_page(AppState(app): AppState<App>) -> Markup {
+    let database = app.deployment.database.clone();
+    let result =
+        tokio::task::spawn_blocking(move || storage::read_notices(&database, NOTICES_SHOWN))
+            .await
+            .map_err(ShellError::from)
+            .and_then(|read| read)
+            .map_err(|error| error.to_string());
+    pages::notifications(&app.observation(), &result)
 }
 
 /// What `windlass serve` runs.

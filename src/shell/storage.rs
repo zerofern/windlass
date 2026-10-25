@@ -9,20 +9,22 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 
 use crate::core::{
-    ApiCookie, ByteSize, Desired, Event, HistoryLimit, Identity, MamEvent, MamPauseEvent,
-    MamRequestMode, MamTorrentId, NtfyTopic, Observation, Origin, PointsReserve, Progress, Ratio,
-    RecordId, RegistryEvent, SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash,
-    TorrentRecord, TorrentState, TunnelEvent, VpnServer, VpnSwitch,
+    ApiCookie, ByteSize, Desired, Event, HistoryLimit, Identity, Logged, MamEvent, MamPauseEvent,
+    MamRequestMode, MamTorrentId, NoticeId, NotificationEvent, NtfyTopic, Observation, Origin,
+    PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent, SettingsEvent, StartupEvent,
+    StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState, TunnelEvent, VpnServer,
+    VpnSwitch,
 };
 
-use super::qbittorrent::torrent_state;
+use super::{notify, qbittorrent::torrent_state};
 
 /// The schema version written by this build. Version 1 held only the MAM
 /// preference; version 2 added settings and history; version 3 marks routine
 /// history entries; version 4 adds the torrent registry and VPN state; version 5
 /// adds the ntfy topic; version 6 adds held torrents, kept torrent files, MAM
-/// state, and the points reserve; version 7 adds snatched bookmarks.
-const SCHEMA_VERSION: i64 = 7;
+/// state, and the points reserve; version 7 adds snatched bookmarks; version 8
+/// adds the notifications log.
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_V1: &str = "CREATE TABLE mam_configuration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -154,9 +156,20 @@ INSERT INTO torrents_v7 SELECT * FROM torrents;
 DROP TABLE torrents;
 ALTER TABLE torrents_v7 RENAME TO torrents;";
 
+/// The notifications log keeps each notice's words as they were when it was
+/// given. Times are Unix seconds.
+const SCHEMA_V8: &str = "CREATE TABLE notices (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    urgent INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    page TEXT NOT NULL
+);";
+
 /// The changes from each version to the next, starting from version 1.
-const UPGRADES: [&str; 6] = [
-    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+const UPGRADES: [&str; 7] = [
+    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
 ];
 
 type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -187,6 +200,8 @@ pub(super) enum Operation {
     ReadMamState,
     SaveRegistrationAttempt(SystemTime),
     SaveReminder(SystemTime),
+    ReadNoticeLog,
+    SaveNotice(Logged, Option<NoticeId>),
 }
 
 pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, FailedAction> {
@@ -254,6 +269,15 @@ pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, Failed
             save_mam_time(path, "last_reminder_at", at)
                 .map(|()| Event::Mam(MamEvent::ReminderSaved)),
             Event::Mam(MamEvent::ReminderSaveFailed),
+        ),
+        Operation::ReadNoticeLog => (
+            read_notice_log(path),
+            Event::Notification(NotificationEvent::LogReadFailed),
+        ),
+        Operation::SaveNotice(entry, forget_through) => (
+            save_notice(path, &entry, forget_through)
+                .map(|()| Event::Notification(NotificationEvent::Saved)),
+            Event::Notification(NotificationEvent::SaveFailed),
         ),
     };
     result.map_err(|error| FailedAction {
@@ -424,6 +448,83 @@ fn save_mam_time(path: &Path, column: &'static str, at: SystemTime) -> StorageRe
         [seconds(at)],
     )?;
     Ok(())
+}
+
+fn read_notice_log(path: &Path) -> StorageResult<Event> {
+    let last: Option<i64> =
+        connection(path)?.query_row("SELECT MAX(id) FROM notices", [], |row| row.get(0))?;
+    let last = last
+        .map(|id| u64::try_from(id).map(NoticeId::new))
+        .transpose()?;
+    Ok(Event::Notification(NotificationEvent::LogRead { last }))
+}
+
+/// Save a notice's words, and forget the oldest ones.
+fn save_notice(path: &Path, entry: &Logged, forget_through: Option<NoticeId>) -> StorageResult<()> {
+    let message = notify::message(&entry.notice);
+    let mut connection = connection(path)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO notices(id, at, urgent, title, body, page) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            integer(entry.id.get()),
+            seconds(entry.at),
+            entry.reach == Reach::Push,
+            message.title,
+            message.body,
+            message.page,
+        ],
+    )?;
+    if let Some(through) = forget_through {
+        transaction.execute(
+            "DELETE FROM notices WHERE id <= ?1",
+            [integer(through.get())],
+        )?;
+    }
+    transaction.commit().map_err(Into::into)
+}
+
+/// A notice as the notifications page shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StoredNotice {
+    pub(super) id: NoticeId,
+    pub(super) at: SystemTime,
+    /// Whether it is pushed to the owner's phone when a topic is set.
+    pub(super) urgent: bool,
+    pub(super) title: String,
+    pub(super) body: String,
+    /// The dashboard page, or the site, that explains it.
+    pub(super) page: String,
+}
+
+/// The newest notices, newest first.
+pub(super) fn read_notices(path: &Path, limit: u32) -> StorageResult<Vec<StoredNotice>> {
+    let connection = connection(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, at, urgent, title, body, page FROM notices ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, at, urgent, title, body, page) = row?;
+        Ok(StoredNotice {
+            id: NoticeId::new(u64::try_from(id)?),
+            at: time_from_seconds(at)?,
+            urgent,
+            title,
+            body,
+            page,
+        })
+    })
+    .collect()
 }
 
 /// Keep a fetched torrent file until qBittorrent has it; it holds the owner's
@@ -720,7 +821,7 @@ mod tests {
         TunnelEvent, VpnServer, VpnSwitch,
     };
 
-    use super::{Operation, execute, state_name, torrent_state};
+    use super::{Operation, execute, notify, read_notices, state_name, torrent_state};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -1034,6 +1135,137 @@ mod tests {
             ),
         ] {
             assert_eq!(outcome(path, operation), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the log's round trip and each way reading or saving it fails"
+    )]
+    fn the_notices_log_keeps_words_and_forgets_the_oldest() -> TestResult {
+        use crate::core::{Logged, Notice, NoticeId, NotificationEvent, Reach, StartupMode};
+
+        let storage = storage()?;
+        let path = &storage.path;
+        let entry = |id, notice: Notice| Logged {
+            id: NoticeId::new(id),
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(id),
+            reach: notice.reach(),
+            notice,
+        };
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogRead { last: None })
+        );
+        let started = Notice::Started {
+            mode: StartupMode::Resume,
+        };
+        for (logged, forget) in [
+            (entry(1, Notice::Test), None),
+            (entry(2, started), None),
+            (entry(3, Notice::MamVisitReminder), Some(NoticeId::new(1))),
+        ] {
+            assert_eq!(
+                outcome(path, Operation::SaveNotice(logged, forget)),
+                Event::Notification(NotificationEvent::Saved)
+            );
+        }
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogRead {
+                last: Some(NoticeId::new(3))
+            })
+        );
+        let notices = read_notices(path, 10).unwrap_or_default();
+        assert_eq!(
+            notices
+                .iter()
+                .map(|notice| (notice.id.get(), notice.urgent))
+                .collect::<Vec<_>>(),
+            [(3, true), (2, false)],
+            "newest first, and the first is forgotten"
+        );
+        assert_eq!(
+            notices
+                .first()
+                .map(|newest| (newest.title.as_str(), newest.page.as_str(), newest.at)),
+            Some((
+                notify::message(&Notice::MamVisitReminder).title,
+                "https://www.myanonamouse.net/",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(3)
+            ))
+        );
+        assert_eq!(
+            read_notices(path, 1).map(|notices| notices.len()).ok(),
+            Some(1)
+        );
+        // An id already taken fails the save.
+        assert_eq!(
+            outcome(path, Operation::SaveNotice(entry(3, Notice::Test), None)),
+            Event::Notification(NotificationEvent::SaveFailed)
+        );
+        assert_eq!(Reach::Push, Notice::Test.reach());
+        // Unreadable or refused notices fail.
+        let sql = |batch: &str| storage.connection.execute_batch(batch).is_ok();
+        assert!(sql("UPDATE notices SET at = -1 WHERE id = 3;"));
+        assert!(read_notices(path, 10).is_err(), "a time before 1970");
+        assert!(sql("UPDATE notices SET at = 3, id = -3 WHERE id = 3;"));
+        assert!(read_notices(path, 10).is_err(), "a negative id");
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogRead {
+                last: Some(NoticeId::new(2))
+            })
+        );
+        // Each column holding the wrong kind of value fails the read.
+        for values in [
+            "'later', 1, 't', 'b', 'p'",
+            "1, 'yes', 't', 'b', 'p'",
+            "1, 1, x'ff', 'b', 'p'",
+            "1, 1, 't', x'ff', 'p'",
+            "1, 1, 't', 'b', x'ff'",
+        ] {
+            assert!(sql(&format!(
+                "DELETE FROM notices WHERE id = 100; INSERT INTO notices VALUES (100, {values});"
+            )));
+            assert!(read_notices(path, 10).is_err(), "{values}");
+        }
+        assert!(sql("DELETE FROM notices WHERE id > 0;"));
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogReadFailed),
+            "only a negative id is left"
+        );
+        // A full log cannot forget, so the save fails as a whole.
+        let refuse = "CREATE TRIGGER keep BEFORE DELETE ON notices \
+                      BEGIN SELECT RAISE(ABORT, 'kept'); END;";
+        assert!(sql(refuse));
+        assert_eq!(
+            outcome(
+                path,
+                Operation::SaveNotice(entry(8, Notice::Test), Some(NoticeId::new(7)))
+            ),
+            Event::Notification(NotificationEvent::SaveFailed)
+        );
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogReadFailed),
+            "nothing was saved"
+        );
+        assert!(sql("DROP TABLE notices;"));
+        let missing = path.with_file_name("missing.sqlite");
+        for path in [path, &missing] {
+            assert_eq!(
+                outcome(path, Operation::ReadNoticeLog),
+                Event::Notification(NotificationEvent::LogReadFailed)
+            );
+            assert_eq!(
+                outcome(path, Operation::SaveNotice(entry(9, Notice::Test), None)),
+                Event::Notification(NotificationEvent::SaveFailed)
+            );
+            assert!(read_notices(path, 10).is_err());
         }
         Ok(())
     }

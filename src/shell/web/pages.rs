@@ -17,6 +17,7 @@ use crate::{
     shell::{
         describe::{CATEGORIES, delivery_failure, exit_ip_failure, qbittorrent_failure, timestamp},
         history::{HistoryPage, HistoryQuery, Page},
+        storage::StoredNotice,
     },
 };
 
@@ -26,6 +27,7 @@ use super::Deployment;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Location {
     Status,
+    Notifications,
     History,
     Settings,
 }
@@ -34,6 +36,7 @@ impl Location {
     pub(super) const fn path(self) -> &'static str {
         match self {
             Self::Status => "/",
+            Self::Notifications => "/notifications",
             Self::History => "/history",
             Self::Settings => "/settings",
         }
@@ -41,6 +44,7 @@ impl Location {
 
     pub(super) fn from_path(path: &str) -> Self {
         match path {
+            "/notifications" => Self::Notifications,
             "/history" => Self::History,
             "/settings" => Self::Settings,
             _ => Self::Status,
@@ -50,6 +54,7 @@ impl Location {
     const fn title(self) -> &'static str {
         match self {
             Self::Status => "Status",
+            Self::Notifications => "Notifications",
             Self::History => "History",
             Self::Settings => "Settings",
         }
@@ -77,7 +82,7 @@ fn layout(location: Location, observation: &Observation, body: &Markup) -> Marku
                     div.bar {
                         a.brand href="/" { "Windlass" }
                         nav aria-label="Main" {
-                            @for page in [Location::Status, Location::History, Location::Settings] {
+                            @for page in [Location::Status, Location::Notifications, Location::History, Location::Settings] {
                                 @if page == location {
                                     a href=(page.path()) aria-current="page" { (page.title()) }
                                 } @else {
@@ -1111,6 +1116,53 @@ pub(super) fn history(
     layout(Location::History, observation, &body)
 }
 
+/// The notifications page: every notice Windlass gave, newest first, each
+/// with its own address for pushes to link to.
+pub(super) fn notifications(
+    observation: &Observation,
+    result: &Result<Vec<StoredNotice>, String>,
+) -> Markup {
+    let body = html! {
+        div.page {
+            div.title-row {
+                h1 { "Notifications" }
+                p.muted { "Urgent notices are also pushed to your phone, as a link to their entry here. The rest are only shown here." }
+            }
+            @match result {
+                Err(error) => {
+                    section.panel.error { h2 { "Notifications could not be read" } p.mono { (error) } }
+                }
+                Ok(notices) if notices.is_empty() => {
+                    section.panel { p { "No notices yet." } }
+                }
+                Ok(notices) => {
+                    ol.notices {
+                        @for notice in notices {
+                            li.panel.notice #{ "notice-" (notice.id.get()) } {
+                                div.notice-head {
+                                    h2 { (notice.title) }
+                                    span.muted {
+                                        (time(notice.at, "full"))
+                                        " · "
+                                        @if notice.urgent { "Urgent" } @else { "Dashboard only" }
+                                    }
+                                }
+                                p { (notice.body) }
+                                @if notice.page.starts_with("https://") {
+                                    a href=(notice.page) rel="noreferrer" { "Open MAM" }
+                                } @else {
+                                    a href=(notice.page) { "Show on the dashboard" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    layout(Location::Notifications, observation, &body)
+}
+
 /// A plain page for refused or failed requests.
 pub(super) fn message(observation: &Observation, title: &str, text: &str) -> Markup {
     let body = html! {
@@ -1226,6 +1278,21 @@ mod tests {
             assert!(html.contains("Loading…"));
             assert!(html.contains("Opening…"));
         }
+    }
+
+    #[test]
+    fn the_notifications_page_says_when_it_is_empty_or_unreadable() {
+        let observation = observation(
+            State::NotStarted,
+            SettingsState::Unread,
+            HistoryState::Closed,
+        );
+        let empty = super::notifications(&observation, &Ok(Vec::new())).into_string();
+        assert!(empty.contains("No notices yet."));
+        let failed =
+            super::notifications(&observation, &Err(String::from("no such table"))).into_string();
+        assert!(failed.contains("Notifications could not be read"));
+        assert!(failed.contains("no such table"));
     }
 
     #[test]
@@ -1929,7 +1996,10 @@ mod tests {
         assert!(render(&notifications, &with_topic(None)).contains("No ntfy topic is set"));
         let configured = with_topic(Some(topic.clone()));
         assert!(render(&notifications, &configured).contains("None yet"));
-        notifications.delivery = Delivery::Sending(Notice::Test);
+        notifications.delivery = Delivery::Sending(crate::core::Push {
+            entry: None,
+            notice: Notice::Test,
+        });
         assert!(render(&notifications, &configured).contains("Sending…"));
         notifications.delivery = Delivery::Idle;
         notifications.last_outcome = Some(Outcome {

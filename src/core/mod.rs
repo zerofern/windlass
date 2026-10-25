@@ -154,12 +154,21 @@ pub enum Action {
         /// The topic to store, if any.
         topic: Option<NtfyTopic>,
     },
-    /// Publish a notice to the ntfy topic.
+    /// Push a notice to the ntfy topic: only a link to its entry in the log.
     SendNotification {
         /// The topic.
         topic: NtfyTopic,
-        /// What to tell the user.
-        notice: Notice,
+        /// The notice and its entry.
+        push: Push,
+    },
+    /// Read the newest id in the notifications log.
+    ReadNoticeLog,
+    /// Save a notice to the notifications log.
+    SaveNotice {
+        /// The notice and its place in the log.
+        entry: Logged,
+        /// Older notices up to this id are forgotten.
+        forget_through: Option<NoticeId>,
     },
     /// Persist the points reserve.
     WritePointsReserve {
@@ -228,8 +237,9 @@ pub use mam_pause::{
     MamRequestMode, MamRequestsStatus,
 };
 pub use notifications::{
-    Condition, Delivery, DeliveryFailure, Notice, NotificationEvent, Notifications, OUTBOX_LIMIT,
-    Outcome, Phase, SettingName, SwitchBlock,
+    Condition, Delivery, DeliveryFailure, LOG_KEPT, Logged, Notice, NoticeId, NoticeLog,
+    NotificationEvent, Notifications, OUTBOX_LIMIT, Outcome, Phase, Push, Reach, SettingName,
+    SwitchBlock,
 };
 pub use port_forwarding::{
     LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, Port, PortForwarding, PortForwardingEvent,

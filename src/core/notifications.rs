@@ -1,8 +1,11 @@
-//! Decide what the user is told through ntfy, and when.
+//! Decide what the user is told, and when.
 //!
 //! Lasting conditions notify once they have held for their grace period and
-//! again when they clear. One-off events notify as they happen. Notices wait in
-//! a bounded outbox and are delivered one at a time, with retries.
+//! again when they clear. One-off events notify as they happen. Every notice is
+//! kept in the notifications log, which the dashboard shows. Urgent notices are
+//! also pushed through ntfy; a push carries only a link to the notice's entry.
+//! Pushes wait in a bounded outbox and are delivered one at a time, with
+//! retries.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -27,6 +30,8 @@ const SEEDING_REQUIRED: Duration = Duration::from_hours(72);
 
 /// How many notices wait for delivery before the oldest are dropped.
 pub const OUTBOX_LIMIT: usize = 50;
+/// How many notices the log keeps; older ones are forgotten.
+pub const LOG_KEPT: u64 = 1_000;
 /// The first retry delay after a failed delivery; it doubles up to the maximum.
 const RETRY_FIRST: Duration = Duration::from_secs(30);
 /// The longest retry delay.
@@ -58,8 +63,84 @@ pub enum SwitchBlock {
     NoOtherServer,
 }
 
-/// Something the user is told. Notices name conditions and counts, never book
-/// titles or account details.
+/// A notice's place in the notifications log, counting from 1 across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct NoticeId(u64);
+
+impl NoticeId {
+    const FIRST: Self = Self(1);
+
+    /// The id stored for a logged notice.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// The number the log stores and links name.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    const fn following(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+/// Where a notice reaches the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Reach {
+    /// Something is wrong or needs the owner: pushed, and on the dashboard.
+    Push,
+    /// Something went back to normal or went as planned: only on the dashboard.
+    Dashboard,
+}
+
+/// A notice as the log keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Logged {
+    /// Its place in the log.
+    pub id: NoticeId,
+    /// When it was decided.
+    pub at: SystemTime,
+    /// What it says.
+    pub notice: Notice,
+    /// Whether it is pushed.
+    pub reach: Reach,
+}
+
+/// A notice waiting to be pushed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Push {
+    /// Its entry in the log, which the push links to; without one, the push
+    /// links to the log itself.
+    pub entry: Option<NoticeId>,
+    /// The notice.
+    pub notice: Notice,
+}
+
+/// Whether notices can be given their place in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeLog {
+    /// The last stored id is not known yet; notices wait for it, in order.
+    Waiting(Vec<(SystemTime, Notice)>),
+    /// The next notice takes this id.
+    Ready {
+        /// The next id.
+        next: NoticeId,
+    },
+    /// The log cannot be read; urgent notices are still pushed.
+    Unavailable,
+}
+
+impl Default for NoticeLog {
+    fn default() -> Self {
+        Self::Waiting(Vec::new())
+    }
+}
+
+/// Something the user is told. Pushed notices carry no words at all; the log
+/// stays on the owner's network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Notice {
     /// Windlass started.
@@ -323,6 +404,79 @@ pub enum Notice {
     MamVisitReminder,
 }
 
+impl Notice {
+    /// Whether the notice is pushed, or only kept on the dashboard.
+    #[must_use]
+    pub const fn reach(&self) -> Reach {
+        match self {
+            Self::Started { .. }
+            | Self::VpnProtectionRestored { .. }
+            | Self::FailoverStarted { .. }
+            | Self::FailoverSucceeded { .. }
+            | Self::ForwardedPortRestored { .. }
+            | Self::QbittorrentReachable
+            | Self::QbittorrentVersionAllowed { .. }
+            | Self::TorrentErrorsCleared
+            | Self::FilesMissingCleared
+            | Self::TorrentsMissingCleared
+            | Self::RegistrySaved
+            | Self::MamSessionAccepted
+            | Self::SeedboxRegistered { .. }
+            | Self::MamIpKnown
+            | Self::RatioRestored
+            | Self::UnsatisfiedBelowLimit
+            | Self::UnsatisfiedSeeding
+            | Self::MamFlagsCleared
+            | Self::DownloadsResumed
+            | Self::SeedingOnTrack
+            | Self::PurchaseMade { .. }
+            | Self::WedgedMidDownload
+            | Self::PurchaseSettled { .. }
+            | Self::MamClientListed
+            | Self::ConnectableAgain => Reach::Dashboard,
+            Self::StartupFailed
+            | Self::VpnProtectionLost { .. }
+            | Self::FailoverFailed { .. }
+            | Self::FailoverBlocked { .. }
+            | Self::ForwardedPortLost
+            | Self::QbittorrentUnreachable { .. }
+            | Self::QbittorrentVersionNotAllowed { .. }
+            | Self::TorrentErrors { .. }
+            | Self::FilesMissing { .. }
+            | Self::TorrentsMissing { .. }
+            | Self::RegistryNotSaved
+            | Self::RegistryUnreadable
+            | Self::SettingNotSaved { .. }
+            | Self::HistoryUnavailable
+            | Self::HistoryEntriesLost { .. }
+            | Self::Test
+            | Self::MamSessionRejected { .. }
+            | Self::SeedboxNotRegistered
+            | Self::MamIpUnknown { .. }
+            | Self::MamStateUnreadable
+            | Self::RatioLow { .. }
+            | Self::UnsatisfiedNearLimit { .. }
+            | Self::UnsatisfiedNotSeeding { .. }
+            | Self::MamFlagged { .. }
+            | Self::MamMessages { .. }
+            | Self::DownloadsHeld { .. }
+            | Self::NoWedgesLeft
+            | Self::PointsBelowReserve { .. }
+            | Self::VipEnding { .. }
+            | Self::DownloadsRefused
+            | Self::SeedingBehind { .. }
+            | Self::PurchaseRefused { .. }
+            | Self::PurchaseUncertain { .. }
+            | Self::WedgeNotSpent
+            | Self::DownloadNotFree { .. }
+            | Self::PurchaseNeedsChecking { .. }
+            | Self::MamClientNotListed { .. }
+            | Self::NotConnectable { .. }
+            | Self::MamVisitReminder => Reach::Push,
+        }
+    }
+}
+
 /// Why a delivery failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DeliveryFailure {
@@ -347,6 +501,17 @@ pub enum NotificationEvent {
         /// Why.
         reason: DeliveryFailure,
     },
+    /// The notifications log was read at startup.
+    LogRead {
+        /// The newest stored notice, if any.
+        last: Option<NoticeId>,
+    },
+    /// The notifications log could not be read.
+    LogReadFailed,
+    /// A notice was saved to the log.
+    Saved,
+    /// Saving a notice failed; it is still pushed if urgent.
+    SaveFailed,
 }
 
 /// A lasting condition worth telling the user about.
@@ -468,12 +633,12 @@ pub enum Delivery {
     /// Nothing is being sent.
     #[default]
     Idle,
-    /// The shell is sending this notice.
-    Sending(Notice),
+    /// The shell is sending this push.
+    Sending(Push),
     /// Sending failed; it is sent again when the timer expires.
     Retrying {
-        /// The notice.
-        notice: Notice,
+        /// The push.
+        push: Push,
         /// The retry timer.
         timer: TimerId,
     },
@@ -493,8 +658,10 @@ pub struct Outcome {
 pub struct Notifications {
     /// Conditions holding now, by how far they have progressed.
     pub conditions: BTreeMap<Condition, Phase>,
-    /// Notices waiting to be sent, oldest first.
-    pub outbox: VecDeque<Notice>,
+    /// Whether notices can be logged.
+    pub log: NoticeLog,
+    /// Pushes waiting to be sent, oldest first.
+    pub outbox: VecDeque<Push>,
     /// The notice being sent.
     pub delivery: Delivery,
     /// The latest delivery result.
@@ -545,6 +712,7 @@ impl Notifications {
     pub(super) const fn new() -> Self {
         Self {
             conditions: BTreeMap::new(),
+            log: NoticeLog::Waiting(Vec::new()),
             outbox: VecDeque::new(),
             delivery: Delivery::Idle,
             last_outcome: None,
@@ -642,15 +810,70 @@ impl Notifications {
         settings: &SettingsState,
         timers: &mut Timers,
     ) -> Vec<Action> {
+        let mut notices = Vec::new();
         for (condition, status) in assess(now.wall, facts) {
-            self.track(now.monotonic, condition, status);
+            notices.extend(self.track(now.monotonic, condition, status));
         }
-        for notice in happened {
-            self.enqueue(notice);
-        }
-        let mut actions = self.schedule_grace(now.monotonic, timers);
+        notices.extend(happened);
+        let mut actions: Vec<Action> = notices
+            .into_iter()
+            .filter_map(|notice| self.record(now.wall, notice))
+            .collect();
+        actions.extend(self.schedule_grace(now.monotonic, timers));
         actions.extend(self.send(settings));
         actions
+    }
+
+    /// Start reading the log's newest id, once storage is open.
+    pub(super) fn start_reading() -> Vec<Action> {
+        vec![Action::ReadNoticeLog]
+    }
+
+    /// Storage cannot be used: waiting notices are pushed without an entry.
+    pub(super) fn log_unavailable(&mut self) {
+        if let NoticeLog::Waiting(waiting) =
+            std::mem::replace(&mut self.log, NoticeLog::Unavailable)
+        {
+            for (at, notice) in waiting {
+                let _ = self.record(at, notice);
+            }
+        }
+    }
+
+    /// Give a notice its place in the log, and queue it for pushing if urgent.
+    fn record(&mut self, at: SystemTime, notice: Notice) -> Option<Action> {
+        let reach = notice.reach();
+        let entry = match &mut self.log {
+            NoticeLog::Waiting(waiting) => {
+                waiting.push((at, notice));
+                return None;
+            }
+            NoticeLog::Ready { next } => {
+                let id = *next;
+                *next = id.following();
+                Some(id)
+            }
+            NoticeLog::Unavailable => None,
+        };
+        if reach == Reach::Push {
+            self.enqueue(Push {
+                entry,
+                notice: notice.clone(),
+            });
+        }
+        entry.map(|id| Action::SaveNotice {
+            entry: Logged {
+                id,
+                at,
+                notice,
+                reach,
+            },
+            forget_through: id
+                .get()
+                .checked_sub(LOG_KEPT)
+                .filter(|through| *through > 0)
+                .map(NoticeId::new),
+        })
     }
 
     pub(super) fn handle(
@@ -659,11 +882,37 @@ impl Notifications {
         event: &NotificationEvent,
         timers: &mut Timers,
     ) -> Vec<Action> {
-        let Delivery::Sending(notice) = &self.delivery else {
+        match event {
+            // The log is read once, at startup.
+            NotificationEvent::LogRead { last } => {
+                let NoticeLog::Waiting(waiting) = &mut self.log else {
+                    return Vec::new();
+                };
+                let waiting = std::mem::take(waiting);
+                self.log = NoticeLog::Ready {
+                    next: last.map_or(NoticeId::FIRST, NoticeId::following),
+                };
+                return waiting
+                    .into_iter()
+                    .filter_map(|(at, notice)| self.record(at, notice))
+                    .collect();
+            }
+            NotificationEvent::LogReadFailed => {
+                self.log_unavailable();
+                return Vec::new();
+            }
+            _ => {}
+        }
+        let Delivery::Sending(push) = &self.delivery else {
             return Vec::new();
         };
         match event {
-            NotificationEvent::SendTest => Vec::new(),
+            // Handled above, or nothing to do with the push being sent.
+            NotificationEvent::SendTest
+            | NotificationEvent::LogRead { .. }
+            | NotificationEvent::LogReadFailed
+            | NotificationEvent::Saved
+            | NotificationEvent::SaveFailed => Vec::new(),
             NotificationEvent::Delivered => {
                 self.delivery = Delivery::Idle;
                 self.failures = 0;
@@ -674,7 +923,7 @@ impl Notifications {
                 Vec::new()
             }
             NotificationEvent::DeliveryFailed { reason } => {
-                let notice = notice.clone();
+                let push = push.clone();
                 self.failures = self.failures.saturating_add(1);
                 self.last_outcome = Some(Outcome {
                     at: now.wall,
@@ -685,7 +934,7 @@ impl Notifications {
                     .saturating_mul(2_u32.saturating_pow(self.failures - 1))
                     .min(RETRY_MAX);
                 let (timer, deadline) = timers.schedule(now.monotonic, after);
-                self.delivery = Delivery::Retrying { notice, timer };
+                self.delivery = Delivery::Retrying { push, timer };
                 vec![Action::StartTimer {
                     name: TimerName::NotificationRetry,
                     id: timer,
@@ -700,49 +949,50 @@ impl Notifications {
         if self.grace_timer.is_some_and(|(timer, _)| timer == id) {
             self.grace_timer = None;
         }
-        if let Delivery::Retrying { notice, timer, .. } = &self.delivery
+        if let Delivery::Retrying { push, timer, .. } = &self.delivery
             && *timer == id
         {
-            self.outbox.push_front(notice.clone());
+            self.outbox.push_front(push.clone());
             self.delivery = Delivery::Idle;
         }
     }
 
-    fn enqueue(&mut self, notice: Notice) {
+    fn enqueue(&mut self, push: Push) {
         if self.outbox.len() >= OUTBOX_LIMIT {
             self.outbox.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.outbox.push_back(notice);
+        self.outbox.push_back(push);
     }
 
-    fn track(&mut self, now: Instant, condition: Condition, status: Status) {
+    /// Follow a condition; the notice to give, if any.
+    fn track(&mut self, now: Instant, condition: Condition, status: Status) -> Option<Notice> {
         match (self.conditions.get(&condition).copied(), status) {
             (None, Status::Active(notice)) => {
                 if condition.grace().is_zero() {
                     self.conditions.insert(condition, Phase::Raised);
-                    self.enqueue(notice);
+                    Some(notice)
                 } else {
                     self.conditions
                         .insert(condition, Phase::Pending { since: now });
+                    None
                 }
             }
             (Some(Phase::Pending { since }), Status::Active(notice))
                 if now.duration_since(since) >= condition.grace() =>
             {
                 self.conditions.insert(condition, Phase::Raised);
-                self.enqueue(notice);
+                Some(notice)
             }
             (Some(Phase::Pending { .. }), Status::Clear(_)) => {
                 self.conditions.remove(&condition);
+                None
             }
             (Some(Phase::Raised), Status::Clear(notice)) => {
                 self.conditions.remove(&condition);
-                if let Some(notice) = notice {
-                    self.enqueue(notice);
-                }
+                notice
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -771,8 +1021,8 @@ impl Notifications {
         }]
     }
 
-    /// Send the oldest notice once settings name a topic; without one, notices
-    /// are discarded.
+    /// Push the oldest waiting notice once settings name a topic; without one,
+    /// pushes are discarded.
     fn send(&mut self, settings: &SettingsState) -> Vec<Action> {
         let topic = match settings {
             SettingsState::Unread | SettingsState::Reading => return Vec::new(),
@@ -789,11 +1039,11 @@ impl Notifications {
         if self.delivery != Delivery::Idle {
             return Vec::new();
         }
-        let Some(notice) = self.outbox.pop_front() else {
+        let Some(push) = self.outbox.pop_front() else {
             return Vec::new();
         };
-        self.delivery = Delivery::Sending(notice.clone());
-        vec![Action::SendNotification { topic, notice }]
+        self.delivery = Delivery::Sending(push.clone());
+        vec![Action::SendNotification { topic, push }]
     }
 }
 

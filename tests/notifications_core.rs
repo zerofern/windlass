@@ -5,43 +5,44 @@ use std::time::{Duration, Instant, SystemTime};
 
 use windlass::core::{
     Action, ClockReading, Condition, Core, Delivery, DeliveryFailure, Event, ExitIpFailure,
-    MamApproval, MamPauseEvent, MamRequestMode, Notice, NotificationEvent, NtfyTopic, OUTBOX_LIMIT,
-    Phase, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, SettingName,
-    SettingsEvent, StartupEvent, StartupMode, SwitchBlock, TimerId, TimerName, TunnelEvent,
-    VpnServer, VpnSwitch,
+    LOG_KEPT, MamApproval, MamPauseEvent, MamRequestMode, Notice, NoticeId, NoticeLog,
+    NotificationEvent, NtfyTopic, OUTBOX_LIMIT, Phase, Push, QbittorrentEvent, QbittorrentFailure,
+    QbittorrentPreferences, Reach, SettingName, SettingsEvent, StartupEvent, StartupMode,
+    SwitchBlock, TimerId, TimerName, TunnelEvent, VpnServer, VpnSwitch,
 };
 
 const TOPIC: &str = "windlass-alerts";
+
+/// How far the notifications log was read at startup.
+#[derive(Clone, Copy)]
+enum Log {
+    Unread,
+    /// Read, with the newest stored id.
+    Read(Option<u64>),
+}
 
 /// A core with a clock that only moves when told to.
 struct Harness {
     core: Core,
     start: Instant,
     elapsed: Duration,
+    /// Every notice saved to the log, with its id, oldest first.
+    logged: Vec<(NoticeId, Notice)>,
 }
 
 impl Harness {
-    /// A started core whose settings name `topic`, with the startup notice
-    /// already delivered.
+    /// A started core whose settings name `topic`, with an empty log.
     fn new(topic: Option<&str>) -> Self {
-        let mut harness = Self {
-            core: Core::new(),
-            start: Instant::now(),
-            elapsed: Duration::from_hours(2),
-        };
-        let _ = harness.send(Event::Startup(StartupEvent::Start {
-            mode: StartupMode::Resume,
-        }));
-        let _ = harness.send(Event::Startup(StartupEvent::StorageOpened));
+        let mut harness = Self::opened(Log::Read(None));
         let ready = harness.send(Event::MamPause(MamPauseEvent::Read {
             mode: Some(MamRequestMode::Paused),
         }));
         assert!(sent(&ready).is_empty(), "settings are not read yet");
         assert_eq!(
-            harness.core.notifications().outbox.front(),
-            Some(&Notice::Started {
+            harness.notices(),
+            [Notice::Started {
                 mode: StartupMode::Resume
-            })
+            }]
         );
         let read = harness.send(Event::Settings(SettingsEvent::Read {
             history_limit: None,
@@ -50,19 +51,38 @@ impl Harness {
                 .map(|topic| NtfyTopic::parse(topic).unwrap_or_else(|_| unreachable!())),
             points_reserve: None,
         }));
-        if topic.is_some() {
-            assert_eq!(
-                sent(&read),
-                vec![Notice::Started {
-                    mode: StartupMode::Resume
-                }]
-            );
-            assert!(harness.delivered().is_empty());
-        } else {
-            assert!(sent(&read).is_empty());
-            assert!(harness.core.notifications().outbox.is_empty());
+        assert!(sent(&read).is_empty(), "the start is only logged");
+        assert!(harness.core.notifications().outbox.is_empty());
+        harness
+    }
+
+    /// A core whose storage opened, with the log read as given.
+    fn opened(log: Log) -> Self {
+        let mut harness = Self {
+            core: Core::new(),
+            start: Instant::now(),
+            elapsed: Duration::from_hours(2),
+            logged: Vec::new(),
+        };
+        let _ = harness.send(Event::Startup(StartupEvent::Start {
+            mode: StartupMode::Resume,
+        }));
+        let opened = harness.send(Event::Startup(StartupEvent::StorageOpened));
+        assert!(opened.contains(&Action::ReadNoticeLog));
+        if let Log::Read(last) = log {
+            let _ = harness.send(Event::Notification(NotificationEvent::LogRead {
+                last: last.map(NoticeId::new),
+            }));
         }
         harness
+    }
+
+    /// The notices saved to the log so far, oldest first.
+    fn notices(&self) -> Vec<Notice> {
+        self.logged
+            .iter()
+            .map(|(_, notice)| notice.clone())
+            .collect()
     }
 
     fn now(&self) -> SystemTime {
@@ -78,7 +98,13 @@ impl Harness {
             monotonic: self.start + self.elapsed,
             wall: self.now(),
         };
-        self.core.handle(now, event)
+        let actions = self.core.handle(now, event);
+        self.logged
+            .extend(actions.iter().filter_map(|action| match action {
+                Action::SaveNotice { entry, .. } => Some((entry.id, entry.notice.clone())),
+                _ => None,
+            }));
+        actions
     }
 
     fn delivered(&mut self) -> Vec<Action> {
@@ -111,9 +137,9 @@ fn sent(actions: &[Action]) -> Vec<Notice> {
     actions
         .iter()
         .filter_map(|action| match action {
-            Action::SendNotification { topic, notice } => {
+            Action::SendNotification { topic, push } => {
                 assert_eq!(topic.expose_secret(), TOPIC);
-                Some(notice.clone())
+                Some(push.notice.clone())
             }
             _ => None,
         })
@@ -131,10 +157,144 @@ fn timer(actions: &[Action], expected: TimerName) -> Option<(TimerId, Duration)>
 }
 
 #[test]
-fn startup_is_announced_once_settings_name_a_topic() {
+fn every_notice_is_logged_and_only_urgent_ones_are_pushed_with_their_entry() {
     let mut harness = Harness::new(Some(TOPIC));
-    assert!(harness.delivered().is_empty(), "nothing else is queued");
-    assert!(harness.core.notifications().last_outcome.is_some());
+    let actions = harness.send(Event::Notification(NotificationEvent::SendTest));
+    let pushes: Vec<_> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::SendNotification { push, .. } => Some(push.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pushes,
+        [Push {
+            entry: Some(NoticeId::new(2)),
+            notice: Notice::Test
+        }],
+        "the start took the first entry"
+    );
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        Action::SaveNotice { entry, forget_through: None }
+            if entry.id == NoticeId::new(2) && entry.reach == Reach::Push
+    )));
+    assert_eq!(
+        Notice::Started {
+            mode: StartupMode::Resume
+        }
+        .reach(),
+        Reach::Dashboard
+    );
+}
+
+#[test]
+fn ids_continue_from_the_log_and_old_notices_are_forgotten() {
+    let mut harness = Harness::opened(Log::Read(Some(LOG_KEPT + 4)));
+    let ready = harness.send(Event::MamPause(MamPauseEvent::Read {
+        mode: Some(MamRequestMode::Paused),
+    }));
+    assert!(ready.iter().any(|action| matches!(
+        action,
+        Action::SaveNotice { entry, forget_through: Some(through) }
+            if entry.id == NoticeId::new(LOG_KEPT + 5) && *through == NoticeId::new(5)
+    )));
+}
+
+#[test]
+fn notices_wait_for_the_log_to_be_read() {
+    let mut harness = Harness::opened(Log::Unread);
+    let _ = harness.send(Event::MamPause(MamPauseEvent::Read {
+        mode: Some(MamRequestMode::Paused),
+    }));
+    let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
+    assert!(harness.notices().is_empty());
+    let _ = harness.send(Event::Notification(NotificationEvent::LogRead {
+        last: Some(NoticeId::new(9)),
+    }));
+    assert_eq!(
+        harness.logged,
+        [
+            (
+                NoticeId::new(10),
+                Notice::Started {
+                    mode: StartupMode::Resume
+                }
+            ),
+            (NoticeId::new(11), Notice::Test)
+        ]
+    );
+    assert_eq!(
+        harness
+            .core
+            .notifications()
+            .outbox
+            .iter()
+            .map(|push| push.entry)
+            .collect::<Vec<_>>(),
+        [Some(NoticeId::new(11))]
+    );
+    // A second read changes nothing.
+    let again = harness.send(Event::Notification(NotificationEvent::LogRead {
+        last: None,
+    }));
+    assert_eq!(
+        harness.core.notifications().log,
+        NoticeLog::Ready {
+            next: NoticeId::new(12)
+        }
+    );
+    assert!(again.is_empty());
+}
+
+#[test]
+fn without_a_log_urgent_notices_are_still_pushed() {
+    let mut harness = Harness::opened(Log::Unread);
+    let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
+    let _ = harness.send(Event::Notification(NotificationEvent::LogReadFailed));
+    assert_eq!(harness.core.notifications().log, NoticeLog::Unavailable);
+    let again = harness.send(Event::Notification(NotificationEvent::LogReadFailed));
+    assert_eq!(sent(&again).len(), 0, "nothing more to push");
+    let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
+    let _ = harness.send(Event::Notification(NotificationEvent::SaveFailed));
+    assert!(harness.notices().is_empty());
+    assert_eq!(
+        harness.core.notifications().outbox,
+        [
+            Push {
+                entry: None,
+                notice: Notice::Test
+            },
+            Push {
+                entry: None,
+                notice: Notice::Test
+            }
+        ]
+    );
+
+    // Storage that cannot open never reads the log.
+    let mut failed = Harness {
+        core: Core::new(),
+        start: Instant::now(),
+        elapsed: Duration::ZERO,
+        logged: Vec::new(),
+    };
+    let _ = failed.send(Event::Startup(StartupEvent::Start {
+        mode: StartupMode::Resume,
+    }));
+    let _ = failed.send(Event::Startup(StartupEvent::StorageOpenFailed));
+    assert_eq!(failed.core.notifications().log, NoticeLog::Unavailable);
+    assert_eq!(
+        failed
+            .core
+            .notifications()
+            .outbox
+            .iter()
+            .map(|push| &push.notice)
+            .collect::<Vec<_>>(),
+        [&Notice::StartupFailed]
+    );
 }
 
 #[test]
@@ -224,13 +384,14 @@ fn qbittorrent_outages_notify_after_five_minutes_and_on_recovery() -> Result<(),
     }));
     assert_eq!(
         harness.deliver_all(&connected),
-        vec![
-            Notice::QbittorrentReachable,
-            Notice::QbittorrentVersionNotAllowed {
-                version: String::from("v5.0.0")
-            }
-        ],
+        vec![Notice::QbittorrentVersionNotAllowed {
+            version: String::from("v5.0.0")
+        }],
         "a version MAM does not allow is reported at once"
+    );
+    assert!(
+        harness.notices().contains(&Notice::QbittorrentReachable),
+        "recovery is only logged"
     );
     Ok(())
 }
@@ -299,30 +460,34 @@ fn failover_is_announced_step_by_step() {
     enable_tunnel(&mut harness, None);
     assert_eq!(
         fail_checks(&mut harness),
-        vec![
-            Notice::VpnProtectionLost { failures: 3 },
-            Notice::FailoverStarted {
-                server: server("two")
-            }
-        ]
+        vec![Notice::VpnProtectionLost { failures: 3 }]
     );
     let _ = harness.send(Event::Tunnel(TunnelEvent::SwitchSaved));
     let switched = harness.send(Event::Tunnel(TunnelEvent::Switched));
-    assert_eq!(
-        harness.deliver_all(&switched),
-        vec![Notice::FailoverSucceeded {
-            server: server("two")
-        }]
-    );
+    assert!(harness.deliver_all(&switched).is_empty());
     let observed = harness.send(Event::Tunnel(TunnelEvent::ExitIpObserved {
         ip: std::net::IpAddr::from([192, 0, 2, 9]),
     }));
+    assert!(harness.deliver_all(&observed).is_empty());
+    // The steps of the switch, and the recovery, are only logged.
     assert_eq!(
-        harness.deliver_all(&observed),
-        vec![Notice::VpnProtectionRestored {
-            exit_ip: std::net::IpAddr::from([192, 0, 2, 9]),
-            server: Some(server("two"))
-        }]
+        harness.notices().get(1..),
+        Some(
+            [
+                Notice::VpnProtectionLost { failures: 3 },
+                Notice::FailoverStarted {
+                    server: server("two")
+                },
+                Notice::FailoverSucceeded {
+                    server: server("two")
+                },
+                Notice::VpnProtectionRestored {
+                    exit_ip: std::net::IpAddr::from([192, 0, 2, 9]),
+                    server: Some(server("two"))
+                }
+            ]
+            .as_slice()
+        )
     );
 }
 
@@ -473,7 +638,12 @@ fn notices_wait_while_one_is_being_sent() {
     let failed = harness.send(Event::Settings(SettingsEvent::NtfyTopicWriteFailed));
     assert!(sent(&failed).is_empty());
     assert_eq!(
-        harness.core.notifications().outbox.back(),
+        harness
+            .core
+            .notifications()
+            .outbox
+            .back()
+            .map(|push| &push.notice),
         Some(&Notice::SettingNotSaved {
             setting: SettingName::NtfyTopic
         })

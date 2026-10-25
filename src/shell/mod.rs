@@ -267,12 +267,17 @@ impl Shell {
             Action::SwitchVpnServer { server } => {
                 return self.tunnel(tunnel::Request::Switch(server));
             }
-            Action::SendNotification { topic, notice } => {
+            Action::SendNotification { topic, push } => {
                 let channel = self.notifications.clone();
                 return self.spawn(async move {
-                    Event::Notification(notify::send(&channel, &topic, &notice).await)
+                    Event::Notification(notify::send(&channel, &topic, &push).await)
                 });
             }
+            Action::ReadNoticeLog => Operation::ReadNoticeLog,
+            Action::SaveNotice {
+                entry,
+                forget_through,
+            } => Operation::SaveNotice(entry, forget_through),
             Action::MamRequest { request, cookie } => {
                 let client = self.mam.clone();
                 let database = self.database.clone();
@@ -448,7 +453,10 @@ mod tests {
             (
                 Action::SendNotification {
                     topic: topic.clone(),
-                    notice: Notice::Test,
+                    push: crate::core::Push {
+                        entry: None,
+                        notice: Notice::Test,
+                    },
                 },
                 Event::Notification(NotificationEvent::DeliveryFailed {
                     reason: DeliveryFailure::Unreachable,

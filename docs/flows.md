@@ -282,11 +282,15 @@ core scenarios with simulated time, and end to end only for their wiring.
 
 ### 21. Deliver notifications
 
-- **Does:** sends notices to the ntfy topic through the relay; lasting problems
-  only after their grace period, and again when they clear; retries with growing
-  waits; keeps a bounded outbox; never names books; links to the dashboard page
-  that explains it, or to MAM for the reminder.
-- **Where:** `core/notifications.rs`, `shell/notify.rs`.
+- **Does:** gives every notice an id, continuing from the last stored one, and
+  keeps it on the notifications page; lasting problems only after their grace
+  period, and again when they clear. Urgent notices are pushed to the ntfy topic
+  through the relay as only a link to their entry; recoveries and progress stay
+  on the page. Retries with growing waits; keeps a bounded outbox. Without a
+  readable log, urgent notices are still pushed, linking to the page.
+- **Where:** `core/notifications.rs` (`record`, `Notice::reach`),
+  `shell/notify.rs`, `shell/storage.rs` (`notices`), `shell/web/pages.rs`
+  (`notifications`).
 - **Tested:** `tests/notifications_core.rs`, `tests/web.rs`, the VM test.
 
 ## Restart

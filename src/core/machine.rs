@@ -196,6 +196,10 @@ impl Core {
             actions.extend(self.registry.start_reading());
             actions.extend(self.tunnel.start_reading());
             actions.extend(self.mam.start_reading());
+            actions.extend(Notifications::start_reading());
+        }
+        if matches!(self.state, State::Failed) {
+            self.notifications.log_unavailable();
         }
         actions
     }

@@ -154,8 +154,9 @@ async fn producers_share_one_runner_and_shutdown_drains_follow_up_writes() -> Te
             row.get(0)
         })?;
     assert_eq!(saved, "paused");
-    // Shutdown drained the follow-up writes: the pause, and the MAM visit
-    // reminder count started at the first run, in either order.
+    // Shutdown drained the follow-up writes: the pause, the MAM visit
+    // reminder count started at the first run, and the start notice, in any
+    // order.
     let last = console_observations
         .borrow()
         .clone()
@@ -167,6 +168,7 @@ async fn producers_share_one_runner_and_shutdown_drains_follow_up_writes() -> Te
             Some(
                 Event::MamPause(MamPauseEvent::Written)
                     | Event::Mam(windlass::core::MamEvent::ReminderSaved)
+                    | Event::Notification(windlass::core::NotificationEvent::Saved)
             )
         ),
         "{last:?}"
@@ -207,10 +209,14 @@ async fn storage_failures_are_observable_without_a_console() -> TestResult {
             .as_deref()
             .is_some_and(|detail| detail.contains("write rejected"))
     );
-    assert_eq!(
+    // The notice of the failure may already be saved.
+    assert!(matches!(
         failed.last_event.map(|event| event.event),
-        Some(Event::MamPause(MamPauseEvent::WriteFailed))
-    );
+        Some(
+            Event::MamPause(MamPauseEvent::WriteFailed)
+                | Event::Notification(windlass::core::NotificationEvent::Saved)
+        )
+    ));
     events.shutdown().await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), worker).await???,

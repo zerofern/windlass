@@ -3,7 +3,7 @@
 # fails, the dashboard is reachable from the LAN but not through the tunnel, and
 # notifications still reach their single destination while the VPN is down.
 # Windlass proves the tunnel works and fails over to the other server by itself,
-# and its notifications reach ntfy through the relay with a link to the dashboard.
+# and its notifications reach ntfy through the relay as a link to their entry.
 # MAM's IP lookup and seedbox registration see the VPN's exit IP, never the host's.
 #
 # The keys below are throwaway test keys; never reuse them.
@@ -239,17 +239,19 @@ in
           )
           web.succeed("curl -sf http://machine:8740/ | grep -q '${ipOf "vpn1"}'")
 
-      with subtest("Notifications reach ntfy through the relay with a dashboard link"):
+      with subtest("Notifications reach ntfy through the relay as a link to their entry"):
           ntfy_log = "/var/log/nginx/ntfy.log"
           web.succeed("curl -sf -X POST -d topic=windlass-vm http://machine:8740/settings/ntfy-topic")
           web.wait_until_succeeds(
               "curl -sf http://machine:8740/settings | grep -q 'Send test notification'", timeout=900
           )
           web.succeed("curl -sf -X POST http://machine:8740/notifications/test")
+          # A push says nothing about the notice; its entry on the dashboard does.
           web.wait_until_succeeds(
-              f"grep -q 'POST /windlass-vm \"Test notification\" \"http://machine:8740/settings\"' {ntfy_log}",
+              f"grep -q 'POST /windlass-vm \"Windlass\" \"http://machine:8740/notifications#notice-' {ntfy_log}",
               timeout=900,
           )
+          web.succeed("curl -sf http://machine:8740/notifications | grep -q 'Test notification'")
 
       with subtest("MAM sees the VPN's exit IP and registers it as the seedbox"):
           mam_log = "/var/log/nginx/mam.log"
@@ -334,8 +336,15 @@ in
           )
           # MAM allows one IP change an hour, so the next switch must wait.
           web.succeed("curl -sf http://machine:8740/ | grep -q 'Not before'")
-          # Each step reached ntfy, even while the tunnel was down.
+          # The lost tunnel was pushed, even while it was down; each step is on
+          # the notifications page.
+          web.wait_until_succeeds(
+              f"test $(grep -c '\"Windlass\" \"http://machine:8740/notifications#notice-' {ntfy_log}) -ge 2",
+              timeout=900,
+          )
           for title in ["VPN not working", "Switching VPN server", "VPN server switched"]:
-              web.wait_until_succeeds(f"grep -q '\"{title}\" \"http://machine:8740/#tunnel\"' {ntfy_log}", timeout=900)
+              web.wait_until_succeeds(
+                  f"curl -sf http://machine:8740/notifications | grep -q '{title}'", timeout=900
+              )
     '';
 }

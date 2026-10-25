@@ -618,21 +618,22 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
 
     // Each older version gains what later versions added.
     for downgrade in [
-        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; \
          ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
          ALTER TABLE history DROP COLUMN routine; PRAGMA user_version = 2;",
-        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; \
          ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
          PRAGMA user_version = 3;",
-        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; \
          ALTER TABLE settings DROP COLUMN ntfy_topic; PRAGMA user_version = 4;",
-        "DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; PRAGMA user_version = 5;",
-        "INSERT INTO torrents (id, mam_id, origin, desired, deletion_allowed) \
+        "DROP TABLE notices; INSERT INTO torrents (id, mam_id, origin, desired, deletion_allowed) \
          VALUES (1, 5, 'bookmark', 'held', 0); PRAGMA user_version = 6;",
+        "DROP TABLE notices; PRAGMA user_version = 7;",
     ] {
         let older = tempfile::tempdir()?;
         let older_path = older.path().join("windlass.sqlite");
@@ -650,6 +651,10 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
             .history_with("/history", "Startup requested (resume existing storage)")
             .await?;
         assert!(history.contains("Startup requested (resume existing storage)"));
+        let notices = dashboard
+            .history_with("/notifications", "<h2>Windlass started</h2>")
+            .await?;
+        assert!(notices.contains("<h2>Windlass started</h2>"), "{notices}");
         dashboard.stop().await?;
     }
 
@@ -667,6 +672,42 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
     let (_, settings) = dashboard.get("/settings").await?;
     assert!(settings.contains("Loading…"));
     dashboard.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_notice_has_an_entry_on_the_notifications_page() -> TestResult {
+    let dashboard = Dashboard::start(StartupMode::Initialise).await?;
+    let (status, _, _) = dashboard.post("/notifications/test", "").await?;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let page = dashboard
+        .history_with("/notifications", "<h2>Test notification</h2>")
+        .await?;
+    assert!(page.contains(r#"href="/notifications" aria-current="page""#));
+    // Newest first: the test, then the start, each with its own address.
+    let test = page
+        .find(r#"id="notice-2""#)
+        .ok_or("no entry for the test")?;
+    let started = page
+        .find(r#"id="notice-1""#)
+        .ok_or("no entry for the start")?;
+    assert!(test < started, "{page}");
+    assert!(page.contains("Dashboard only"), "the start is not pushed");
+    assert!(page.contains("Urgent"), "the test is pushed");
+    // Commands on the page return to it.
+    let (status, location, _) = dashboard
+        .post("/mam/pause", "next=%2Fnotifications")
+        .await?;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location, "/notifications");
+    dashboard.stop().await?;
+
+    // An unreadable log is reported on the page.
+    let broken = Dashboard::start(StartupMode::Initialise).await?;
+    Connection::open(&broken.path)?.execute_batch("DROP TABLE notices;")?;
+    let (_, page) = broken.get("/notifications").await?;
+    assert!(page.contains("Notifications could not be read"), "{page}");
+    broken.stop().await?;
     Ok(())
 }
 
