@@ -8,6 +8,8 @@ SQLite persistence, and native systemd services on NixOS.
 - [Application foundation](.workflow/features/B-0008/brief.md) is ready for Design.
 - [Web dashboard and MAM pause control](.workflow/features/B-0003/brief.md) is ready for Design.
 - [Feature Briefs](.workflow/features/) contain the agreed and proposed flows.
+- [Flows](docs/flows.md) maps what Windlass does, flow by flow, with how each is
+  tested and the end-to-end tests still planned.
 - [Project instructions](AGENTS.md) define coding and testing conventions.
 
 ## Proof of concept
