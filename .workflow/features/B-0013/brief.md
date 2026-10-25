@@ -61,7 +61,8 @@ Acceptance:
   otherwise. It follows the ratio in every reading, because a falling ratio
   takes Power User away too.
 - When VIP would lapse and MAM's unsatisfied count is above that class's limit,
-  Windlass renews VIP ahead of other purchases.
+  Windlass renews VIP ahead of other purchases, spending into the points reserve
+  if that is the only way, with an urgent notice when it does.
 - When the ratio comes close to losing a class, the owner is told before it
   happens, with the unsatisfied count and the limit it would fall to.
 - Downloads already hold when a download would leave fewer than 2 slots free
@@ -112,9 +113,16 @@ next payout includes them.
 
 Acceptance:
 
-- When the account's wedges rise by 8 or more without a purchase by Windlass,
-  Windlass takes it as a vault payout and sends a notice to donate again, with a
-  link to the vault page.
+- Windlass follows the account's wedge count in every reading. When it rises
+  by 8 (the owner had donated) or 2 (the owner had not) and Windlass bought no
+  wedges, Windlass takes it as a vault payout.
+- After a payout, Windlass reads the bonus history for a donation (`type`
+  `millionaires`, 2000 points) made since. Until one shows, the owner is
+  reminded to donate, with a link to
+  `https://www.myanonamouse.net/millionaires/pot.php`: pushed once at the
+  payout, and kept on the dashboard until the donation shows.
+- The bonus history is read for this at most once an hour, only while a
+  reminder is open.
 - Windlass never donates; the API does not offer it.
 
 ## Feature-wide constraints and acceptance
@@ -151,13 +159,17 @@ does not offer.
 - Decided: pushes carry only a link to the notice's entry, so titles stay on the
   LAN (B-0002's rule holds).
 - Decided: when VIP ends, the account falls to Power User while its ratio keeps
-  that class. The ratio Power User needs is not in the captured rules; assumed
-  2.0 until confirmed, and the fallback is User (50) below it.
-- VIP renewal for the unsatisfied limit: may it dip into the points reserve when
-  nothing else keeps the count within the limit? Proposed: yes, with an urgent
-  notice; otherwise downloads hold and the owner is told.
+  that class. Power User's requirements are not in the captured rules; the owner
+  believes a ratio of 2.0 and 3 months' membership. Windlass assumes the
+  membership is met (the API does not report it) and watches the ratio; below
+  2.0 it plans for User (50). A ratio with nothing downloaded counts as above
+  every floor (MAM shows it as `∞`).
+- Decided: VIP renewal may spend into the points reserve when nothing else keeps
+  the unsatisfied count within the fallback limit, with an urgent notice.
 - "Download now" lasts until that torrent finishes downloading.
 - Millionaire's Vault: bonus history shows donations (`type` `millionaires`,
-  `amount` 2000) but no payout entry has been seen yet, so the payout is taken
-  from a jump in wedges. When a payout shows in the history, Windlass should use
-  that instead. The vault page's address is still needed for the link.
+  `amount` 2000) but no payout entry has been seen, so the payout is taken from
+  a rise of 8 or 2 wedges. A gift of wedges from another member of the same size
+  would be mistaken for a payout; the reminder then asks for a donation the
+  owner may not need to make, which is harmless. If a payout entry shows in the
+  history, Windlass should use it instead.
