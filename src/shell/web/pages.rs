@@ -790,10 +790,14 @@ fn settings_live(observation: &Observation) -> Markup {
     let (reserve, reserve_tone) = loaded.map_or(("Loading…", "neutral"), |settings| {
         setting_label(&settings.points_reserve)
     });
+    let (torrents, torrents_tone) = loaded.map_or(("Loading…", "neutral"), |settings| {
+        setting_label(&settings.torrent_limits)
+    });
     html! {
         span class={ "tag " (cookie_tone) } data-live="api-cookie-status" { (cookie) }
         span class={ "tag " (limit_tone) } data-live="history-limit-status" { (limit) }
         span class={ "tag " (reserve_tone) } data-live="points-reserve-status" { (reserve) }
+        span class={ "tag " (torrents_tone) } data-live="torrent-limits-status" { (torrents) }
     }
 }
 
@@ -808,6 +812,42 @@ pub(super) struct SettingsForm {
     pub(super) ntfy_topic_error: Option<String>,
     pub(super) points_reserve: Option<String>,
     pub(super) points_reserve_error: Option<String>,
+    pub(super) max_downloading: Option<String>,
+    pub(super) max_active: Option<String>,
+    pub(super) torrent_limits_error: Option<String>,
+}
+
+fn limits_form(settings: &Settings, form: &SettingsForm) -> Markup {
+    let requested = settings.torrent_limits.requested;
+    let invalid = form.torrent_limits_error.as_ref().map(|_| "true");
+    let described = form.torrent_limits_error.as_ref().map(|_| "limits-error");
+    html! {
+        form.setting #torrent-limits method="post" action="/settings/torrent-limits" {
+            div.setting-head {
+                span.label { "Torrent limits" }
+                @let (label, tone) = setting_label(&settings.torrent_limits);
+                span class={ "tag " (tone) } data-live="torrent-limits-status" { (label) }
+            }
+            p.hint {
+                "How many torrents may download at once, and how many may be active: downloading, or seeding while peers download from them. "
+                "Windlass sets qBittorrent's queue to match, and torrents still short of MAM's 72 hours of seeding always run. Defaults 5 and 10."
+            }
+            div.row {
+                label for="max-downloading" { "Downloading" }
+                input #max-downloading .short type="text" inputmode="numeric" name="downloading"
+                    value=(form.max_downloading.clone().unwrap_or_else(|| requested.downloading().to_string()))
+                    aria-invalid=[invalid] aria-describedby=[described];
+                label for="max-active" { "Active" }
+                input #max-active .short type="text" inputmode="numeric" name="active"
+                    value=(form.max_active.clone().unwrap_or_else(|| requested.active().to_string()))
+                    aria-invalid=[invalid] aria-describedby=[described];
+                button.primary type="submit" { "Save" }
+            }
+            @if let Some(error) = &form.torrent_limits_error {
+                p.field-error #limits-error { (error) }
+            }
+        }
+    }
 }
 
 fn reserve_form(settings: &Settings, form: &SettingsForm) -> Markup {
@@ -951,6 +991,7 @@ pub(super) fn settings(
                     }
                     (topic_form(settings, form))
                     (reserve_form(settings, form))
+                    (limits_form(settings, form))
                     form.setting method="post" action="/settings/history-limit" {
                         div.setting-head {
                             label for="history-limit" { "History size limit" }
@@ -1241,6 +1282,11 @@ mod tests {
                 requested: crate::core::PointsReserve::default(),
                 persistence: SettingPersistence::Idle,
             },
+            torrent_limits: Setting {
+                saved: crate::core::TorrentLimits::default(),
+                requested: crate::core::TorrentLimits::default(),
+                persistence: SettingPersistence::Idle,
+            },
         })
     }
 
@@ -1498,6 +1544,7 @@ mod tests {
                     preferences: QbittorrentPreferences {
                         listen_port: Port::new(listen),
                         interface: interface.map(str::to_owned),
+                        queue: None,
                     },
                 }),
                 Event::Qbittorrent(QbittorrentEvent::Synced(torrents.clone())),

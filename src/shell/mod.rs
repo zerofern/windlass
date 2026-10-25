@@ -260,6 +260,9 @@ impl Shell {
             Action::SetQbittorrentListenPort { port } => {
                 return self.qbittorrent(qbittorrent::Request::SetListenPort(port));
             }
+            Action::SetQbittorrentQueue { queue } => {
+                return self.qbittorrent(qbittorrent::Request::SetQueue(queue));
+            }
             Action::QbittorrentCommand { command } => {
                 return self.qbittorrent(qbittorrent::Request::Command(command));
             }
@@ -291,6 +294,7 @@ impl Shell {
                 });
             }
             Action::WritePointsReserve { reserve } => Operation::WritePointsReserve(reserve),
+            Action::WriteTorrentLimits { limits } => Operation::WriteTorrentLimits(limits),
             Action::WriteRotatedApiCookie { cookie } => Operation::WriteRotatedApiCookie(cookie),
             Action::ReadMamState => Operation::ReadMamState,
             Action::SaveRegistrationAttempt { at } => Operation::SaveRegistrationAttempt(at),

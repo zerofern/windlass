@@ -50,6 +50,7 @@ impl Harness {
             ntfy_topic: topic
                 .map(|topic| NtfyTopic::parse(topic).unwrap_or_else(|_| unreachable!())),
             points_reserve: None,
+            torrent_limits: None,
         }));
         assert!(sent(&read).is_empty(), "the start is only logged");
         assert!(harness.core.notifications().outbox.is_empty());

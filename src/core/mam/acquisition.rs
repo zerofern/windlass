@@ -12,7 +12,7 @@ use super::{
     Bookmark, BookmarkPage, MamFailure, PersonalFreeleech, WedgeSpent,
     account::{Account, ClientStanding},
 };
-use crate::core::{Download, MamTorrentId, UserData};
+use crate::core::{Download, DownloadingLimit, MamTorrentId, UserData};
 
 /// How often bookmarks are listed.
 pub const BOOKMARKS_EVERY: Duration = Duration::from_mins(15);
@@ -52,6 +52,13 @@ pub enum Hold {
     ClientUnavailable,
     /// MAM's client list does not show the running qBittorrent as allowed.
     MamClientList(ClientStanding),
+    /// As many downloads are running as the owner allows.
+    DownloadingLimit {
+        /// Windlass's downloads running now.
+        downloading: u32,
+        /// The owner's limit.
+        limit: DownloadingLimit,
+    },
     /// The account has not been read yet.
     AccountUnknown,
     /// The ratio is below 2.0.
@@ -238,6 +245,9 @@ pub(super) struct Facts<'a> {
     pub(super) client: ClientStanding,
     /// Downloads qBittorrent added in the last hour, or will add.
     pub(super) recent: u32,
+    /// Windlass's downloads that are running and not finished.
+    pub(super) downloading: u32,
+    pub(super) downloading_limit: DownloadingLimit,
     pub(super) account: &'a Account,
 }
 
@@ -394,6 +404,12 @@ impl Acquisition {
         }
         if !facts.client_ready {
             return Next::Hold(Hold::ClientUnavailable);
+        }
+        if facts.downloading >= facts.downloading_limit.into_inner() {
+            return Next::Hold(Hold::DownloadingLimit {
+                downloading: facts.downloading,
+                limit: facts.downloading_limit,
+            });
         }
         let Some(data) = facts.account.fresh(facts.now, self.last_admission) else {
             return Next::NeedReading;

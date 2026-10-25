@@ -425,6 +425,11 @@ mod tests {
                 requested: PointsReserve::default(),
                 persistence: SettingPersistence::Idle,
             },
+            torrent_limits: Setting {
+                saved: crate::core::TorrentLimits::default(),
+                requested: crate::core::TorrentLimits::default(),
+                persistence: SettingPersistence::Idle,
+            },
         })
     }
 

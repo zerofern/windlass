@@ -172,3 +172,8 @@ li.notice { scroll-margin-top: 5rem; }
 li.notice:target { border-color: var(--warning-line); background: var(--warning-soft); }
 .notice-head { display: flex; flex-wrap: wrap; gap: .25rem 1rem; align-items: baseline; justify-content: space-between; }
 .notice-head h2 { margin: 0; font-size: 1.05rem; }
+
+/* Torrent limits: two short numbers in one setting. */
+.setting .label { font-weight: 600; }
+.setting .row label { font-weight: 500; }
+.setting input.short { width: 6em; }

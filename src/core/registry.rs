@@ -15,6 +15,9 @@ use super::{Action, ClockReading, Session, Torrent, TorrentCommand, TorrentHash,
 pub const COUNTER_SAVE_INTERVAL: Duration = Duration::from_mins(15);
 /// How long an unchanged command waits before it is sent again.
 const COMMAND_REPEAT_AFTER: Duration = Duration::from_mins(1);
+/// MAM requires 72 hours of seeding; until then a torrent is unsatisfied and
+/// stopping it risks a hit-and-run.
+pub const SEEDING_REQUIRED: Duration = Duration::from_hours(72);
 
 /// A registry row's identity, allocated by the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -580,7 +583,9 @@ impl Records {
     }
 
     /// The first change needed: removals, whole content, held torrents
-    /// stopped, fetched torrents added, then starts.
+    /// stopped, fetched torrents added, starts, then force starts: a complete
+    /// torrent short of MAM's seeding runs regardless of qBittorrent's queue,
+    /// and goes back to the queue once it has seeded long enough.
     fn reconcile(&self, session: &Session) -> Option<TorrentCommand> {
         let present = |desired: Desired| {
             self.records()
@@ -626,7 +631,24 @@ impl Records {
             .filter(|(_, torrent)| matches!(torrent.state, TorrentState::Stopped { .. }))
             .map(|(hash, _)| hash.clone())
             .collect();
-        (!stopped.is_empty()).then_some(TorrentCommand::Start(stopped))
+        if !stopped.is_empty() {
+            return Some(TorrentCommand::Start(stopped));
+        }
+        let unsatisfied = |torrent: &Torrent| {
+            torrent.completed_at.is_some() && torrent.seeding_time < SEEDING_REQUIRED
+        };
+        let force: Vec<TorrentHash> = present(Desired::Active)
+            .filter(|(_, torrent)| unsatisfied(torrent) && !torrent.force_start)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        if !force.is_empty() {
+            return Some(TorrentCommand::ForceStart(force));
+        }
+        let release: Vec<TorrentHash> = present(Desired::Active)
+            .filter(|(_, torrent)| !unsatisfied(torrent) && torrent.force_start)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        (!release.is_empty()).then_some(TorrentCommand::EndForceStart(release))
     }
 }
 

@@ -206,6 +206,9 @@ pub(super) fn hold(hold: Hold) -> String {
             "MAM's client list does not show the running qBittorrent as allowed: {}",
             client_standing(standing)
         ),
+        Hold::DownloadingLimit { downloading, limit } => {
+            format!("{downloading} downloads are running, and the limit is {limit}")
+        }
         Hold::AccountUnknown => String::from("the account has not been read from MAM yet"),
         Hold::RatioLow => String::from("the ratio is below 2.0"),
         Hold::UnsatisfiedLimit { count, limit } => format!(
@@ -514,6 +517,14 @@ fn torrent_command(command: &TorrentCommand) -> String {
             format!("Remove {} torrents and their files", hashes.len())
         }
         TorrentCommand::Stop(hashes) => format!("Stop {} held torrents", hashes.len()),
+        TorrentCommand::ForceStart(hashes) => format!(
+            "Force-start {} torrents still short of MAM's 72 hours of seeding",
+            hashes.len()
+        ),
+        TorrentCommand::EndForceStart(hashes) => format!(
+            "Return {} torrents that have seeded 72 hours to qBittorrent's queue",
+            hashes.len()
+        ),
         TorrentCommand::Add { mam, hash } => format!(
             "Add MAM torrent {} ({}) from its kept torrent file",
             mam.get(),
@@ -570,6 +581,11 @@ fn qbittorrent(event: &QbittorrentEvent) -> String {
             qbittorrent_failure(*reason)
         ),
         QbittorrentEvent::ListenPortSet => String::from("qBittorrent accepted the new listen port"),
+        QbittorrentEvent::QueueSet => String::from("qBittorrent accepted the new queue settings"),
+        QbittorrentEvent::QueueSetFailed { reason } => format!(
+            "Setting qBittorrent's queue failed: {}",
+            qbittorrent_failure(*reason)
+        ),
         QbittorrentEvent::ListenPortSetFailed { reason } => format!(
             "Setting qBittorrent's listen port failed: {}",
             qbittorrent_failure(*reason)
@@ -615,15 +631,19 @@ fn settings(event: &SettingsEvent) -> String {
             api_cookie,
             ntfy_topic,
             points_reserve,
+            torrent_limits,
         } => {
             let configured = |set: bool| if set { "configured" } else { "not configured" };
+            let limits = torrent_limits.unwrap_or_default();
             format!(
                 "Settings read: history limit {}, API cookie {}, notification topic {}, \
-                 points reserve {}",
+                 points reserve {}, at most {} downloading and {} active torrents",
                 history_limit.unwrap_or_default(),
                 configured(api_cookie.is_some()),
                 configured(ntfy_topic.is_some()),
-                points_reserve.unwrap_or_default()
+                points_reserve.unwrap_or_default(),
+                limits.downloading(),
+                limits.active()
             )
         }
         SettingsEvent::ReadFailed => String::from("Settings could not be read"),
@@ -652,6 +672,15 @@ fn settings(event: &SettingsEvent) -> String {
         SettingsEvent::PointsReserveWritten => String::from("Points reserve saved"),
         SettingsEvent::PointsReserveWriteFailed => {
             String::from("Points reserve could not be saved")
+        }
+        SettingsEvent::SetTorrentLimits { limits } => format!(
+            "Torrent limits change to {} downloading and {} active requested",
+            limits.downloading(),
+            limits.active()
+        ),
+        SettingsEvent::TorrentLimitsWritten => String::from("Torrent limits saved"),
+        SettingsEvent::TorrentLimitsWriteFailed => {
+            String::from("Torrent limits could not be saved")
         }
         SettingsEvent::RotatedApiCookieWritten => {
             String::from("The new API cookie MAM issued was saved")
@@ -740,6 +769,27 @@ pub(super) fn action(action: &Action) -> String {
             super::notify::message(&entry.notice).title
         ),
         Action::WritePointsReserve { reserve } => format!("Save points reserve: {reserve}"),
+        Action::WriteTorrentLimits { limits } => format!(
+            "Save torrent limits: {} downloading, {} active",
+            limits.downloading(),
+            limits.active()
+        ),
+        Action::SetQbittorrentQueue { queue } => {
+            let limit = |limit: Option<u32>| {
+                limit.map_or_else(|| String::from("no limit"), |limit| limit.to_string())
+            };
+            format!(
+                "Set qBittorrent's queue: {} downloading, {} active, {} seeding, idle torrents {}",
+                limit(queue.max_downloading),
+                limit(queue.max_active),
+                limit(queue.max_seeding),
+                if queue.idle_not_counted {
+                    "not counted"
+                } else {
+                    "counted"
+                }
+            )
+        }
         Action::WriteRotatedApiCookie { .. } => {
             String::from("Save the new API cookie MAM issued (value not recorded)")
         }
@@ -797,6 +847,7 @@ mod tests {
                 api_cookie: cookie.clone(),
                 ntfy_topic: None,
                 points_reserve: None,
+                torrent_limits: None,
             }),
             Event::Settings(SettingsEvent::ReadFailed),
             Event::Settings(SettingsEvent::HistoryLimitWritten),
@@ -971,6 +1022,7 @@ mod tests {
                 QbittorrentEvent::PreferencesRead(QbittorrentPreferences {
                     listen_port: Some(PORT),
                     interface: Some(String::from("wg0")),
+                    queue: None,
                 }),
                 true,
             ),
@@ -979,6 +1031,7 @@ mod tests {
                 true,
             ),
             qbittorrent(QbittorrentEvent::ListenPortSet, false),
+            qbittorrent(QbittorrentEvent::QueueSet, false),
         ];
         for reason in [
             QbittorrentFailure::Unreachable,
@@ -990,6 +1043,7 @@ mod tests {
                 QbittorrentEvent::SyncFailed { reason },
                 QbittorrentEvent::PreferencesReadFailed { reason },
                 QbittorrentEvent::ListenPortSetFailed { reason },
+                QbittorrentEvent::QueueSetFailed { reason },
                 QbittorrentEvent::CommandFailed { reason },
             ] {
                 entries.push(qbittorrent(failure, false));
@@ -1199,6 +1253,7 @@ mod tests {
             api_cookie: None,
             ntfy_topic: NtfyTopic::parse("alerts").ok(),
             points_reserve: None,
+            torrent_limits: None,
         });
         assert!(event(&secret).contains("notification topic configured"));
         let id = timer_actions().into_iter().find_map(|action| match action {
@@ -1448,6 +1503,11 @@ mod tests {
                 },
                 SettingsEvent::PointsReserveWritten,
                 SettingsEvent::PointsReserveWriteFailed,
+                SettingsEvent::SetTorrentLimits {
+                    limits: crate::core::TorrentLimits::default(),
+                },
+                SettingsEvent::TorrentLimitsWritten,
+                SettingsEvent::TorrentLimitsWriteFailed,
                 SettingsEvent::RotatedApiCookieWritten,
                 SettingsEvent::RotatedApiCookieWriteFailed,
             ]
@@ -1477,6 +1537,29 @@ mod tests {
             },
             Action::QbittorrentCommand {
                 command: TorrentCommand::Stop(vec![hash.clone()]),
+            },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::ForceStart(vec![hash.clone()]),
+            },
+            Action::QbittorrentCommand {
+                command: TorrentCommand::EndForceStart(vec![hash.clone()]),
+            },
+            Action::WriteTorrentLimits {
+                limits: crate::core::TorrentLimits::default(),
+            },
+            Action::SetQbittorrentQueue {
+                queue: crate::core::QueuePreferences::for_limits(
+                    crate::core::TorrentLimits::default(),
+                ),
+            },
+            Action::SetQbittorrentQueue {
+                queue: crate::core::QueuePreferences {
+                    queueing: false,
+                    max_downloading: None,
+                    max_active: None,
+                    max_seeding: None,
+                    idle_not_counted: false,
+                },
             },
             Action::QbittorrentCommand {
                 command: TorrentCommand::Add { mam: torrent, hash },
@@ -1524,6 +1607,10 @@ mod tests {
             Hold::AccountUnknown,
             Hold::RatioLow,
             Hold::UnsatisfiedLimit { count: 1, limit: 2 },
+            Hold::DownloadingLimit {
+                downloading: 5,
+                limit: crate::core::DownloadingLimit::default(),
+            },
             Hold::NoWedge,
             Hold::NotBookmarked,
         ]

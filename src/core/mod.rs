@@ -175,6 +175,16 @@ pub enum Action {
         /// The reserve to store.
         reserve: PointsReserve,
     },
+    /// Set qBittorrent's queue.
+    SetQbittorrentQueue {
+        /// The queue settings.
+        queue: QueuePreferences,
+    },
+    /// Persist the torrent limits.
+    WriteTorrentLimits {
+        /// The limits to store.
+        limits: TorrentLimits,
+    },
     /// Persist a cookie MAM issued in place of the saved one.
     WriteRotatedApiCookie {
         /// The cookie.
@@ -246,17 +256,19 @@ pub use port_forwarding::{
 };
 pub use qbittorrent::{
     Activity, ByteSize, ClientVersion, MamApproval, POLL_INTERVAL, Progress, Qbittorrent,
-    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Ratio, Session, SyncPosition,
-    SyncUpdate, Torrent, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
+    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, QueuePreferences, Ratio, Session,
+    SyncPosition, SyncUpdate, Torrent, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
+    Wanted,
 };
 pub use registry::{
     COUNTER_SAVE_INTERVAL, Desired, Download, Identity, MamTorrentId, Observation, Origin,
-    RecordId, Records, Registry, RegistryEvent, TorrentRecord,
+    RecordId, Records, Registry, RegistryEvent, SEEDING_REQUIRED, TorrentRecord,
 };
 pub use settings::{
-    ApiCookie, EntryCount, HistoryLimit, HistoryLimitError, InvalidApiCookie, InvalidNtfyTopic,
-    NtfyTopic, PointsReserve, PointsReserveError, Setting, SettingPersistence, SettingStatus,
-    Settings, SettingsEvent, SettingsState,
+    ActiveLimit, ActiveLimitError, ApiCookie, DownloadingLimit, DownloadingLimitError, EntryCount,
+    FewerActiveThanDownloading, HistoryLimit, HistoryLimitError, InvalidApiCookie,
+    InvalidNtfyTopic, NtfyTopic, PointsReserve, PointsReserveError, Setting, SettingPersistence,
+    SettingStatus, Settings, SettingsEvent, SettingsState, TorrentLimits,
 };
 pub use startup::{StartupEvent, StartupMode};
 pub use timer::{Deadline, TimerId, TimerName};

@@ -152,16 +152,20 @@ impl Core {
             actions.extend(self.port_forwarding.renew());
         }
         let registry = &mut self.registry;
-        actions.extend(self.qbittorrent.decide(
-            occurred_at,
-            &mut self.timers,
-            self.port_forwarding.forwarded_port(),
-            |session| registry.command(occurred_at.monotonic, session),
-        ));
+        let wanted = super::Wanted {
+            listen_port: self.port_forwarding.forwarded_port(),
+            queue: self
+                .settings
+                .torrent_limits()
+                .map(super::QueuePreferences::for_limits),
+        };
         actions.extend(
             self.qbittorrent
-                .follow_forwarded_port(self.port_forwarding.forwarded_port()),
+                .decide(occurred_at, &mut self.timers, wanted, |session| {
+                    registry.command(occurred_at.monotonic, session)
+                }),
         );
+        actions.extend(self.qbittorrent.follow_preferences(wanted));
         actions.extend(
             self.history
                 .after_step(self.step, self.settings.history_limit()),
@@ -251,6 +255,12 @@ impl Core {
                     }),
                 interface: session.and_then(|session| session.preferences.interface.clone()),
             },
+            // Until settings are read, the default limits apply.
+            downloading_limit: self
+                .settings
+                .torrent_limits()
+                .unwrap_or_default()
+                .downloading(),
             registry: &self.registry,
         };
         self.mam.decide(now, &context, &mut self.timers)

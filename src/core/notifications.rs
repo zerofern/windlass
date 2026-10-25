@@ -19,14 +19,13 @@ use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
     Hold, Mam, MamSession, Points, Port, PortForwarding, Protection, Purchase, Qbittorrent,
     QbittorrentFailure, Registry, SeedboxStatus, SessionRejection, SettingsState, StartupMode,
-    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer, timer::Timers,
+    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer,
+    registry::SEEDING_REQUIRED, timer::Timers,
 };
 
 /// A torrent completed this long ago must have seeded 72 hours by now, or soon
 /// will not within MAM's 30 days.
 const SEEDING_DEADLINE_WARNING: Duration = Duration::from_hours(20 * 24);
-/// MAM requires 72 hours of seeding.
-const SEEDING_REQUIRED: Duration = Duration::from_hours(72);
 
 /// How many notices wait for delivery before the oldest are dropped.
 pub const OUTBOX_LIMIT: usize = 50;

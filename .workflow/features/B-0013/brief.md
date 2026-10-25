@@ -32,6 +32,16 @@ Acceptance:
   Windlass force-starts it, so a limit can never make it a hit-and-run.
 - Windlass sets every other qBittorrent setting it depends on (listen port,
   interface, queue), and puts back any that drift.
+- Implemented: the limits are one setting (`TorrentLimits`, schema 9), saved
+  from the settings page, with at least as many active as downloading. The core
+  wants qBittorrent's queue as `QueuePreferences::for_limits`: queueing on, the
+  two limits, as many seeding as active, and slow torrents not counted. It sets
+  the queue after the listen port, reads it back, and puts it back when it
+  drifts; a queue qBittorrent does not report is left alone. Complete torrents
+  with less than 72 hours of seeding time are force-started and released once
+  they have it. Admission holds with `Hold::DownloadingLimit` while Windlass's
+  own running downloads reach the limit. The interface is still set by the NixOS
+  module, not by Windlass.
 
 ### S2: The download queue
 

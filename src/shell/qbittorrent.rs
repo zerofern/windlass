@@ -17,8 +17,8 @@ use serde_json::{Map, Value};
 
 use crate::core::{
     ByteSize, MamTorrentId, Port, Progress, QbittorrentEvent, QbittorrentFailure,
-    QbittorrentPreferences, Ratio, SyncPosition, SyncUpdate, TorrentCommand, TorrentHash,
-    TorrentState, TorrentUpdate,
+    QbittorrentPreferences, QueuePreferences, Ratio, SyncPosition, SyncUpdate, TorrentCommand,
+    TorrentHash, TorrentState, TorrentUpdate,
 };
 
 use super::storage;
@@ -32,6 +32,7 @@ pub(super) enum Request {
     Sync(SyncPosition),
     ReadPreferences,
     SetListenPort(Port),
+    SetQueue(QueuePreferences),
     Command(TorrentCommand),
 }
 
@@ -43,6 +44,7 @@ impl Request {
             Self::Sync(_) => QbittorrentEvent::SyncFailed { reason },
             Self::ReadPreferences => QbittorrentEvent::PreferencesReadFailed { reason },
             Self::SetListenPort(_) => QbittorrentEvent::ListenPortSetFailed { reason },
+            Self::SetQueue(_) => QbittorrentEvent::QueueSetFailed { reason },
             Self::Command(_) => QbittorrentEvent::CommandFailed { reason },
         }
     }
@@ -96,6 +98,10 @@ impl Client {
                 .set_listen_port(*port)
                 .await
                 .map(|()| QbittorrentEvent::ListenPortSet),
+            Request::SetQueue(queue) => self
+                .set_queue(*queue)
+                .await
+                .map(|()| QbittorrentEvent::QueueSet),
             Request::Command(command) => self
                 .command(command)
                 .await
@@ -149,11 +155,13 @@ impl Client {
 
     async fn preferences(&self) -> Outcome<QbittorrentPreferences> {
         let raw: RawPreferences = self.json("api/v2/app/preferences").await?;
+        let queue = raw.queue();
         Ok(QbittorrentPreferences {
             listen_port: raw.listen_port.and_then(Port::new),
             interface: raw
                 .current_network_interface
                 .filter(|interface| !interface.is_empty()),
+            queue,
         })
     }
 
@@ -175,6 +183,21 @@ impl Client {
             .await
     }
 
+    async fn set_queue(&self, queue: QueuePreferences) -> Outcome<()> {
+        // qBittorrent takes -1 for no limit.
+        let limit = |limit: Option<u32>| limit.map_or(-1, i64::from);
+        let preferences = serde_json::json!({
+            "queueing_enabled": queue.queueing,
+            "max_active_downloads": limit(queue.max_downloading),
+            "max_active_torrents": limit(queue.max_active),
+            "max_active_uploads": limit(queue.max_seeding),
+            "dont_count_slow_torrents": queue.idle_not_counted,
+        })
+        .to_string();
+        self.post("api/v2/app/setPreferences", &[("json", preferences)])
+            .await
+    }
+
     async fn command(&self, command: &TorrentCommand) -> Outcome<()> {
         let hashes = |hashes: &[TorrentHash]| {
             hashes
@@ -191,6 +214,17 @@ impl Client {
             TorrentCommand::Stop(stopped) => {
                 self.post("api/v2/torrents/stop", &[("hashes", hashes(stopped))])
                     .await
+            }
+            TorrentCommand::ForceStart(forced) => {
+                let form = [("hashes", hashes(forced)), ("value", String::from("true"))];
+                self.post("api/v2/torrents/setForceStart", &form).await
+            }
+            TorrentCommand::EndForceStart(released) => {
+                let form = [
+                    ("hashes", hashes(released)),
+                    ("value", String::from("false")),
+                ];
+                self.post("api/v2/torrents/setForceStart", &form).await
             }
             TorrentCommand::Add { mam, .. } => self.add(*mam).await,
             TorrentCommand::Remove(removed) => {
@@ -247,6 +281,25 @@ impl Client {
 struct RawPreferences {
     listen_port: Option<u16>,
     current_network_interface: Option<String>,
+    queueing_enabled: Option<bool>,
+    max_active_downloads: Option<i64>,
+    max_active_torrents: Option<i64>,
+    max_active_uploads: Option<i64>,
+    dont_count_slow_torrents: Option<bool>,
+}
+
+impl RawPreferences {
+    /// The queue, when qBittorrent reports all of it; a negative limit is none.
+    fn queue(&self) -> Option<QueuePreferences> {
+        let limit = |limit: Option<i64>| limit.map(|limit| u32::try_from(limit).ok());
+        Some(QueuePreferences {
+            queueing: self.queueing_enabled?,
+            max_downloading: limit(self.max_active_downloads)?,
+            max_active: limit(self.max_active_torrents)?,
+            max_seeding: limit(self.max_active_uploads)?,
+            idle_not_counted: self.dont_count_slow_torrents?,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,6 +369,7 @@ fn torrent_update(fields: &Value) -> TorrentUpdate {
         completed_at: time("completion_on"),
         content_path: path("content_path"),
         save_path: path("save_path"),
+        force_start: fields.get("force_start").and_then(Value::as_bool),
     }
 }
 
@@ -372,11 +426,58 @@ mod tests {
                 QbittorrentEvent::ListenPortSetFailed { reason },
             ),
             (
+                Request::SetQueue(crate::core::QueuePreferences::for_limits(
+                    crate::core::TorrentLimits::default(),
+                )),
+                QbittorrentEvent::QueueSetFailed { reason },
+            ),
+            (
                 Request::Command(TorrentCommand::Start(Vec::new())),
                 QbittorrentEvent::CommandFailed { reason },
             ),
         ] {
             assert_eq!(execute(None, request).await, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_queue_is_read_only_when_qbittorrent_reports_all_of_it() -> Result<(), serde_json::Error> {
+        let full = json!({
+            "queueing_enabled": true,
+            "max_active_downloads": 2,
+            "max_active_torrents": -1,
+            "max_active_uploads": 4,
+            "dont_count_slow_torrents": true
+        });
+        let raw: super::RawPreferences = serde_json::from_value(full.clone())?;
+        assert_eq!(
+            raw.queue(),
+            Some(crate::core::QueuePreferences {
+                queueing: true,
+                max_downloading: Some(2),
+                max_active: None,
+                max_seeding: Some(4),
+                idle_not_counted: true,
+            })
+        );
+        for missing in [
+            "queueing_enabled",
+            "max_active_downloads",
+            "max_active_torrents",
+            "max_active_uploads",
+            "dont_count_slow_torrents",
+        ] {
+            let partial: serde_json::Map<String, serde_json::Value> = full
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(name, _)| *name != missing)
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let raw: super::RawPreferences =
+                serde_json::from_value(serde_json::Value::Object(partial))?;
+            assert_eq!(raw.queue(), None, "{missing}");
         }
         Ok(())
     }

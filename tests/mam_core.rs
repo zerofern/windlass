@@ -96,6 +96,7 @@ impl Harness {
                 api_cookie: setup.cookie.map(cookie),
                 ntfy_topic: windlass::core::NtfyTopic::parse("test-topic").ok(),
                 points_reserve: None,
+                torrent_limits: None,
             }),
             Event::Registry(
                 setup
@@ -1172,6 +1173,7 @@ fn a_repair_records_a_matching_port_and_a_differing_exit_ip() {
             preferences: QbittorrentPreferences {
                 listen_port: Some(forwarded),
                 interface: Some(String::from("wg0")),
+                queue: None,
             },
         }),
     ] {
@@ -1531,6 +1533,44 @@ fn downloads_added_in_the_last_hour_count_against_the_limit_after_a_restart() {
         Some(Hold::UnsatisfiedLimit {
             count: 148,
             limit: 150
+        })
+    );
+}
+
+#[test]
+fn no_download_starts_while_the_downloading_limit_is_reached() {
+    let now = SystemTime::UNIX_EPOCH + EPOCH;
+    let fills = ['a', 'b', 'c', 'd', 'e', 'f'];
+    let rows = (2..=7)
+        .zip(fills)
+        .map(|(id, fill)| download_row(id, fill, Duration::from_hours(3), false, now))
+        .collect::<Vec<_>>();
+    // Five running downloads, the default limit; the sixth is held.
+    let mut rows = rows;
+    if let Some(held) = rows.last_mut() {
+        held.desired = Desired::Held;
+    }
+    let (mut harness, actions) = Harness::start(Setup {
+        rows: Some(rows),
+        ..Setup::default()
+    });
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let actions = harness.answer(read(account(harness.wall())));
+    let free = |id| {
+        let mut listing = bookmark(id);
+        listing.free = true;
+        listing
+    };
+    let listings: Vec<Bookmark> = std::iter::once(bookmark(1))
+        .chain((2..=7).map(free))
+        .collect();
+    let _ = harness.checked(actions, &listings);
+    assert_eq!(
+        harness.mam().acquisition.hold,
+        Some(Hold::DownloadingLimit {
+            downloading: 5,
+            limit: windlass::core::DownloadingLimit::default()
         })
     );
 }

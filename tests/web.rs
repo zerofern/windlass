@@ -618,22 +618,30 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
 
     // Each older version gains what later versions added.
     for downgrade in [
-        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "ALTER TABLE settings DROP COLUMN max_downloading; \
+         ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; \
          ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
          ALTER TABLE history DROP COLUMN routine; PRAGMA user_version = 2;",
-        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "ALTER TABLE settings DROP COLUMN max_downloading; \
+         ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; \
          ALTER TABLE settings DROP COLUMN ntfy_topic; DROP TABLE torrents; DROP TABLE vpn_state; \
          PRAGMA user_version = 3;",
-        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "ALTER TABLE settings DROP COLUMN max_downloading; \
+         ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; \
          ALTER TABLE settings DROP COLUMN ntfy_topic; PRAGMA user_version = 4;",
-        "DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
+        "ALTER TABLE settings DROP COLUMN max_downloading; \
+         ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; PRAGMA user_version = 5;",
-        "DROP TABLE notices; INSERT INTO torrents (id, mam_id, origin, desired, deletion_allowed) \
+        "ALTER TABLE settings DROP COLUMN max_downloading; \
+         ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; INSERT INTO torrents (id, mam_id, origin, desired, deletion_allowed) \
          VALUES (1, 5, 'bookmark', 'held', 0); PRAGMA user_version = 6;",
-        "DROP TABLE notices; PRAGMA user_version = 7;",
+        "ALTER TABLE settings DROP COLUMN max_downloading; \
+         ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; PRAGMA user_version = 7;",
+        "ALTER TABLE settings DROP COLUMN max_downloading; \
+         ALTER TABLE settings DROP COLUMN max_active; PRAGMA user_version = 8;",
     ] {
         let older = tempfile::tempdir()?;
         let older_path = older.path().join("windlass.sqlite");
@@ -680,18 +688,18 @@ async fn every_notice_has_an_entry_on_the_notifications_page() -> TestResult {
     let dashboard = Dashboard::start(StartupMode::Initialise).await?;
     let (status, _, _) = dashboard.post("/notifications/test", "").await?;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let page = dashboard
+    let _ = dashboard
         .history_with("/notifications", "<h2>Test notification</h2>")
         .await?;
+    let page = dashboard
+        .history_with("/notifications", "<h2>Windlass started</h2>")
+        .await?;
     assert!(page.contains(r#"href="/notifications" aria-current="page""#));
-    // Newest first: the test, then the start, each with its own address.
-    let test = page
-        .find(r#"id="notice-2""#)
-        .ok_or("no entry for the test")?;
-    let started = page
-        .find(r#"id="notice-1""#)
-        .ok_or("no entry for the start")?;
-    assert!(test < started, "{page}");
+    // Newest first, each with its own address; the test and the start may be
+    // logged in either order.
+    let newest = page.find(r#"id="notice-2""#).ok_or("no second entry")?;
+    let oldest = page.find(r#"id="notice-1""#).ok_or("no first entry")?;
+    assert!(newest < oldest, "{page}");
     assert!(page.contains("Dashboard only"), "the start is not pushed");
     assert!(page.contains("Urgent"), "the test is pushed");
     // Commands on the page return to it.
@@ -926,6 +934,43 @@ async fn failed_settings_saves_are_reported() -> TestResult {
         body.contains("value=\"200\""),
         "the requested value is shown"
     );
+    dashboard.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn torrent_limits_are_validated_and_saved() -> TestResult {
+    let dashboard = Dashboard::start(StartupMode::Initialise).await?;
+    dashboard
+        .wait(|observation| observation.settings.loaded().is_some())
+        .await?;
+    let (_, settings) = dashboard.get("/settings").await?;
+    assert!(settings.contains("Torrent limits"), "{settings}");
+    for (form, error) in [
+        ("downloading=0&active=5", "Enter whole numbers"),
+        ("downloading=two&active=5", "Enter whole numbers"),
+        ("downloading=6&active=3", "allow at least as many active"),
+    ] {
+        let (code, _, body) = dashboard.post("/settings/torrent-limits", form).await?;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{form}");
+        assert!(body.contains(error), "{form}: {body}");
+        assert!(body.contains("The saved limits are still in use."));
+    }
+    let (code, _, _) = dashboard
+        .post("/settings/torrent-limits", "downloading=3&active=8")
+        .await?;
+    assert_eq!(code, StatusCode::SEE_OTHER);
+    dashboard
+        .wait(|observation| {
+            observation.settings.torrent_limits().is_some_and(|limits| {
+                limits.downloading().into_inner() == 3 && limits.active().into_inner() == 8
+            })
+        })
+        .await?;
+    let history = dashboard
+        .history_with("/history?kind=settings", "Torrent limits saved")
+        .await?;
+    assert!(history.contains("Torrent limits change to 3 downloading and 8 active requested"));
     dashboard.stop().await?;
     Ok(())
 }

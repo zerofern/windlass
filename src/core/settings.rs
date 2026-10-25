@@ -48,6 +48,79 @@ impl PointsReserve {
     }
 }
 
+/// How many torrents may download at once.
+#[nutype(
+    validate(greater_or_equal = 1, less_or_equal = 100),
+    default = 5,
+    derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Display, Serialize
+    )
+)]
+pub struct DownloadingLimit(u32);
+
+/// How many torrents may be active at once: downloading, or seeding while peers
+/// download from them. Seeds nobody downloads from do not count.
+#[nutype(
+    validate(greater_or_equal = 1, less_or_equal = 1_000),
+    default = 10,
+    derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Display, Serialize
+    )
+)]
+pub struct ActiveLimit(u32);
+
+/// How many torrents may download, and be active, at once. Downloading
+/// torrents are active, so the active limit is never below the downloading one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TorrentLimits {
+    downloading: DownloadingLimit,
+    active: ActiveLimit,
+}
+
+/// Why submitted torrent limits were rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FewerActiveThanDownloading;
+
+impl fmt::Display for FewerActiveThanDownloading {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("Downloading torrents are active too, so allow at least as many active.")
+    }
+}
+
+impl Error for FewerActiveThanDownloading {}
+
+impl TorrentLimits {
+    /// Limits with at least as many active torrents as downloading ones.
+    ///
+    /// # Errors
+    /// Returns an error when fewer torrents may be active than may download.
+    pub fn new(
+        downloading: DownloadingLimit,
+        active: ActiveLimit,
+    ) -> Result<Self, FewerActiveThanDownloading> {
+        if active.into_inner() < downloading.into_inner() {
+            return Err(FewerActiveThanDownloading);
+        }
+        Ok(Self {
+            downloading,
+            active,
+        })
+    }
+
+    /// How many torrents may download at once.
+    #[must_use]
+    pub const fn downloading(self) -> DownloadingLimit {
+        self.downloading
+    }
+
+    /// How many torrents may be active at once.
+    #[must_use]
+    pub const fn active(self) -> ActiveLimit {
+        self.active
+    }
+}
+
 /// A number of history entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
 pub struct EntryCount(u64);
@@ -331,6 +404,8 @@ pub struct Settings {
     pub ntfy_topic: Setting<Option<NtfyTopic>>,
     /// Bonus points every purchase leaves.
     pub points_reserve: Setting<PointsReserve>,
+    /// How many torrents may download, and be active, at once.
+    pub torrent_limits: Setting<TorrentLimits>,
 }
 
 impl Settings {
@@ -378,6 +453,12 @@ impl SettingsState {
             .map(|settings| settings.points_reserve.saved.points())
     }
 
+    /// The saved torrent limits, once settings are loaded.
+    #[must_use]
+    pub fn torrent_limits(&self) -> Option<TorrentLimits> {
+        self.loaded().map(|settings| settings.torrent_limits.saved)
+    }
+
     /// The saved history limit, once settings are loaded.
     #[must_use]
     pub fn history_limit(&self) -> Option<HistoryLimit> {
@@ -403,6 +484,8 @@ pub enum SettingsEvent {
         ntfy_topic: Option<NtfyTopic>,
         /// The saved points reserve, if any.
         points_reserve: Option<PointsReserve>,
+        /// The saved torrent limits, if any.
+        torrent_limits: Option<TorrentLimits>,
     },
     /// Saved settings could not be read.
     ReadFailed,
@@ -446,6 +529,15 @@ pub enum SettingsEvent {
     PointsReserveWritten,
     /// Saving the points reserve failed.
     PointsReserveWriteFailed,
+    /// The user set the torrent limits.
+    SetTorrentLimits {
+        /// The limits.
+        limits: TorrentLimits,
+    },
+    /// The torrent limits were saved.
+    TorrentLimitsWritten,
+    /// Saving the torrent limits failed.
+    TorrentLimitsWriteFailed,
     /// A cookie MAM issued to replace the saved one was saved.
     RotatedApiCookieWritten,
     /// Saving a cookie MAM issued failed; the saved one stays in use.
@@ -457,21 +549,25 @@ pub(super) fn handle(state: &mut SettingsState, event: SettingsEvent) -> Vec<Act
     let write_cookie = |cookie| Action::WriteApiCookie { cookie };
     let write_topic = |topic| Action::WriteNtfyTopic { topic };
     let write_reserve = |reserve| Action::WritePointsReserve { reserve };
+    let write_limits = |limits| Action::WriteTorrentLimits { limits };
     match event {
         SettingsEvent::Read {
             history_limit,
             api_cookie,
             ntfy_topic,
             points_reserve,
+            torrent_limits,
         } => {
             if matches!(state, SettingsState::Reading) {
                 let limit = history_limit.unwrap_or_default();
                 let reserve = points_reserve.unwrap_or_default();
+                let limits = torrent_limits.unwrap_or_default();
                 *state = SettingsState::Loaded(Settings {
                     history_limit: Setting::loaded(limit, limit),
                     api_cookie: Setting::loaded(api_cookie.clone(), api_cookie),
                     ntfy_topic: Setting::loaded(ntfy_topic.clone(), ntfy_topic),
                     points_reserve: Setting::loaded(reserve, reserve),
+                    torrent_limits: Setting::loaded(limits, limits),
                 });
             }
             Vec::new()
@@ -523,6 +619,15 @@ pub(super) fn handle(state: &mut SettingsState, event: SettingsEvent) -> Vec<Act
         }),
         SettingsEvent::PointsReserveWriteFailed => change(state, |settings| {
             settings.points_reserve.complete(false).map(write_reserve)
+        }),
+        SettingsEvent::SetTorrentLimits { limits } => change(state, |settings| {
+            settings.torrent_limits.request(limits).map(write_limits)
+        }),
+        SettingsEvent::TorrentLimitsWritten => change(state, |settings| {
+            settings.torrent_limits.complete(true).map(write_limits)
+        }),
+        SettingsEvent::TorrentLimitsWriteFailed => change(state, |settings| {
+            settings.torrent_limits.complete(false).map(write_limits)
         }),
         SettingsEvent::RotatedApiCookieWritten => change(state, |settings| {
             settings.api_cookie.complete(true).map(write_cookie)

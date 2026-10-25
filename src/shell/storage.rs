@@ -9,11 +9,11 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 
 use crate::core::{
-    ApiCookie, ByteSize, Desired, Event, HistoryLimit, Identity, Logged, MamEvent, MamPauseEvent,
-    MamRequestMode, MamTorrentId, NoticeId, NotificationEvent, NtfyTopic, Observation, Origin,
-    PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent, SettingsEvent, StartupEvent,
-    StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState, TunnelEvent, VpnServer,
-    VpnSwitch,
+    ActiveLimit, ApiCookie, ByteSize, Desired, DownloadingLimit, Event, HistoryLimit, Identity,
+    Logged, MamEvent, MamPauseEvent, MamRequestMode, MamTorrentId, NoticeId, NotificationEvent,
+    NtfyTopic, Observation, Origin, PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent,
+    SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentRecord,
+    TorrentState, TunnelEvent, VpnServer, VpnSwitch,
 };
 
 use super::{notify, qbittorrent::torrent_state};
@@ -23,8 +23,8 @@ use super::{notify, qbittorrent::torrent_state};
 /// history entries; version 4 adds the torrent registry and VPN state; version 5
 /// adds the ntfy topic; version 6 adds held torrents, kept torrent files, MAM
 /// state, and the points reserve; version 7 adds snatched bookmarks; version 8
-/// adds the notifications log.
-const SCHEMA_VERSION: i64 = 8;
+/// adds the notifications log; version 9 adds the torrent limits.
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_V1: &str = "CREATE TABLE mam_configuration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -167,9 +167,12 @@ const SCHEMA_V8: &str = "CREATE TABLE notices (
     page TEXT NOT NULL
 );";
 
+const SCHEMA_V9: &str = "ALTER TABLE settings ADD COLUMN max_downloading INTEGER;
+ALTER TABLE settings ADD COLUMN max_active INTEGER;";
+
 /// The changes from each version to the next, starting from version 1.
-const UPGRADES: [&str; 7] = [
-    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+const UPGRADES: [&str; 8] = [
+    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 ];
 
 type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -196,6 +199,7 @@ pub(super) enum Operation {
     ReadLastVpnSwitch,
     SaveVpnSwitch(VpnSwitch),
     WritePointsReserve(PointsReserve),
+    WriteTorrentLimits(TorrentLimits),
     WriteRotatedApiCookie(ApiCookie),
     ReadMamState,
     SaveRegistrationAttempt(SystemTime),
@@ -253,6 +257,10 @@ pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, Failed
         Operation::WritePointsReserve(reserve) => (
             write_points_reserve(path, reserve),
             Event::Settings(SettingsEvent::PointsReserveWriteFailed),
+        ),
+        Operation::WriteTorrentLimits(limits) => (
+            write_torrent_limits(path, limits),
+            Event::Settings(SettingsEvent::TorrentLimitsWriteFailed),
         ),
         Operation::WriteRotatedApiCookie(cookie) => (
             write_api_cookie(path, Some(&cookie))
@@ -374,16 +382,32 @@ fn invalid_data(detail: &'static str) -> io::Error {
 }
 
 fn read_settings(path: &Path) -> StorageResult<Event> {
-    type Stored = (Option<i64>, Option<String>, Option<String>, Option<i64>);
+    type Stored = (
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
     let stored: Option<Stored> = connection(path)?
         .query_row(
-            "SELECT history_limit, api_cookie, ntfy_topic, points_reserve FROM settings \
-             WHERE singleton = 1",
+            "SELECT history_limit, api_cookie, ntfy_topic, points_reserve, max_downloading, \
+             max_active FROM settings WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()?;
-    let (limit, cookie, topic, reserve) = stored.unwrap_or_default();
+    let (limit, cookie, topic, reserve, downloading, active) = stored.unwrap_or_default();
     let history_limit = limit
         .map(|limit| {
             u32::try_from(limit)
@@ -406,12 +430,43 @@ fn read_settings(path: &Path) -> StorageResult<Event> {
                 .ok_or_else(|| invalid_data("invalid points reserve"))
         })
         .transpose()?;
+    let torrent_limits = match (downloading, active) {
+        (Some(downloading), Some(active)) => Some(torrent_limits(downloading, active)?),
+        _ => None,
+    };
     Ok(Event::Settings(SettingsEvent::Read {
         history_limit,
         api_cookie,
         ntfy_topic,
         points_reserve,
+        torrent_limits,
     }))
+}
+
+fn torrent_limits(downloading: i64, active: i64) -> StorageResult<TorrentLimits> {
+    let downloading = u32::try_from(downloading)
+        .ok()
+        .and_then(|limit| DownloadingLimit::try_new(limit).ok());
+    let active = u32::try_from(active)
+        .ok()
+        .and_then(|limit| ActiveLimit::try_new(limit).ok());
+    downloading
+        .zip(active)
+        .and_then(|(downloading, active)| TorrentLimits::new(downloading, active).ok())
+        .ok_or_else(|| invalid_data("invalid torrent limits").into())
+}
+
+fn write_torrent_limits(path: &Path, limits: TorrentLimits) -> StorageResult<Event> {
+    connection(path)?.execute(
+        "INSERT INTO settings(singleton, max_downloading, max_active) VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET max_downloading = excluded.max_downloading,
+             max_active = excluded.max_active",
+        [
+            limits.downloading().into_inner(),
+            limits.active().into_inner(),
+        ],
+    )?;
+    Ok(Event::Settings(SettingsEvent::TorrentLimitsWritten))
 }
 
 fn write_points_reserve(path: &Path, reserve: PointsReserve) -> StorageResult<Event> {
@@ -678,6 +733,8 @@ fn observation(row: &Row<'_>, last_seen: i64) -> StorageResult<Observation> {
             completed_at: time(17)?,
             content_path: row.get(18)?,
             save_path: row.get(19)?,
+            // Not saved; qBittorrent's next full update says.
+            force_start: false,
         },
         last_seen: time_from_seconds(last_seen)?,
     })
@@ -860,6 +917,7 @@ mod tests {
                 completed_at: Some(at(1_700_000_600)),
                 content_path: Some(String::from("/srv/books/A Synthetic Audiobook")),
                 save_path: Some(String::from("/srv/books")),
+                force_start: false,
             },
             last_seen: at(1_700_001_000),
         };
@@ -1123,6 +1181,7 @@ mod tests {
                     api_cookie: cookie,
                     ntfy_topic: topic,
                     points_reserve: None,
+                    torrent_limits: None,
                 }),
             ),
             (
@@ -1331,13 +1390,14 @@ mod tests {
         reason = "one table of every MAM storage operation and its failure"
     )]
     fn mam_state_reserve_and_torrent_files_round_trip() -> TestResult {
-        use crate::core::{ApiCookie, MamEvent, PointsReserve, SettingsEvent};
+        use crate::core::{ApiCookie, MamEvent, PointsReserve, SettingsEvent, TorrentLimits};
 
         let storage = storage()?;
         let path = &storage.path;
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let cookie = ApiCookie::parse("rotated-cookie")?;
         let reserve = PointsReserve::try_new(30_000)?;
+        let limits = TorrentLimits::default();
         for (operation, expected) in [
             (
                 Operation::ReadMamState,
@@ -1370,12 +1430,17 @@ mod tests {
                 Event::Settings(SettingsEvent::RotatedApiCookieWritten),
             ),
             (
+                Operation::WriteTorrentLimits(limits),
+                Event::Settings(SettingsEvent::TorrentLimitsWritten),
+            ),
+            (
                 Operation::ReadSettings,
                 Event::Settings(SettingsEvent::Read {
                     history_limit: None,
                     api_cookie: Some(cookie),
                     ntfy_topic: None,
                     points_reserve: Some(reserve),
+                    torrent_limits: Some(limits),
                 }),
             ),
         ] {
@@ -1418,6 +1483,26 @@ mod tests {
         );
 
         // Values no build could write are refused.
+        for corrupt in [
+            "max_downloading = 9, max_active = 3",
+            "max_active = -1",
+            "max_downloading = 'x'",
+            "max_downloading = 3, max_active = 'x'",
+        ] {
+            assert!(
+                storage
+                    .connection
+                    .execute_batch(&format!("UPDATE settings SET {corrupt};"))
+                    .is_ok()
+            );
+            assert_eq!(
+                outcome(path, Operation::ReadSettings),
+                Event::Settings(SettingsEvent::ReadFailed),
+                "{corrupt}"
+            );
+        }
+        let restore = "UPDATE settings SET max_downloading = 5, max_active = 10;";
+        assert!(storage.connection.execute_batch(restore).is_ok());
         let corrupt = "UPDATE settings SET points_reserve = -1; \
                        UPDATE mam_state SET last_reminder_at = -5;";
         assert!(storage.connection.execute_batch(corrupt).is_ok());
@@ -1452,6 +1537,10 @@ mod tests {
                 Operation::WriteRotatedApiCookie(ApiCookie::parse("other")?),
                 Event::Settings(SettingsEvent::RotatedApiCookieWriteFailed),
             ),
+            (
+                Operation::WriteTorrentLimits(limits),
+                Event::Settings(SettingsEvent::TorrentLimitsWriteFailed),
+            ),
         ] {
             assert_eq!(outcome(&missing, operation), expected);
         }
@@ -1460,7 +1549,8 @@ mod tests {
 
         // Storage that opens but has lost what is written fails the write.
         let broken = "DROP TABLE mam_state; DROP TABLE torrent_files; \
-                      ALTER TABLE settings DROP COLUMN points_reserve;";
+                      ALTER TABLE settings DROP COLUMN points_reserve; \
+                      ALTER TABLE settings DROP COLUMN max_active;";
         assert!(storage.connection.execute_batch(broken).is_ok());
         assert_eq!(
             outcome(path, Operation::SaveReminder(at(1))),
@@ -1469,6 +1559,10 @@ mod tests {
         assert_eq!(
             outcome(path, Operation::WritePointsReserve(reserve)),
             Event::Settings(SettingsEvent::PointsReserveWriteFailed)
+        );
+        assert_eq!(
+            outcome(path, Operation::WriteTorrentLimits(limits)),
+            Event::Settings(SettingsEvent::TorrentLimitsWriteFailed)
         );
         assert!(super::keep_torrent_file(path, mam, &hash, b"x").is_err());
         Ok(())

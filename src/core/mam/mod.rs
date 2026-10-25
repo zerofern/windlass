@@ -44,8 +44,8 @@ pub use network::{
 
 use self::acquisition::{Facts, Next};
 use super::{
-    Action, ApiCookie, ClientVersion, ClockReading, Desired, MamRequestsStatus, MamTorrentId,
-    Notice, Records, Registry, TimerId, TimerName, timer::Timers,
+    Action, ApiCookie, ClientVersion, ClockReading, Desired, DownloadingLimit, MamRequestsStatus,
+    MamTorrentId, Notice, Records, Registry, TimerId, TimerName, timer::Timers,
 };
 
 /// The owner is reminded to visit MAM this often.
@@ -140,6 +140,8 @@ pub(super) struct Context<'a> {
     pub(super) client_version: Option<ClientVersion>,
     /// What the rest of Windlass knows about the connection.
     pub(super) connection: Connection,
+    /// How many torrents may download at once.
+    pub(super) downloading_limit: DownloadingLimit,
     pub(super) registry: &'a Registry,
 }
 
@@ -558,6 +560,13 @@ impl Mam {
             _ => None,
         };
         let recent = self.watch_downloads(now, records);
+        let downloading = records.map_or(0, |records| {
+            let running = records
+                .downloads()
+                .filter(|download| !download.finished && !download.held)
+                .count();
+            u32::try_from(running).unwrap_or(u32::MAX)
+        });
         let facts = Facts {
             now: now.monotonic,
             wall: now.wall,
@@ -566,6 +575,8 @@ impl Mam {
             client_ready: context.client_ready,
             client: self.client,
             recent,
+            downloading,
+            downloading_limit: context.downloading_limit,
             account: &self.account,
         };
         let next = records.map_or(Next::Idle, |records| {

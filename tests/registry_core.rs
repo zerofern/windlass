@@ -399,6 +399,7 @@ fn the_listen_port_comes_before_registry_commands() {
         QbittorrentPreferences {
             listen_port: Some(forwarded),
             interface: None,
+            queue: None,
         },
     )));
     harness.poll(&actions);

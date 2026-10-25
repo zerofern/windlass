@@ -65,6 +65,10 @@ times; it works without the script, without live updates. It shows:
   qBittorrent and content missing on disk. Bookmarks snatched before have a
   "Download again" button. Windlass adopts torrents it finds,
   starts stopped ones, selects every file, and removes those marked removed.
+  It keeps qBittorrent's queue to the torrent limits set on the settings page (by
+  default 5 downloading and 10 active, where idle seeds do not count) and
+  force-starts any complete torrent still short of MAM's 72 hours of seeding, so
+  a limit never stops one.
 - **MAM:** whether the API session works, the IP and ASN MAM sees, the seedbox
   registration and when it may next be renewed; the account as MAM last reported
   it (ratio, upload buffer, points, wedges, VIP, unsatisfied torrents, and flagged
@@ -74,7 +78,7 @@ times; it works without the script, without live updates. It shows:
   problems reported but not yet resolved. The notifications page lists every
   notice, newest first.
 - **Settings:** the MAM API cookie, the ntfy topic with a test button, the bonus
-  points reserve, and the history size limit, each confirmed only once saved, plus the read-only
+  points reserve, the torrent limits, and the history size limit, each confirmed only once saved, plus the read-only
   deployment settings.
 
 Windlass sends notifications to an ntfy topic set on the settings page: when it

@@ -31,6 +31,7 @@ core scenarios with simulated time, and end to end only for their wiring.
 | 6 | Keep the forwarded port and qBittorrent's listen port | Yes | Yes | Yes |
 | 7 | Keep the privacy boundary | – | – | Yes |
 | 8 | Keep qBittorrent matching the registry | Yes | Yes | – |
+| 8a | Keep torrents within the limits; never queue an unsatisfied seed | Yes | Yes | – |
 | 9 | Use the API session and keep the cookie | Yes | Yes | – |
 | 10 | Observe the IP and register the seedbox | Yes | Yes | Yes |
 | 11 | Turn bookmarks into queued and snatched rows | Yes | Yes | – |
@@ -133,6 +134,23 @@ core scenarios with simulated time, and end to end only for their wiring.
 - **Tested:** `tests/registry_core.rs`, `tests/integrations_core.rs`,
   `tests/integrations.rs`, `tests/mam.rs` (add).
 
+### 8a. Keep torrents within the limits; never queue an unsatisfied seed
+
+- **Trigger:** every qBittorrent poll; a saved change to the limits.
+- **Does:** keeps qBittorrent's queue matched to the owner's limits (default 5
+  downloading, 10 active): queueing on, the same downloading and active limits,
+  as many seeding as active, and idle torrents not counted, so a seed nobody
+  downloads from keeps seeding. Changes are read back to confirm them; a queue
+  qBittorrent does not report is left alone. A complete torrent short of MAM's
+  72 hours of seeding is force-started so the queue never holds it, and goes back
+  to the queue once it has seeded long enough. Windlass starts no new download
+  while its own running downloads reach the downloading limit.
+- **Where:** `core/qbittorrent.rs` (`set_preferences`, `QueuePreferences`),
+  `core/registry.rs` (`reconcile`), `core/mam/acquisition.rs` (`next`),
+  `core/settings.rs` (`TorrentLimits`), `shell/qbittorrent.rs`.
+- **Tested:** `tests/integrations_core.rs`, `tests/integrations.rs`,
+  `tests/mam_core.rs`, `tests/web.rs`.
+
 ## MAM access
 
 ### 9. Use the API session and keep the cookie
@@ -179,7 +197,7 @@ core scenarios with simulated time, and end to end only for their wiring.
 - **Trigger:** each decision while a queued bookmark waits.
 - **Does:** admits the oldest queued bookmark still bookmarked when MAM is
   available, the seedbox confirmed, downloads not refused, qBittorrent ready and
-  listed by MAM, the account read in the last 5 minutes, the ratio at least 2.0,
+  listed by MAM, fewer of Windlass's downloads running than the downloading limit, the account read in the last 5 minutes, the ratio at least 2.0,
   and an unsatisfied slot free after a reserve of 2, counting downloads
   qBittorrent added in the last hour. The torrent's flags must be at most 5
   minutes old: from the bookmark listing, or else a lookup by ID. No wedge when it

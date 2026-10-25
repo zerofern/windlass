@@ -30,9 +30,9 @@ use tokio_stream::{Stream, StreamExt, wrappers::WatchStream};
 
 use crate::{
     core::{
-        ApiCookie, Event, HistoryLimit, HistoryState, MamEvent, MamPauseEvent, MamRequestMode,
-        NotificationEvent, NtfyTopic, PointsReserve, RecordId, RegistryEvent, SettingsEvent,
-        StartupEvent, StartupMode, State,
+        ActiveLimit, ApiCookie, DownloadingLimit, Event, HistoryLimit, HistoryState, MamEvent,
+        MamPauseEvent, MamRequestMode, NotificationEvent, NtfyTopic, PointsReserve, RecordId,
+        RegistryEvent, SettingsEvent, StartupEvent, StartupMode, State, TorrentLimits,
     },
     runner::{Observation, Runner},
     shell::{
@@ -132,6 +132,7 @@ pub fn router(
         .route("/settings/ntfy-topic", post(set_ntfy_topic))
         .route("/settings/ntfy-topic/clear", post(clear_ntfy_topic))
         .route("/settings/points-reserve", post(set_points_reserve))
+        .route("/settings/torrent-limits", post(set_torrent_limits))
         .route("/notifications/test", post(send_test_notification))
         .route("/torrents/redownload", post(redownload))
         .route("/mam/purchase/checked", post(purchase_checked))
@@ -311,6 +312,42 @@ async fn set_points_reserve(
                 points_reserve_error: Some(String::from(
                     "Enter a whole number of points up to 100000000. The saved reserve is still in use.",
                 )),
+                ..SettingsForm::default()
+            },
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitsForm {
+    downloading: String,
+    active: String,
+}
+
+async fn set_torrent_limits(
+    AppState(app): AppState<App>,
+    Form(form): Form<LimitsForm>,
+) -> Response {
+    let number = |value: &str| value.trim().parse::<u32>().ok();
+    let downloading =
+        number(&form.downloading).and_then(|limit| DownloadingLimit::try_new(limit).ok());
+    let active = number(&form.active).and_then(|limit| ActiveLimit::try_new(limit).ok());
+    let limits = match downloading.zip(active) {
+        Some((downloading, active)) => {
+            TorrentLimits::new(downloading, active).map_err(|error| error.to_string())
+        }
+        None => Err(String::from(
+            "Enter whole numbers: 1 to 100 downloading, 1 to 1000 active.",
+        )),
+    };
+    match limits {
+        Ok(limits) => send_setting(&app, SettingsEvent::SetTorrentLimits { limits }).await,
+        Err(error) => rejected(
+            &app,
+            &SettingsForm {
+                max_downloading: Some(form.downloading),
+                max_active: Some(form.active),
+                torrent_limits_error: Some(format!("{error} The saved limits are still in use.")),
                 ..SettingsForm::default()
             },
         ),
