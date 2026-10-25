@@ -125,6 +125,9 @@ pub enum Origin {
 pub enum Desired {
     /// Selected, waiting for a free MAM slot.
     Queued,
+    /// Bookmarked, but MAM reports it snatched before; it waits for the owner to
+    /// ask for it again.
+    Snatched,
     /// In qBittorrent, whole, and running.
     Active,
     /// In qBittorrent and stopped, because a download's wedge was not spent.
@@ -161,9 +164,11 @@ pub struct TorrentRecord {
     pub observation: Option<Observation>,
 }
 
-/// Results of registry storage.
+/// Results of registry storage, and the owner's requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RegistryEvent {
+    /// The owner asked to download a snatched torrent again.
+    Redownload(RecordId),
     /// Every row was read.
     Read(Vec<TorrentRecord>),
     /// Reading failed.
@@ -229,6 +234,7 @@ impl Registry {
                 records.save_failed = false;
                 records.save(now)
             }
+            (Self::Loaded(records), RegistryEvent::Redownload(id)) => records.redownload(now, id),
             (Self::Loaded(records), RegistryEvent::SaveFailed) if records.saving.is_some() => {
                 // Retried with the next qBittorrent update.
                 records
@@ -360,9 +366,13 @@ impl Records {
         self.by_mam.contains_key(&id)
     }
 
-    /// Queue these bookmarked torrents.
-    pub(super) fn queue(&mut self, now: Instant, ids: &[MamTorrentId]) -> Vec<Action> {
-        for &mam in ids {
+    /// Record new bookmarks: queued, or waiting for the owner when snatched before.
+    pub(super) fn bookmarked(
+        &mut self,
+        now: Instant,
+        bookmarks: impl IntoIterator<Item = (MamTorrentId, Desired)>,
+    ) -> Vec<Action> {
+        for (mam, desired) in bookmarks {
             if self.by_mam.contains_key(&mam) {
                 continue;
             }
@@ -374,7 +384,7 @@ impl Records {
                     id,
                     identity: Identity::Mam(mam),
                     origin: Origin::Bookmark,
-                    desired: Desired::Queued,
+                    desired,
                     save_path: None,
                     deletion_allowed: false,
                     observation: None,
@@ -382,6 +392,21 @@ impl Records {
             );
             self.unsaved.insert(id);
         }
+        self.save(now)
+    }
+
+    /// Queue a snatched torrent the owner wants again.
+    fn redownload(&mut self, now: Instant, id: RecordId) -> Vec<Action> {
+        let Some(entry) = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.record.desired == Desired::Snatched)
+        else {
+            return Vec::new();
+        };
+        entry.record.desired = Desired::Queued;
+        entry.record.origin = Origin::Redownload;
+        self.unsaved.insert(id);
         self.save(now)
     }
 

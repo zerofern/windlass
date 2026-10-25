@@ -133,6 +133,7 @@ rules beyond what Windlass's tests need.
 
 - The Dynamic Seedbox responses and a client list entry are not yet captured
   (B-0011 calls 3 and 12). Until they are, the fake follows the documentation
-  and these responses are marked as unconfirmed.
+  and these responses are marked as unconfirmed. Its client entry
+  (`fake_mam::client`) is a guess Windlass's tolerant reader must accept.
 - The archived POC fake (`POC/windlass-testkit`) is audited before any of it is
   reused, as ADR-0001 requires.

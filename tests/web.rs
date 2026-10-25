@@ -433,6 +433,9 @@ async fn history_records_every_step_and_pages_through_it() -> TestResult {
         dashboard.events.send(pause.clone()).await?;
     }
     dashboard.wait_for_rows(65).await?;
+    let _ = dashboard
+        .history_with("/history", "Pause of MAM requests requested")
+        .await?;
     let (status, body) = dashboard.get("/history").await?;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Pause of MAM requests requested"), "{body}");
@@ -452,7 +455,9 @@ async fn history_records_every_step_and_pages_through_it() -> TestResult {
     let (_, newer_page) = dashboard.get("/history?after=1").await?;
     assert!(newer_page.contains("Storage opened"));
 
-    let (_, startup) = dashboard.get("/history?kind=startup").await?;
+    let startup = dashboard
+        .history_with("/history?kind=startup", "Storage opened")
+        .await?;
     assert!(startup.contains("Storage opened"));
     assert!(!startup.contains("Pause of MAM requests requested"));
     let (_, future) = dashboard
@@ -505,7 +510,12 @@ async fn history_is_trimmed_to_the_configured_limit() -> TestResult {
                 .is_some_and(|event| matches!(event.event, Event::History(_)))
         })
         .await?;
-    let (_, body) = dashboard.get("/history?kind=history").await?;
+    let body = dashboard
+        .history_with(
+            "/history?kind=history",
+            "Oldest history removed; 90 entries kept",
+        )
+        .await?;
     assert!(
         body.contains("Oldest history removed; 90 entries kept"),
         "{body}"
@@ -581,7 +591,9 @@ async fn missing_history_storage_is_shown_as_unavailable() -> TestResult {
     );
     let (_, body) = dashboard.get("/").await?;
     assert!(body.contains("Unavailable: history could not be opened"));
-    let (_, history) = dashboard.get("/history").await?;
+    let history = dashboard
+        .history_with("/history", "History could not be read")
+        .await?;
     assert!(history.contains("History could not be read"));
     dashboard.stop().await?;
     Ok(())
@@ -619,6 +631,8 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
          ALTER TABLE settings DROP COLUMN ntfy_topic; PRAGMA user_version = 4;",
         "DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; PRAGMA user_version = 5;",
+        "INSERT INTO torrents (id, mam_id, origin, desired, deletion_allowed) \
+         VALUES (1, 5, 'bookmark', 'held', 0); PRAGMA user_version = 6;",
     ] {
         let older = tempfile::tempdir()?;
         let older_path = older.path().join("windlass.sqlite");
@@ -632,7 +646,9 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
             dashboard.observations.borrow().history,
             HistoryState::Open { .. }
         ));
-        let (_, history) = dashboard.get("/history").await?;
+        let history = dashboard
+            .history_with("/history", "Startup requested (resume existing storage)")
+            .await?;
         assert!(history.contains("Startup requested (resume existing storage)"));
         dashboard.stop().await?;
     }
@@ -650,6 +666,38 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
     assert!(body.contains("newer Windlass"));
     let (_, settings) = dashboard.get("/settings").await?;
     assert!(settings.contains("Loading…"));
+    dashboard.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn redownload_requests_name_a_registry_row() -> TestResult {
+    let dashboard = Dashboard::start(StartupMode::Initialise).await?;
+    for form in ["record=0", "record=not-a-number", ""] {
+        let (status, _, _) = dashboard.post("/torrents/redownload", form).await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{form}");
+    }
+    let (status, _, _) = dashboard
+        .post("/mam/purchase/checked", "made=maybe")
+        .await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    for made in ["yes", "no"] {
+        let (status, location, _) = dashboard
+            .post("/mam/purchase/checked", &format!("made={made}"))
+            .await?;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location, "/");
+    }
+    let (status, location, _) = dashboard.post("/torrents/redownload", "record=5").await?;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location, "/");
+    let history = dashboard
+        .history_with("/history", "Download torrent row 5 again")
+        .await?;
+    assert!(
+        history.contains("Download torrent row 5 again"),
+        "{history}"
+    );
     dashboard.stop().await?;
     Ok(())
 }
@@ -722,8 +770,15 @@ async fn commands_after_shutdown_are_refused() -> TestResult {
     let (status, _, body) = dashboard.post("/mam/resume", "next=/").await?;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(body.contains("shutting down"));
-    let (status, _, _) = dashboard.post("/settings/api-cookie/clear", "").await?;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    for (uri, form) in [
+        ("/settings/api-cookie/clear", ""),
+        ("/notifications/test", ""),
+        ("/mam/purchase/checked", "made=yes"),
+        ("/torrents/redownload", "record=1"),
+    ] {
+        let (status, _, _) = dashboard.post(uri, form).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+    }
     tokio::time::timeout(Duration::from_secs(10), dashboard.runner).await???;
     Ok(())
 }
@@ -882,7 +937,9 @@ async fn notification_topics_are_set_tested_and_cleared() -> TestResult {
     let (_, status) = dashboard.get("/").await?;
     assert!(status.contains("Delivery failing"), "{status}");
     assert!(status.contains("ntfy did not answer"));
-    let (_, history) = dashboard.get("/history?kind=notifications").await?;
+    let history = dashboard
+        .history_with("/history?kind=notifications", "Test notification requested")
+        .await?;
     assert!(history.contains("Test notification requested"));
     assert!(
         !history.contains("windlass-alerts"),

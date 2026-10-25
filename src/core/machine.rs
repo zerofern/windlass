@@ -148,6 +148,9 @@ impl Core {
             actions.extend(self.registry.observe(occurred_at, session));
         }
         actions.extend(self.decide_mam(occurred_at));
+        if self.mam.take_lease_renewal() {
+            actions.extend(self.port_forwarding.renew());
+        }
         let registry = &mut self.registry;
         actions.extend(self.qbittorrent.decide(
             occurred_at,
@@ -209,6 +212,10 @@ impl Core {
     /// Let MAM work choose its next request from the rest of the core's state.
     fn decide_mam(&mut self, now: ClockReading) -> Vec<Action> {
         let loaded = self.settings.loaded();
+        let session = match &self.qbittorrent {
+            Qbittorrent::Connected(session) => Some(&**session),
+            _ => None,
+        };
         let context = Context {
             requests: self.state.mam_requests(),
             protected: self
@@ -224,6 +231,21 @@ impl Core {
                     session.listed() && session.approval != MamApproval::NotAllowed
                 }
                 _ => false,
+            },
+            client_version: session
+                .and_then(|session| super::ClientVersion::parse(&session.version)),
+            connection: super::Connection {
+                listen_port: session.and_then(|session| session.preferences.listen_port),
+                forwarded_port: self.port_forwarding.forwarded_port(),
+                tunnel_ip: self
+                    .tunnel
+                    .watch
+                    .as_ref()
+                    .and_then(|watch| match watch.protection {
+                        Protection::Available { exit_ip, .. } => Some(exit_ip),
+                        _ => None,
+                    }),
+                interface: session.and_then(|session| session.preferences.interface.clone()),
             },
             registry: &self.registry,
         };

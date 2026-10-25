@@ -209,16 +209,18 @@ pub use history::{HistoryEvent, HistoryState, Step, Trim};
 pub use machine::{Core, State};
 pub use mam::{
     ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Acquisition, Asn, Attention, BOOKMARKS_EVERY,
-    Bookmark, BookmarkPage, Bookmarks, Budget, CLIENT_STATS_EVERY, Connectable, FetchedTorrent,
-    Hold, IpObservation, LastAttempt, LastReminder, Listed, MAX_BOOKMARK_PAGES, Mam, MamEvent,
-    MamFailure, MamNotices, MamReply, MamRequest, Network, OBSERVE_EVERY, Observed, Outstanding,
-    PersonalFreeleech, Points, Purchase, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR,
-    RATIO_TARGET, RATIO_URGENT, RECENT_ADMISSION, REGISTRATION_SPACING, REMINDER_EVERY,
-    REQUEST_BURST, REQUEST_REFILL, Reading, RedCategory, Registration, RegistrationAllowance,
-    RegistrationFailure, Seedbox, SeedboxStatus, Session as MamSession, SessionRejection,
-    SnatchSummary, UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB, UPLOAD_STEP,
-    UploadCredit, UploadCreditError, UserData, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN,
-    VIP_WARN_WITHIN, WedgeCheck,
+    Bookmark, BookmarkPage, Bookmarks, Budget, CLIENT_STATS_EVERY, ClientList, ClientStanding,
+    Connectability, Connectable, Connection, FetchedTorrent, Findings, Hold, IpFinding,
+    IpObservation, LastAttempt, LastReminder, Listed, ListedClient, MAX_BOOKMARK_PAGES, Mam,
+    MamEvent, MamFailure, MamNotices, MamReply, MamRequest, Network, OBSERVE_EVERY, Observed,
+    Outstanding, PersonalFreeleech, Points, PortFinding, Purchase, PurchaseOutcome, PurchaseRecord,
+    RATIO_FLOOR, RATIO_TARGET, RATIO_URGENT, RECENT_ADMISSION, REGISTRATION_SPACING,
+    REMINDER_EVERY, REPAIR_SETTLES_AFTER, REQUEST_BURST, REQUEST_REFILL, Reading, RedCategory,
+    Registration, RegistrationAllowance, RegistrationFailure, Seedbox, SeedboxStatus,
+    Session as MamSession, SessionRejection, SettledBy, SnatchSummary, UNSATISFIED_RESERVE,
+    UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB, UPLOAD_STEP, UnsureWedge, UploadCredit, UploadCreditError,
+    UserData, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN, WedgeCheck,
+    WedgeSpent,
 };
 pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,

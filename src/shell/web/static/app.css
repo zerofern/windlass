@@ -80,6 +80,7 @@ nav a[aria-current="page"] { background: var(--accent-soft); color: var(--ink); 
 }
 .mam-control { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .mam-control form { margin: 0; }
+form.inline { margin: .35rem 0 0; }
 .disconnected-banner { background: #2b3036; color: #ffffff; padding: 10px 16px; font-size: 14px; }
 .disconnected [data-live] { opacity: 0.55; }
 .disconnected [data-live] button { pointer-events: none; }

@@ -108,6 +108,17 @@ impl Default for Account {
     }
 }
 
+/// A client list entry. MAM's shape is not yet captured (B-0011 call 3), so
+/// this is a plausible guess that Windlass's reader must tolerate, not a
+/// recorded fixture.
+pub(super) fn client(version: &str, connectable: &str) -> Value {
+    json!({
+        "client": format!("qBittorrent {version}"),
+        "connectable": connectable,
+        "torrents": 1,
+    })
+}
+
 /// A synthetic torrent in the catalogue.
 #[derive(Debug, Clone)]
 pub(super) struct Torrent {

@@ -615,13 +615,69 @@ pub(super) fn message(notice: &Notice) -> Message {
             4,
             "warning",
         ),
+        Notice::PurchaseSettled {
+            purchase: wanted,
+            made,
+        } => at_mam(
+            "Purchase settled",
+            format!(
+                "The uncertain purchase of {} {}; Windlass buys again only as needed.",
+                purchase(*wanted),
+                if *made {
+                    "went through"
+                } else {
+                    "did not go through"
+                }
+            ),
+            3,
+            "white_check_mark",
+        ),
+        Notice::PurchaseNeedsChecking { purchase: wanted } => at_mam(
+            "Check a purchase on MAM",
+            format!(
+                "MAM's figures do not show whether it sold {}. Check your bonus points on MAM, then say on the dashboard whether it went through; Windlass buys nothing until then.",
+                purchase(*wanted)
+            ),
+            4,
+            "warning",
+        ),
         Notice::WedgeNotSpent => at_mam(
             "Wedge not spent",
             String::from(
-                "MAM's wedge count did not drop after a wedged download, so Windlass stopped the torrent to protect the ratio.",
+                "MAM's bonus history shows no wedge spent on a wedged download, so Windlass stopped the torrent to protect the ratio.",
             ),
             5,
             "rotating_light",
+        ),
+        Notice::MamClientNotListed { standing } => at_mam(
+            "qBittorrent not listed by MAM",
+            format!(
+                "Downloads are held: {}. Check MAM's client list on its site.",
+                super::describe::client_standing(*standing)
+            ),
+            4,
+            "warning",
+        ),
+        Notice::MamClientListed => at_mam(
+            "qBittorrent listed by MAM",
+            String::from("MAM lists the running qBittorrent again."),
+            2,
+            "white_check_mark",
+        ),
+        Notice::NotConnectable { findings } => at_mam(
+            "qBittorrent not connectable",
+            format!(
+                "MAM still cannot reach qBittorrent after Windlass's repair. {}. Check that the namespace firewall admits the forwarded port.",
+                super::describe::findings(findings)
+            ),
+            4,
+            "warning",
+        ),
+        Notice::ConnectableAgain => at_mam(
+            "qBittorrent connectable",
+            String::from("MAM reaches qBittorrent again."),
+            2,
+            "white_check_mark",
         ),
         Notice::MamVisitReminder => message(
             "Visit MAM",
@@ -655,9 +711,9 @@ mod tests {
     };
 
     use crate::core::{
-        DeliveryFailure, EntryCount, Hold, Notice, NotificationEvent, NtfyTopic, Points, Port,
-        Purchase, QbittorrentFailure, SessionRejection, SettingName, StartupMode, SwitchBlock,
-        UploadCredit, VpnServer,
+        ClientStanding, DeliveryFailure, EntryCount, Hold, Notice, NotificationEvent, NtfyTopic,
+        Points, Port, Purchase, QbittorrentFailure, SessionRejection, SettingName, StartupMode,
+        SwitchBlock, UploadCredit, VpnServer,
     };
 
     use super::{Channel, message, send};
@@ -825,7 +881,37 @@ mod tests {
             Notice::PurchaseUncertain { purchase: upload },
             Notice::WedgeNotSpent,
             Notice::MamVisitReminder,
+            Notice::MamClientListed,
+            Notice::ConnectableAgain,
+            Notice::PurchaseSettled {
+                purchase: Purchase::Vip,
+                made: true,
+            },
+            Notice::PurchaseSettled {
+                purchase: Purchase::Vip,
+                made: false,
+            },
+            Notice::PurchaseNeedsChecking {
+                purchase: Purchase::Vip,
+            },
+            Notice::NotConnectable {
+                findings: crate::core::Findings {
+                    listen_port: crate::core::PortFinding::NoForwardedPort,
+                    lease_renewed: false,
+                    exit_ip: crate::core::IpFinding::Unknown,
+                    registered: false,
+                    interface: Some(String::from("wg0")),
+                },
+            },
         ];
+        notices.extend(
+            [
+                ClientStanding::NotListed,
+                ClientStanding::Refused,
+                ClientStanding::NotUnderstood,
+            ]
+            .map(|standing| Notice::MamClientNotListed { standing }),
+        );
         notices.extend(
             [
                 SessionRejection::InvalidCookie,

@@ -12,7 +12,7 @@ use std::{
 use nutype::nutype;
 use serde::Serialize;
 
-use super::super::{ByteSize, MamTorrentId, TorrentHash};
+use super::super::{ByteSize, ClientVersion, MamTorrentId, TorrentHash};
 
 /// A request Windlass makes to MAM. Only one is outstanding at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -40,6 +40,8 @@ pub enum MamRequest {
     },
     /// Buy from the bonus point store.
     Buy(Purchase),
+    /// Read the wedges spent on personal freeleech, from User Bonus History.
+    WedgeHistory,
 }
 
 impl MamRequest {
@@ -227,8 +229,8 @@ pub struct UserData {
     pub summary: Option<SnatchSummary>,
     /// Notification counts, when requested.
     pub notices: Option<MamNotices>,
-    /// How many clients MAM lists, when requested.
-    pub clients: Option<u32>,
+    /// The clients MAM lists, when requested.
+    pub clients: Option<Vec<ListedClient>>,
 }
 
 impl UserData {
@@ -252,6 +254,18 @@ impl UserData {
     pub fn is_vip(&self, now: SystemTime) -> bool {
         self.vip_until.is_some_and(|until| until > now)
     }
+}
+
+/// A client MAM lists for the account, as far as Windlass can read the entry.
+/// The entry's shape is not yet captured, so each part is optional.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListedClient {
+    /// The qBittorrent version MAM names for it, if Windlass finds one.
+    pub qbittorrent: Option<ClientVersion>,
+    /// Whether MAM can reach it, if the entry says.
+    pub connectable: Option<Connectable>,
+    /// Whether MAM marks it as not allowed.
+    pub refused: bool,
 }
 
 /// A bookmarked torrent as Torrent Search lists it.
@@ -340,6 +354,18 @@ pub enum MamReply {
         /// The points left.
         points: Points,
     },
+    /// Wedges spent on personal freeleech, newest first.
+    WedgeHistory(Vec<WedgeSpent>),
+}
+
+/// A wedge spent to make a torrent a personal freeleech, as User Bonus History
+/// lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WedgeSpent {
+    /// The torrent.
+    pub torrent: MamTorrentId,
+    /// When.
+    pub at: SystemTime,
 }
 
 /// Why MAM refused a session.

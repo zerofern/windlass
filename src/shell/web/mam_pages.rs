@@ -7,11 +7,11 @@ use maud::{Markup, html};
 
 use crate::{
     core::{
-        Attention, Connectable, LastAttempt, Mam, MamSession, Points, PurchaseOutcome,
-        PurchaseRecord, RegistrationAllowance, RegistrationFailure, SeedboxStatus, SettingsState,
-        UPLOAD_BUFFER,
+        Attention, Connectability, Connectable, LastAttempt, Mam, MamSession, Points,
+        PurchaseOutcome, PurchaseRecord, RegistrationAllowance, RegistrationFailure, SeedboxStatus,
+        SettingsState, SettledBy, UPLOAD_BUFFER,
     },
-    shell::describe::{gib, hold, mam_failure, purchase, rejection},
+    shell::describe::{client_standing, findings, gib, hold, mam_failure, purchase, rejection},
 };
 
 use super::pages::time;
@@ -175,6 +175,8 @@ fn account_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup
                         }
                     }
                 }
+                (client_list(mam))
+                (repair(mam))
                 @if let Some(attention) = account.attention().filter(Attention::any) {
                     dt { "Flagged by MAM" }
                     dd {
@@ -190,6 +192,54 @@ fn account_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup
                     dt { "VIP renewal" } dd { "Due; about " (Points(cost)) " points" }
                 }
                 @if let Some(record) = &account.last_purchase { (last_purchase(record)) }
+            }
+        }
+    }
+}
+
+/// What Windlass did when MAM could not reach qBittorrent.
+fn repair(mam: &Mam) -> Markup {
+    html! {
+        @match &mam.connectability {
+            Connectability::Fine => {}
+            Connectability::Repaired { wall, findings: found, .. } => {
+                dt { "Connectability repair" }
+                dd {
+                    "Made at " (time(*wall, "full"))
+                    "; a reading 30 minutes later shows whether it worked. " (findings(found)) "."
+                }
+            }
+            Connectability::Unresolved { repaired, findings: found } => {
+                dt { "Connectability repair" }
+                dd.attention {
+                    "Still not connectable after the repair at " (time(*repaired, "full")) ". "
+                    (findings(found)) "."
+                }
+            }
+        }
+    }
+}
+
+/// MAM's client list and what it says about the running qBittorrent.
+fn client_list(mam: &Mam) -> Markup {
+    html! {
+        @if let Some(list) = &mam.account.client_list {
+            dt { "Clients MAM lists" }
+            dd {
+                (client_standing(mam.client)) " · read " (time(list.at, "full"))
+                @for client in &list.clients {
+                    br;
+                    @match client.qbittorrent {
+                        Some(version) => { "qBittorrent " (version) }
+                        None => "An entry Windlass cannot read",
+                    }
+                    @match &client.connectable {
+                        Some(Connectable::Yes) => " · connectable",
+                        Some(Connectable::No) => " · not connectable",
+                        _ => "",
+                    }
+                    @if client.refused { " · marked not allowed" }
+                }
             }
         }
     }
@@ -213,6 +263,21 @@ fn outcome(outcome: Option<&PurchaseOutcome>) -> Markup {
             Some(PurchaseOutcome::Refused(Some(message))) => { "refused: " (message) }
             Some(PurchaseOutcome::Refused(None)) => "refused",
             Some(PurchaseOutcome::Uncertain) => "uncertain; nothing more is bought until the next reading",
+            Some(PurchaseOutcome::Settled { made, by }) => {
+                @if *made { "made" } @else { "not made" }
+                @match by {
+                    SettledBy::Reading => ", as the next reading showed",
+                    SettledBy::Owner => ", as you checked on MAM",
+                }
+            }
+            Some(PurchaseOutcome::Unresolved) => {
+                "the next reading could not tell whether it went through. Check your bonus points on MAM, then say:"
+                form.inline method="post" action="/mam/purchase/checked" {
+                    button.secondary type="submit" name="made" value="yes" { "It went through" }
+                    " "
+                    button.secondary type="submit" name="made" value="no" { "It did not" }
+                }
+            }
         }
     }
 }
@@ -240,10 +305,6 @@ fn bookmarks_panel(mam: &Mam) -> Markup {
                 }
                 @if let Some(failure) = &acquisition.bookmarks.last_failure {
                     dt { "Failed listings" } dd { (acquisition.bookmarks.failures) ": " (mam_failure(failure)) }
-                }
-                @if !acquisition.suppressed.is_empty() {
-                    dt { "Snatched before" }
-                    dd { (acquisition.suppressed.len()) " bookmarks are not downloaded again automatically" }
                 }
                 @if let Some(reason) = acquisition.hold {
                     dt { "Next download waits" } dd { (hold(reason)) }
@@ -289,6 +350,24 @@ mod tests {
             ),
             (Some(PurchaseOutcome::Refused(None)), "refused"),
             (Some(PurchaseOutcome::Uncertain), "uncertain"),
+            (
+                Some(PurchaseOutcome::Settled {
+                    made: true,
+                    by: crate::core::SettledBy::Reading,
+                }),
+                "made, as the next reading showed",
+            ),
+            (
+                Some(PurchaseOutcome::Settled {
+                    made: false,
+                    by: crate::core::SettledBy::Owner,
+                }),
+                "not made, as you checked on MAM",
+            ),
+            (
+                Some(PurchaseOutcome::Unresolved),
+                "action=\"/mam/purchase/checked\"",
+            ),
         ] {
             assert!(
                 outcome(state.as_ref()).into_string().contains(text),
@@ -353,7 +432,82 @@ mod tests {
                 messages: 2,
                 ..MamNotices::default()
             }),
-            clients: Some(1),
+            clients: Some(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn connectability_repairs_are_shown() {
+        use crate::core::{Connectability, Findings, IpFinding, PortFinding};
+
+        let findings = Findings {
+            listen_port: PortFinding::NoForwardedPort,
+            lease_renewed: false,
+            exit_ip: IpFinding::Unknown,
+            registered: false,
+            interface: None,
+        };
+        let mut mam = Mam::default();
+        mam.account.reading = Some(Reading {
+            data: data(),
+            at: SystemTime::UNIX_EPOCH,
+            taken: Instant::now(),
+        });
+        mam.connectability = Connectability::Repaired {
+            at: Instant::now(),
+            wall: SystemTime::UNIX_EPOCH,
+            findings: findings.clone(),
+        };
+        let html = render(&mam, true);
+        assert!(html.contains("shows whether it worked"), "{html}");
+        assert!(html.contains("the VPN forwards no port"), "{html}");
+        mam.connectability = Connectability::Unresolved {
+            repaired: SystemTime::UNIX_EPOCH,
+            findings,
+        };
+        let html = render(&mam, true);
+        assert!(html.contains("Still not connectable"), "{html}");
+    }
+
+    #[test]
+    fn the_client_list_is_shown_with_what_it_means() {
+        use crate::core::{ClientList, ClientStanding, ClientVersion, ListedClient};
+
+        let mut mam = Mam::default();
+        mam.account.reading = Some(Reading {
+            data: data(),
+            at: SystemTime::UNIX_EPOCH,
+            taken: Instant::now(),
+        });
+        mam.account.client_list = Some(ClientList {
+            clients: vec![
+                ListedClient {
+                    qbittorrent: ClientVersion::parse("5.1.0"),
+                    connectable: Some(Connectable::Yes),
+                    refused: true,
+                },
+                ListedClient {
+                    qbittorrent: None,
+                    connectable: Some(Connectable::No),
+                    refused: false,
+                },
+                ListedClient {
+                    qbittorrent: None,
+                    connectable: None,
+                    refused: false,
+                },
+            ],
+            at: SystemTime::UNIX_EPOCH,
+        });
+        mam.client = ClientStanding::NotListed;
+        let html = render(&mam, true);
+        for text in [
+            "Clients MAM lists",
+            "not the running version",
+            "qBittorrent 5.1.0 · connectable · marked not allowed",
+            "An entry Windlass cannot read · not connectable",
+        ] {
+            assert!(html.contains(text), "{text}: {html}");
         }
     }
 
@@ -400,7 +554,6 @@ mod tests {
         mam.account.last_failure = Some(MamFailure::Malformed);
         mam.acquisition.refused = Some(SystemTime::UNIX_EPOCH);
         mam.acquisition.hold = Some(Hold::DownloadsRefused);
-        mam.acquisition.suppressed = MamTorrentId::new(3).into_iter().collect();
         mam.acquisition.fetching = MamTorrentId::new(4).map(|id| (id, true));
         mam.acquisition.bookmarks.failures = 1;
         mam.acquisition.bookmarks.last_failure = Some(MamFailure::Unreachable);
@@ -415,7 +568,6 @@ mod tests {
             "Reading failed 1 times",
             "Downloads refused",
             "Failed listings",
-            "Snatched before",
             "spending a wedge",
         ] {
             assert!(html.contains(text), "{text}: {html}");

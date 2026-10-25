@@ -29,9 +29,12 @@ Acceptance:
   [torrent registry](../../decisions/adr/0004-torrent-registry.md) and admitted
   when a slot frees.
 - Implemented: bookmarks are listed every 15 minutes, 100 to a page and at most
-  10 pages, with the accepted `"searchIn": "bookmarks"` JSON POST. Bookmarks MAM
-  reports as snatched are suppressed and those already in the registry are
-  skipped; the rest are saved as *Queued*. Explicit re-download is not built.
+  10 pages, with the accepted `"searchIn": "bookmarks"` JSON POST. Bookmarks
+  already in the registry are skipped. New ones are saved as *Queued*, or, when
+  MAM reports them snatched, as *Snatched*: known, shown on the dashboard, and
+  not downloaded until the owner presses "Download again", which queues the row
+  with origin *Redownload*. A later listing that no longer says snatched does
+  not queue it.
 
 ### S2: Admit and acquire a torrent
 

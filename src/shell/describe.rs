@@ -5,11 +5,11 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
-    Action, ByteSize, DeliveryFailure, Event, ExitIpFailure, HistoryEvent, Hold, MamEvent,
-    MamFailure, MamPauseEvent, MamReply, MamRequest, MamRequestMode, MappingFailure,
-    NotificationEvent, PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure,
-    Registration, RegistryEvent, SessionRejection, SettingsEvent, StartupEvent, StartupMode,
-    TimerName, TorrentCommand, TunnelEvent,
+    Action, ByteSize, ClientStanding, DeliveryFailure, Event, ExitIpFailure, Findings,
+    HistoryEvent, Hold, IpFinding, MamEvent, MamFailure, MamPauseEvent, MamReply, MamRequest,
+    MamRequestMode, MappingFailure, NotificationEvent, PortFinding, PortForwardingEvent, Purchase,
+    QbittorrentEvent, QbittorrentFailure, Registration, RegistryEvent, SessionRejection,
+    SettingsEvent, StartupEvent, StartupMode, TimerName, TorrentCommand, TunnelEvent,
 };
 
 /// History categories, used for filtering.
@@ -124,6 +124,67 @@ pub(super) fn mam_failure(failure: &MamFailure) -> String {
     }
 }
 
+/// What Windlass checked and found when MAM could not reach qBittorrent.
+pub(super) fn findings(findings: &Findings) -> String {
+    let port = match findings.listen_port {
+        PortFinding::Matches(port) => {
+            format!("qBittorrent listens on the forwarded port {}", port.get())
+        }
+        PortFinding::Differs {
+            listening: Some(listening),
+            forwarded,
+        } => format!(
+            "qBittorrent listened on {}, not the forwarded port {}; Windlass is setting it",
+            listening.get(),
+            forwarded.get()
+        ),
+        PortFinding::Differs {
+            listening: None,
+            forwarded,
+        } => format!(
+            "qBittorrent's listen port is unknown; the forwarded port is {}",
+            forwarded.get()
+        ),
+        PortFinding::NoForwardedPort => String::from("the VPN forwards no port"),
+    };
+    let lease = if findings.lease_renewed {
+        "a new forwarded-port lease was asked for"
+    } else {
+        "no lease could be renewed"
+    };
+    let ip = match findings.exit_ip {
+        IpFinding::Matches(ip) => format!("MAM sees {ip}, the tunnel's exit IP"),
+        IpFinding::Differs { mam, tunnel } => {
+            format!("MAM sees {mam}, but the tunnel's exit IP is {tunnel}")
+        }
+        IpFinding::Unknown => String::from("the IP MAM sees, or the tunnel's, is unknown"),
+    };
+    let registration = if findings.registered {
+        "the seedbox registration was confirmed and is renewed when allowed"
+    } else {
+        "the seedbox registration was not confirmed; Windlass registers when allowed"
+    };
+    let interface = findings.interface.as_ref().map_or_else(
+        || String::from("qBittorrent is not bound to an interface"),
+        |interface| format!("qBittorrent is bound to {interface}"),
+    );
+    format!("{port}; {lease}; {ip}; {registration}; {interface}")
+}
+
+/// What MAM's client list says about the running qBittorrent.
+pub(super) const fn client_standing(standing: ClientStanding) -> &'static str {
+    match standing {
+        ClientStanding::Unknown => "not read yet",
+        ClientStanding::NoneListed => "MAM lists no client yet",
+        ClientStanding::Listed => "MAM lists the running version",
+        ClientStanding::NotListed => "MAM lists qBittorrent, but not the running version",
+        ClientStanding::Refused => "MAM marks the running version as not allowed",
+        ClientStanding::NotUnderstood => {
+            "MAM lists clients in a form Windlass cannot match to qBittorrent"
+        }
+    }
+}
+
 /// Why the next bookmarked torrent waits.
 pub(super) fn hold(hold: Hold) -> String {
     match hold {
@@ -139,6 +200,10 @@ pub(super) fn hold(hold: Hold) -> String {
         Hold::ClientUnavailable => {
             String::from("qBittorrent is not connected, or MAM does not allow its version")
         }
+        Hold::MamClientList(standing) => format!(
+            "MAM's client list does not show the running qBittorrent as allowed: {}",
+            client_standing(standing)
+        ),
         Hold::AccountUnknown => String::from("the account has not been read from MAM yet"),
         Hold::RatioLow => String::from("the ratio is below 2.0"),
         Hold::UnsatisfiedLimit { count, limit } => format!(
@@ -179,6 +244,7 @@ fn mam_request(request: &MamRequest) -> String {
             }
         ),
         MamRequest::Buy(bought) => format!("Buy {}", purchase(*bought)),
+        MamRequest::WedgeHistory => String::from("Read the wedges spent, from MAM's bonus history"),
     }
 }
 
@@ -229,6 +295,9 @@ fn mam(event: &MamEvent) -> String {
                 Ok(MamReply::Purchased { points }) => {
                     format!("Purchase made; {points} points left")
                 }
+                Ok(MamReply::WedgeHistory(spent)) => {
+                    format!("Bonus history read: {} wedges spent", spent.len())
+                }
                 Err(failure) => format!("MAM request failed: {}", mam_failure(failure)),
             };
             if rotated.is_some() {
@@ -251,6 +320,12 @@ fn mam(event: &MamEvent) -> String {
         MamEvent::RegistrationAttemptSaved => String::from("Seedbox registration attempt recorded"),
         MamEvent::RegistrationAttemptSaveFailed => {
             String::from("Seedbox registration attempt could not be recorded, so it was not sent")
+        }
+        MamEvent::PurchaseChecked { made: true } => {
+            String::from("You checked on MAM: the uncertain purchase went through")
+        }
+        MamEvent::PurchaseChecked { made: false } => {
+            String::from("You checked on MAM: the uncertain purchase did not go through")
         }
         MamEvent::ReminderSaved => String::from("MAM visit reminder time saved"),
         MamEvent::ReminderSaveFailed => String::from("MAM visit reminder time could not be saved"),
@@ -387,6 +462,12 @@ fn tunnel(event: &TunnelEvent) -> String {
 
 fn registry(event: &RegistryEvent) -> String {
     match event {
+        RegistryEvent::Redownload(id) => {
+            format!(
+                "Download torrent row {} again, as asked on the dashboard",
+                id.get()
+            )
+        }
         RegistryEvent::Read(records) => format!("Torrent registry read: {} rows", records.len()),
         RegistryEvent::ReadFailed => String::from("Torrent registry could not be read"),
         RegistryEvent::Saved => String::from("Torrent registry saved"),
@@ -1076,10 +1157,12 @@ mod tests {
 
     #[test]
     fn registry_events_and_commands_are_described() -> Result<(), &'static str> {
-        use crate::core::{RegistryEvent, TorrentCommand, TorrentHash};
+        use crate::core::{RecordId, RegistryEvent, TorrentCommand, TorrentHash};
 
         let registry = |event, routine| (Event::Registry(event), "torrents", routine);
+        let row = RecordId::new(3).ok_or("zero id")?;
         check(&[
+            registry(RegistryEvent::Redownload(row), false),
             registry(RegistryEvent::Read(Vec::new()), false),
             registry(RegistryEvent::ReadFailed, false),
             registry(RegistryEvent::Saved, true),
@@ -1143,9 +1226,10 @@ mod tests {
         use std::{net::IpAddr, time::Duration};
 
         use crate::core::{
-            Asn, BookmarkPage, ByteSize, FetchedTorrent, Hold, IpObservation, MamEvent, MamFailure,
-            MamReply, MamRequest, MamTorrentId, Points, PointsReserve, Purchase, Registration,
-            SessionRejection, TimerName, TorrentCommand, TorrentHash, UploadCredit, UserData,
+            Asn, BookmarkPage, ByteSize, ClientStanding, FetchedTorrent, Hold, IpObservation,
+            MamEvent, MamFailure, MamReply, MamRequest, MamTorrentId, Points, PointsReserve,
+            Purchase, Registration, SessionRejection, TimerName, TorrentCommand, TorrentHash,
+            UploadCredit, UserData,
         };
 
         let id = timer_actions()
@@ -1214,6 +1298,9 @@ mod tests {
                     size: ByteSize(1 << 20),
                 }))),
                 answered(Ok(MamReply::Purchased { points: Points(2) })),
+                answered(Ok(MamReply::WedgeHistory(Vec::new()))),
+                MamEvent::PurchaseChecked { made: true },
+                MamEvent::PurchaseChecked { made: false },
                 MamEvent::Answered {
                     result: Err(MamFailure::Unreachable),
                     rotated: ApiCookie::parse("rotated").ok(),
@@ -1317,6 +1404,7 @@ mod tests {
                 },
                 MamRequest::Buy(upload),
                 MamRequest::Buy(Purchase::Vip),
+                MamRequest::WedgeHistory,
             ]
             .map(|request| Action::MamRequest {
                 request,
@@ -1339,10 +1427,61 @@ mod tests {
             Hold::UnsatisfiedLimit { count: 1, limit: 2 },
             Hold::NoWedge,
             Hold::NotBookmarked,
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            [
+                ClientStanding::Unknown,
+                ClientStanding::NoneListed,
+                ClientStanding::Listed,
+                ClientStanding::NotListed,
+                ClientStanding::Refused,
+                ClientStanding::NotUnderstood,
+            ]
+            .map(Hold::MamClientList),
+        ) {
             assert!(!super::hold(hold).is_empty());
         }
         assert_eq!(super::gib(ByteSize(3 << 29)), "1.5 GiB");
+
+        let port = crate::core::Port::new(41000).ok_or("zero port")?;
+        let other = crate::core::Port::new(6881).ok_or("zero port")?;
+        let mam = IpAddr::from([192, 0, 2, 10]);
+        let tunnel = IpAddr::from([192, 0, 2, 11]);
+        for (listen_port, exit_ip, text) in [
+            (
+                crate::core::PortFinding::Matches(port),
+                crate::core::IpFinding::Matches(mam),
+                "listens on the forwarded port 41000",
+            ),
+            (
+                crate::core::PortFinding::Differs {
+                    listening: Some(other),
+                    forwarded: port,
+                },
+                crate::core::IpFinding::Differs { mam, tunnel },
+                "listened on 6881, not the forwarded port 41000",
+            ),
+            (
+                crate::core::PortFinding::Differs {
+                    listening: None,
+                    forwarded: port,
+                },
+                crate::core::IpFinding::Unknown,
+                "listen port is unknown",
+            ),
+        ] {
+            let found = crate::core::Findings {
+                listen_port,
+                lease_renewed: true,
+                exit_ip,
+                registered: true,
+                interface: Some(String::from("wg0")),
+            };
+            let described = super::findings(&found);
+            assert!(described.contains(text), "{described}");
+            assert!(described.contains("bound to wg0"), "{described}");
+        }
         Ok(())
     }
 }

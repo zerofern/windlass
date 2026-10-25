@@ -13,10 +13,10 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    Action, ClockReading, Desired, EntryCount, Failover, Hold, Mam, MamSession, Points, Port,
-    PortForwarding, Protection, Purchase, Qbittorrent, QbittorrentFailure, Registry, SeedboxStatus,
-    SessionRejection, SettingsState, StartupMode, SwitchAllowance, TimerId, TimerName,
-    TorrentState, Tunnel, VpnServer, timer::Timers,
+    Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
+    Hold, Mam, MamSession, Points, Port, PortForwarding, Protection, Purchase, Qbittorrent,
+    QbittorrentFailure, Registry, SeedboxStatus, SessionRejection, SettingsState, StartupMode,
+    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer, timer::Timers,
 };
 
 /// A torrent completed this long ago must have seeded 72 hours by now, or soon
@@ -282,6 +282,35 @@ pub enum Notice {
     },
     /// A download's wedge was not spent, so the torrent is stopped.
     WedgeNotSpent,
+    /// An uncertain purchase was settled, from the next reading or by the owner.
+    PurchaseSettled {
+        /// What Windlass tried to buy.
+        purchase: Purchase,
+        /// Whether MAM sold it.
+        made: bool,
+    },
+    /// The next reading could not tell whether an uncertain purchase went
+    /// through; nothing more is bought until the owner checks on MAM.
+    PurchaseNeedsChecking {
+        /// What Windlass tried to buy.
+        purchase: Purchase,
+    },
+    /// MAM's client list does not show the running qBittorrent as allowed, so
+    /// downloads are held.
+    MamClientNotListed {
+        /// What the list says.
+        standing: ClientStanding,
+    },
+    /// MAM lists the running qBittorrent again.
+    MamClientListed,
+    /// MAM still cannot reach qBittorrent after Windlass's repair and a fresh
+    /// reading.
+    NotConnectable {
+        /// What Windlass checked and found.
+        findings: Findings,
+    },
+    /// MAM reaches qBittorrent again.
+    ConnectableAgain,
     /// A weekly reminder to visit MAM.
     MamVisitReminder,
 }
@@ -361,6 +390,12 @@ pub enum Condition {
     DownloadsRefused,
     /// Torrents behind on seeding.
     SeedingBehind,
+    /// MAM's client list does not show qBittorrent as allowed.
+    MamClient,
+    /// MAM cannot reach qBittorrent after a repair.
+    Connectable,
+    /// An uncertain purchase waits for the owner.
+    PurchaseUnresolved,
 }
 
 impl Condition {
@@ -381,7 +416,10 @@ impl Condition {
             | Self::PointsReserve
             | Self::VipEnding
             | Self::DownloadsRefused
-            | Self::SeedingBehind => Duration::ZERO,
+            | Self::SeedingBehind
+            | Self::MamClient
+            | Self::Connectable
+            | Self::PurchaseUnresolved => Duration::ZERO,
             Self::MamIp => Duration::from_mins(15),
             Self::UnsatisfiedNotSeeding | Self::DownloadsHeld => Duration::from_mins(30),
             Self::RegistrySave => Duration::from_mins(2),
@@ -1030,6 +1068,34 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
                     .map(|until| Notice::VipEnding { until }),
                 None,
             ),
+        ),
+        (
+            Condition::MamClient,
+            match mam.client {
+                ClientStanding::Unknown | ClientStanding::NoneListed => Status::Unchanged,
+                ClientStanding::Listed => Status::Clear(Some(Notice::MamClientListed)),
+                standing => Status::Active(Notice::MamClientNotListed { standing }),
+            },
+        ),
+        (
+            Condition::PurchaseUnresolved,
+            account
+                .unresolved_purchase()
+                .map_or(Status::Clear(None), |purchase| {
+                    Status::Active(Notice::PurchaseNeedsChecking { purchase })
+                }),
+        ),
+        (
+            Condition::Connectable,
+            match &mam.connectability {
+                Connectability::Fine => Status::Clear(Some(Notice::ConnectableAgain)),
+                Connectability::Repaired { .. } => Status::Unchanged,
+                Connectability::Unresolved { findings, .. } => {
+                    Status::Active(Notice::NotConnectable {
+                        findings: findings.clone(),
+                    })
+                }
+            },
         ),
         (
             Condition::DownloadsRefused,

@@ -9,6 +9,7 @@ mod account;
 mod acquisition;
 mod api;
 mod budget;
+mod connectability;
 mod network;
 
 use std::time::{Duration, Instant, SystemTime};
@@ -16,21 +17,25 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Serialize;
 
 pub use account::{
-    ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Attention, CLIENT_STATS_EVERY, PurchaseOutcome,
-    PurchaseRecord, RATIO_FLOOR, RATIO_TARGET, RATIO_URGENT, Reading, UNSATISFIED_RESERVE,
-    UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB, UPLOAD_STEP, VIP_FILL, VIP_PRICE_PER_WEEK,
-    VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
+    ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Attention, CLIENT_STATS_EVERY, ClientList,
+    ClientStanding, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR, RATIO_TARGET, RATIO_URGENT,
+    Reading, SettledBy, UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB, UPLOAD_STEP,
+    VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
 };
 pub use acquisition::{
     Acquisition, BOOKMARKS_EVERY, Bookmarks, Hold, Listed, MAX_BOOKMARK_PAGES, RECENT_ADMISSION,
-    WedgeCheck,
+    UnsureWedge, WedgeCheck,
 };
 pub use api::{
-    Asn, Bookmark, BookmarkPage, Connectable, FetchedTorrent, IpObservation, MamFailure,
-    MamNotices, MamReply, MamRequest, PersonalFreeleech, Points, Purchase, RedCategory,
+    Asn, Bookmark, BookmarkPage, Connectable, FetchedTorrent, IpObservation, ListedClient,
+    MamFailure, MamNotices, MamReply, MamRequest, PersonalFreeleech, Points, Purchase, RedCategory,
     Registration, SessionRejection, SnatchSummary, UploadCredit, UploadCreditError, UserData,
+    WedgeSpent,
 };
 pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL};
+pub use connectability::{
+    Connectability, Connection, Findings, IpFinding, PortFinding, REPAIR_SETTLES_AFTER,
+};
 pub use network::{
     LastAttempt, Network, OBSERVE_EVERY, Observed, REGISTRATION_SPACING, RegistrationAllowance,
     RegistrationFailure, Seedbox, SeedboxStatus, Session,
@@ -38,8 +43,8 @@ pub use network::{
 
 use self::acquisition::{Facts, Next};
 use super::{
-    Action, ApiCookie, ClockReading, MamRequestsStatus, MamTorrentId, Notice, Registry, TimerId,
-    TimerName, timer::Timers,
+    Action, ApiCookie, ClientVersion, ClockReading, Desired, MamRequestsStatus, MamTorrentId,
+    Notice, Registry, TimerId, TimerName, timer::Timers,
 };
 
 /// The owner is reminded to visit MAM this often.
@@ -70,6 +75,11 @@ pub enum MamEvent {
     RegistrationAttemptSaved,
     /// Saving the registration attempt failed; it is not sent.
     RegistrationAttemptSaveFailed,
+    /// The owner checked on MAM whether an unresolved purchase went through.
+    PurchaseChecked {
+        /// Whether it did.
+        made: bool,
+    },
     /// The reminder time was saved.
     ReminderSaved,
     /// Saving the reminder time failed.
@@ -125,6 +135,10 @@ pub(super) struct Context<'a> {
     pub(super) requested_cookie: Option<&'a ApiCookie>,
     pub(super) reserve: Option<Points>,
     pub(super) client_ready: bool,
+    /// The running qBittorrent's version, once connected.
+    pub(super) client_version: Option<ClientVersion>,
+    /// What the rest of Windlass knows about the connection.
+    pub(super) connection: Connection,
     pub(super) registry: &'a Registry,
 }
 
@@ -151,6 +165,11 @@ pub struct Mam {
     pub outstanding: Option<Outstanding>,
     /// The last visit reminder.
     pub last_reminder: LastReminder,
+    /// What MAM's client list says about the running qBittorrent.
+    pub client: ClientStanding,
+    /// Whether MAM can reach qBittorrent, and what Windlass did about it.
+    pub connectability: Connectability,
+    renew_lease: bool,
     cookie_in_use: Option<ApiCookie>,
     issued_cookie: Option<ApiCookie>,
     epoch: u64,
@@ -173,6 +192,9 @@ impl Mam {
             budget: Budget::new(),
             outstanding: None,
             last_reminder: LastReminder::Unread,
+            client: ClientStanding::Unknown,
+            connectability: Connectability::Fine,
+            renew_lease: false,
             cookie_in_use: None,
             issued_cookie: None,
             epoch: 0,
@@ -268,6 +290,13 @@ impl Mam {
                 (Vec::new(), None)
             }
             MamEvent::ReminderSaved | MamEvent::ReminderSaveFailed => (Vec::new(), None),
+            MamEvent::PurchaseChecked { made } => {
+                if let Some(purchase) = self.account.checked(made) {
+                    self.notices
+                        .push(Notice::PurchaseSettled { purchase, made });
+                }
+                (Vec::new(), None)
+            }
             MamEvent::Answered { result, rotated } => {
                 let Some(Outstanding::Request { request, epoch, .. }) = self
                     .outstanding
@@ -315,15 +344,27 @@ impl Mam {
                 Vec::new()
             }
             (MamRequest::LoadUserData { .. }, Ok(MamReply::UserData(data))) if current => {
-                let held = self.acquisition.check_wedges(&data);
-                self.account.read(now.monotonic, now.wall, *data);
-                match (held, registry.records_mut()) {
+                self.acquisition.check_wedges(&data);
+                if let Some((purchase, PurchaseOutcome::Settled { made, .. })) =
+                    self.account.read(now.monotonic, now.wall, *data)
+                {
+                    self.notices
+                        .push(Notice::PurchaseSettled { purchase, made });
+                }
+                Vec::new()
+            }
+            (MamRequest::WedgeHistory, Ok(MamReply::WedgeHistory(spent))) if current => {
+                match (self.acquisition.history(&spent), registry.records_mut()) {
                     (Some(hash), Some(records)) => {
                         self.notices.push(Notice::WedgeNotSpent);
                         records.hold(now.monotonic, &hash)
                     }
                     _ => Vec::new(),
                 }
+            }
+            (MamRequest::WedgeHistory, Err(_)) if current => {
+                self.acquisition.history_failed = Some(now.monotonic);
+                Vec::new()
             }
             (MamRequest::LoadUserData { .. }, Err(failure)) if current => {
                 self.account.failed(now.monotonic, failure);
@@ -412,7 +453,8 @@ impl Mam {
         self.acquisition.fetching = None;
         match result {
             Ok(MamReply::Fetched(fetched)) => {
-                // A fetch follows a fresh reading, which cleared any earlier check.
+                // A fetch follows a fresh reading and a settled check.
+                self.acquisition.unsure_wedge = None;
                 self.acquisition.wedge_check =
                     self.account
                         .data()
@@ -420,6 +462,9 @@ impl Mam {
                         .map(|data| WedgeCheck {
                             expected: data.wedges.saturating_sub(1),
                             hash: fetched.hash.clone(),
+                            id,
+                            fetched: now.wall,
+                            confirming: false,
                         });
                 registry
                     .records_mut()
@@ -430,12 +475,21 @@ impl Mam {
                 self.acquisition.refused = Some(now.wall);
                 Vec::new()
             }
+            // MAM may have spent the wedge; User Bonus History shows whether.
+            Err(failure) if wedge && failure.uncertain() => {
+                self.acquisition.unsure_wedge = Some(UnsureWedge {
+                    id,
+                    at: now.wall,
+                    spent: None,
+                });
+                Vec::new()
+            }
             Err(_) | Ok(_) => Vec::new(),
         }
     }
 
-    /// Queue new bookmarks once the listing is complete; bookmarks MAM reports
-    /// snatched before are not queued.
+    /// Record new bookmarks once the listing is complete; bookmarks MAM reports
+    /// snatched before wait for the owner.
     fn listed(
         &mut self,
         now: ClockReading,
@@ -450,14 +504,20 @@ impl Mam {
         ) else {
             return Vec::new();
         };
-        let (snatched, wanted): (Vec<&Bookmark>, Vec<&Bookmark>) = listed
+        let new: Vec<(MamTorrentId, Desired)> = listed
             .bookmarks
             .iter()
             .filter(|bookmark| !records.knows(bookmark.id))
-            .partition(|bookmark| bookmark.snatched);
-        let wanted: Vec<MamTorrentId> = wanted.iter().map(|bookmark| bookmark.id).collect();
-        self.acquisition.suppressed = snatched.iter().map(|bookmark| bookmark.id).collect();
-        records.queue(now.monotonic, &wanted)
+            .map(|bookmark| {
+                let desired = if bookmark.snatched {
+                    Desired::Snatched
+                } else {
+                    Desired::Queued
+                };
+                (bookmark.id, desired)
+            })
+            .collect();
+        records.bookmarked(now.monotonic, new)
     }
 
     /// Choose and send the next request, if one is wanted and allowed.
@@ -480,12 +540,15 @@ impl Mam {
             .cookie
             .filter(|_| !self.session.blocks(observed.as_ref()))
             .cloned();
+        self.client = self.account.client_standing(context.client_version);
+        self.follow_connectability(now, context);
         let facts = Facts {
             now: now.monotonic,
             wall: now.wall,
             mam_available: available && cookie.is_some(),
             seedbox_confirmed: self.seedbox.confirms(observed.as_ref()),
             client_ready: context.client_ready,
+            client: self.client,
             account: &self.account,
         };
         let next = match context.registry {
@@ -536,6 +599,51 @@ impl Mam {
         actions
     }
 
+    /// Whether a new forwarded-port lease is wanted, once.
+    pub(super) const fn take_lease_renewal(&mut self) -> bool {
+        std::mem::replace(&mut self.renew_lease, false)
+    }
+
+    /// When MAM cannot reach qBittorrent, check the connection, ask for a new
+    /// lease, and observe and register again when allowed (A6).
+    fn follow_connectability(&mut self, now: ClockReading, context: &Context<'_>) {
+        let reading = self
+            .account
+            .reading
+            .as_ref()
+            .map(|reading| (reading.taken, self.unreachable(context.client_version)));
+        if !self.connectability.follow(reading) {
+            return;
+        }
+        let observed = self.network.current().cloned();
+        let findings = Findings::check(
+            &context.connection,
+            observed.as_ref().map(|observed| observed.ip),
+            self.seedbox.confirms(observed.as_ref()),
+        );
+        self.renew_lease = findings.lease_renewed;
+        self.connectability
+            .repaired(now.monotonic, now.wall, findings);
+        self.network.unconfirm();
+        self.seedbox.unconfirm();
+    }
+
+    /// Whether the latest reading says MAM cannot reach qBittorrent: the snatch
+    /// summary, or the running client's entry in the client list.
+    fn unreachable(&self, running: Option<ClientVersion>) -> bool {
+        let summary = self
+            .account
+            .data()
+            .and_then(|data| data.summary.as_ref())
+            .is_some_and(|summary| summary.connectable == Connectable::No);
+        let client = running.is_some_and(|running| {
+            self.account
+                .running_client(running)
+                .any(|client| client.connectable == Some(Connectable::No))
+        });
+        summary || client
+    }
+
     /// The most urgent request wanted now.
     fn wanted(
         &self,
@@ -556,6 +664,9 @@ impl Mam {
         }
         if let Some(client_stats) = self.account.wanted(now.monotonic, early) {
             return Some(Wanted::Request(MamRequest::LoadUserData { client_stats }));
+        }
+        if self.acquisition.history_wanted(now.monotonic) {
+            return Some(Wanted::Request(MamRequest::WedgeHistory));
         }
         if let Some(purchase) = reserve.and_then(|reserve| {
             self.account
@@ -648,6 +759,7 @@ impl Mam {
             registration,
             self.account.next_due(early),
             self.acquisition.bookmarks.next_due(),
+            self.acquisition.history_due(),
             self.budget.next_token(now.monotonic),
         ]
         .into_iter()

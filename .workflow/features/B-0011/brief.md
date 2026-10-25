@@ -85,20 +85,35 @@ upload credit when it is needed.
 
 ### Implementation status
 
-Implemented: A1, A2, A3's watches, A4, A7 to A22, S1, S2, S3, and S5, with the
-notification conditions below, except as listed here. Not yet built:
+Implemented: A1 to A22, S1 to S5, and the notification conditions below. Not
+yet built: admission step 7, disk space, which waits for B-0001.
 
-- A5's check that MAM lists the running qBittorrent as an authorized client;
-  only the client count is read.
-- A6's repair steps and the notice that follows them; connectability is shown
-  on the dashboard only.
-- S4's reconciliation from User Bonus History; an uncertain purchase blocks
-  buying until the next account reading instead.
-- Admission step 7, disk space, waiting for B-0001.
-
-Windlass records its own wedge use by linking the registry row to the fetched
-torrent, so a bookmark is never fetched twice. The wedge check runs on the next
-account reading; a balance that did not fall stops the torrent and holds it.
+- **A5.** Each client list entry is searched for a qBittorrent version (as
+  `qBittorrent 5.1.2`, `qBittorrent/v5.1.2`, or a `-qB5120-` peer ID), a field
+  naming connectability, and words or flags that mark it not allowed. The entry's
+  real shape is still to be captured (call 3), so this reading is tolerant, not
+  confirmed. Downloads wait when MAM lists qBittorrent but not the running
+  version, marks the running version not allowed, or lists entries Windlass
+  cannot match; an empty list, as before anything seeds, admits the first
+  download. Once a seeding entry is captured, the reader should be narrowed to it.
+- **A6.** When the snatch summary or the running client's entry says MAM cannot
+  reach qBittorrent, Windlass records what it finds (listen port against the
+  forwarded port, the IP MAM sees against the tunnel's, the seedbox registration,
+  and the bound interface), asks for a new lease, and observes and registers
+  again when allowed. A reading taken at least 30 minutes later judges the
+  repair; if MAM still cannot reach qBittorrent, the owner is told what was
+  found. Windlass cannot inspect the namespace firewall, so the notice asks the
+  owner to check it.
+- **S4.** User Bonus History lists gifts and wedges, not upload credit or VIP, so
+  an uncertain purchase is settled from the next reading: points not spent mean
+  MAM did not sell it; for VIP, a later `vip_until` means it did; for upload
+  credit, points spent and the credit arriving mean it did. Anything else waits
+  for the owner, who says on the dashboard whether it went through; nothing is
+  bought until then. The wait is held in memory, so a restart ends it; the
+  restarted Windlass buys only from a fresh reading. For wedges, User Bonus History settles both a balance that
+  did not fall after a wedged download, before the torrent is stopped, and a
+  wedged download whose answer was lost, before it is fetched again: a wedge
+  already spent is not spent twice.
 
 ## Admission: from bookmark to download
 

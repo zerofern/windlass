@@ -30,9 +30,9 @@ use tokio_stream::{Stream, StreamExt, wrappers::WatchStream};
 
 use crate::{
     core::{
-        ApiCookie, Event, HistoryLimit, HistoryState, MamPauseEvent, MamRequestMode,
-        NotificationEvent, NtfyTopic, PointsReserve, SettingsEvent, StartupEvent, StartupMode,
-        State,
+        ApiCookie, Event, HistoryLimit, HistoryState, MamEvent, MamPauseEvent, MamRequestMode,
+        NotificationEvent, NtfyTopic, PointsReserve, RecordId, RegistryEvent, SettingsEvent,
+        StartupEvent, StartupMode, State,
     },
     runner::{Observation, Runner},
     shell::{
@@ -131,6 +131,8 @@ pub fn router(
         .route("/settings/ntfy-topic/clear", post(clear_ntfy_topic))
         .route("/settings/points-reserve", post(set_points_reserve))
         .route("/notifications/test", post(send_test_notification))
+        .route("/torrents/redownload", post(redownload))
+        .route("/mam/purchase/checked", post(purchase_checked))
         .route("/static/app.css", get(stylesheet))
         .route("/static/app.js", get(script))
         .route("/favicon.ico", get(StatusCode::NO_CONTENT))
@@ -365,6 +367,44 @@ async fn send_test_notification(AppState(app): AppState<App>) -> Response {
         .await
     {
         Ok(()) => back(Some(Location::Settings.path())).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckedForm {
+    made: String,
+}
+
+async fn purchase_checked(AppState(app): AppState<App>, Form(form): Form<CheckedForm>) -> Response {
+    let made = match form.made.as_str() {
+        "yes" => true,
+        "no" => false,
+        _ => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    match app
+        .send(Event::Mam(MamEvent::PurchaseChecked { made }))
+        .await
+    {
+        Ok(()) => back(Some(Location::Status.path())).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RedownloadForm {
+    record: u64,
+}
+
+async fn redownload(AppState(app): AppState<App>, Form(form): Form<RedownloadForm>) -> Response {
+    let Some(record) = RecordId::new(form.record) else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
+    match app
+        .send(Event::Registry(RegistryEvent::Redownload(record)))
+        .await
+    {
+        Ok(()) => back(Some(Location::Status.path())).into_response(),
         Err(response) => response,
     }
 }

@@ -60,7 +60,8 @@ times; it works without the script, without live updates. It shows:
   the network interface, the listen port against the forwarded port, and the lease.
 - **Torrents:** every torrent in the registry with what Windlass wants for it, its
   state, progress, size, upload, and completion, marking torrents missing from
-  qBittorrent and content missing on disk. Windlass adopts torrents it finds,
+  qBittorrent and content missing on disk. Bookmarks snatched before have a
+  "Download again" button. Windlass adopts torrents it finds,
   starts stopped ones, selects every file, and removes those marked removed.
 - **MAM:** whether the API session works, the IP and ASN MAM sees, the seedbox
   registration and when it may next be renewed; the account as MAM last reported
@@ -107,13 +108,24 @@ Windlass saves it and uses it from then on.
   50 GiB steps when the upload buffer falls below 25 GiB or the ratio below 3.0.
   Purchases never take points below the reserve set on the settings page, 20,000
   by default, and an uncertain purchase stops further buying until MAM is read again.
-- It lists your bookmarks every 15 minutes and queues those not snatched. It admits
+- It lists your bookmarks every 15 minutes and queues them. Bookmarks MAM reports
+  as snatched before are listed under Torrents but wait for you to press
+  "Download again". It admits
   the oldest queued torrent once the seedbox is confirmed, qBittorrent is ready,
   the account was read in the last five minutes, the ratio is at least 2.0, and an
-  unsatisfied slot is free after a reserve of two. A torrent is downloaded with a
+  unsatisfied slot is free after a reserve of two, and MAM's client list shows the
+  running qBittorrent (or lists nothing yet). A torrent is downloaded with a
   freeleech wedge unless it is already a personal freeleech, or a VIP torrent while
-  the account is VIP. The next account reading must show the wedge spent; if not,
-  the torrent is stopped and you are told.
+  the account is VIP. The next account reading must show the wedge spent, or MAM's
+  bonus history must list it; if neither does, the torrent is stopped and you are
+  told.
+- When MAM cannot reach qBittorrent, Windlass checks the listen port, the forwarded
+  port, the IP MAM sees, and the seedbox registration, renews the lease, and
+  registers again when allowed. If MAM still cannot reach it 30 minutes later, you
+  are told what it found.
+- A purchase whose answer was lost is settled from the next account reading; when
+  that cannot tell, the dashboard asks you to check MAM and say whether it went
+  through, and nothing is bought until you do.
 
 MAM's rules come first: Windlass calls only documented API functions, never logs
 in with a password, and never gifts points or wedges. The feature briefs for

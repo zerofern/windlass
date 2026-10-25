@@ -7,11 +7,11 @@ use maud::{DOCTYPE, Markup, html};
 
 use crate::{
     core::{
-        Activity, ByteSize, Condition, Delivery, Desired, EntryCount, Failover, HistoryState,
-        MamApproval, MamRequestsStatus, MappingFailure, Notifications, NtfyTopic, Origin, Outcome,
-        POLL_INTERVAL, Phase, Port, PortForwarding, Protection, Qbittorrent, Ratio, Records,
-        Registry, Session, Setting, SettingStatus, Settings, SettingsState, SwitchAllowance,
-        Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
+        Activity, Bookmarks, ByteSize, Condition, Delivery, Desired, EntryCount, Failover,
+        HistoryState, MamApproval, MamRequestsStatus, MappingFailure, Notifications, NtfyTopic,
+        Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding, Protection, Qbittorrent,
+        Ratio, Records, Registry, Session, Setting, SettingStatus, Settings, SettingsState,
+        SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
     },
     runner::Observation,
     shell::{
@@ -226,6 +226,9 @@ const fn condition(condition: Condition) -> &'static str {
         Condition::VipEnding => "VIP ending",
         Condition::DownloadsRefused => "MAM refused a download",
         Condition::SeedingBehind => "Torrents behind on seeding",
+        Condition::MamClient => "qBittorrent not listed by MAM",
+        Condition::Connectable => "qBittorrent not connectable",
+        Condition::PurchaseUnresolved => "A purchase to check on MAM",
     }
 }
 
@@ -347,7 +350,11 @@ fn status_live(observation: &Observation) -> Markup {
                 (port_forwarding_panel(&observation.port_forwarding))
                 (qbittorrent_panel(&observation.qbittorrent, observation.port_forwarding.forwarded_port()))
             }
-            (torrent_list(&observation.qbittorrent, &observation.registry))
+            (torrent_list(
+                &observation.qbittorrent,
+                &observation.registry,
+                &observation.mam.acquisition.bookmarks,
+            ))
             @if let Some(error) = &observation.storage_error {
                 section.panel.error aria-labelledby="storage-error" {
                     h2 #storage-error { "Latest storage error" }
@@ -581,13 +588,13 @@ fn ratio(ratio: Ratio) -> String {
 
 /// The torrent registry, with what qBittorrent reports now; while the
 /// registry is unavailable, what qBittorrent reports.
-fn torrent_list(qbittorrent: &Qbittorrent, registry: &Registry) -> Markup {
+fn torrent_list(qbittorrent: &Qbittorrent, registry: &Registry, bookmarks: &Bookmarks) -> Markup {
     let session = match qbittorrent {
         Qbittorrent::Connected(session) => Some(&**session),
         _ => None,
     };
     match registry {
-        Registry::Loaded(records) => registry_table(records, session),
+        Registry::Loaded(records) => registry_table(records, session, bookmarks),
         Registry::ReadFailed => html! {
             section.panel.error aria-labelledby="registry-error" {
                 h2 #registry-error { "Torrent registry unavailable" }
@@ -633,6 +640,7 @@ fn session_table(session: Option<&Session>) -> Markup {
 const fn wanted(record: &TorrentRecord) -> &'static str {
     match (record.desired, record.origin) {
         (Desired::Queued, _) => "Queued",
+        (Desired::Snatched, _) => "Snatched before, not downloaded",
         (Desired::Active, Origin::Adopted) => "Active, adopted",
         (Desired::Active, Origin::Bookmark | Origin::Redownload) => "Active",
         (Desired::Held, _) => "Held: its wedge was not spent",
@@ -653,13 +661,14 @@ fn registry_state(
         ),
         (None, Desired::Active) if listed => ("Missing from qBittorrent", true),
         (None, Desired::Queued) => ("Waiting to download", false),
+        (None, Desired::Snatched) => ("Waiting for you", false),
         (None, Desired::Held) => ("Held, not in qBittorrent", true),
         (None, Desired::Removed) => ("Not in qBittorrent", false),
         (None, Desired::Active) => ("Unknown", false),
     }
 }
 
-fn registry_table(records: &Records, session: Option<&Session>) -> Markup {
+fn registry_table(records: &Records, session: Option<&Session>, bookmarks: &Bookmarks) -> Markup {
     type Row<'a> = (
         String,
         &'a TorrentRecord,
@@ -675,12 +684,15 @@ fn registry_table(records: &Records, session: Option<&Session>) -> Markup {
                 .and_then(|hash| session?.torrents.get(hash));
             // What qBittorrent reports now, or else what it reported last.
             let seen = live.or_else(|| record.observation.as_ref().map(|seen| &seen.torrent));
+            // Before qBittorrent has it, the bookmark names it.
             let name = seen.map_or_else(
                 || {
-                    record
-                        .identity
-                        .mam_id()
-                        .map_or_else(String::new, |id| format!("MAM torrent {}", id.get()))
+                    record.identity.mam_id().map_or_else(String::new, |id| {
+                        bookmarks.find(id).map_or_else(
+                            || format!("MAM torrent {}", id.get()),
+                            |bookmark| bookmark.title.clone(),
+                        )
+                    })
                 },
                 |torrent| torrent.name.clone(),
             );
@@ -713,7 +725,15 @@ fn registry_table(records: &Records, session: Option<&Session>) -> Markup {
                         @let (state, attention) = registry_state(record, live, listed);
                         tr {
                             td { (name) }
-                            td { (wanted(record)) }
+                            td {
+                                (wanted(record))
+                                @if record.desired == Desired::Snatched {
+                                    form.inline method="post" action="/torrents/redownload" {
+                                        input type="hidden" name="record" value=(record.id.get());
+                                        button.secondary type="submit" { "Download again" }
+                                    }
+                                }
+                            }
                             td class=[attention.then_some("attention")] { (state) }
                             @match seen {
                                 Some(torrent) => {
@@ -1347,6 +1367,7 @@ mod tests {
         use super::{qbittorrent_panel, size, torrent_list};
 
         let render = |markup: maud::Markup| markup.into_string();
+        let none = crate::core::Bookmarks::default();
         assert!(render(qbittorrent_panel(&Qbittorrent::Disabled, None)).contains("Not configured"));
         assert!(render(qbittorrent_panel(&Qbittorrent::Connecting, None)).contains("Connecting"));
         let unreachable = drive(vec![
@@ -1421,14 +1442,14 @@ mod tests {
             for text in expected {
                 assert!(html.contains(text), "{text}: {html}");
             }
-            let list = render(torrent_list(core.qbittorrent(), core.registry()));
+            let list = render(torrent_list(core.qbittorrent(), core.registry(), &none));
             assert!(
                 list.contains("A Synthetic Audiobook") && list.contains("50.0%"),
                 "{list}"
             );
         }
         let reading = crate::core::Registry::Reading;
-        assert!(render(torrent_list(&Qbittorrent::Disabled, &reading)).is_empty());
+        assert!(render(torrent_list(&Qbittorrent::Disabled, &reading, &none)).is_empty());
         assert_eq!(size(ByteSize(512)), "512 B");
         assert_eq!(size(ByteSize(1536)), "1.5 KiB");
         assert_eq!(size(ByteSize(5 * 1024 * 1024 * 1024)), "5.0 GiB");
@@ -1499,9 +1520,13 @@ mod tests {
         );
         // Connected, but with no torrents yet: no list.
         assert!(
-            super::torrent_list(core.qbittorrent(), core.registry())
-                .into_string()
-                .is_empty()
+            super::torrent_list(
+                core.qbittorrent(),
+                core.registry(),
+                &crate::core::Bookmarks::default()
+            )
+            .into_string()
+            .is_empty()
         );
     }
 
@@ -1703,6 +1728,60 @@ mod tests {
     }
 
     #[test]
+    fn snatched_bookmarks_are_named_and_can_be_downloaded_again() -> Result<(), &'static str> {
+        use crate::core::{
+            Bookmark, Bookmarks, Desired, Identity, Listed, MamTorrentId, Origin,
+            PersonalFreeleech, RecordId, TorrentRecord,
+        };
+
+        use super::torrent_list;
+
+        let mam = MamTorrentId::new(78).ok_or("zero id")?;
+        let row = |id, mam| -> Result<TorrentRecord, &'static str> {
+            Ok(TorrentRecord {
+                id: RecordId::new(id).ok_or("zero id")?,
+                identity: Identity::Mam(mam),
+                origin: Origin::Bookmark,
+                desired: Desired::Snatched,
+                save_path: None,
+                deletion_allowed: false,
+                observation: None,
+            })
+        };
+        let unlisted = MamTorrentId::new(79).ok_or("zero id")?;
+        let alone = with_registry(vec![row(4, mam)?, row(5, unlisted)?]);
+        let mut bookmarks = Bookmarks::default();
+        bookmarks.latest = Some(Listed {
+            at: SystemTime::UNIX_EPOCH,
+            found: 1,
+            bookmarks: vec![Bookmark {
+                id: mam,
+                title: String::from("A Book Snatched Before"),
+                vip: false,
+                free: false,
+                personal: PersonalFreeleech::No,
+                snatched: true,
+                vip_expires: None,
+                bookmarked_at: None,
+            }],
+        });
+        let html =
+            torrent_list(&Qbittorrent::Disabled, alone.core.registry(), &bookmarks).into_string();
+        for text in [
+            "A Book Snatched Before",
+            "MAM torrent 79",
+            "Snatched before, not downloaded",
+            "Waiting for you",
+            "action=\"/torrents/redownload\"",
+            "name=\"record\" value=\"4\"",
+            "Download again",
+        ] {
+            assert!(html.contains(text), "{text}: {html}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn registry_rows_have_words() -> Result<(), &'static str> {
         use crate::core::{
             ByteSize, Event, Progress, QbittorrentEvent, QbittorrentPreferences, Ratio, Registry,
@@ -1749,7 +1828,12 @@ mod tests {
         ] {
             let _ = clocked.send(event);
         }
-        let html = torrent_list(clocked.core.qbittorrent(), clocked.core.registry()).into_string();
+        let html = torrent_list(
+            clocked.core.qbittorrent(),
+            clocked.core.registry(),
+            &crate::core::Bookmarks::default(),
+        )
+        .into_string();
         for text in [
             "Active, adopted",
             "Missing from qBittorrent",
@@ -1764,7 +1848,12 @@ mod tests {
             assert!(html.contains(text), "{text}: {html}");
         }
 
-        let html = torrent_list(clocked.core.qbittorrent(), &Registry::ReadFailed).into_string();
+        let html = torrent_list(
+            clocked.core.qbittorrent(),
+            &Registry::ReadFailed,
+            &crate::core::Bookmarks::default(),
+        )
+        .into_string();
         assert!(
             html.contains("Torrent registry unavailable") && html.contains("A Damaged Book"),
             "{html}"
@@ -1789,15 +1878,24 @@ mod tests {
             });
         }
         let alone = with_registry(rows);
-        let html = torrent_list(&Qbittorrent::Disabled, alone.core.registry()).into_string();
+        let html = torrent_list(
+            &Qbittorrent::Disabled,
+            alone.core.registry(),
+            &crate::core::Bookmarks::default(),
+        )
+        .into_string();
         for text in ["A Remembered Book", "Unknown", "Not yet", "<td></td>"] {
             assert!(html.contains(text), "{text}: {html}");
         }
         let empty = with_registry(Vec::new());
         assert!(
-            torrent_list(&Qbittorrent::Disabled, empty.core.registry())
-                .into_string()
-                .is_empty()
+            torrent_list(
+                &Qbittorrent::Disabled,
+                empty.core.registry(),
+                &crate::core::Bookmarks::default()
+            )
+            .into_string()
+            .is_empty()
         );
         Ok(())
     }
@@ -1881,6 +1979,9 @@ mod tests {
             Condition::VipEnding,
             Condition::DownloadsRefused,
             Condition::SeedingBehind,
+            Condition::MamClient,
+            Condition::Connectable,
+            Condition::PurchaseUnresolved,
         ];
         let words: std::collections::BTreeSet<_> = all.into_iter().map(condition).collect();
         assert_eq!(words.len(), all.len());

@@ -3,8 +3,10 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use super::{MamFailure, Points, Purchase, UploadCredit, UserData};
-use crate::core::ByteSize;
+use serde::Serialize;
+
+use super::{ListedClient, MamFailure, Points, Purchase, UploadCredit, UserData};
+use crate::core::{ByteSize, ClientVersion};
 
 /// How often the account is read.
 pub const ACCOUNT_READ_EVERY: Duration = Duration::from_mins(15);
@@ -52,6 +54,41 @@ pub struct Reading {
     pub taken: Instant,
 }
 
+/// MAM's client list, from the latest reading that included it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientList {
+    /// The clients MAM lists.
+    pub clients: Vec<ListedClient>,
+    /// When it was read.
+    pub at: SystemTime,
+}
+
+/// What MAM's client list says about the running qBittorrent (A5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum ClientStanding {
+    /// The list, or the running version, is not known yet.
+    #[default]
+    Unknown,
+    /// MAM lists no client, as before anything seeds.
+    NoneListed,
+    /// MAM lists the running version and does not refuse it.
+    Listed,
+    /// MAM lists qBittorrent, but not the running version.
+    NotListed,
+    /// MAM marks the running version as not allowed.
+    Refused,
+    /// MAM lists clients in a form Windlass cannot match to qBittorrent.
+    NotUnderstood,
+}
+
+impl ClientStanding {
+    /// Whether downloads may start: MAM lists the client, or nothing yet.
+    #[must_use]
+    pub const fn admits(self) -> bool {
+        matches!(self, Self::Listed | Self::NoneListed)
+    }
+}
+
 /// How a purchase ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PurchaseOutcome {
@@ -59,8 +96,36 @@ pub enum PurchaseOutcome {
     Made(Points),
     /// MAM refused it.
     Refused(Option<String>),
-    /// The outcome is unknown; nothing else is bought until a new reading.
+    /// The outcome is unknown; nothing else is bought until the next reading
+    /// settles it.
     Uncertain,
+    /// An uncertain purchase, settled.
+    Settled {
+        /// Whether MAM sold it.
+        made: bool,
+        /// Who settled it.
+        by: SettledBy,
+    },
+    /// The next reading could not tell whether MAM sold it; nothing else is
+    /// bought until the owner checks on MAM.
+    Unresolved,
+}
+
+/// Who settled an uncertain purchase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SettledBy {
+    /// The next reading: the points spent and what they bought.
+    Reading,
+    /// The owner, after checking on MAM.
+    Owner,
+}
+
+/// What a purchase can change, as the reading before it showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Before {
+    points: Points,
+    uploaded: ByteSize,
+    vip_until: Option<SystemTime>,
 }
 
 /// The latest purchase.
@@ -73,7 +138,7 @@ pub struct PurchaseRecord {
     /// How it ended, once it did.
     pub outcome: Option<PurchaseOutcome>,
     sent: Instant,
-    points_before: Option<Points>,
+    before: Option<Before>,
     vip_hundredths: Option<u64>,
 }
 
@@ -92,6 +157,8 @@ pub struct Account {
     pub last_purchase: Option<PurchaseRecord>,
     /// Points per week of VIP, from the last VIP purchase.
     pub vip_price_per_week: u64,
+    /// MAM's client list.
+    pub client_list: Option<ClientList>,
     client_stats_read: Option<Instant>,
     last_request: Option<Instant>,
     refused: Option<(Purchase, Instant)>,
@@ -112,6 +179,7 @@ impl Account {
             last_failure: None,
             last_purchase: None,
             vip_price_per_week: VIP_PRICE_PER_WEEK,
+            client_list: None,
             client_stats_read: None,
             last_request: None,
             refused: None,
@@ -189,9 +257,20 @@ impl Account {
         }
     }
 
-    pub(super) fn read(&mut self, now: Instant, wall: SystemTime, data: UserData) {
-        if data.clients.is_some() {
+    /// Store a reading; whether it settled an uncertain purchase, and how.
+    pub(super) fn read(
+        &mut self,
+        now: Instant,
+        wall: SystemTime,
+        data: UserData,
+    ) -> Option<(Purchase, PurchaseOutcome)> {
+        let settled = self.settle(&data);
+        if let Some(clients) = &data.clients {
             self.client_stats_read = Some(now);
+            self.client_list = Some(ClientList {
+                clients: clients.clone(),
+                at: wall,
+            });
         }
         self.reading = Some(Reading {
             data,
@@ -201,6 +280,61 @@ impl Account {
         self.failures = 0;
         self.last_failure = None;
         self.next_read = now.checked_add(ACCOUNT_READ_EVERY);
+        settled
+    }
+
+    /// Settle an uncertain purchase from the reading after it: points that
+    /// were not spent mean MAM did not sell it; points spent and what they buy
+    /// arrived mean it did. Anything else waits for the owner.
+    fn settle(&mut self, after: &UserData) -> Option<(Purchase, PurchaseOutcome)> {
+        let record = self
+            .last_purchase
+            .as_mut()
+            .filter(|record| record.outcome == Some(PurchaseOutcome::Uncertain))?;
+        let made = record.before.and_then(|before| match record.purchase {
+            Purchase::Vip => Some(after.vip_until > before.vip_until),
+            Purchase::Upload(amount) => {
+                let gib = u64::from(amount.into_inner());
+                let price = gib.saturating_mul(UPLOAD_PRICE_PER_GIB);
+                let spent = before.points.0.saturating_sub(after.points.0);
+                let credited = after.uploaded.0.saturating_sub(before.uploaded.0) >= gib << 30;
+                match (spent >= price / 2, credited) {
+                    (false, _) => Some(false),
+                    (true, true) => Some(true),
+                    (true, false) => None,
+                }
+            }
+        });
+        let outcome = made.map_or(PurchaseOutcome::Unresolved, |made| {
+            PurchaseOutcome::Settled {
+                made,
+                by: SettledBy::Reading,
+            }
+        });
+        record.outcome = Some(outcome.clone());
+        Some((record.purchase, outcome))
+    }
+
+    /// The owner checked an unresolved purchase on MAM.
+    pub(super) fn checked(&mut self, made: bool) -> Option<Purchase> {
+        let record = self
+            .last_purchase
+            .as_mut()
+            .filter(|record| record.outcome == Some(PurchaseOutcome::Unresolved))?;
+        record.outcome = Some(PurchaseOutcome::Settled {
+            made,
+            by: SettledBy::Owner,
+        });
+        Some(record.purchase)
+    }
+
+    /// The purchase waiting for the owner, if one does.
+    #[must_use]
+    pub fn unresolved_purchase(&self) -> Option<Purchase> {
+        self.last_purchase
+            .as_ref()
+            .filter(|record| record.outcome == Some(PurchaseOutcome::Unresolved))
+            .map(|record| record.purchase)
     }
 
     pub(super) fn failed(&mut self, now: Instant, failure: MamFailure) {
@@ -213,6 +347,41 @@ impl Account {
         self.failures = self.failures.saturating_add(1);
         self.last_failure = Some(failure);
         self.next_read = now.checked_add(wait);
+    }
+
+    /// The entries MAM lists for the running qBittorrent version.
+    pub fn running_client(
+        &self,
+        running: ClientVersion,
+    ) -> impl Iterator<Item = &ListedClient> + '_ {
+        self.client_list
+            .iter()
+            .flat_map(|list| &list.clients)
+            .filter(move |client| client.qbittorrent == Some(running))
+    }
+
+    /// What MAM's client list says about the running qBittorrent.
+    #[must_use]
+    pub fn client_standing(&self, running: Option<ClientVersion>) -> ClientStanding {
+        let (Some(list), Some(running)) = (&self.client_list, running) else {
+            return ClientStanding::Unknown;
+        };
+        let ours: Vec<&ListedClient> = self.running_client(running).collect();
+        if ours.iter().any(|client| client.refused) {
+            ClientStanding::Refused
+        } else if !ours.is_empty() {
+            ClientStanding::Listed
+        } else if list.clients.is_empty() {
+            ClientStanding::NoneListed
+        } else if list
+            .clients
+            .iter()
+            .all(|client| client.qbittorrent.is_none())
+        {
+            ClientStanding::NotUnderstood
+        } else {
+            ClientStanding::NotListed
+        }
     }
 
     /// The ratio in thousandths, if anything was downloaded.
@@ -283,10 +452,12 @@ impl Account {
         reserve: Points,
     ) -> Option<Purchase> {
         let since = self.last_purchase.as_ref().map(|purchase| purchase.sent);
-        let waiting = self
-            .last_purchase
-            .as_ref()
-            .is_some_and(|purchase| purchase.outcome.is_none());
+        let waiting = self.last_purchase.as_ref().is_some_and(|purchase| {
+            matches!(
+                purchase.outcome,
+                None | Some(PurchaseOutcome::Uncertain | PurchaseOutcome::Unresolved)
+            )
+        });
         let data = self.fresh(now, since).filter(|_| !waiting)?;
         let affordable = |cost: u64| data.points.0 >= reserve.0.saturating_add(cost);
         let backed_off = |wanted: Purchase| {
@@ -328,7 +499,11 @@ impl Account {
             at: wall,
             outcome: None,
             sent: now,
-            points_before: self.data().map(|data| data.points),
+            before: self.data().map(|data| Before {
+                points: data.points,
+                uploaded: data.uploaded,
+                vip_until: data.vip_until,
+            }),
             vip_hundredths: self.data().and_then(|data| vip_hundredths(data, wall)),
         });
     }
@@ -347,16 +522,17 @@ impl Account {
             at: wall,
             outcome: None,
             sent: now,
-            points_before: None,
+            before: None,
             vip_hundredths: None,
         });
         if let (PurchaseOutcome::Made(after), Purchase::Vip, Some(before), Some(hundredths)) = (
             &outcome,
             record.purchase,
-            record.points_before,
+            record.before,
             record.vip_hundredths,
         ) {
-            let price = before.0.saturating_sub(after.0).saturating_mul(100) / hundredths.max(1);
+            let price =
+                before.points.0.saturating_sub(after.0).saturating_mul(100) / hundredths.max(1);
             self.vip_price_per_week = Some(price)
                 .filter(|price| *price > 0)
                 .unwrap_or(self.vip_price_per_week);

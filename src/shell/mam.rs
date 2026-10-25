@@ -8,9 +8,10 @@ use serde_json::{Map, Value, json};
 use time::{PrimitiveDateTime, macros::format_description};
 
 use crate::core::{
-    ApiCookie, Bookmark, BookmarkPage, ByteSize, Connectable, FetchedTorrent, IpObservation,
-    MamFailure, MamNotices, MamReply, MamRequest, MamTorrentId, PersonalFreeleech, Points,
-    Purchase, RedCategory, Registration, SessionRejection, SnatchSummary, UserData,
+    ApiCookie, Bookmark, BookmarkPage, ByteSize, ClientVersion, Connectable, FetchedTorrent,
+    IpObservation, ListedClient, MamFailure, MamNotices, MamReply, MamRequest, MamTorrentId,
+    PersonalFreeleech, Points, Purchase, RedCategory, Registration, SessionRejection,
+    SnatchSummary, UserData, WedgeSpent,
 };
 
 use super::torrent_file;
@@ -42,6 +43,7 @@ pub(super) struct Client {
     search: Url,
     download: Url,
     store: Url,
+    bonus_history: Url,
 }
 
 impl Client {
@@ -62,6 +64,7 @@ impl Client {
             search: site("tor/js/loadSearchJSONbasic.php")?,
             download: site("tor/download.php")?,
             store: site("json/bonusBuy.php")?,
+            bonus_history: site("json/userBonusHistory.php")?,
         })
     }
 }
@@ -170,6 +173,11 @@ fn build(client: &Client, request: &MamRequest) -> reqwest::RequestBuilder {
             };
             client.http.get(url)
         }
+        MamRequest::WedgeHistory => {
+            let mut url = client.bonus_history.clone();
+            url.query_pairs_mut().append_pair("type[]", "wedgePF");
+            client.http.get(url)
+        }
     }
 }
 
@@ -224,6 +232,9 @@ fn interpret(
             json().and_then(|value| understood(bookmarks(&value).map(MamReply::Bookmarks)))
         }
         MamRequest::Buy(_) => json().and_then(|value| purchase(&value)),
+        MamRequest::WedgeHistory => {
+            json().and_then(|value| understood(wedge_history(&value).map(MamReply::WedgeHistory)))
+        }
     };
     (result, None)
 }
@@ -284,6 +295,26 @@ fn purchase(value: &Value) -> Result<MamReply, MamFailure> {
     }
 }
 
+/// User Bonus History: a list, newest first. Only personal freeleech wedges
+/// that name a torrent are kept.
+fn wedge_history(value: &Value) -> Option<Vec<WedgeSpent>> {
+    let entries = value.as_array()?;
+    Some(
+        entries
+            .iter()
+            .filter(|entry| text(entry, "type").as_deref() == Some("wedgePF"))
+            .filter_map(|entry| {
+                Some(WedgeSpent {
+                    torrent: MamTorrentId::new(number(entry.get("tid")?)?)?,
+                    at: SystemTime::UNIX_EPOCH.checked_add(
+                        Duration::try_from_secs_f64(float(entry.get("timestamp")?)?).ok()?,
+                    )?,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn ip_observation(value: &Value) -> Option<IpObservation> {
     Some(IpObservation {
         ip: text(value, "ip")?.parse().ok()?,
@@ -306,11 +337,101 @@ fn user_data(value: &Value) -> Option<UserData> {
             .and_then(Value::as_object)
             .map(snatch_summary),
         notices: value.get("notifs").and_then(Value::as_object).map(notices),
-        clients: value
-            .get("clientStats")
-            .and_then(Value::as_array)
-            .map(|clients| u32::try_from(clients.len()).unwrap_or(u32::MAX)),
+        clients: value.get("clientStats").and_then(clients),
     })
+}
+
+/// MAM's client list: a list, or an object of entries. An entry's shape is not
+/// yet captured, so each is searched for what Windlass needs.
+fn clients(value: &Value) -> Option<Vec<ListedClient>> {
+    let entries: Vec<&Value> = match value {
+        Value::Array(entries) => entries.iter().collect(),
+        Value::Object(entries) => entries.values().collect(),
+        _ => return None,
+    };
+    Some(entries.into_iter().map(listed_client).collect())
+}
+
+fn listed_client(entry: &Value) -> ListedClient {
+    let fields: Vec<(&str, &Value)> = match entry {
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+        other => vec![("", other)],
+    };
+    let qbittorrent = fields
+        .iter()
+        .filter_map(|(_, value)| value.as_str())
+        .find_map(qbittorrent_version);
+    let connectable = fields
+        .iter()
+        .find(|(key, _)| key.to_ascii_lowercase().contains("connect"))
+        .and_then(|(_, value)| match value {
+            Value::String(text) => Some(Connectable::parse(text)),
+            Value::Bool(true) => Some(Connectable::Yes),
+            Value::Bool(false) => Some(Connectable::No),
+            Value::Number(number) => Some(if number.as_u64() == Some(0) {
+                Connectable::No
+            } else {
+                Connectable::Yes
+            }),
+            _ => None,
+        });
+    let refused = fields.iter().any(|(key, value)| {
+        let key = key.to_ascii_lowercase();
+        match value {
+            Value::String(text) => refusal(text),
+            Value::Bool(flag) => {
+                (*flag && refusal(&key))
+                    || (!*flag && ["allowed", "approved", "authorized"].contains(&key.as_str()))
+            }
+            _ => false,
+        }
+    });
+    ListedClient {
+        qbittorrent,
+        connectable,
+        refused,
+    }
+}
+
+/// Whether text says a client is not allowed.
+fn refusal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "not allowed",
+        "disallowed",
+        "unauthori",
+        "banned",
+        "blocked",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
+/// A qBittorrent version named in text, such as `qBittorrent 5.1.2`,
+/// `qBittorrent/v5.1.2`, or the peer ID prefix `-qB5120-`.
+fn qbittorrent_version(text: &str) -> Option<ClientVersion> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(at) = lower.find("qbittorrent") {
+        let rest = lower.get(at + "qbittorrent".len()..)?;
+        let version: String = rest
+            .trim_start_matches([' ', '/', 'v', '-', ':'])
+            .chars()
+            .take_while(|character| character.is_ascii_digit() || *character == '.')
+            .collect();
+        return ClientVersion::parse(version.trim_end_matches('.'));
+    }
+    let at = text.find("-qB")?;
+    let digits = text.get(at + 3..at + 7)?;
+    let mut parts = digits.chars().map(|digit| digit.to_digit(10));
+    let (Some(Some(major)), Some(Some(minor)), Some(Some(patch))) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    ClientVersion::parse(&format!("{major}.{minor}.{patch}"))
 }
 
 fn snatch_summary(summary: &Map<String, Value>) -> SnatchSummary {
@@ -479,6 +600,7 @@ mod tests {
             world.account.vip_until = Some(SystemTime::UNIX_EPOCH + VIP_UNTIL);
             world.account.duplicates = 1;
             world.account.not_seeding_unsatisfied = 2;
+            world.account.clients = vec![super::super::fake_mam::client("5.2.2", "yes")];
             world
                 .torrents
                 .insert(BOOK, Torrent::bookmarked("Synthetic Book", 1_048_576));
@@ -502,6 +624,95 @@ mod tests {
         })
         .ok_or("client")?;
         Ok((fake, client, ApiCookie::parse("fake-session")?))
+    }
+
+    #[test]
+    fn bonus_history_keeps_wedges_spent_on_torrents() {
+        use serde_json::json;
+
+        let history = json!([
+            {"timestamp": 1_790_000_000.5, "amount": -1, "type": "wedgePF", "tid": 330_896},
+            {"timestamp": 1_641_914_230.1, "amount": -1, "type": "giftWedge", "tid": null},
+            {"timestamp": 1_610_486_584.1, "amount": -10, "type": "wedgeGFL", "tid": 220_870},
+            {"timestamp": "not a time", "type": "wedgePF", "tid": 5},
+            {"timestamp": 1.0, "type": "wedgePF", "tid": 0},
+            {"timestamp": 1.0e19, "type": "wedgePF", "tid": 6},
+        ]);
+        let spent = super::wedge_history(&history).unwrap_or_default();
+        assert_eq!(spent.len(), 1);
+        assert_eq!(
+            spent.first().map(|entry| entry.torrent.get()),
+            Some(330_896)
+        );
+        assert_eq!(super::wedge_history(&json!({"error": "no"})), None);
+    }
+
+    #[test]
+    fn client_entries_are_searched_for_what_windlass_needs() {
+        use serde_json::json;
+
+        use crate::core::{ClientVersion, Connectable, ListedClient};
+
+        let version = |text| ClientVersion::parse(text);
+        let list = json!([
+            {"client": "qBittorrent 5.1.2", "connectable": "yes", "torrents": 3},
+            {"agent": "qBittorrent/v5.0.4", "connectable": false, "status": "Not allowed"},
+            {"peer_id": "-qB5200-abcdefghijkl", "connectable": 0},
+            {"client": "Transmission 4.0", "isConnectable": 1, "banned": true},
+            {"client": "qbittorrent", "allowed": false},
+            "qBittorrent 5.1.1",
+            {"client": "-qB52x0-"},
+            {"client": "qBittorrent 5.1.3", "connectable": true},
+        ]);
+        let clients = super::clients(&list).unwrap_or_default();
+        assert_eq!(
+            clients,
+            [
+                ListedClient {
+                    qbittorrent: version("5.1.2"),
+                    connectable: Some(Connectable::Yes),
+                    refused: false,
+                },
+                ListedClient {
+                    qbittorrent: version("5.0.4"),
+                    connectable: Some(Connectable::No),
+                    refused: true,
+                },
+                ListedClient {
+                    qbittorrent: version("5.2.0"),
+                    connectable: Some(Connectable::No),
+                    refused: false,
+                },
+                ListedClient {
+                    qbittorrent: None,
+                    connectable: Some(Connectable::Yes),
+                    refused: true,
+                },
+                ListedClient {
+                    qbittorrent: None,
+                    connectable: None,
+                    refused: true,
+                },
+                ListedClient {
+                    qbittorrent: version("5.1.1"),
+                    connectable: None,
+                    refused: false,
+                },
+                ListedClient {
+                    qbittorrent: None,
+                    connectable: None,
+                    refused: false,
+                },
+                ListedClient {
+                    qbittorrent: version("5.1.3"),
+                    connectable: Some(Connectable::Yes),
+                    refused: false,
+                },
+            ]
+        );
+        let keyed = json!({"1": {"client": "qBittorrent 5.1.2", "connectable": null}});
+        assert_eq!(super::clients(&keyed).map(|clients| clients.len()), Some(1));
+        assert_eq!(super::clients(&json!("none")), None);
     }
 
     async fn ask(client: &Client, request: MamRequest, cookie: &ApiCookie) -> Answer {
@@ -586,7 +797,13 @@ mod tests {
         .await;
         assert_eq!(
             answer.result,
-            Ok(MamReply::UserData(Box::new(user(Some(0)))))
+            Ok(MamReply::UserData(Box::new(user(Some(vec![
+                crate::core::ListedClient {
+                    qbittorrent: crate::core::ClientVersion::parse("5.2.2"),
+                    connectable: Some(Connectable::Yes),
+                    refused: false,
+                }
+            ])))))
         );
         let rotated = answer.rotated.ok_or("MAM issued no new cookie")?;
         assert_ne!(rotated, cookie);
@@ -640,6 +857,16 @@ mod tests {
         );
         assert_eq!(answer.file, Some(file));
         assert_eq!(fake.with(|world| world.account.wedges), Some(199));
+        // The bonus history lists the wedge, for the torrent fetched.
+        let answer = ask(&client, MamRequest::WedgeHistory, &cookie).await;
+        assert!(
+            matches!(
+                &answer.result,
+                Ok(MamReply::WedgeHistory(spent)) if spent.iter().any(|entry| entry.torrent == BOOK_ID)
+            ),
+            "{:?}",
+            answer.result
+        );
 
         let upload = MamRequest::Buy(Purchase::Upload(UploadCredit::try_new(50)?));
         let answer = ask(&client, upload, &cookie).await;
@@ -691,6 +918,12 @@ mod tests {
                 ),
                 (Host::Site, "POST", "/tor/js/loadSearchJSONbasic.php", ""),
                 (Host::Site, "GET", "/tor/download.php", "tid=4242&fl=1"),
+                (
+                    Host::Site,
+                    "GET",
+                    "/json/userBonusHistory.php",
+                    "type%5B%5D=wedgePF"
+                ),
                 (
                     Host::Site,
                     "GET",

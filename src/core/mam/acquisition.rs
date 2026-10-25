@@ -5,7 +5,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
-use super::{Bookmark, BookmarkPage, MamFailure, account::Account};
+use super::{
+    Bookmark, BookmarkPage, MamFailure, WedgeSpent,
+    account::{Account, ClientStanding},
+};
 use crate::core::{MamTorrentId, TorrentHash, UserData};
 
 /// How often bookmarks are listed.
@@ -16,6 +19,8 @@ pub const MAX_BOOKMARK_PAGES: usize = 10;
 /// if MAM's count may not show them yet.
 pub const RECENT_ADMISSION: Duration = Duration::from_hours(1);
 const RETRY_AFTER: Duration = Duration::from_mins(5);
+/// MAM's history and Windlass's clock may differ by this much.
+const HISTORY_CLOCK_SLACK: Duration = Duration::from_mins(10);
 const PAGE_SIZE: usize = 100;
 
 /// Why the next queued torrent is not downloaded yet.
@@ -29,6 +34,8 @@ pub enum Hold {
     DownloadsRefused,
     /// qBittorrent is not connected or runs a version MAM does not allow.
     ClientUnavailable,
+    /// MAM's client list does not show the running qBittorrent as allowed.
+    MamClientList(ClientStanding),
     /// The account has not been read yet.
     AccountUnknown,
     /// The ratio is below 2.0.
@@ -147,6 +154,23 @@ pub struct WedgeCheck {
     pub expected: u32,
     /// The torrent, held if the wedge was not spent.
     pub hash: TorrentHash,
+    /// The torrent on MAM.
+    pub id: MamTorrentId,
+    /// When it was fetched.
+    pub fetched: SystemTime,
+    /// The balance did not fall, so User Bonus History decides.
+    pub confirming: bool,
+}
+
+/// A wedged download whose answer was lost: MAM may have spent the wedge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsureWedge {
+    /// The torrent.
+    pub id: MamTorrentId,
+    /// When it was asked for.
+    pub at: SystemTime,
+    /// Whether User Bonus History shows a wedge spent on it, once read.
+    pub spent: Option<bool>,
 }
 
 /// What the admission order decides for the next queued torrent.
@@ -163,6 +187,8 @@ pub(super) enum Next {
     },
     /// A fresh reading of the account must come first.
     NeedReading,
+    /// User Bonus History must show whether an earlier attempt spent a wedge.
+    NeedHistory,
     /// It waits.
     Hold(Hold),
 }
@@ -175,6 +201,7 @@ pub(super) struct Facts<'a> {
     pub(super) mam_available: bool,
     pub(super) seedbox_confirmed: bool,
     pub(super) client_ready: bool,
+    pub(super) client: ClientStanding,
     pub(super) account: &'a Account,
 }
 
@@ -183,15 +210,16 @@ pub(super) struct Facts<'a> {
 pub struct Acquisition {
     /// Listing bookmarks.
     pub bookmarks: Bookmarks,
-    /// Bookmarks MAM reports snatched before, which are not downloaded again
-    /// automatically.
-    pub suppressed: Vec<MamTorrentId>,
     /// When MAM refused a download; downloads are held since.
     pub refused: Option<SystemTime>,
     /// Why the next queued torrent waits, if it does.
     pub hold: Option<Hold>,
     /// A wedged download whose wedge the next reading must show spent.
     pub wedge_check: Option<WedgeCheck>,
+    /// A wedged download whose answer was lost.
+    pub unsure_wedge: Option<UnsureWedge>,
+    /// When reading User Bonus History last failed.
+    pub history_failed: Option<Instant>,
     /// The download being fetched.
     pub fetching: Option<(MamTorrentId, bool)>,
     /// Downloads admitted, most recent last.
@@ -208,10 +236,11 @@ impl Acquisition {
                 last_failure: None,
                 listing: None,
             },
-            suppressed: Vec::new(),
             refused: None,
             hold: None,
             wedge_check: None,
+            unsure_wedge: None,
+            history_failed: None,
             fetching: None,
             admitted: Vec::new(),
         }
@@ -256,6 +285,9 @@ impl Acquisition {
         let Some(data) = facts.account.fresh(facts.now, self.last_admission()) else {
             return Next::NeedReading;
         };
+        if !facts.client.admits() {
+            return Next::Hold(Hold::MamClientList(facts.client));
+        }
         if facts.account.ratio_low().is_some() {
             return Next::Hold(Hold::RatioLow);
         }
@@ -278,7 +310,23 @@ impl Acquisition {
         {
             return Next::Hold(Hold::UnsatisfiedLimit { count, limit });
         }
-        let wedge = !free_for_owner(bookmark, data, facts.wall);
+        // A wedge not yet shown spent is settled before another download.
+        if self
+            .wedge_check
+            .as_ref()
+            .is_some_and(|check| check.confirming)
+        {
+            return Next::NeedHistory;
+        }
+        let unsure = self
+            .unsure_wedge
+            .filter(|unsure| unsure.id == bookmark.id)
+            .map(|unsure| unsure.spent);
+        if unsure == Some(None) {
+            return Next::NeedHistory;
+        }
+        // A wedge an earlier attempt spent is not spent again.
+        let wedge = !free_for_owner(bookmark, data, facts.wall) && unsure != Some(Some(true));
         if wedge && data.wedges == 0 {
             return Next::Hold(Hold::NoWedge);
         }
@@ -295,11 +343,55 @@ impl Acquisition {
             .retain(|at| now.saturating_duration_since(*at) < RECENT_ADMISSION);
     }
 
-    /// A reading arrived: check the wedge spent on the last download. The hash
-    /// of a download whose wedge was not spent, to hold.
-    pub(super) fn check_wedges(&mut self, data: &UserData) -> Option<TorrentHash> {
-        let check = self.wedge_check.take()?;
-        (data.wedges > check.expected).then_some(check.hash)
+    /// A reading arrived: a balance that fell shows the wedge spent; one that
+    /// did not leaves User Bonus History to decide.
+    pub(super) fn check_wedges(&mut self, data: &UserData) {
+        self.wedge_check = self
+            .wedge_check
+            .take()
+            .filter(|check| data.wedges > check.expected)
+            .map(|check| WedgeCheck {
+                confirming: true,
+                ..check
+            });
+    }
+
+    /// Whether User Bonus History is wanted now.
+    pub(super) fn history_wanted(&self, now: Instant) -> bool {
+        let needed = self
+            .wedge_check
+            .as_ref()
+            .is_some_and(|check| check.confirming)
+            || self
+                .unsure_wedge
+                .is_some_and(|unsure| unsure.spent.is_none());
+        needed
+            && self
+                .history_failed
+                .is_none_or(|failed| now.saturating_duration_since(failed) >= RETRY_AFTER)
+    }
+
+    /// When User Bonus History may be asked for again after a failure.
+    pub(super) fn history_due(&self) -> Option<Instant> {
+        self.history_failed
+            .and_then(|failed| failed.checked_add(RETRY_AFTER))
+    }
+
+    /// User Bonus History arrived. The hash of a download whose wedge was not
+    /// spent, to hold.
+    pub(super) fn history(&mut self, spent: &[WedgeSpent]) -> Option<TorrentHash> {
+        self.history_failed = None;
+        let spent_on = |id: MamTorrentId, since: SystemTime| {
+            let since = since.checked_sub(HISTORY_CLOCK_SLACK).unwrap_or(since);
+            spent
+                .iter()
+                .any(|entry| entry.torrent == id && entry.at >= since)
+        };
+        if let Some(unsure) = &mut self.unsure_wedge {
+            unsure.spent = Some(spent_on(unsure.id, unsure.at));
+        }
+        let check = self.wedge_check.take_if(|check| check.confirming)?;
+        (!spent_on(check.id, check.fetched)).then_some(check.hash)
     }
 }
 

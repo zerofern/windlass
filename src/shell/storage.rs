@@ -21,8 +21,8 @@ use super::qbittorrent::torrent_state;
 /// preference; version 2 added settings and history; version 3 marks routine
 /// history entries; version 4 adds the torrent registry and VPN state; version 5
 /// adds the ntfy topic; version 6 adds held torrents, kept torrent files, MAM
-/// state, and the points reserve.
-const SCHEMA_VERSION: i64 = 6;
+/// state, and the points reserve; version 7 adds snatched bookmarks.
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_V1: &str = "CREATE TABLE mam_configuration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -125,8 +125,39 @@ CREATE TABLE mam_state (
 );
 ALTER TABLE settings ADD COLUMN points_reserve INTEGER;";
 
+/// The registry table is rebuilt again to allow snatched bookmarks.
+const SCHEMA_V7: &str = "CREATE TABLE torrents_v7 (
+    id INTEGER PRIMARY KEY,
+    mam_id INTEGER,
+    hash TEXT UNIQUE,
+    origin TEXT NOT NULL CHECK (origin IN ('bookmark', 'redownload', 'adopted')),
+    desired TEXT NOT NULL CHECK (desired IN ('queued', 'snatched', 'active', 'held', 'removed')),
+    save_path TEXT,
+    deletion_allowed INTEGER NOT NULL,
+    name TEXT,
+    state TEXT,
+    progress_permille INTEGER,
+    size INTEGER,
+    total_size INTEGER,
+    downloaded INTEGER,
+    uploaded INTEGER,
+    ratio_thousandths INTEGER,
+    seeding_seconds INTEGER,
+    added_at INTEGER,
+    completed_at INTEGER,
+    content_path TEXT,
+    observed_save_path TEXT,
+    last_seen INTEGER,
+    CHECK (mam_id IS NOT NULL OR hash IS NOT NULL)
+);
+INSERT INTO torrents_v7 SELECT * FROM torrents;
+DROP TABLE torrents;
+ALTER TABLE torrents_v7 RENAME TO torrents;";
+
 /// The changes from each version to the next, starting from version 1.
-const UPGRADES: [&str; 5] = [SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6];
+const UPGRADES: [&str; 6] = [
+    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+];
 
 type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -496,6 +527,7 @@ fn torrent_record(row: &Row<'_>) -> StorageResult<TorrentRecord> {
     };
     let desired = match row.get::<_, String>(4)?.as_str() {
         "queued" => Desired::Queued,
+        "snatched" => Desired::Snatched,
         "active" => Desired::Active,
         "held" => Desired::Held,
         "removed" => Desired::Removed,
@@ -577,6 +609,7 @@ fn save_torrents(path: &Path, records: &[TorrentRecord]) -> StorageResult<Event>
                 },
                 match record.desired {
                     Desired::Queued => "queued",
+                    Desired::Snatched => "snatched",
                     Desired::Active => "active",
                     Desired::Held => "held",
                     Desired::Removed => "removed",
@@ -1137,6 +1170,19 @@ mod tests {
         assert_eq!(
             outcome(path, Operation::ReadTorrentRegistry),
             Event::Registry(RegistryEvent::Read(held))
+        );
+
+        let mut snatched = records();
+        for record in &mut snatched {
+            record.desired = Desired::Snatched;
+        }
+        assert_eq!(
+            outcome(path, Operation::SaveTorrents(snatched.clone())),
+            Event::Registry(RegistryEvent::Saved)
+        );
+        assert_eq!(
+            outcome(path, Operation::ReadTorrentRegistry),
+            Event::Registry(RegistryEvent::Read(snatched))
         );
 
         // Values no build could write are refused.
