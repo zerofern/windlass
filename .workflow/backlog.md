@@ -106,6 +106,19 @@
   [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop), and
   [account safety](#b-0011-mam-account-safety-and-bonus-points).
 
+## B-0013: Download queue, torrent limits, and narrated notices
+
+- Status: Needs Direction
+- Value: Bookmarked torrents download in an order the owner can see and change,
+  within configurable downloading and active limits that keep the connection
+  usable, and every unexpected event is reported with what Windlass did.
+- Direction: [MAM API compliance](direction.md#mam-api-compliance),
+  [Notifications](direction.md#notifications)
+- Feature Brief: [Download queue, torrent limits, and what Windlass did](features/B-0013/brief.md)
+- Relationships: Extends [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop),
+  [account safety](#b-0011-mam-account-safety-and-bonus-points), and
+  [notifications](#b-0002-important-event-notifications).
+
 ## B-0009: Audiobookshelf integration
 
 - Status: Needs Direction
