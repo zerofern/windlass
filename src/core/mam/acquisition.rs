@@ -33,6 +33,9 @@ pub const LOOKUP_FRESH_FOR: Duration = Duration::from_mins(5);
 pub const WATCH_FRESH_FOR: Duration = Duration::from_mins(20);
 /// Bonus history read this recently can decide whether a wedge is needed.
 pub const HISTORY_FRESH_FOR: Duration = Duration::from_mins(5);
+/// The bonus history is read this long after a wedged download, so MAM has
+/// recorded the wedge.
+pub const WEDGE_RECORDED_AFTER: Duration = Duration::from_mins(1);
 const RETRY_AFTER: Duration = Duration::from_mins(5);
 const PAGE_SIZE: usize = 100;
 
@@ -322,16 +325,30 @@ impl Acquisition {
             .max_by_key(|(_, at)| *at)
     }
 
-    /// Whether the bonus history was read within `within` and after the last
-    /// wedged download of this torrent.
+    /// Whether the bonus history was read recently enough, and long enough
+    /// after the last wedged download of this torrent to show its wedge.
     fn history_settles(&self, id: MamTorrentId, now: Instant) -> Option<&WedgeHistory> {
         self.history.as_ref().filter(|history| {
             now.saturating_duration_since(history.at) <= HISTORY_FRESH_FOR
                 && self
-                    .wedge_attempts
-                    .get(&id)
-                    .is_none_or(|attempt| history.at > *attempt)
+                    .wedge_recorded(id)
+                    .is_none_or(|recorded| history.at >= recorded)
         })
+    }
+
+    /// When MAM has recorded the wedge of this torrent's last wedged download.
+    fn wedge_recorded(&self, id: MamTorrentId) -> Option<Instant> {
+        self.wedge_attempts
+            .get(&id)
+            .and_then(|attempt| attempt.checked_add(WEDGE_RECORDED_AFTER))
+    }
+
+    /// Whether the bonus history may be asked for now about this torrent.
+    fn may_ask_history(&self, id: MamTorrentId, now: Instant) -> bool {
+        Self::may_ask(self.history_failed, now)
+            && self
+                .wedge_recorded(id)
+                .is_none_or(|recorded| now >= recorded)
     }
 
     /// Whether a lookup or the bonus history may be asked for now.
@@ -339,14 +356,9 @@ impl Acquisition {
         failed.is_none_or(|failed| now.saturating_duration_since(failed) >= RETRY_AFTER)
     }
 
-    /// Ask for this now, unless the last request of its kind failed too
-    /// recently.
-    fn ask(failed: Option<Instant>, now: Instant, next: Next) -> Next {
-        if Self::may_ask(failed, now) {
-            next
-        } else {
-            Next::Idle
-        }
+    /// Ask for this now if allowed, or wait.
+    const fn ask(allowed: bool, next: Next) -> Next {
+        if allowed { next } else { Next::Idle }
     }
 
     /// Decide for the first queued torrent that is still bookmarked and listed.
@@ -407,7 +419,10 @@ impl Acquisition {
         let id = bookmark.id;
         // The torrent as MAM lists it now decides whether a wedge is needed.
         let Some((Some(listing), _)) = self.current(id, facts.now, LOOKUP_FRESH_FOR) else {
-            return Self::ask(self.lookup_failed, facts.now, Next::LookUp(id));
+            return Self::ask(
+                Self::may_ask(self.lookup_failed, facts.now),
+                Next::LookUp(id),
+            );
         };
         if free_for_owner(listing, data, facts.wall) {
             return Next::Fetch { id, wedge: false };
@@ -415,7 +430,7 @@ impl Acquisition {
         // A wedge spent before, or by an attempt whose answer was lost, is not
         // spent again.
         let Some(history) = self.history_settles(id, facts.now) else {
-            return Self::ask(self.history_failed, facts.now, Next::NeedHistory);
+            return Self::ask(self.may_ask_history(id, facts.now), Next::NeedHistory);
         };
         let wedge = !history.wedged.contains(&id);
         if wedge && data.wedges == 0 {
@@ -464,9 +479,9 @@ impl Acquisition {
         if history.is_some_and(|history| history.wedged.contains(&download.mam)) {
             return DownloadWatch::Wedged;
         }
-        if let Some(attempt) = self.wedge_attempts.get(&download.mam) {
-            // Only a history read after the wedged download can show its wedge.
-            return if history.is_some_and(|history| history.at > *attempt) {
+        if let Some(recorded) = self.wedge_recorded(download.mam) {
+            // Only a history read once MAM recorded the wedge can show it.
+            return if history.is_some_and(|history| history.at >= recorded) {
                 DownloadWatch::NotFree {
                     wedge_missing: true,
                     listed: true,
@@ -501,7 +516,7 @@ impl Acquisition {
                 DownloadWatch::NeedLookup if Self::may_ask(self.lookup_failed, now) => {
                     Next::LookUp(download.mam)
                 }
-                DownloadWatch::NeedHistory if Self::may_ask(self.history_failed, now) => {
+                DownloadWatch::NeedHistory if self.may_ask_history(download.mam, now) => {
                     Next::NeedHistory
                 }
                 DownloadWatch::NotFree {
@@ -525,8 +540,8 @@ impl Acquisition {
         wanted
     }
 
-    /// When a lookup or the bonus history may next be asked for, or a download
-    /// free for now must be checked again.
+    /// When a lookup or the bonus history may next be asked for, a wedge has
+    /// been recorded, or a download free for now must be checked again.
     pub(super) fn next_due(&self) -> Option<Instant> {
         let free_until = self
             .watched
@@ -537,8 +552,19 @@ impl Acquisition {
             .min();
         let retry =
             |failed: Option<Instant>| failed.and_then(|failed| failed.checked_add(RETRY_AFTER));
+        let recorded = self
+            .wedge_attempts
+            .keys()
+            .filter_map(|id| self.wedge_recorded(*id))
+            .filter(|recorded| {
+                self.history
+                    .as_ref()
+                    .is_none_or(|history| history.at < *recorded)
+            })
+            .min();
         [
             free_until,
+            recorded,
             retry(self.lookup_failed),
             retry(self.history_failed),
         ]

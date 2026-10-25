@@ -732,42 +732,40 @@ fn a_cookie_mam_issues_is_saved_and_continues_the_session() {
 }
 
 #[test]
-fn the_bucket_allows_five_requests_then_one_every_ten_seconds() {
+fn the_bucket_allows_ten_requests_then_one_every_three_seconds() {
+    const FOUND: u32 = 750;
+    let page = |start: u32| BookmarkPage {
+        found: FOUND,
+        bookmarks: (u64::from(start) + 1..=u64::from((start + 100).min(FOUND)))
+            .map(bookmark)
+            .collect(),
+    };
     let (mut harness, actions) = Harness::start(Setup::default());
     let actions = harness.register(&actions);
-    // Three requests so far; the account read is the fourth, bookmarks the fifth.
+    // The IP lookup, registration, and account read; bookmarks are the fourth.
     assert_eq!(requests(&actions).len(), 1);
     let actions = harness.answer(read(account(harness.wall())));
     assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
-    let page = BookmarkPage {
-        found: 250,
-        bookmarks: (1..=100).map(bookmark).collect(),
-    };
-    let actions = harness.answer(Ok(MamReply::Bookmarks(page)));
-    assert_eq!(
-        requests(&actions),
-        [MamRequest::ListBookmarks { start: 100 }]
-    );
-    let page = BookmarkPage {
-        found: 250,
-        bookmarks: (101..=200).map(bookmark).collect(),
-    };
-    let actions = harness.answer(Ok(MamReply::Bookmarks(page)));
+    // Pages two to seven use the rest of the bucket.
+    for start in (0..600).step_by(100) {
+        let actions = harness.answer(Ok(MamReply::Bookmarks(page(start))));
+        assert_eq!(
+            requests(&actions),
+            [MamRequest::ListBookmarks { start: start + 100 }]
+        );
+    }
+    let actions = harness.answer(Ok(MamReply::Bookmarks(page(600))));
     assert!(requests(&actions).is_empty(), "the bucket is empty");
     assert_eq!(
         timer(&actions, TimerName::Mam).map(|(_, after)| after),
-        Some(Duration::from_secs(10))
+        Some(Duration::from_secs(3))
     );
     let actions = harness.wake(&actions);
     assert_eq!(
         requests(&actions),
-        [MamRequest::ListBookmarks { start: 200 }]
+        [MamRequest::ListBookmarks { start: 700 }]
     );
-    let page = BookmarkPage {
-        found: 250,
-        bookmarks: (201..=250).map(bookmark).collect(),
-    };
-    let _ = harness.answer(Ok(MamReply::Bookmarks(page)));
+    let _ = harness.answer(Ok(MamReply::Bookmarks(page(700))));
     assert_eq!(
         harness
             .mam()
@@ -776,7 +774,7 @@ fn the_bucket_allows_five_requests_then_one_every_ten_seconds() {
             .latest
             .as_ref()
             .map(|listed| listed.bookmarks.len()),
-        Some(250)
+        Some(750)
     );
 }
 
@@ -894,7 +892,10 @@ fn a_bookmark_is_queued_wedged_fetched_and_added() {
             .map(|record| (record.desired, record.identity.hash().cloned())),
         Some((Desired::Active, Some(hash('a'))))
     );
-    assert!(requests(&actions).is_empty(), "no bucket token is left");
+    assert!(
+        requests(&actions).is_empty(),
+        "the bonus history waits until MAM recorded the wedge"
+    );
 
     // The next qBittorrent update adds it from the kept file.
     let actions = harness.poll(Vec::new());

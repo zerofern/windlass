@@ -52,13 +52,18 @@ Acceptance:
 ### S3: Keep enough unsatisfied room
 
 Story: Unsatisfied torrents never exceed what the account's class allows, also
-when VIP ends.
+when VIP ends or the account drops a class.
 
 Acceptance:
 
-- When VIP would lapse and MAM's unsatisfied count is above the limit of the
-  class the account would fall to (100 for Power User, by rule 2.8), Windlass
-  renews VIP ahead of other purchases.
+- Windlass works out the class the account would fall to when VIP ends: Power
+  User (100 unsatisfied, rule 2.8) while the ratio keeps that class, User (50)
+  otherwise. It follows the ratio in every reading, because a falling ratio
+  takes Power User away too.
+- When VIP would lapse and MAM's unsatisfied count is above that class's limit,
+  Windlass renews VIP ahead of other purchases.
+- When the ratio comes close to losing a class, the owner is told before it
+  happens, with the unsatisfied count and the limit it would fall to.
 - Downloads already hold when a download would leave fewer than 2 slots free
   (B-0011 A2).
 
@@ -74,20 +79,59 @@ Acceptance:
   it." When freeleech ends mid-download, Windlass pauses the torrent first, then
   wedges it, then resumes it once MAM's bonus history shows the wedge.
 - Every notice is kept on the dashboard's notifications page, newest first, with
-  its full text, and every push links to its entry there.
+  its full text and its own address.
+- A push carries no content: it says only that Windlass has a notice, and links
+  to that notice's entry on the notifications page. Nothing about the account or
+  its torrents leaves the LAN.
+- Each notice is either urgent or quiet. Urgent ones are pushed; quiet ones
+  (a torrent finished, a purchase settled, a repair that worked) are only on the
+  notifications page.
+
+### S5: Never a hit-and-run
+
+Story: A torrent short of MAM's seeding requirement keeps seeding, whatever
+happens, and when Windlass cannot keep it seeding the owner knows at once.
+
+Acceptance:
+
+- Windlass treats every unsatisfied torrent as one it must seed: it is never
+  paused, queued, or removed by Windlass, and is force-started if qBittorrent
+  stops it.
+- When an unsatisfied torrent is not seeding (the VPN is down, qBittorrent is
+  unreachable, the torrent is stopped or in error, MAM reports the client not
+  connectable), Windlass tries what it can (restart the tunnel check, renew the
+  port lease, register the seedbox, start the torrent) and sends an urgent
+  notice saying what is wrong and what it tried.
+- While it stays unresolved and needs the owner, the notice is repeated, at
+  most once an hour. When seeding resumes, a quiet notice says so.
+
+### S6: Millionaire's Vault reminder
+
+Story: When the vault pays out, the owner is reminded to donate again, so the
+next payout includes them.
+
+Acceptance:
+
+- When the account's wedges rise by 8 or more without a purchase by Windlass,
+  Windlass takes it as a vault payout and sends a notice to donate again, with a
+  link to the vault page.
+- Windlass never donates; the API does not offer it.
 
 ## Feature-wide constraints and acceptance
 
 - MAM's rules and B-0011's invariants come first; no setting or override relaxes
   them.
-- The request budget may be loosened: it guards against a bug sending many
-  requests, not against MAM's limits, which each request type keeps on its own.
+- The request budget is 10 at once, then one every 3 seconds (was 5 and one
+  every 10 seconds). It guards against a bug sending many requests, not against
+  MAM's limits, which each request type keeps on its own (IP lookup once a
+  minute, seedbox registration once an hour).
 
 ## Scope
 
 Download and active limits, qBittorrent's queue settings, the queue page,
-reordering and "download now", VIP renewal for the unsatisfied limit, narrated
-notices, and the notifications page.
+reordering and "download now", VIP renewal for the unsatisfied limit, ratio and
+class watching, narrated notices, the notifications page, content-free pushes,
+quiet notices, hit-and-run prevention, and the vault reminder.
 
 ## Non-goals
 
@@ -104,18 +148,16 @@ does not offer.
 
 ## Open questions and assumptions
 
-- Book titles in push notifications: B-0002 keeps titles out of notices because
-  ntfy.sh is a hosted service outside the VPN. Proposed: the push says what
-  happened without the title ("A download stopped being free…") and links to the
-  notifications page, which shows the title on the LAN.
+- Decided: pushes carry only a link to the notice's entry, so titles stay on the
+  LAN (B-0002's rule holds).
+- Decided: when VIP ends, the account falls to Power User while its ratio keeps
+  that class. The ratio Power User needs is not in the captured rules; assumed
+  2.0 until confirmed, and the fallback is User (50) below it.
 - VIP renewal for the unsatisfied limit: may it dip into the points reserve when
   nothing else keeps the count within the limit? Proposed: yes, with an urgent
   notice; otherwise downloads hold and the owner is told.
-- The class the account falls to when VIP ends is assumed to be Power User
-  (limit 100); MAM reports only the current class's limit.
-- New request budget, proposed: 10 at once, then one every 3 seconds (was 5 and
-  one every 10 seconds). MAM's own limits (IP lookup once a minute, seedbox
-  registration once an hour) stay.
 - "Download now" lasts until that torrent finishes downloading.
-- Millionaire's Vault reminder: waits for a capture of
-  `userBonusHistory.php?type[]=millionaires` and the vault page's address.
+- Millionaire's Vault: bonus history shows donations (`type` `millionaires`,
+  `amount` 2000) but no payout entry has been seen yet, so the payout is taken
+  from a jump in wedges. When a payout shows in the history, Windlass should use
+  that instead. The vault page's address is still needed for the link.

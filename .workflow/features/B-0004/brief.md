@@ -32,7 +32,7 @@ configured, and shared and endpoint limits permit. Only documented successful `C
 Without a cookie, show setup required and make no MAM requests.
 
 - Implemented: requests leave only while MAM requests are resumed, VPN protection
-  is available, and the core's shared token bucket (5 requests, one more every 10
+  is available, and the core's shared token bucket (10 requests, one more every 3
   seconds) has a token; one request is outstanding at a time. The IP lookup needs
   no cookie; every other request needs the saved cookie and a session not
   refused. The dashboard's MAM access panel shows the session as unverified,

@@ -220,8 +220,8 @@ pub use mam::{
     RegistrationAllowance, RegistrationFailure, Seedbox, SeedboxStatus, Session as MamSession,
     SessionRejection, SettledBy, SnatchSummary, UNSATISFIED_RESERVE, UPLOAD_BUFFER,
     UPLOAD_PRICE_PER_GIB, UPLOAD_STEP, UploadCredit, UploadCreditError, UserData, VIP_FILL,
-    VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN, WATCH_FRESH_FOR, WedgeHistory,
-    WedgeSpent,
+    VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN, WATCH_FRESH_FOR, WEDGE_RECORDED_AFTER,
+    WedgeHistory, WedgeSpent,
 };
 pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,

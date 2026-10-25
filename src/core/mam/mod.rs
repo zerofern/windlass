@@ -25,7 +25,7 @@ pub use account::{
 pub use acquisition::{
     Acquisition, BOOKMARKS_EVERY, Bookmarks, DownloadWatch, HISTORY_FRESH_FOR, Hold,
     LOOKUP_FRESH_FOR, Listed, Lookup, MAX_BOOKMARK_PAGES, RECENT_ADMISSION, WATCH_FRESH_FOR,
-    WedgeHistory,
+    WEDGE_RECORDED_AFTER, WedgeHistory,
 };
 pub use api::{
     Asn, Bookmark, BookmarkPage, Connectable, FetchedTorrent, IpObservation, ListedClient,

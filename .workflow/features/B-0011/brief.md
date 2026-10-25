@@ -166,8 +166,8 @@ bookmarked is looked up by itself, as often. A VIP torrent or account whose VIP
 ends within those 20 minutes counts as not free. When a download is no longer free, Windlass spends a
 wedge on it, with a fresh count of wedges; with none left, or when MAM no longer
 lists it, it stops the torrent and tells the owner, and resumes it once it is
-free again. A wedged download whose wedge the next bonus history read does not
-show is stopped and reported, and never wedged twice. A download that finished
+free again. A wedged download whose wedge the bonus history, read at least a minute
+later so MAM has recorded it, does not show is stopped and reported, and never wedged twice. A download that finished
 before Windlass could show it free is reported, not stopped, since stopping would
 only stop seeding. This runs at startup too, so it needs no saved state. MAM's
 site-wide freeleech carries no end time in the captured responses, so up to

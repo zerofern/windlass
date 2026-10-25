@@ -1,12 +1,12 @@
-//! The token bucket every Windlass request to MAM draws from (Direction): five
-//! tokens, one restored every ten seconds, starting full.
+//! The token bucket every Windlass request to MAM draws from (Direction): ten
+//! tokens, one restored every three seconds, starting full.
 
 use std::time::{Duration, Instant};
 
 /// Tokens the bucket holds when full.
-pub const REQUEST_BURST: u32 = 5;
+pub const REQUEST_BURST: u32 = 10;
 /// How often one token is restored.
-pub const REQUEST_REFILL: Duration = Duration::from_secs(10);
+pub const REQUEST_REFILL: Duration = Duration::from_secs(3);
 
 /// The shared request budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

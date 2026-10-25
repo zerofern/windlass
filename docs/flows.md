@@ -139,7 +139,7 @@ core scenarios with simulated time, and end to end only for their wiring.
 
 - **Trigger:** the owner pastes the `mam_id` cookie and resumes MAM requests.
 - **Does:** sends requests only while resumed, protected, and within the shared
-  budget (5 at once, then one every 10 seconds), one at a time, naming
+  budget (10 at once, then one every 3 seconds), one at a time, naming
   `Windlass/<version>`. Saves every replacement cookie MAM issues. A refused
   session stops cookie requests until MAM sees another IP or ASN (for a
   mismatch) or the owner changes the cookie.
@@ -211,8 +211,8 @@ core scenarios with simulated time, and end to end only for their wiring.
   the last 20 minutes, which the bookmark listing refreshes for every bookmarked
   download at once. When freeleech or VIP ends, Windlass spends a wedge (with a
   fresh wedge count); with none left, or when MAM no longer lists it, it stops
-  the torrent and resumes it once free. A wedge missing from the history stops
-  the torrent and is never retried. A download that finished first is reported.
+  the torrent and resumes it once free. A wedge missing from the history, read a
+  minute after the download, stops the torrent and is never retried. A download that finished first is reported.
 - **Where:** `core/mam/acquisition.rs` (`watch`, `watch_next`),
   `core/mam/mod.rs` (`follow_downloads`).
 - **Tested:** `tests/mam_core.rs`; E5 and E5b end to end.
