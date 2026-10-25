@@ -21,11 +21,16 @@ pub const MAX_BOOKMARK_PAGES: usize = 10;
 /// Downloads admitted this recently count against the unsatisfied limit even
 /// if MAM's count may not show them yet.
 pub const RECENT_ADMISSION: Duration = Duration::from_hours(1);
-/// How recent a torrent's lookup must be before it is downloaded.
-///
-/// A running download that is free only for now is checked this often, and a
-/// download must stay free for at least this long to need no wedge.
+/// How recent a torrent's flags must be before it is downloaded, from the
+/// bookmark listing or a lookup by its ID.
 pub const LOOKUP_FRESH_FOR: Duration = Duration::from_mins(5);
+/// How recent a running download's flags must be.
+///
+/// Bookmarks are listed every 15 minutes, which refreshes every bookmarked
+/// download at once; this leaves 5 minutes for a listing to finish before a
+/// download is looked up by itself. A download must stay free for at least
+/// this long to need no wedge.
+pub const WATCH_FRESH_FOR: Duration = Duration::from_mins(20);
 /// Bonus history read this recently can decide whether a wedge is needed.
 pub const HISTORY_FRESH_FOR: Duration = Duration::from_mins(5);
 const RETRY_AFTER: Duration = Duration::from_mins(5);
@@ -66,6 +71,8 @@ pub enum Hold {
 pub struct Listed {
     /// When the listing finished.
     pub at: SystemTime,
+    /// When, by the process clock.
+    pub taken: Instant,
     /// Bookmarks in total, as MAM counts them.
     pub found: u32,
     /// The bookmarks.
@@ -122,6 +129,7 @@ impl Bookmarks {
         }
         self.latest = Some(Listed {
             at: wall,
+            taken: now,
             found: page.found,
             bookmarks: self.listing.take().unwrap_or_default(),
         });
@@ -281,11 +289,37 @@ impl Acquisition {
         }
     }
 
-    /// A lookup of this torrent taken within `within`.
-    fn fresh_lookup(&self, id: MamTorrentId, now: Instant, within: Duration) -> Option<&Lookup> {
-        self.lookups
+    /// The torrent as MAM reported it most recently, if no longer ago than
+    /// `within`.
+    fn current(
+        &self,
+        id: MamTorrentId,
+        now: Instant,
+        within: Duration,
+    ) -> Option<(Option<&Bookmark>, Instant)> {
+        self.latest(id)
+            .filter(|(_, at)| now.saturating_duration_since(*at) <= within)
+    }
+
+    /// The torrent as MAM reported it most recently, by the bookmark listing
+    /// or a lookup by its ID, and when; `None` inside when MAM no longer lists
+    /// it.
+    fn latest(&self, id: MamTorrentId) -> Option<(Option<&Bookmark>, Instant)> {
+        let looked_up = self
+            .lookups
             .get(&id)
-            .filter(|lookup| now.saturating_duration_since(lookup.at) <= within)
+            .map(|lookup| (lookup.listing.as_ref(), lookup.at));
+        let listed = self.bookmarks.latest.as_ref().and_then(|latest| {
+            latest
+                .bookmarks
+                .iter()
+                .find(|bookmark| bookmark.id == id)
+                .map(|bookmark| (Some(bookmark), latest.taken))
+        });
+        [looked_up, listed]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(_, at)| *at)
     }
 
     /// Whether the bonus history was read within `within` and after the last
@@ -372,10 +406,7 @@ impl Acquisition {
         }
         let id = bookmark.id;
         // The torrent as MAM lists it now decides whether a wedge is needed.
-        let Some(listing) = self
-            .fresh_lookup(id, facts.now, LOOKUP_FRESH_FOR)
-            .and_then(|lookup| lookup.listing.as_ref())
-        else {
+        let Some((Some(listing), _)) = self.current(id, facts.now, LOOKUP_FRESH_FOR) else {
             return Self::ask(self.lookup_failed, facts.now, Next::LookUp(id));
         };
         if free_for_owner(listing, data, facts.wall) {
@@ -444,20 +475,18 @@ impl Acquisition {
                 DownloadWatch::NeedHistory
             };
         }
-        let Some(lookup) = self.fresh_lookup(download.mam, now, LOOKUP_FRESH_FOR) else {
+        let Some((listing, seen)) = self.current(download.mam, now, WATCH_FRESH_FOR) else {
             return DownloadWatch::NeedLookup;
         };
-        let free = lookup
-            .listing
-            .as_ref()
+        let free = listing
             .zip(data)
             .is_some_and(|(listing, data)| free_for_owner(listing, data, wall));
         if free {
             DownloadWatch::FreeForNow
-        } else if history.is_some_and(|history| history.at >= lookup.at) {
+        } else if history.is_some_and(|history| history.at >= seen) {
             DownloadWatch::NotFree {
                 wedge_missing: false,
-                listed: lookup.listing.is_some(),
+                listed: listing.is_some(),
             }
         } else {
             DownloadWatch::NeedHistory
@@ -503,8 +532,8 @@ impl Acquisition {
             .watched
             .iter()
             .filter(|(_, watch)| *watch == DownloadWatch::FreeForNow)
-            .filter_map(|(download, _)| self.lookups.get(&download.mam))
-            .filter_map(|lookup| lookup.at.checked_add(LOOKUP_FRESH_FOR))
+            .filter_map(|(download, _)| self.latest(download.mam))
+            .filter_map(|(_, seen)| seen.checked_add(WATCH_FRESH_FOR))
             .min();
         let retry =
             |failed: Option<Instant>| failed.and_then(|failed| failed.checked_add(RETRY_AFTER));
@@ -552,7 +581,7 @@ pub(super) fn recent(download: &Download, wall: SystemTime) -> bool {
 /// the next check: freeleech for everyone, a personal freeleech, or a VIP
 /// torrent while both it and the account are VIP.
 fn free_for_owner(listing: &Bookmark, data: &UserData, now: SystemTime) -> bool {
-    let until = now.checked_add(LOOKUP_FRESH_FOR).unwrap_or(now);
+    let until = now.checked_add(WATCH_FRESH_FOR).unwrap_or(now);
     let account_vip = data.is_vip(until);
     let torrent_vip = listing.vip && listing.vip_expires.is_none_or(|expires| expires > until);
     listing.free

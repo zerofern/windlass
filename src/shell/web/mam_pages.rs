@@ -331,7 +331,9 @@ fn bookmarks_panel(mam: &Mam) -> Markup {
 const fn download_watch(watch: DownloadWatch) -> &'static str {
     match watch {
         DownloadWatch::Wedged => "a wedge makes it free for you",
-        DownloadWatch::FreeForNow => "free for you now; checked again every 5 minutes",
+        DownloadWatch::FreeForNow => {
+            "free for you now; checked again with the next bookmark listing"
+        }
         DownloadWatch::NeedLookup | DownloadWatch::NeedHistory => "being checked with MAM",
         DownloadWatch::NotFree {
             wedge_missing: true,
@@ -503,7 +505,7 @@ mod tests {
         for text in [
             "Running downloads",
             "a wedge makes it free for you",
-            "checked again every 5 minutes",
+            "checked again with the next bookmark listing",
             "being checked with MAM",
             "shows no wedge spent",
             "no longer lists it",
@@ -659,6 +661,7 @@ mod tests {
         mam.acquisition.hold = Some(Hold::NoWedge);
         mam.acquisition.bookmarks.latest = Some(Listed {
             at: SystemTime::UNIX_EPOCH,
+            taken: std::time::Instant::now(),
             found: 7,
             bookmarks: Vec::new(),
         });

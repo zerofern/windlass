@@ -1753,6 +1753,7 @@ mod tests {
         let mut bookmarks = Bookmarks::default();
         bookmarks.latest = Some(Listed {
             at: SystemTime::UNIX_EPOCH,
+            taken: std::time::Instant::now(),
             found: 1,
             bookmarks: vec![Bookmark {
                 id: mam,

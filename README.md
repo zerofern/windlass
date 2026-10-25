@@ -115,12 +115,13 @@ Windlass saves it and uses it from then on.
   the account was read in the last five minutes, the ratio is at least 2.0, and an
   unsatisfied slot is free after a reserve of two, counting downloads qBittorrent
   added in the last hour, and MAM's client list shows the running qBittorrent (or
-  lists nothing yet). Just before downloading, Windlass looks the torrent up on MAM
-  again. It spends a wedge only when the torrent is not already free for you
+  lists nothing yet). Its flags must be at most 5 minutes old: from the bookmark
+  listing, or else from looking the torrent up on MAM. It spends a wedge only when the torrent is not already free for you
   (freeleech for everyone, a personal freeleech, or VIP while you are VIP) and
   MAM's bonus history shows none spent on it; afterwards the history must list
   the wedge, or the torrent is stopped and you are told.
-- Every running download must stay free for you. When its freeleech or VIP ends,
+- Every running download must stay free for you. Each bookmark listing, every 15
+  minutes, re-checks all of them at once. When a download's freeleech or VIP ends,
   Windlass spends a wedge on it; with none left, it stops the torrent and tells
   you, and resumes it once it is free again. After a restart, Windlass checks all
   of this with MAM and qBittorrent before downloading anything.

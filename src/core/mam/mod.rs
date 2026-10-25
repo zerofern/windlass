@@ -24,7 +24,8 @@ pub use account::{
 };
 pub use acquisition::{
     Acquisition, BOOKMARKS_EVERY, Bookmarks, DownloadWatch, HISTORY_FRESH_FOR, Hold,
-    LOOKUP_FRESH_FOR, Listed, Lookup, MAX_BOOKMARK_PAGES, RECENT_ADMISSION, WedgeHistory,
+    LOOKUP_FRESH_FOR, Listed, Lookup, MAX_BOOKMARK_PAGES, RECENT_ADMISSION, WATCH_FRESH_FOR,
+    WedgeHistory,
 };
 pub use api::{
     Asn, Bookmark, BookmarkPage, Connectable, FetchedTorrent, IpObservation, ListedClient,
@@ -506,6 +507,11 @@ impl Mam {
         ) else {
             return Vec::new();
         };
+        // A queued bookmark MAM now reports snatched waits for the owner.
+        let mut actions = Vec::new();
+        for bookmark in listed.bookmarks.iter().filter(|bookmark| bookmark.snatched) {
+            actions.extend(records.snatched(now.monotonic, bookmark.id));
+        }
         let new: Vec<(MamTorrentId, Desired)> = listed
             .bookmarks
             .iter()
@@ -519,7 +525,8 @@ impl Mam {
                 (bookmark.id, desired)
             })
             .collect();
-        records.bookmarked(now.monotonic, new)
+        actions.extend(records.bookmarked(now.monotonic, new));
+        actions
     }
 
     /// Choose and send the next request, if one is wanted and allowed.
@@ -760,13 +767,17 @@ impl Mam {
         }) {
             return Some(Wanted::Request(MamRequest::Buy(purchase)));
         }
+        // A due listing refreshes every bookmark's flags in one request, so it
+        // comes before looking a single torrent up.
+        let listing = self.acquisition.bookmarks.wanted(now.monotonic);
+        let next = match (next, listing) {
+            (Next::LookUp(_), Some(_)) => Next::Idle,
+            (next, _) => next,
+        };
         if let Some(request) = acquisition_request(next) {
             return Some(Wanted::Request(request));
         }
-        self.acquisition
-            .bookmarks
-            .wanted(now.monotonic)
-            .map(|start| Wanted::Request(MamRequest::ListBookmarks { start }))
+        listing.map(|start| Wanted::Request(MamRequest::ListBookmarks { start }))
     }
 
     /// Pause or lost protection: work in progress is dropped, and the session

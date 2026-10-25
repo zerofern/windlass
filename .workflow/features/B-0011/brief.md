@@ -136,12 +136,14 @@ only when all of these hold:
 4. qBittorrent is reachable, at an allowed version, and listed by MAM as an
    authorized client (A5). Downloads are not disabled (A10).
 5. An unsatisfied slot is free after the reserve, by MAM's count (A2).
-6. The download costs no ratio (principle 2), judged from the torrent as MAM
-   lists it now, looked up by its ID within the last 5 minutes:
+6. The download costs no ratio (principle 2), judged from the torrent's flags
+   from the last 5 minutes: the bookmark listing when it is that recent, which
+   it usually is since downloads follow a listing, or else a lookup by its ID.
+   A due listing comes before single lookups.
    - no wedge for a torrent that is freeleech for everyone (the owner decided on
      2026-10-25 not to wedge torrents that are already free), a personal
      freeleech, or a VIP torrent while it and the account stay VIP for at least
-     the next 5 minutes;
+     the next 20 minutes;
    - a wedge for any other torrent, unless the bonus history, read within the
      last 5 minutes and after any earlier attempt, shows one already spent.
    If no wedge is available, the torrent stays queued and the owner is told. A
@@ -157,16 +159,21 @@ indefinitely.
 Freeleech for everyone and VIP status can end while a torrent downloads. So
 every unfinished download Windlass added, and every one added in the last hour,
 must be shown free for the owner: by a wedge in the bonus history, which lasts,
-or by a lookup in the last 5 minutes. One that is free only for now is looked up
-again every 5 minutes. When a download is no longer free, Windlass spends a
+or by its flags from the last 20 minutes. To keep requests to MAM few, those
+flags come from the bookmark listing, every 15 minutes, which covers every
+bookmarked download in one request per 100 bookmarks; only a download no longer
+bookmarked is looked up by itself, as often. A VIP torrent or account whose VIP
+ends within those 20 minutes counts as not free. When a download is no longer free, Windlass spends a
 wedge on it, with a fresh count of wedges; with none left, or when MAM no longer
 lists it, it stops the torrent and tells the owner, and resumes it once it is
 free again. A wedged download whose wedge the next bonus history read does not
 show is stopped and reported, and never wedged twice. A download that finished
 before Windlass could show it free is reported, not stopped, since stopping would
 only stop seeding. This runs at startup too, so it needs no saved state. MAM's
-site-wide freeleech carries no end time in the captured responses, so up to 5
-minutes of a download could fall after freeleech ends. It is removed only by the owner's cleanup permission, once A3 is
+site-wide freeleech carries no end time in the captured responses, so up to
+about 15 minutes of a download could fall after freeleech ends. The owner chose
+this over looking each download up every 5 minutes, which would send MAM a
+request per download every 5 minutes. It is removed only by the owner's cleanup permission, once A3 is
 satisfied and space is needed.
 
 When a gate holds a torrent, the dashboard names the gate and MAM's value
@@ -363,9 +370,9 @@ details are not recorded here.
   site-wide freeleech list (2026-10-25) returned `free` 1, `vip` 0,
   `personal_freeleech` 0, and `fl_vip` 1, so `fl_vip` also covers site-wide
   freeleech. No field says when the freeleech ends (`vip_expire` covers VIP
-  status only), so Windlass looks running free downloads up again every 5
-  minutes. The result also carries `w` (1), whose meaning is unknown; Windlass
-  does not use it. A misspelt `tor[...]` parameter is ignored and the search
+  status only), so Windlass re-checks running free downloads with each bookmark
+  listing (see "Running downloads stay free"). The result also carries `w` (1),
+  whose meaning is unknown; Windlass does not use it. A misspelt `tor[...]` parameter is ignored and the search
   returns the newest torrents on the site instead, so Windlass takes only the
   result whose `id` is the one it asked for.
 - Agreed with the owner: Windlass does not wait to confirm a wedge. The wedge is

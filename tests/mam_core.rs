@@ -233,14 +233,14 @@ impl Harness {
         self.sync(torrents)
     }
 
-    /// Answer lookups with these listings, and the bonus history with no
-    /// wedges, until something else is asked.
+    /// Answer bookmark listings and lookups with these listings, and the bonus
+    /// history with no wedges, until something else is asked.
     fn checked(&mut self, actions: Vec<Action>, listings: &[Bookmark]) -> Vec<Action> {
         self.checked_with(actions, listings, &[])
     }
 
-    /// Answer lookups with these listings, and the bonus history with these
-    /// wedges, until something else is asked.
+    /// Answer bookmark listings and lookups with these listings, and the bonus
+    /// history with these wedges, until something else is asked.
     fn checked_with(
         &mut self,
         mut actions: Vec<Action>,
@@ -256,12 +256,31 @@ impl Harness {
                 [MamRequest::WedgeHistory] => {
                     self.answer(Ok(MamReply::WedgeHistory(spent.to_vec())))
                 }
+                // A due listing comes before single lookups; it lists these.
+                [MamRequest::ListBookmarks { start: 0 }] => self.answer(listed(listings.to_vec())),
                 // The bucket ran out; the next token comes soon.
                 [] if timer(&actions, TimerName::Mam)
                     .is_some_and(|(_, after)| after <= windlass::core::REQUEST_REFILL) =>
                 {
                     self.wake(&actions)
                 }
+                _ => return actions,
+            };
+        }
+    }
+
+    /// Answer readings with a healthy account, bookmark listings with none,
+    /// lookups with this listing, and the bonus history with no wedges, until
+    /// something else is asked.
+    fn respond(&mut self, mut actions: Vec<Action>, listing: &Bookmark) -> Vec<Action> {
+        loop {
+            actions = match requests(&actions).as_slice() {
+                [MamRequest::LoadUserData { .. }] => self.answer(read(account(self.wall()))),
+                [MamRequest::ListBookmarks { .. }] => self.answer(listed(Vec::new())),
+                [MamRequest::LookUpTorrent { .. }] => {
+                    self.answer(Ok(MamReply::Torrent(Some(Box::new(listing.clone())))))
+                }
+                [MamRequest::WedgeHistory] => self.answer(Ok(MamReply::WedgeHistory(Vec::new()))),
                 _ => return actions,
             };
         }
@@ -849,14 +868,8 @@ fn a_bookmark_is_queued_wedged_fetched_and_added() {
         Some(Desired::Snatched),
         "snatched before, so known but not queued"
     );
-    // It was looked up on MAM, and the bonus history showed no wedge on it yet.
-    assert!(
-        harness
-            .mam()
-            .acquisition
-            .lookups
-            .contains_key(&torrent_id(1))
-    );
+    // The bookmark listing had just given its flags, so no lookup was needed.
+    assert!(harness.mam().acquisition.lookups.is_empty());
     assert_eq!(
         requests(&actions),
         [MamRequest::FetchTorrent {
@@ -1342,10 +1355,10 @@ fn a_lost_wedged_download_that_spent_nothing_is_wedged_again() {
 #[test]
 fn each_download_is_judged_by_its_listing_on_mam_now() {
     let mut harness = empty_harness();
-    // Freeleech for everyone, as MAM lists it now: no wedge.
+    // Freeleech for everyone, as the bookmark listing reports it now: no wedge.
     let mut free = bookmark(1);
     free.free = true;
-    let actions = listed_then_looked_up(&mut harness, vec![bookmark(1)], &[free]);
+    let actions = listed_then_looked_up(&mut harness, vec![free], &[]);
     assert_eq!(
         requests(&actions),
         [MamRequest::FetchTorrent {
@@ -1357,7 +1370,7 @@ fn each_download_is_judged_by_its_listing_on_mam_now() {
     let mut ending = bookmark(1);
     ending.vip = true;
     ending.vip_expires = Some(harness.wall() + Duration::from_mins(2));
-    let actions = listed_then_looked_up(&mut harness, vec![bookmark(1)], &[ending]);
+    let actions = listed_then_looked_up(&mut harness, vec![ending], &[]);
     assert_eq!(
         requests(&actions),
         [MamRequest::FetchTorrent {
@@ -1368,7 +1381,7 @@ fn each_download_is_judged_by_its_listing_on_mam_now() {
     // Free through VIP while the account is VIP; not once VIP lapsed.
     let mut through_vip = bookmark(1);
     through_vip.personal = PersonalFreeleech::ThroughVip;
-    let actions = listed_then_looked_up(&mut harness, vec![bookmark(1)], &[through_vip]);
+    let actions = listed_then_looked_up(&mut harness, vec![through_vip], &[]);
     assert_eq!(
         requests(&actions),
         [MamRequest::FetchTorrent {
@@ -1381,22 +1394,59 @@ fn each_download_is_judged_by_its_listing_on_mam_now() {
 #[test]
 fn torrents_mam_no_longer_lists_or_reports_snatched_are_not_downloaded() {
     let mut harness = empty_harness();
+    // No wedge is left, so the bookmarks wait in the queue.
+    let mut none_left = account(harness.wall());
+    none_left.wedges = 0;
+    let actions = listed_with(
+        &mut harness,
+        none_left,
+        vec![bookmark(1), bookmark(2), bookmark(3), bookmark(4)],
+    );
+    assert!(requests(&actions).is_empty(), "{actions:?}");
+    assert_eq!(harness.mam().acquisition.hold, Some(Hold::NoWedge));
+    let _ = harness.send(Event::Registry(RegistryEvent::Saved));
+    // The next listing reports torrent 2 snatched since: it waits for the owner.
     let mut snatched = bookmark(2);
     snatched.snatched = true;
-    // Torrent 1 is gone from MAM; torrent 2 was snatched since it was listed.
-    let actions = listed_then_looked_up(
-        &mut harness,
-        vec![bookmark(1), bookmark(2), bookmark(3)],
-        &[snatched, bookmark(3)],
-    );
+    let actions = harness.later(Duration::from_mins(15));
+    assert!(matches!(
+        requests(&actions).first(),
+        Some(MamRequest::LoadUserData { .. })
+    ));
+    let mut still_none = account(harness.wall());
+    still_none.wedges = 0;
+    let actions = harness.answer(read(still_none));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let actions = harness.answer(listed(vec![
+        bookmark(1),
+        snatched,
+        bookmark(3),
+        bookmark(4),
+    ]));
+    let _ = harness.checked(actions, &[]);
     assert_eq!(
         harness.record(2).map(|record| record.desired),
+        Some(Desired::Snatched)
+    );
+    // Wedges arrive once the listing is old: each candidate is looked up.
+    // Torrent 1 is gone from MAM, and torrent 3 snatched since.
+    let mut snatched_since = bookmark(3);
+    snatched_since.snatched = true;
+    let actions = harness.later(Duration::from_mins(6));
+    assert!(matches!(
+        requests(&actions).first(),
+        Some(MamRequest::LoadUserData { .. })
+    ));
+    let actions = harness.answer(read(account(harness.wall())));
+    let actions = harness.checked(actions, &[snatched_since, bookmark(4)]);
+    assert_eq!(
+        harness.record(3).map(|record| record.desired),
         Some(Desired::Snatched)
     );
     assert_eq!(
         requests(&actions),
         [MamRequest::FetchTorrent {
-            id: torrent_id(3),
+            id: torrent_id(4),
             wedge: true
         }]
     );
@@ -1408,30 +1458,28 @@ fn torrents_mam_no_longer_lists_or_reports_snatched_are_not_downloaded() {
 
 #[test]
 fn a_failed_lookup_is_tried_again_after_a_wait() {
-    let mut harness = empty_harness();
-    let now = harness.wall();
-    let actions = listed_with(&mut harness, account(now), Vec::new());
-    assert!(requests(&actions).is_empty(), "{actions:?}");
-    let _ = harness.send(Event::Registry(RegistryEvent::Saved));
-    let actions = harness.later(Duration::from_mins(15));
-    assert!(matches!(
-        requests(&actions).first(),
-        Some(MamRequest::LoadUserData { .. })
-    ));
+    let now = SystemTime::UNIX_EPOCH + EPOCH;
+    let (mut harness, actions) = Harness::start(Setup {
+        rows: Some(vec![download_row(
+            1,
+            'a',
+            Duration::from_hours(3),
+            false,
+            now,
+        )]),
+        ..Setup::default()
+    });
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
     let actions = harness.answer(read(account(harness.wall())));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
-    let actions = harness.answer(listed(vec![bookmark(1)]));
     assert_eq!(
         requests(&actions),
         [MamRequest::LookUpTorrent { id: torrent_id(1) }]
     );
     let actions = harness.answer(Err(MamFailure::Unreachable));
+    let actions = without_bookmarks(&mut harness, actions);
     assert!(requests(&actions).is_empty(), "{actions:?}");
     let actions = harness.later(Duration::from_mins(5));
-    let actions = match requests(&actions).as_slice() {
-        [MamRequest::LoadUserData { .. }] => harness.answer(read(account(harness.wall()))),
-        _ => actions,
-    };
     assert_eq!(
         requests(&actions),
         [MamRequest::LookUpTorrent { id: torrent_id(1) }]
@@ -1458,9 +1506,6 @@ fn downloads_added_in_the_last_hour_count_against_the_limit_after_a_restart() {
         summary.unsatisfied = 145;
     }
     let actions = harness.answer(read(near));
-    let actions = harness.checked(actions, &[]);
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
-    let actions = harness.answer(listed(vec![bookmark(1)]));
     let _ = harness.checked(actions, &[bookmark(1)]);
     // 145 by MAM's count and 3 added in the last hour leave no slot.
     assert_eq!(
@@ -1511,10 +1556,23 @@ fn a_download_whose_freeleech_ends_is_wedged_while_it_runs() {
     ));
     let actions = harness.checked(actions, &[]);
     let _ = without_bookmarks(&mut harness, actions);
-    // Freeleech ends; the next check finds it and spends a wedge.
+    // Not bookmarked, so it is looked up by itself, and not again soon.
+    let actions = harness.later(Duration::from_mins(10));
+    let actions = without_bookmarks(&mut harness, actions);
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::LookUpTorrent { .. })),
+        "{actions:?}"
+    );
+    // The routine reading and bookmark listing come and go.
+    let actions = harness.later(Duration::from_mins(6));
+    let actions = harness.respond(actions, &bookmark(1));
+    assert!(requests(&actions).is_empty(), "{actions:?}");
+    // Freeleech ends; the next check finds it, and spending a wedge needs a
+    // fresh count of wedges.
     let actions = harness.later(Duration::from_mins(6));
     let actions = harness.checked(actions, &[bookmark(1)]);
-    // Spending one needs a fresh count of wedges.
     assert!(matches!(
         requests(&actions).as_slice(),
         [MamRequest::LoadUserData { .. }]
@@ -1562,15 +1620,15 @@ fn a_download_that_is_not_free_and_cannot_be_wedged_stops_until_it_is_free() {
             .notices()
             .contains(&Notice::DownloadNotFree { stopped: true })
     );
+    // With no wedge to spend, nothing more is asked.
+    let actions = harness.later(Duration::from_mins(1));
+    let actions = without_bookmarks(&mut harness, actions);
+    assert!(requests(&actions).is_empty(), "{actions:?}");
     // It becomes freeleech for everyone: it runs again.
     let mut free = bookmark(1);
     free.free = true;
-    let actions = harness.later(Duration::from_mins(6));
-    let actions = match requests(&actions).as_slice() {
-        [MamRequest::LoadUserData { .. }] => harness.answer(read(account(harness.wall()))),
-        _ => actions,
-    };
-    let _ = harness.checked(actions, &[free]);
+    let actions = harness.later(Duration::from_mins(21));
+    let _ = harness.respond(actions, &free);
     assert_eq!(
         harness.record(1).map(|record| record.desired),
         Some(Desired::Active)
