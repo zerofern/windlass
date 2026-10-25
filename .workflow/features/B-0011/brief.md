@@ -18,13 +18,17 @@ upload credit when it is needed.
    the gap between two MAM readings, such as a download admitted since the last
    reading, and never relax a limit MAM reports. When MAM's reading is missing,
    stale, or not understood, the gates it feeds stay closed.
-2. **Downloads never cost ratio.** Every torrent is downloaded as a personal
-   freeleech, using a wedge, or as a VIP torrent while the account is VIP. If
-   neither is possible, the torrent waits.
+2. **Downloads never cost ratio.** Every torrent is downloaded while it is free
+   for the owner: freeleech for everyone, a personal freeleech, a VIP torrent
+   while the account is VIP, or with a wedge. If none is possible, the torrent
+   waits; if a running download stops being free, it is wedged or stopped.
 3. **Gates and watches.** A *gate* is checked before an action, so the action
    never happens when it would break a rule. A *watch* is checked continuously,
    so the owner hears about drift, and Windlass repairs what it can, long before
    MAM acts.
+4. **Verify before acting.** What Windlass saved is only where it starts. After
+   a restart, and before every download, it asks MAM and qBittorrent what is true
+   now, because the world may have changed while it was not looking.
 
 ## Sources
 
@@ -46,7 +50,7 @@ upload credit when it is needed.
 | ID | Rule | Invariant | Kind | Verified with MAM | How Windlass keeps it |
 | --- | --- | --- | --- | --- | --- |
 | A1 | 1.4, 2.4 | Global ratio stays at or above 1.0. | Watch | Load User Data `uploaded_bytes` and `downloaded_bytes`; the `ratio` text is never parsed | Downloads never cost ratio (principle 2), so the ratio should only rise. If it falls below the target of 3.0, Windlass buys upload credit (spending policy). Below 2.0 it notifies and holds every download until it understands why; below 1.1 the notice is urgent. |
-| A2 | 2.8 | Unsatisfied torrents stay below the class limit: 20 for new members, 50 User, 100 Power User, 150 VIP, 200 above VIP. | Gate, watch | Load User Data `snatch_summary.unsat` `count` and `limit` | Admit only if MAM's unsatisfied count, plus torrents Windlass admitted since that reading, plus 1, stays at least the reserve of 2 below MAM's limit. A missing count or limit closes the gate. Crossing the limit blocks downloads for up to 24 hours. Notify at 80% of the limit. |
+| A2 | 2.8 | Unsatisfied torrents stay below the class limit: 20 for new members, 50 User, 100 Power User, 150 VIP, 200 above VIP. | Gate, watch | Load User Data `snatch_summary.unsat` `count` and `limit` | Admit only if MAM's unsatisfied count, plus downloads qBittorrent added in the last hour (MAM's count lags), plus 1, stays at least the reserve of 2 below MAM's limit. A missing count or limit closes the gate. Crossing the limit blocks downloads for up to 24 hours. Notify at 80% of the limit. |
 | A3 | 2.5 | Every downloaded torrent seeds 72 hours within 30 days of completion. | Gate, watch | `snatch_summary` counts `seedUnsat`, `inactUnsat`, `seedHnr`, and `inactHnr`; MAM does not name the torrents (see the open questions) | Windlass never stops, pauses, or removes a torrent until qBittorrent shows 72 hours plus the 24-hour margin and MAM's counts agree. The watch notifies when a torrent completed 20 or more days ago has not yet seeded 72 hours, which happens if seeding is interrupted, for example while the VPN is down, and whenever `inactUnsat` or `inactHnr` is above 0: a torrent MAM counts as unsatisfied is not seeding. |
 | A4 | 2.7 | No partial torrents. | Gate, watch | `snatch_summary.partial` | Every file stays selected (implemented). If MAM reports `partial` true, Windlass notifies. |
 | A5 | 2.3 | Only approved, release versions of qBittorrent; no auto-update. | Gate, watch | Load User Data `clientStats=true`; `notifs.aboutToDropClient` | The NixOS module refuses other versions and pins the package (implemented). MAM announces approval changes on the site, such as a new release not to update to yet, and only the owner can act on them, so the weekly reminder (A9) asks the owner to read them. Windlass also checks that MAM lists the client it sees as the running qBittorrent and does not report it as unauthorized; otherwise downloads are held and the owner is notified. A nonzero `aboutToDropClient` is an urgent notice. |
@@ -79,7 +83,7 @@ upload credit when it is needed.
 | --- | --- | --- | --- |
 | S1 | Owner | Bonus points never fall below the reserve set on the settings page, 20,000 by default. | Every purchase requires MAM's reported points, minus the price, to stay at or above the reserve. |
 | S5 | Owner | Upload credit stays at least 25 GiB above download, so VIP can be bought when downloads need it. | When MAM's uploaded minus downloaded falls below 25 GiB, Windlass buys upload credit in 50 GiB steps, within the points reserve. |
-| S2 | Download docs | A wedge is spent only on purpose. | Windlass adds `fl=1` only to a download its policy wedges, and never to a VIP torrent while the account is VIP or a torrent MAM already reports as a personal freeleech. Search flags lag up to about 20 minutes, so Windlass also records its own wedge use and never wedges a torrent twice. The next Load User Data reading must show `wedges` lower by the number spent; if not, the torrents are paused and the owner told. |
+| S2 | Download docs | A wedge is spent only on purpose. | Windlass adds `fl=1` only to a download that is not free for the owner, judged from the torrent as MAM lists it just before the download. Search flags lag up to about 20 minutes, so before spending a wedge Windlass reads User Bonus History and never wedges a torrent the history shows wedged. After a wedged download, a later read of the history must list the wedge; if not, the torrent is stopped and the owner told. |
 | S3 | Store docs | Purchases use only documented amounts. | Upload credit in whole GiB of at least 50, or `Max Affordable `; VIP only as `max`, which fills to 90 days and buys at least 7 days. |
 | S4 | Owner | A purchase is never repeated after an uncertain result. | A purchase whose outcome is unknown, for example a timeout, is reconciled from Load User Data and User Bonus History before anything else is bought. |
 
@@ -110,10 +114,13 @@ yet built: admission step 7, disk space, which waits for B-0001.
   credit, points spent and the credit arriving mean it did. Anything else waits
   for the owner, who says on the dashboard whether it went through; nothing is
   bought until then. The wait is held in memory, so a restart ends it; the
-  restarted Windlass buys only from a fresh reading. For wedges, User Bonus History settles both a balance that
-  did not fall after a wedged download, before the torrent is stopped, and a
-  wedged download whose answer was lost, before it is fetched again: a wedge
-  already spent is not spent twice.
+  restarted Windlass buys only from a fresh reading. For wedges, see S2: the
+  bonus history read before each wedged download, and after it, keeps a wedge
+  from being spent twice, also after a lost answer or a restart.
+- **Verify before acting.** Nothing Windlass decides about downloads rests on
+  state saved before a restart: recent downloads come from qBittorrent's added
+  times, each torrent's flags from a lookup by ID just before it is downloaded,
+  and the freeleech of each running download from the watch below.
 
 ## Admission: from bookmark to download
 
@@ -129,16 +136,37 @@ only when all of these hold:
 4. qBittorrent is reachable, at an allowed version, and listed by MAM as an
    authorized client (A5). Downloads are not disabled (A10).
 5. An unsatisfied slot is free after the reserve, by MAM's count (A2).
-6. The download costs no ratio (principle 2):
-   - a VIP torrent while MAM reports the account as VIP, without a wedge;
-   - any other torrent, including one that is freeleech site-wide, with a
-     wedge, so that freeleech cannot end mid-download.
-   If no wedge is available, a VIP torrent may wait for VIP to be bought; any
-   other torrent stays queued and the owner is told.
+6. The download costs no ratio (principle 2), judged from the torrent as MAM
+   lists it now, looked up by its ID within the last 5 minutes:
+   - no wedge for a torrent that is freeleech for everyone (the owner decided on
+     2026-10-25 not to wedge torrents that are already free), a personal
+     freeleech, or a VIP torrent while it and the account stay VIP for at least
+     the next 5 minutes;
+   - a wedge for any other torrent, unless the bonus history, read within the
+     last 5 minutes and after any earlier attempt, shows one already spent.
+   If no wedge is available, the torrent stays queued and the owner is told. A
+   torrent MAM no longer lists is skipped, and one MAM now reports snatched
+   waits for the owner like any snatched bookmark.
 7. Disk space suffices for the full size (Direction, B-0001).
 
 The torrent is then downloaded, added to qBittorrent whole, and seeded
-indefinitely. It is removed only by the owner's cleanup permission, once A3 is
+indefinitely.
+
+### Running downloads stay free
+
+Freeleech for everyone and VIP status can end while a torrent downloads. So
+every unfinished download Windlass added, and every one added in the last hour,
+must be shown free for the owner: by a wedge in the bonus history, which lasts,
+or by a lookup in the last 5 minutes. One that is free only for now is looked up
+again every 5 minutes. When a download is no longer free, Windlass spends a
+wedge on it, with a fresh count of wedges; with none left, or when MAM no longer
+lists it, it stops the torrent and tells the owner, and resumes it once it is
+free again. A wedged download whose wedge the next bonus history read does not
+show is stopped and reported, and never wedged twice. A download that finished
+before Windlass could show it free is reported, not stopped, since stopping would
+only stop seeding. This runs at startup too, so it needs no saved state. MAM's
+site-wide freeleech carries no end time in the captured responses, so up to 5
+minutes of a download could fall after freeleech ends. It is removed only by the owner's cleanup permission, once A3 is
 satisfied and space is needed.
 
 When a gate holds a torrent, the dashboard names the gate and MAM's value
@@ -169,9 +197,10 @@ Agreed with the owner. Windlass reads the points balance, class, VIP expiry, and
 ratio from Load User Data, and never spends below the points reserve. In order of
 priority:
 
-1. **Wedge every download that is not freeleech for the owner.** A VIP torrent
-   while the account is VIP, a torrent MAM reports as a personal freeleech, and
-   a torrent Windlass has already wedged get no wedge. Wedges cannot be bought
+1. **Wedge every download that is not freeleech for the owner.** A torrent
+   freeleech for everyone, a VIP torrent while the account is VIP, a torrent MAM
+   reports as a personal freeleech, and a torrent already wedged get no wedge; a
+   running download whose freeleech ends gets one then. Wedges cannot be bought
    through the API, so they are spent only here, and none left means the
    torrent waits and the owner is told.
 2. **Keep VIP.** VIP makes VIP torrents freeleech and so saves wedges, while
@@ -205,7 +234,10 @@ New notification conditions, using B-0002's grace periods:
 | MAM reports a notification for the account, as a count without its text | Immediately; urgent for `aboutToDropClient` |
 | MAM reports a partial download, duplicate peers, tracker errors, or another red category | Immediately |
 | A torrent MAM counts as unsatisfied is not seeding (`inactUnsat`, `inactHnr`) | 30 minutes |
-| A wedged download did not lower the wedge balance; the torrent is paused | Immediately |
+| A wedged download's wedge is missing from the bonus history; the torrent is stopped | Immediately |
+| A running download is no longer free and no wedge can be spent; it is stopped | Immediately |
+| A wedge was spent on a running download whose freeleech ended | Immediately |
+| A download finished before Windlass could show it free | Immediately |
 | The MAM session was rejected (expired cookie or ASN mismatch) | Immediately |
 | Visit MAM: keep the account active and check announcements (A9, A5); links to MAM's main page, not the dashboard | Weekly |
 

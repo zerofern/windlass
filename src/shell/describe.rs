@@ -7,9 +7,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::core::{
     Action, ByteSize, ClientStanding, DeliveryFailure, Event, ExitIpFailure, Findings,
     HistoryEvent, Hold, IpFinding, MamEvent, MamFailure, MamPauseEvent, MamReply, MamRequest,
-    MamRequestMode, MappingFailure, NotificationEvent, PortFinding, PortForwardingEvent, Purchase,
-    QbittorrentEvent, QbittorrentFailure, Registration, RegistryEvent, SessionRejection,
-    SettingsEvent, StartupEvent, StartupMode, TimerName, TorrentCommand, TunnelEvent,
+    MamRequestMode, MappingFailure, NotificationEvent, PersonalFreeleech, PortFinding,
+    PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure, Registration,
+    RegistryEvent, SessionRejection, SettingsEvent, StartupEvent, StartupMode, TimerName,
+    TorrentCommand, TunnelEvent,
 };
 
 /// History categories, used for filtering.
@@ -245,6 +246,9 @@ fn mam_request(request: &MamRequest) -> String {
         ),
         MamRequest::Buy(bought) => format!("Buy {}", purchase(*bought)),
         MamRequest::WedgeHistory => String::from("Read the wedges spent, from MAM's bonus history"),
+        MamRequest::LookUpTorrent { id } => {
+            format!("Look up MAM torrent {} as it is now", id.get())
+        }
     }
 }
 
@@ -295,6 +299,23 @@ fn mam(event: &MamEvent) -> String {
                 Ok(MamReply::Purchased { points }) => {
                     format!("Purchase made; {points} points left")
                 }
+                Ok(MamReply::Torrent(Some(listing))) => format!(
+                    "MAM torrent {} looked up: {}{}{}{}",
+                    listing.id.get(),
+                    if listing.free { "freeleech, " } else { "" },
+                    if listing.vip { "VIP, " } else { "" },
+                    match listing.personal {
+                        PersonalFreeleech::No => "not free for you",
+                        PersonalFreeleech::ThroughVip => "free for you through VIP",
+                        PersonalFreeleech::ThroughWedge => "free for you through a wedge",
+                    },
+                    if listing.snatched {
+                        ", snatched before"
+                    } else {
+                        ""
+                    }
+                ),
+                Ok(MamReply::Torrent(None)) => String::from("MAM no longer lists the torrent"),
                 Ok(MamReply::WedgeHistory(spent)) => {
                     format!("Bonus history read: {} wedges spent", spent.len())
                 }
@@ -1299,6 +1320,43 @@ mod tests {
                 }))),
                 answered(Ok(MamReply::Purchased { points: Points(2) })),
                 answered(Ok(MamReply::WedgeHistory(Vec::new()))),
+                answered(Ok(MamReply::Torrent(None))),
+                answered(Ok(MamReply::Torrent(Some(Box::new(
+                    crate::core::Bookmark {
+                        id: torrent,
+                        title: String::from("Synthetic"),
+                        vip: true,
+                        free: true,
+                        personal: crate::core::PersonalFreeleech::ThroughWedge,
+                        snatched: true,
+                        vip_expires: None,
+                        bookmarked_at: None,
+                    },
+                ))))),
+                answered(Ok(MamReply::Torrent(Some(Box::new(
+                    crate::core::Bookmark {
+                        id: torrent,
+                        title: String::from("Synthetic"),
+                        vip: false,
+                        free: false,
+                        personal: crate::core::PersonalFreeleech::ThroughVip,
+                        snatched: false,
+                        vip_expires: None,
+                        bookmarked_at: None,
+                    },
+                ))))),
+                answered(Ok(MamReply::Torrent(Some(Box::new(
+                    crate::core::Bookmark {
+                        id: torrent,
+                        title: String::from("Synthetic"),
+                        vip: false,
+                        free: false,
+                        personal: crate::core::PersonalFreeleech::No,
+                        snatched: false,
+                        vip_expires: None,
+                        bookmarked_at: None,
+                    },
+                ))))),
                 MamEvent::PurchaseChecked { made: true },
                 MamEvent::PurchaseChecked { made: false },
                 MamEvent::Answered {
@@ -1405,6 +1463,7 @@ mod tests {
                 MamRequest::Buy(upload),
                 MamRequest::Buy(Purchase::Vip),
                 MamRequest::WedgeHistory,
+                MamRequest::LookUpTorrent { id: torrent },
             ]
             .map(|request| Action::MamRequest {
                 request,

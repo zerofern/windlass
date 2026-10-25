@@ -42,6 +42,11 @@ pub enum MamRequest {
     Buy(Purchase),
     /// Read the wedges spent on personal freeleech, from User Bonus History.
     WedgeHistory,
+    /// Look one torrent up by its ID, for its flags as MAM reports them now.
+    LookUpTorrent {
+        /// The torrent.
+        id: MamTorrentId,
+    },
 }
 
 impl MamRequest {
@@ -356,6 +361,8 @@ pub enum MamReply {
     },
     /// Wedges spent on personal freeleech, newest first.
     WedgeHistory(Vec<WedgeSpent>),
+    /// A torrent looked up by its ID; `None` when MAM does not list it.
+    Torrent(Option<Box<Bookmark>>),
 }
 
 /// A wedge spent to make a torrent a personal freeleech, as User Bonus History

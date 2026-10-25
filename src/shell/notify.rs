@@ -615,6 +615,30 @@ pub(super) fn message(notice: &Notice) -> Message {
             4,
             "warning",
         ),
+        Notice::DownloadNotFree { stopped: true } => at_mam(
+            "Download stopped",
+            String::from(
+                "A download is no longer free for you, and no wedge could be spent on it, so Windlass stopped it to protect the ratio. It resumes if it becomes free or a wedge is available.",
+            ),
+            4,
+            "warning",
+        ),
+        Notice::DownloadNotFree { stopped: false } => at_mam(
+            "Download may have cost ratio",
+            String::from(
+                "A download finished before Windlass could confirm it was free for you. Check your ratio on MAM.",
+            ),
+            4,
+            "warning",
+        ),
+        Notice::WedgedMidDownload => at_mam(
+            "Wedge spent on a running download",
+            String::from(
+                "A download's freeleech ended before it finished, so Windlass spent a wedge on it.",
+            ),
+            2,
+            "white_check_mark",
+        ),
         Notice::PurchaseSettled {
             purchase: wanted,
             made,
@@ -894,6 +918,9 @@ mod tests {
             Notice::PurchaseNeedsChecking {
                 purchase: Purchase::Vip,
             },
+            Notice::DownloadNotFree { stopped: true },
+            Notice::DownloadNotFree { stopped: false },
+            Notice::WedgedMidDownload,
             Notice::NotConnectable {
                 findings: crate::core::Findings {
                     listen_port: crate::core::PortFinding::NoForwardedPort,

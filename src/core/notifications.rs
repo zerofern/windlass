@@ -282,6 +282,14 @@ pub enum Notice {
     },
     /// A download's wedge was not spent, so the torrent is stopped.
     WedgeNotSpent,
+    /// A running download is no longer free for the owner.
+    DownloadNotFree {
+        /// Whether Windlass stopped it: no wedge was left, or MAM no longer
+        /// lists it. Otherwise it finished before Windlass could tell.
+        stopped: bool,
+    },
+    /// A running download's freeleech ended, so Windlass spent a wedge on it.
+    WedgedMidDownload,
     /// An uncertain purchase was settled, from the next reading or by the owner.
     PurchaseSettled {
         /// What Windlass tried to buy.

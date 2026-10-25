@@ -113,12 +113,17 @@ Windlass saves it and uses it from then on.
   "Download again". It admits
   the oldest queued torrent once the seedbox is confirmed, qBittorrent is ready,
   the account was read in the last five minutes, the ratio is at least 2.0, and an
-  unsatisfied slot is free after a reserve of two, and MAM's client list shows the
-  running qBittorrent (or lists nothing yet). A torrent is downloaded with a
-  freeleech wedge unless it is already a personal freeleech, or a VIP torrent while
-  the account is VIP. The next account reading must show the wedge spent, or MAM's
-  bonus history must list it; if neither does, the torrent is stopped and you are
-  told.
+  unsatisfied slot is free after a reserve of two, counting downloads qBittorrent
+  added in the last hour, and MAM's client list shows the running qBittorrent (or
+  lists nothing yet). Just before downloading, Windlass looks the torrent up on MAM
+  again. It spends a wedge only when the torrent is not already free for you
+  (freeleech for everyone, a personal freeleech, or VIP while you are VIP) and
+  MAM's bonus history shows none spent on it; afterwards the history must list
+  the wedge, or the torrent is stopped and you are told.
+- Every running download must stay free for you. When its freeleech or VIP ends,
+  Windlass spends a wedge on it; with none left, it stops the torrent and tells
+  you, and resumes it once it is free again. After a restart, Windlass checks all
+  of this with MAM and qBittorrent before downloading anything.
 - When MAM cannot reach qBittorrent, Windlass checks the listen port, the forwarded
   port, the IP MAM sees, and the seedbox registration, renews the lease, and
   registers again when allowed. If MAM still cannot reach it 30 minutes later, you

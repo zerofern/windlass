@@ -23,8 +23,8 @@ pub use account::{
     VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
 };
 pub use acquisition::{
-    Acquisition, BOOKMARKS_EVERY, Bookmarks, Hold, Listed, MAX_BOOKMARK_PAGES, RECENT_ADMISSION,
-    UnsureWedge, WedgeCheck,
+    Acquisition, BOOKMARKS_EVERY, Bookmarks, DownloadWatch, HISTORY_FRESH_FOR, Hold,
+    LOOKUP_FRESH_FOR, Listed, Lookup, MAX_BOOKMARK_PAGES, RECENT_ADMISSION, WedgeHistory,
 };
 pub use api::{
     Asn, Bookmark, BookmarkPage, Connectable, FetchedTorrent, IpObservation, ListedClient,
@@ -344,26 +344,35 @@ impl Mam {
                 Vec::new()
             }
             (MamRequest::LoadUserData { .. }, Ok(MamReply::UserData(data))) if current => {
-                self.acquisition.check_wedges(&data);
                 if let Some((purchase, PurchaseOutcome::Settled { made, .. })) =
                     self.account.read(now.monotonic, now.wall, *data)
                 {
                     self.notices
                         .push(Notice::PurchaseSettled { purchase, made });
                 }
-                Vec::new()
+                self.follow_downloads(now, registry)
             }
             (MamRequest::WedgeHistory, Ok(MamReply::WedgeHistory(spent))) if current => {
-                match (self.acquisition.history(&spent), registry.records_mut()) {
-                    (Some(hash), Some(records)) => {
-                        self.notices.push(Notice::WedgeNotSpent);
-                        records.hold(now.monotonic, &hash)
-                    }
-                    _ => Vec::new(),
-                }
+                self.acquisition.history_read(now.monotonic, &spent);
+                self.follow_downloads(now, registry)
             }
             (MamRequest::WedgeHistory, Err(_)) if current => {
-                self.acquisition.history_failed = Some(now.monotonic);
+                self.acquisition.history_failed(now.monotonic);
+                Vec::new()
+            }
+            (MamRequest::LookUpTorrent { id }, Ok(MamReply::Torrent(listing))) if current => {
+                let snatched = listing.as_ref().is_some_and(|listing| listing.snatched);
+                self.acquisition
+                    .looked_up(now.monotonic, *id, listing.map(|listing| *listing));
+                let mut actions = match registry.records_mut() {
+                    Some(records) if snatched => records.snatched(now.monotonic, *id),
+                    _ => Vec::new(),
+                };
+                actions.extend(self.follow_downloads(now, registry));
+                actions
+            }
+            (MamRequest::LookUpTorrent { .. }, Err(_)) if current => {
+                self.acquisition.lookup_failed(now.monotonic);
                 Vec::new()
             }
             (MamRequest::LoadUserData { .. }, Err(failure)) if current => {
@@ -451,39 +460,32 @@ impl Mam {
         registry: &mut Registry,
     ) -> Vec<Action> {
         self.acquisition.fetching = None;
+        // Only a loaded registry has rows to fetch for.
+        let queued = registry.records_mut().is_some_and(|records| {
+            records
+                .find_mam(id)
+                .is_some_and(|record| record.desired == Desired::Queued)
+        });
         match result {
-            Ok(MamReply::Fetched(fetched)) => {
-                // A fetch follows a fresh reading and a settled check.
-                self.acquisition.unsure_wedge = None;
-                self.acquisition.wedge_check =
-                    self.account
-                        .data()
-                        .filter(|_| wedge)
-                        .map(|data| WedgeCheck {
-                            expected: data.wedges.saturating_sub(1),
-                            hash: fetched.hash.clone(),
-                            id,
-                            fetched: now.wall,
-                            confirming: false,
-                        });
-                registry
-                    .records_mut()
-                    .map(|records| records.fetched(now.monotonic, id, fetched.hash))
-                    .unwrap_or_default()
+            // A queued torrent becomes a download.
+            Ok(MamReply::Fetched(fetched)) if queued => registry
+                .records_mut()
+                .map(|records| records.fetched(now.monotonic, id, fetched.hash))
+                .unwrap_or_default(),
+            // A running download was wedged because its freeleech ended; the
+            // bonus history must show the wedge before it counts.
+            Ok(MamReply::Fetched(_)) => {
+                if wedge {
+                    self.notices.push(Notice::WedgedMidDownload);
+                }
+                self.follow_downloads(now, registry)
             }
             Err(MamFailure::Refused { .. }) => {
                 self.acquisition.refused = Some(now.wall);
                 Vec::new()
             }
-            // MAM may have spent the wedge; User Bonus History shows whether.
-            Err(failure) if wedge && failure.uncertain() => {
-                self.acquisition.unsure_wedge = Some(UnsureWedge {
-                    id,
-                    at: now.wall,
-                    spent: None,
-                });
-                Vec::new()
-            }
+            // A lost answer may have spent a wedge; the bonus history shows
+            // whether before another is spent.
             Err(_) | Ok(_) => Vec::new(),
         }
     }
@@ -542,6 +544,24 @@ impl Mam {
             .cloned();
         self.client = self.account.client_standing(context.client_version);
         self.follow_connectability(now, context);
+        let records = match context.registry {
+            Registry::Loaded(records) => Some(records),
+            _ => None,
+        };
+        let recent = records.map_or(0, |records| {
+            records
+                .downloads()
+                .filter(|download| acquisition::recent(download, now.wall))
+                .count()
+        });
+        self.acquisition.watched = records.map_or_else(Vec::new, |records| {
+            self.acquisition.watch_all(
+                records.downloads(),
+                self.account.data(),
+                now.monotonic,
+                now.wall,
+            )
+        });
         let facts = Facts {
             now: now.monotonic,
             wall: now.wall,
@@ -549,21 +569,27 @@ impl Mam {
             seedbox_confirmed: self.seedbox.confirms(observed.as_ref()),
             client_ready: context.client_ready,
             client: self.client,
+            recent: u32::try_from(recent).unwrap_or(u32::MAX),
             account: &self.account,
         };
-        let next = match context.registry {
-            Registry::Loaded(records) => self.acquisition.next(records.queued(), facts),
-            _ => Next::Idle,
-        };
+        let next = records.map_or(Next::Idle, |records| {
+            self.acquisition.next(records.queued(), facts)
+        });
+        let watching = self.acquisition.watch_next(&self.account, now.monotonic);
         self.acquisition.hold = match next {
             Next::Hold(hold) => Some(hold),
             Next::NeedReading if self.account.reading.is_none() => Some(Hold::AccountUnknown),
             _ => None,
         };
-        // A wedged download is checked at the next reading, which comes early.
-        let early = next == Next::NeedReading || self.acquisition.wedge_check.is_some();
+        let early = next == Next::NeedReading || watching == Next::NeedReading;
         if available && self.outstanding.is_none() {
-            let wanted = self.wanted(now, cookie.is_some(), context.reserve, next, early);
+            let wanted = self.wanted(
+                now,
+                cookie.is_some(),
+                context.reserve,
+                (watching, next),
+                early,
+            );
             match (wanted, &cookie) {
                 (Some(Wanted::Register), Some(cookie)) if self.budget.take(now.monotonic) => {
                     self.outstanding = Some(Outstanding::SavingRegistration {
@@ -580,7 +606,13 @@ impl Mam {
                             self.account.buying(*purchase, now.monotonic, now.wall);
                         }
                         MamRequest::FetchTorrent { id, wedge } => {
-                            self.acquisition.fetching(now.monotonic, *id, *wedge);
+                            let admitted = records.is_some_and(|records| {
+                                records
+                                    .find_mam(*id)
+                                    .is_some_and(|record| record.desired == Desired::Queued)
+                            });
+                            self.acquisition
+                                .fetching(now.monotonic, *id, *wedge, admitted);
                         }
                         _ => {}
                     }
@@ -602,6 +634,59 @@ impl Mam {
     /// Whether a new forwarded-port lease is wanted, once.
     pub(super) const fn take_lease_renewal(&mut self) -> bool {
         std::mem::replace(&mut self.renew_lease, false)
+    }
+
+    /// Apply what Windlass knows about each running download it added: a
+    /// download shown free runs; one that is not free and cannot be wedged
+    /// stops, and the owner is told once.
+    fn follow_downloads(&mut self, now: ClockReading, registry: &mut Registry) -> Vec<Action> {
+        let Some(records) = registry.records_mut() else {
+            return Vec::new();
+        };
+        let watched = self.acquisition.watch_all(
+            records.downloads(),
+            self.account.data(),
+            now.monotonic,
+            now.wall,
+        );
+        let no_wedges = self.account.data().is_some_and(|data| data.wedges == 0);
+        let mut actions = Vec::new();
+        for (download, watch) in &watched {
+            let notice = match *watch {
+                DownloadWatch::Wedged | DownloadWatch::FreeForNow => {
+                    if download.held {
+                        actions.extend(records.resume(now.monotonic, &download.hash));
+                    }
+                    self.acquisition.reported.remove(&download.mam);
+                    None
+                }
+                DownloadWatch::NotFree {
+                    wedge_missing: true,
+                    ..
+                } => Some(Notice::WedgeNotSpent),
+                DownloadWatch::NotFree { .. } if download.finished => {
+                    Some(Notice::DownloadNotFree { stopped: false })
+                }
+                DownloadWatch::NotFree { listed, .. } if !listed || no_wedges => {
+                    Some(Notice::DownloadNotFree { stopped: true })
+                }
+                // Waiting for MAM, or a wedge is spent on it next.
+                DownloadWatch::NeedLookup
+                | DownloadWatch::NeedHistory
+                | DownloadWatch::NotFree { .. } => None,
+            };
+            let Some(notice) = notice else {
+                continue;
+            };
+            if !download.finished && !download.held {
+                actions.extend(records.hold(now.monotonic, &download.hash));
+            }
+            if self.acquisition.reported.insert(download.mam) {
+                self.notices.push(notice);
+            }
+        }
+        self.acquisition.watched = watched;
+        actions
     }
 
     /// When MAM cannot reach qBittorrent, check the connection, ask for a new
@@ -644,13 +729,14 @@ impl Mam {
         summary || client
     }
 
-    /// The most urgent request wanted now.
+    /// The most urgent request wanted now: the watch over running downloads
+    /// before purchases, and admission after them.
     fn wanted(
         &self,
         now: ClockReading,
         cookie: bool,
         reserve: Option<Points>,
-        next: Next,
+        (watching, next): (Next, Next),
         early: bool,
     ) -> Option<Wanted> {
         if self.network.due(now.monotonic) {
@@ -665,8 +751,8 @@ impl Mam {
         if let Some(client_stats) = self.account.wanted(now.monotonic, early) {
             return Some(Wanted::Request(MamRequest::LoadUserData { client_stats }));
         }
-        if self.acquisition.history_wanted(now.monotonic) {
-            return Some(Wanted::Request(MamRequest::WedgeHistory));
+        if let Some(request) = acquisition_request(watching) {
+            return Some(Wanted::Request(request));
         }
         if let Some(purchase) = reserve.and_then(|reserve| {
             self.account
@@ -674,8 +760,8 @@ impl Mam {
         }) {
             return Some(Wanted::Request(MamRequest::Buy(purchase)));
         }
-        if let Next::Fetch { id, wedge } = next {
-            return Some(Wanted::Request(MamRequest::FetchTorrent { id, wedge }));
+        if let Some(request) = acquisition_request(next) {
+            return Some(Wanted::Request(request));
         }
         self.acquisition
             .bookmarks
@@ -759,7 +845,7 @@ impl Mam {
             registration,
             self.account.next_due(early),
             self.acquisition.bookmarks.next_due(),
-            self.acquisition.history_due(),
+            self.acquisition.next_due(),
             self.budget.next_token(now.monotonic),
         ]
         .into_iter()
@@ -784,6 +870,16 @@ impl Mam {
             id,
             deadline,
         }]
+    }
+}
+
+/// The request bookmark acquisition or the watch over downloads wants.
+const fn acquisition_request(next: Next) -> Option<MamRequest> {
+    match next {
+        Next::Fetch { id, wedge } => Some(MamRequest::FetchTorrent { id, wedge }),
+        Next::LookUp(id) => Some(MamRequest::LookUpTorrent { id }),
+        Next::NeedHistory => Some(MamRequest::WedgeHistory),
+        Next::Idle | Next::NeedReading | Next::Hold(_) => None,
     }
 }
 

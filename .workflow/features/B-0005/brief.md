@@ -57,7 +57,8 @@ Acceptance:
   admitted in the last hour count against the unsatisfied limit until MAM's count
   catches up. The fetched file must be a valid torrent; it is kept in SQLite, the
   registry row is linked to its info hash as *Active*, and the file is then added
-  to qBittorrent. A refused download closes the gate until restart or a new cookie.
+  to qBittorrent. Just before each download the torrent is looked up on MAM by
+  its ID, so its flags are current; see B-0011's admission order. A refused download closes the gate until restart or a new cookie.
 
 Proposed ordering, pending agreement:
 

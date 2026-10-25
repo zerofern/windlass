@@ -136,6 +136,21 @@ pub enum Desired {
     Removed,
 }
 
+/// A download Windlass added, as the guard over running downloads sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Download {
+    /// The torrent on MAM.
+    pub mam: MamTorrentId,
+    /// Its info hash.
+    pub hash: TorrentHash,
+    /// Whether Windlass keeps it stopped.
+    pub held: bool,
+    /// Whether qBittorrent reports it complete.
+    pub finished: bool,
+    /// When qBittorrent added it; unknown until qBittorrent lists it.
+    pub added_at: Option<SystemTime>,
+}
+
 /// What qBittorrent last reported about a torrent, and when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Observation {
@@ -331,6 +346,25 @@ impl Records {
         self.entries.get(id).map(|entry| &entry.record)
     }
 
+    /// Downloads Windlass added from MAM, wanted running or held.
+    pub fn downloads(&self) -> impl Iterator<Item = Download> + '_ {
+        self.records().filter_map(|record| {
+            let Identity::Linked { mam, hash } = &record.identity else {
+                return None;
+            };
+            let seen = record.observation.as_ref().map(|seen| &seen.torrent);
+            (matches!(record.desired, Desired::Active | Desired::Held)
+                && record.origin != Origin::Adopted)
+                .then(|| Download {
+                    mam: *mam,
+                    hash: hash.clone(),
+                    held: record.desired == Desired::Held,
+                    finished: seen.is_some_and(|torrent| torrent.completed_at.is_some()),
+                    added_at: seen.and_then(|torrent| torrent.added_at),
+                })
+        })
+    }
+
     /// Queued torrents, oldest first.
     pub fn queued(&self) -> impl Iterator<Item = MamTorrentId> + '_ {
         self.records()
@@ -420,6 +454,32 @@ impl Records {
         // Only a queued row is fetched, so the MAM ID has a row.
         if let Some(&id) = self.by_mam.get(&mam) {
             self.link(id, mam, hash);
+        }
+        self.save(now)
+    }
+
+    /// A queued bookmark MAM now reports snatched before waits for the owner.
+    pub(super) fn snatched(&mut self, now: Instant, mam: MamTorrentId) -> Vec<Action> {
+        let id = self.by_mam.get(&mam).copied().filter(|id| {
+            self.entries.get(id).is_some_and(|entry| {
+                entry.record.desired == Desired::Queued && entry.record.origin == Origin::Bookmark
+            })
+        });
+        if let Some(id) = id {
+            self.set_desired(id, Desired::Snatched);
+        }
+        self.save(now)
+    }
+
+    /// Let a held torrent run again.
+    pub(super) fn resume(&mut self, now: Instant, hash: &TorrentHash) -> Vec<Action> {
+        let id = self.by_hash.get(hash).copied().filter(|id| {
+            self.entries
+                .get(id)
+                .is_some_and(|entry| entry.record.desired == Desired::Held)
+        });
+        if let Some(id) = id {
+            self.set_desired(id, Desired::Active);
         }
         self.save(now)
     }

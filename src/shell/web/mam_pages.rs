@@ -7,9 +7,9 @@ use maud::{Markup, html};
 
 use crate::{
     core::{
-        Attention, Connectability, Connectable, LastAttempt, Mam, MamSession, Points,
-        PurchaseOutcome, PurchaseRecord, RegistrationAllowance, RegistrationFailure, SeedboxStatus,
-        SettingsState, SettledBy, UPLOAD_BUFFER,
+        Attention, Connectability, Connectable, DownloadWatch, LastAttempt, Mam, MamSession,
+        Points, PurchaseOutcome, PurchaseRecord, RegistrationAllowance, RegistrationFailure,
+        SeedboxStatus, SettingsState, SettledBy, UPLOAD_BUFFER,
     },
     shell::describe::{client_standing, findings, gib, hold, mam_failure, purchase, rejection},
 };
@@ -313,8 +313,32 @@ fn bookmarks_panel(mam: &Mam) -> Markup {
                     dt { "Downloading" }
                     dd { "MAM torrent " (id.get()) @if wedge { ", spending a wedge" } }
                 }
+                @if !acquisition.watched.is_empty() {
+                    dt { "Running downloads" }
+                    dd {
+                        @for (index, (download, watch)) in acquisition.watched.iter().enumerate() {
+                            @if index > 0 { br; }
+                            "MAM torrent " (download.mam.get()) ": " (download_watch(*watch))
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+/// What Windlass knows about a running download it added.
+const fn download_watch(watch: DownloadWatch) -> &'static str {
+    match watch {
+        DownloadWatch::Wedged => "a wedge makes it free for you",
+        DownloadWatch::FreeForNow => "free for you now; checked again every 5 minutes",
+        DownloadWatch::NeedLookup | DownloadWatch::NeedHistory => "being checked with MAM",
+        DownloadWatch::NotFree {
+            wedge_missing: true,
+            ..
+        } => "stopped: MAM's bonus history shows no wedge spent on it",
+        DownloadWatch::NotFree { listed: false, .. } => "stopped: MAM no longer lists it",
+        DownloadWatch::NotFree { .. } => "not free for you; a wedge is spent if one is left",
     }
 }
 
@@ -433,6 +457,59 @@ mod tests {
                 ..MamNotices::default()
             }),
             clients: Some(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn running_downloads_are_shown_with_what_windlass_knows() {
+        use crate::core::{Download, DownloadWatch, TorrentHash};
+
+        let mut mam = Mam::default();
+        let hash = TorrentHash::parse(&"a".repeat(40));
+        let watches = [
+            DownloadWatch::Wedged,
+            DownloadWatch::FreeForNow,
+            DownloadWatch::NeedLookup,
+            DownloadWatch::NotFree {
+                wedge_missing: true,
+                listed: true,
+            },
+            DownloadWatch::NotFree {
+                wedge_missing: false,
+                listed: false,
+            },
+            DownloadWatch::NotFree {
+                wedge_missing: false,
+                listed: true,
+            },
+        ];
+        mam.acquisition.watched = MamTorrentId::new(5)
+            .zip(hash)
+            .into_iter()
+            .flat_map(|(id, hash)| {
+                watches.map(|watch| {
+                    let download = Download {
+                        mam: id,
+                        hash: hash.clone(),
+                        held: false,
+                        finished: false,
+                        added_at: None,
+                    };
+                    (download, watch)
+                })
+            })
+            .collect();
+        let html = render(&mam, true);
+        for text in [
+            "Running downloads",
+            "a wedge makes it free for you",
+            "checked again every 5 minutes",
+            "being checked with MAM",
+            "shows no wedge spent",
+            "no longer lists it",
+            "a wedge is spent if one is left",
+        ] {
+            assert!(html.contains(text), "{text}: {html}");
         }
     }
 

@@ -173,6 +173,12 @@ fn build(client: &Client, request: &MamRequest) -> reqwest::RequestBuilder {
             };
             client.http.get(url)
         }
+        MamRequest::LookUpTorrent { id } => {
+            let mut url = client.search.clone();
+            url.query_pairs_mut()
+                .append_pair("tor[id]", &id.get().to_string());
+            client.http.get(url)
+        }
         MamRequest::WedgeHistory => {
             let mut url = client.bonus_history.clone();
             url.query_pairs_mut().append_pair("type[]", "wedgePF");
@@ -232,6 +238,16 @@ fn interpret(
             json().and_then(|value| understood(bookmarks(&value).map(MamReply::Bookmarks)))
         }
         MamRequest::Buy(_) => json().and_then(|value| purchase(&value)),
+        MamRequest::LookUpTorrent { id } => json().and_then(|value| {
+            understood(bookmarks(&value).map(|page| {
+                MamReply::Torrent(
+                    page.bookmarks
+                        .into_iter()
+                        .find(|listing| listing.id == *id)
+                        .map(Box::new),
+                )
+            }))
+        }),
         MamRequest::WedgeHistory => {
             json().and_then(|value| understood(wedge_history(&value).map(MamReply::WedgeHistory)))
         }
@@ -834,6 +850,23 @@ mod tests {
             }))
         );
 
+        // One torrent is looked up by its ID, as MAM lists it now.
+        let answer = ask(&client, MamRequest::LookUpTorrent { id: BOOK_ID }, &cookie).await;
+        assert_eq!(
+            answer.result,
+            Ok(MamReply::Torrent(Some(Box::new(bookmark(
+                BOOK_ID,
+                "Synthetic Book"
+            )))))
+        );
+        let answer = ask(
+            &client,
+            MamRequest::LookUpTorrent { id: UNKNOWN_ID },
+            &cookie,
+        )
+        .await;
+        assert_eq!(answer.result, Ok(MamReply::Torrent(None)));
+
         let request = MamRequest::FetchTorrent {
             id: BOOK_ID,
             wedge: true,
@@ -917,6 +950,18 @@ mod tests {
                     "snatch_summary=true&notif=true"
                 ),
                 (Host::Site, "POST", "/tor/js/loadSearchJSONbasic.php", ""),
+                (
+                    Host::Site,
+                    "GET",
+                    "/tor/js/loadSearchJSONbasic.php",
+                    "tor%5Bid%5D=4242"
+                ),
+                (
+                    Host::Site,
+                    "GET",
+                    "/tor/js/loadSearchJSONbasic.php",
+                    "tor%5Bid%5D=1"
+                ),
                 (Host::Site, "GET", "/tor/download.php", "tid=4242&fl=1"),
                 (
                     Host::Site,
