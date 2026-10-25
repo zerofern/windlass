@@ -10,6 +10,8 @@ use super::{Asn, IpObservation, MamFailure, SessionRejection};
 
 /// How often the IP MAM sees is observed; MAM allows once a minute.
 pub const OBSERVE_EVERY: Duration = Duration::from_mins(5);
+/// MAM allows one IP lookup a minute.
+pub const LOOKUP_SPACING: Duration = Duration::from_mins(1);
 /// MAM allows one seedbox registration per rolling hour, whatever its result.
 pub const REGISTRATION_SPACING: Duration = Duration::from_hours(1);
 
@@ -85,6 +87,9 @@ pub struct Network {
     pub failures: u32,
     /// Why the latest lookup failed.
     pub last_failure: Option<MamFailure>,
+    /// When the latest lookup was sent, or when Windlass started, since a
+    /// previous run may have sent one moments before.
+    pub last_sent: Option<Instant>,
 }
 
 impl Network {
@@ -94,6 +99,7 @@ impl Network {
             next_lookup: None,
             failures: 0,
             last_failure: None,
+            last_sent: None,
         }
     }
 
@@ -106,8 +112,28 @@ impl Network {
             .map(|observed| &observed.observation)
     }
 
+    /// Whether a lookup is wanted now and MAM's spacing allows it.
     pub(super) fn due(&self, now: Instant) -> bool {
         self.next_lookup.is_none_or(|next| next <= now)
+            && self
+                .last_sent
+                .is_none_or(|sent| now.saturating_duration_since(sent) >= LOOKUP_SPACING)
+    }
+
+    /// When the next lookup may be sent; now when absent.
+    pub(super) fn next_due(&self) -> Option<Instant> {
+        let spaced = self
+            .last_sent
+            .and_then(|sent| sent.checked_add(LOOKUP_SPACING));
+        match (self.next_lookup, spaced) {
+            (Some(next), Some(spaced)) => Some(next.max(spaced)),
+            (next, spaced) => next.or(spaced),
+        }
+    }
+
+    /// A lookup was sent now, or Windlass started.
+    pub(super) const fn sent(&mut self, now: Instant) {
+        self.last_sent = Some(now);
     }
 
     pub(super) fn observed(&mut self, now: Instant, wall: SystemTime, observation: IpObservation) {

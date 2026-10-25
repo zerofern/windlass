@@ -1,6 +1,6 @@
 //! Run Windlass end to end against the fake MAM server (B-0012), a fake
-//! qBittorrent web UI, and a fake exit-IP service: from a pasted cookie to a
-//! registered seedbox, a VIP purchase, and a wedged bookmark in qBittorrent.
+//! qBittorrent web UI, and a fake exit-IP service, driven over its dashboard:
+//! the flows of `docs/flows.md`, tests E1 to E7.
 
 #[path = "support/fake_mam.rs"]
 #[allow(
@@ -49,14 +49,16 @@ const HOST: &str = "127.0.0.1:8740";
 const BOOK: u64 = 1001;
 const GIB: u64 = 1 << 30;
 
-/// A qBittorrent web UI that keeps the torrents Windlass adds.
+/// A qBittorrent web UI that keeps the torrents Windlass adds, each half
+/// downloaded and added just now.
 #[derive(Debug, Default)]
 struct FakeQbittorrent {
     torrents: BTreeMap<String, &'static str>,
-    /// The hash of the next torrent added, as the test knows it.
-    next_hash: Option<String>,
+    /// The hashes of the next torrents added, in order, as the test knows them.
+    next_hashes: Vec<String>,
     added: Vec<usize>,
     stopped: Vec<String>,
+    started: Vec<String>,
 }
 
 type SharedQbittorrent = Arc<Mutex<FakeQbittorrent>>;
@@ -84,6 +86,10 @@ async fn fake_qbittorrent(fake: SharedQbittorrent) -> TestResult<SocketAddr> {
             "/api/v2/sync/maindata",
             get(
                 |State(fake): State<SharedQbittorrent>, Query(rid): Query<Rid>| async move {
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|since| since.as_secs())
+                        .unwrap_or_default();
                     let torrents: serde_json::Map<String, Value> = fake
                         .lock()
                         .map(|fake| fake.torrents.clone())
@@ -93,7 +99,7 @@ async fn fake_qbittorrent(fake: SharedQbittorrent) -> TestResult<SocketAddr> {
                             let fields = json!({
                                 "name": "Synthetic Book", "state": state, "progress": 0.5,
                                 "size": GIB, "total_size": GIB, "completed": 0, "uploaded": 0,
-                                "ratio": 0.0, "seeding_time": 0, "added_on": 1_790_000_000,
+                                "ratio": 0.0, "seeding_time": 0, "added_on": now,
                                 "completion_on": -1, "content_path": "", "save_path": "/srv"
                             });
                             (hash, fields)
@@ -112,7 +118,8 @@ async fn fake_qbittorrent(fake: SharedQbittorrent) -> TestResult<SocketAddr> {
                 match fake.lock() {
                     Ok(mut fake) if torrent => {
                         fake.added.push(body.len());
-                        if let Some(hash) = fake.next_hash.take() {
+                        if !fake.next_hashes.is_empty() {
+                            let hash = fake.next_hashes.remove(0);
                             fake.torrents.insert(hash, "downloading");
                         }
                         StatusCode::OK
@@ -130,6 +137,21 @@ async fn fake_qbittorrent(fake: SharedQbittorrent) -> TestResult<SocketAddr> {
                         for hash in form.hashes.split('|') {
                             fake.stopped.push(hash.to_owned());
                             fake.torrents.insert(hash.to_owned(), "stoppedDL");
+                        }
+                    }
+                    StatusCode::OK
+                },
+            ),
+        )
+        .route(
+            "/api/v2/torrents/start",
+            post(
+                |State(fake): State<SharedQbittorrent>,
+                 axum::Form(form): axum::Form<Hashes>| async move {
+                    if let Ok(mut fake) = fake.lock() {
+                        for hash in form.hashes.split('|') {
+                            fake.started.push(hash.to_owned());
+                            fake.torrents.insert(hash.to_owned(), "downloading");
                         }
                     }
                     StatusCode::OK
@@ -162,7 +184,36 @@ struct Windlass {
 
 impl Windlass {
     async fn start(mam: &FakeMam, qbittorrent: SocketAddr) -> TestResult<Self> {
-        let directory = tempfile::tempdir()?;
+        Self::start_in(
+            tempfile::tempdir()?,
+            StartupMode::Initialise,
+            mam,
+            qbittorrent,
+        )
+        .await
+    }
+
+    /// Stop Windlass and start it again on the same storage.
+    async fn restart(self, mam: &FakeMam, qbittorrent: SocketAddr) -> TestResult<Self> {
+        let Self {
+            events,
+            runner,
+            _directory: directory,
+            ..
+        } = self;
+        events.shutdown().await?;
+        let _ = runner.await??;
+        let windlass = Self::start_in(directory, StartupMode::Resume, mam, qbittorrent).await?;
+        windlass.ready().await?;
+        Ok(windlass)
+    }
+
+    async fn start_in(
+        directory: tempfile::TempDir,
+        mode: StartupMode,
+        mam: &FakeMam,
+        qbittorrent: SocketAddr,
+    ) -> TestResult<Self> {
         let path: PathBuf = directory.path().join("windlass.sqlite");
         let exit_ip = fake_exit_ip().await?;
         let integrations = Integrations {
@@ -184,9 +235,7 @@ impl Windlass {
         let (runner, events, observations) = Runner::with_integrations(path.clone(), integrations);
         let runner = tokio::spawn(runner.run());
         events
-            .send(Event::Startup(StartupEvent::Start {
-                mode: StartupMode::Initialise,
-            }))
+            .send(Event::Startup(StartupEvent::Start { mode }))
             .await?;
         for event in enable {
             events.send(event).await?;
@@ -214,7 +263,7 @@ impl Windlass {
 
     async fn wait(&self, predicate: impl FnMut(&Observation) -> bool) -> TestResult<Observation> {
         let mut observations = self.observations.clone();
-        let seen = tokio::time::timeout(Duration::from_mins(1), async {
+        let seen = tokio::time::timeout(Duration::from_mins(3), async {
             observations
                 .wait_for(predicate)
                 .await
@@ -284,7 +333,7 @@ async fn a_pasted_cookie_leads_to_a_registered_seedbox_and_a_wedged_download() -
         world.account.uploaded = 80 * GIB;
     });
     let qbittorrent = Arc::new(Mutex::new(FakeQbittorrent {
-        next_hash: Some(book_hash.clone()),
+        next_hashes: vec![book_hash.clone()],
         ..FakeQbittorrent::default()
     }));
     let webui = fake_qbittorrent(Arc::clone(&qbittorrent)).await?;
@@ -435,5 +484,316 @@ async fn a_refused_session_is_reported_and_stops_requests() -> TestResult {
     let status = windlass.get("/").await?;
     assert!(status.contains("Session refused"), "{status}");
     assert!(status.contains("Not read yet"), "{status}");
+    windlass.stop().await
+}
+
+/// A fake qBittorrent that will report these torrents once Windlass adds them.
+fn qbittorrent_adding(hashes: Vec<String>) -> SharedQbittorrent {
+    Arc::new(Mutex::new(FakeQbittorrent {
+        next_hashes: hashes,
+        ..FakeQbittorrent::default()
+    }))
+}
+
+impl Windlass {
+    /// Name an ntfy topic, paste the cookie, and resume MAM requests, as the
+    /// owner does. ntfy does not answer here, so notices stay waiting.
+    async fn connect(&self) -> TestResult {
+        self.ready().await?;
+        assert_eq!(
+            self.post("/settings/ntfy-topic", "topic=windlass-test")
+                .await?,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            self.post("/settings/api-cookie", "cookie=fake-session")
+                .await?,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            self.post("/mam/resume", "next=%2F").await?,
+            StatusCode::SEE_OTHER
+        );
+        Ok(())
+    }
+
+    /// Wait until qBittorrent lists this torrent.
+    async fn in_qbittorrent(&self, hash: &str) -> TestResult<Observation> {
+        self.wait(|observation| match &observation.qbittorrent {
+            windlass::core::Qbittorrent::Connected(session) => {
+                session.torrents.keys().any(|known| known.as_str() == hash)
+            }
+            _ => false,
+        })
+        .await
+    }
+}
+
+/// The registry row for this MAM torrent.
+fn record(observation: &Observation, mam: u64) -> Option<windlass::core::TorrentRecord> {
+    match &observation.registry {
+        Registry::Loaded(records) => windlass::core::MamTorrentId::new(mam)
+            .and_then(|id| records.find_mam(id))
+            .cloned(),
+        _ => None,
+    }
+}
+
+/// Whether a notice is waiting to be sent; ntfy is unreachable in these tests.
+fn noticed(observation: &Observation, notice: &windlass::core::Notice) -> bool {
+    let notifications = &observation.notifications;
+    notifications.outbox.contains(notice)
+        || matches!(&notifications.delivery, windlass::core::Delivery::Sending(sending) if sending == notice)
+}
+
+/// Requests Windlass sent to MAM for this path, with their query strings.
+fn sent(mam: &FakeMam, path: &str) -> Vec<String> {
+    mam.journal()
+        .into_iter()
+        .filter(|request| request.path == path)
+        .map(|request| request.query)
+        .collect()
+}
+
+/// E3: a bookmark snatched before waits for the owner, and "Download again"
+/// downloads it.
+#[tokio::test]
+async fn a_snatched_bookmark_waits_until_the_owner_downloads_it_again() -> TestResult {
+    let mam = FakeMam::start().await?;
+    let mut book = Torrent::bookmarked("A Book Read Before", GIB);
+    book.snatched = true;
+    let hash = book.hash();
+    mam.with(|world| {
+        world.torrents.insert(BOOK, book);
+    });
+    let qbittorrent = qbittorrent_adding(vec![hash.clone()]);
+    let webui = fake_qbittorrent(Arc::clone(&qbittorrent)).await?;
+    let windlass = Windlass::start(&mam, webui).await?;
+    windlass.connect().await?;
+
+    let observation = windlass
+        .wait(|observation| {
+            record(observation, BOOK).is_some_and(|row| row.desired == Desired::Snatched)
+        })
+        .await?;
+    let row = record(&observation, BOOK).ok_or("no row")?;
+    let status = windlass.get("/").await?;
+    for text in [
+        "A Book Read Before",
+        "Snatched before, not downloaded",
+        "Download again",
+    ] {
+        assert!(status.contains(text), "{text}: {status}");
+    }
+    assert!(sent(&mam, "/tor/download.php").is_empty());
+
+    // The owner asks for it on the dashboard.
+    assert_eq!(
+        windlass
+            .post("/torrents/redownload", &format!("record={}", row.id.get()))
+            .await?,
+        StatusCode::SEE_OTHER
+    );
+    let observation = windlass.in_qbittorrent(&hash).await?;
+    assert_eq!(
+        record(&observation, BOOK).map(|row| (row.desired, row.origin)),
+        Some((Desired::Active, windlass::core::Origin::Redownload))
+    );
+    assert_eq!(
+        sent(&mam, "/tor/download.php"),
+        [format!("tid={BOOK}&fl=1")]
+    );
+    assert_eq!(mam.violations(), Vec::<String>::new());
+    windlass.stop().await
+}
+
+/// E4: a purchase whose answer is lost is settled by the owner on the
+/// dashboard, and upload credit is then bought.
+#[tokio::test]
+async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
+    let mam = FakeMam::start().await?;
+    mam.with(|world| {
+        // Little upload beyond downloads, so upload credit is wanted.
+        world.account.uploaded = 20 * GIB;
+        world.account.points = 100_000.5;
+        world.fail("/json/bonusBuy.php", fake_mam::Fault::Status(500), 1);
+    });
+    let webui = fake_qbittorrent(qbittorrent_adding(Vec::new())).await?;
+    let windlass = Windlass::start(&mam, webui).await?;
+    windlass.connect().await?;
+
+    let outcome = |observation: &Observation| {
+        observation
+            .mam
+            .account
+            .last_purchase
+            .as_ref()
+            .and_then(|purchase| purchase.outcome.clone())
+    };
+    windlass
+        .wait(|observation| outcome(observation) == Some(PurchaseOutcome::Uncertain))
+        .await?;
+    // MAM took points but shows no credit, so the next reading cannot tell.
+    mam.with(|world| world.account.points -= 25_000.0);
+    let observation = windlass
+        .wait(|observation| outcome(observation) == Some(PurchaseOutcome::Unresolved))
+        .await?;
+    assert!(noticed(
+        &observation,
+        &windlass::core::Notice::PurchaseNeedsChecking {
+            purchase: windlass::core::Purchase::Upload(windlass::core::UploadCredit::try_new(50)?),
+        }
+    ));
+    let status = windlass.get("/").await?;
+    assert!(status.contains("It went through"), "{status}");
+    assert_eq!(sent(&mam, "/json/bonusBuy.php").len(), 1);
+
+    // The owner checked on MAM: it did not go through, so it is bought again.
+    assert_eq!(
+        windlass.post("/mam/purchase/checked", "made=no").await?,
+        StatusCode::SEE_OTHER
+    );
+    windlass
+        .wait(|observation| matches!(outcome(observation), Some(PurchaseOutcome::Made(_))))
+        .await?;
+    assert_eq!(mam.with(|world| world.account.uploaded), Some(70 * GIB));
+    assert_eq!(sent(&mam, "/json/bonusBuy.php").len(), 2);
+    windlass.stop().await
+}
+
+/// E5, E6, E7: a download that is freeleech for everyone needs no wedge. Its
+/// freeleech ends; after a restart, the bookmark listing (not a lookup of its
+/// own) shows it, and Windlass wedges it, without registering again within
+/// the hour.
+#[tokio::test]
+async fn a_download_whose_freeleech_ends_is_wedged_after_a_restart() -> TestResult {
+    let mam = FakeMam::start().await?;
+    let mut book = Torrent::bookmarked("A Free Book", GIB);
+    book.free = true;
+    let hash = book.hash();
+    mam.with(|world| {
+        world.torrents.insert(BOOK, book);
+    });
+    let qbittorrent = qbittorrent_adding(vec![hash.clone()]);
+    let webui = fake_qbittorrent(Arc::clone(&qbittorrent)).await?;
+    let windlass = Windlass::start(&mam, webui).await?;
+    windlass.connect().await?;
+    windlass.in_qbittorrent(&hash).await?;
+    assert_eq!(sent(&mam, "/tor/download.php"), [format!("tid={BOOK}")]);
+    assert_eq!(mam.with(|world| world.account.wedges), Some(200));
+
+    // Freeleech ends while it downloads.
+    mam.with(|world| {
+        if let Some(book) = world.torrents.get_mut(&BOOK) {
+            book.free = false;
+        }
+    });
+    let windlass = windlass.restart(&mam, webui).await?;
+    let observation = windlass
+        .wait(|observation| {
+            observation
+                .mam
+                .acquisition
+                .watched
+                .iter()
+                .any(|(_, watch)| *watch == windlass::core::DownloadWatch::Wedged)
+        })
+        .await?;
+    assert!(noticed(
+        &observation,
+        &windlass::core::Notice::WedgedMidDownload
+    ));
+    assert_eq!(
+        sent(&mam, "/tor/download.php"),
+        [format!("tid={BOOK}"), format!("tid={BOOK}&fl=1")]
+    );
+    assert_eq!(mam.with(|world| world.account.wedges), Some(199));
+    assert_eq!(
+        record(&observation, BOOK).map(|row| row.desired),
+        Some(Desired::Active)
+    );
+    // The bookmark listing covered it: no lookup of its own.
+    let searches = sent(&mam, "/tor/js/loadSearchJSONbasic.php");
+    assert!(
+        searches.iter().all(|query| !query.contains("tor%5Bid%5D")),
+        "{searches:?}"
+    );
+    // The attempt saved before the restart keeps MAM's hour.
+    assert_eq!(sent(&mam, "/json/dynamicSeedbox.php").len(), 1);
+    assert_eq!(mam.violations(), Vec::<String>::new());
+    windlass.stop().await
+}
+
+/// E5, E6, E7: a download no longer free, with no wedge left, is stopped; it
+/// is no longer bookmarked, so it is looked up by itself. Once it is free
+/// again, it runs again.
+#[tokio::test]
+async fn a_download_that_cannot_be_wedged_stops_and_resumes_when_free() -> TestResult {
+    let mam = FakeMam::start().await?;
+    let mut book = Torrent::bookmarked("Another Free Book", GIB);
+    book.free = true;
+    let hash = book.hash();
+    mam.with(|world| {
+        world.torrents.insert(BOOK, book);
+    });
+    let qbittorrent = qbittorrent_adding(vec![hash.clone()]);
+    let webui = fake_qbittorrent(Arc::clone(&qbittorrent)).await?;
+    let windlass = Windlass::start(&mam, webui).await?;
+    windlass.connect().await?;
+    windlass.in_qbittorrent(&hash).await?;
+
+    // Freeleech ends, the owner removed the bookmark, and no wedge is left.
+    let set_free = |free: bool| {
+        mam.with(|world| {
+            if let Some(book) = world.torrents.get_mut(&BOOK) {
+                book.free = free;
+                book.bookmarked = None;
+            }
+            world.account.wedges = 0;
+        })
+    };
+    set_free(false);
+    let windlass = windlass.restart(&mam, webui).await?;
+    let observation = windlass
+        .wait(|observation| {
+            record(observation, BOOK).is_some_and(|row| row.desired == Desired::Held)
+        })
+        .await?;
+    assert!(noticed(
+        &observation,
+        &windlass::core::Notice::DownloadNotFree { stopped: true }
+    ));
+    let searches = sent(&mam, "/tor/js/loadSearchJSONbasic.php");
+    assert!(
+        searches
+            .iter()
+            .any(|query| query == &format!("tor%5Bid%5D={BOOK}")),
+        "{searches:?}"
+    );
+    windlass
+        .wait(|_| {
+            qbittorrent
+                .lock()
+                .is_ok_and(|fake| fake.stopped.contains(&hash))
+        })
+        .await?;
+
+    // It is freeleech again: it runs again.
+    set_free(true);
+    let windlass = windlass.restart(&mam, webui).await?;
+    windlass
+        .wait(|observation| {
+            record(observation, BOOK).is_some_and(|row| row.desired == Desired::Active)
+        })
+        .await?;
+    windlass
+        .wait(|_| {
+            qbittorrent
+                .lock()
+                .is_ok_and(|fake| fake.started.contains(&hash))
+        })
+        .await?;
+    assert_eq!(sent(&mam, "/tor/download.php"), [format!("tid={BOOK}")]);
+    assert_eq!(mam.violations(), Vec::<String>::new());
     windlass.stop().await
 }

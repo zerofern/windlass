@@ -124,6 +124,15 @@ impl Harness {
             let _ = harness.sync(Vec::new());
         }
         let actions = harness.send(Event::Mam(MamEvent::Enable));
+        // The first IP lookup waits a minute after a start, since a previous
+        // run may have just made one; let that minute pass.
+        let actions = if timer(&actions, TimerName::Mam)
+            .is_some_and(|(_, after)| after <= windlass::core::LOOKUP_SPACING)
+        {
+            harness.wake(&actions)
+        } else {
+            actions
+        };
         (harness, actions)
     }
 
@@ -432,7 +441,10 @@ fn nothing_is_sent_until_mam_is_enabled_unpaused_and_protected() {
         mode: MamRequestMode::Enabled,
     }));
     assert!(requests(&actions).is_empty());
+    // The lookup sent before the pause still counts against MAM's minute.
     let actions = harness.send(Event::MamPause(MamPauseEvent::Written));
+    assert!(requests(&actions).is_empty(), "{actions:?}");
+    let actions = harness.wake(&actions);
     assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
 }
 
@@ -659,13 +671,8 @@ fn mam_asking_to_wait_delays_the_retry() {
         Some(start + Duration::from_mins(20))
     );
     assert_eq!(harness.mam().network.failures, 1);
-    // The account does not depend on the lookup.
-    assert_eq!(
-        requests(&actions),
-        [MamRequest::LoadUserData { client_stats: true }]
-    );
-    let _ = harness.answer(read(account(harness.wall())));
-    let _ = harness.answer(listed(Vec::new()));
+    // Nothing that needs the session is sent before MAM shows which IP it sees.
+    assert!(requests(&actions).is_empty(), "{actions:?}");
     harness.advance(Duration::from_mins(20));
     let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
     assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
@@ -1091,6 +1098,9 @@ fn an_unreachable_client_is_repaired_and_reported_if_that_did_not_work() {
             .any(|action| matches!(action, Action::RequestPortMapping { .. })),
         "{actions:?}"
     );
+    // The IP is looked up again once MAM's minute has passed.
+    assert!(requests(&actions).is_empty(), "{actions:?}");
+    let actions = harness.wake(&actions);
     assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
     let expected = Findings {
         listen_port: PortFinding::Differs {
@@ -1220,6 +1230,7 @@ fn a_repair_that_worked_is_not_reported() {
         Connectability::Repaired { findings, .. }
             if findings.listen_port == PortFinding::NoForwardedPort && !findings.lease_renewed
     ));
+    let actions = harness.wake(&actions);
     assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
     let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
     assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
@@ -1472,6 +1483,8 @@ fn a_failed_lookup_is_tried_again_after_a_wait() {
     let actions = harness.register(&actions);
     assert_eq!(requests(&actions).len(), 1);
     let actions = harness.answer(read(account(harness.wall())));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let actions = harness.answer(listed(Vec::new()));
     assert_eq!(
         requests(&actions),
         [MamRequest::LookUpTorrent { id: torrent_id(1) }]
@@ -1535,8 +1548,11 @@ fn running_download(listing: Bookmark, wedges: u32) -> (Harness, Vec<Action>) {
     assert_eq!(requests(&actions).len(), 1);
     let mut data = account(harness.wall());
     data.wedges = wedges;
-    // After a restart, the download is checked with MAM before anything else.
+    // After a restart, the download is checked with MAM before anything else:
+    // the bookmark listing first, then a lookup, since it is not bookmarked.
     let actions = harness.answer(read(data));
+    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    let actions = harness.answer(listed(Vec::new()));
     assert_eq!(
         requests(&actions),
         [MamRequest::LookUpTorrent { id: torrent_id(1) }]
@@ -1609,8 +1625,8 @@ fn a_download_whose_freeleech_ends_is_wedged_while_it_runs() {
 #[test]
 fn a_download_that_is_not_free_and_cannot_be_wedged_stops_until_it_is_free() {
     let (mut harness, actions) = running_download(bookmark(1), 0);
-    assert_eq!(requests(&actions), [MamRequest::WedgeHistory]);
-    let _ = harness.answer(Ok(MamReply::WedgeHistory(Vec::new())));
+    // The bonus history shows no wedge on it.
+    let _ = harness.checked(actions, &[]);
     assert_eq!(
         harness.record(1).map(|record| record.desired),
         Some(Desired::Held)
@@ -1863,7 +1879,8 @@ fn a_purchase_the_reading_cannot_settle_waits_for_the_owner() {
     let actions = harness.answer(Err(MamFailure::Unreachable));
     let _ = without_bookmarks(&mut harness, actions);
     // Points were spent, but no upload credit arrived: Windlass cannot tell.
-    let actions = harness.later(Duration::from_mins(15));
+    // The next reading comes early, to settle it.
+    let actions = harness.later(Duration::from_mins(1));
     assert!(matches!(
         requests(&actions).first(),
         Some(MamRequest::LoadUserData { .. })
@@ -2170,6 +2187,12 @@ fn failed_readings_listings_and_lookups_are_retried_later() {
         harness.mam().network.next_lookup,
         Some(started + windlass::core::OBSERVE_EVERY)
     );
+    // Nothing that needs the session is sent before MAM shows which IP it sees.
+    assert!(requests(&actions).is_empty(), "{actions:?}");
+    harness.advance(windlass::core::OBSERVE_EVERY);
+    let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    let actions = harness.register(&actions);
+    let started = harness.start + harness.elapsed;
     assert_eq!(
         requests(&actions),
         [MamRequest::LoadUserData { client_stats: true }]

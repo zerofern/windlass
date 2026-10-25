@@ -33,18 +33,18 @@ core scenarios with simulated time, and end to end only for their wiring.
 | 8 | Keep qBittorrent matching the registry | Yes | Yes | – |
 | 9 | Use the API session and keep the cookie | Yes | Yes | – |
 | 10 | Observe the IP and register the seedbox | Yes | Yes | Yes |
-| 11 | Turn bookmarks into queued and snatched rows | Yes | Partly | – |
-| 12 | Admit a download: gates and the wedge decision | Yes | Partly | – |
+| 11 | Turn bookmarks into queued and snatched rows | Yes | Yes | – |
+| 12 | Admit a download: gates and the wedge decision | Yes | Yes | – |
 | 13 | Fetch and add a download | Yes | Yes | – |
-| 14 | Keep running downloads free | Yes | **No** | – |
+| 14 | Keep running downloads free | Yes | Yes | – |
 | 15 | Watch the account | Yes | **No** | – |
 | 16 | Check MAM's client list (A5) | Yes | **No** | – |
 | 17 | Keep qBittorrent connectable (A6) | Yes | **No** | – |
-| 18 | Spend points: VIP and upload credit | Yes | Partly | – |
-| 19 | Settle an uncertain purchase | Yes | **No** | – |
+| 18 | Spend points: VIP and upload credit | Yes | Yes | – |
+| 19 | Settle an uncertain purchase | Yes | Yes | – |
 | 20 | Remind the owner weekly | Yes | – | – |
 | 21 | Deliver notifications | Yes | Yes (web) | Yes |
-| 22 | Restart and verify before acting | Partly | **No** | – |
+| 22 | Restart and verify before acting | Partly | Yes | – |
 
 ## Running and operating
 
@@ -150,7 +150,11 @@ core scenarios with simulated time, and end to end only for their wiring.
 ### 10. Observe the IP and register the seedbox
 
 - **Trigger:** every 5 minutes; a server switch; a connectability repair.
-- **Does:** reads the IP and ASN MAM sees; registers it as the seedbox when it
+- **Does:** reads the IP and ASN MAM sees, never twice within a minute, also
+  across a restart: the first lookup after a start waits a minute, since the
+  previous run may have just made one. Nothing that uses the cookie is sent until
+  MAM has shown which IP and ASN it sees, after a start or a server switch, since
+  the session is locked to an ASN. Registers the IP as the seedbox when it
   changes, at most once an hour, saving each attempt before sending it, so
   restarts keep the spacing. No download starts until MAM confirms the current IP.
 - **Where:** `core/mam/network.rs`.
@@ -168,8 +172,7 @@ core scenarios with simulated time, and end to end only for their wiring.
   becomes *Snatched*. Snatched rows show on the dashboard with "Download again",
   which queues them with origin *Redownload*.
 - **Where:** `core/mam/mod.rs` (`listed`), `core/registry.rs`, `shell/web/pages.rs`.
-- **Tested:** `tests/mam_core.rs`; the button's route in `tests/web.rs`.
-- **Missing end to end:** E3 below.
+- **Tested:** `tests/mam_core.rs`; the button's route in `tests/web.rs`; E3.
 
 ### 12. Admit a download: gates and the wedge decision
 
@@ -185,10 +188,8 @@ core scenarios with simulated time, and end to end only for their wiring.
   shows one already spent. Torrents MAM no longer lists are skipped. Disk space
   is not checked yet (B-0001).
 - **Where:** `core/mam/acquisition.rs` (`next`).
-- **Tested:** `tests/mam_core.rs` covers every gate and wedge case; `tests/mam.rs`
-  covers the wedged happy path.
-- **Missing end to end:** a site-wide freeleech bookmark downloaded without a
-  wedge (part of E5).
+- **Tested:** `tests/mam_core.rs` covers every gate and wedge case; E1 and E3 the
+  wedged path; E5 a site-wide freeleech bookmark downloaded without a wedge.
 
 ### 13. Fetch and add a download
 
@@ -214,10 +215,9 @@ core scenarios with simulated time, and end to end only for their wiring.
   the torrent and is never retried. A download that finished first is reported.
 - **Where:** `core/mam/acquisition.rs` (`watch`, `watch_next`),
   `core/mam/mod.rs` (`follow_downloads`).
-- **Tested:** `tests/mam_core.rs` only.
+- **Tested:** `tests/mam_core.rs`; E5 and E5b end to end.
 - **Known limit:** MAM gives no end time for site-wide freeleech, so up to about
   15 minutes of a download can fall after it ends.
-- **Missing end to end:** E5.
 
 ## Account safety and spending
 
@@ -260,17 +260,16 @@ core scenarios with simulated time, and end to end only for their wiring.
   buys 50 GiB of upload credit when the buffer is under 25 GiB or the ratio under
   3.0; never below the points reserve; backs off 6 hours after a refusal.
 - **Where:** `core/mam/account.rs` (`wanted_purchase`).
-- **Tested:** `tests/mam_core.rs`; `tests/mam.rs` covers a VIP renewal.
-- **Missing end to end:** upload credit (part of E4).
+- **Tested:** `tests/mam_core.rs`; E1 covers a VIP renewal and E4 upload credit.
 
 ### 19. Settle an uncertain purchase
 
-- **Does:** a purchase whose answer was lost is settled from the next reading
-  (points not spent, a later VIP end, or credit arrived); otherwise the dashboard
-  asks the owner, and nothing is bought until they answer.
+- **Does:** a purchase whose answer was lost is settled from the next reading,
+  which comes early, about a minute later (points not spent, a later VIP end, or
+  credit arrived); otherwise the dashboard asks the owner, and nothing is bought
+  until they answer.
 - **Where:** `core/mam/account.rs` (`settle`, `checked`), `shell/web/mam_pages.rs`.
-- **Tested:** `tests/mam_core.rs`; the route in `tests/web.rs`.
-- **Missing end to end:** E4.
+- **Tested:** `tests/mam_core.rs`; the route in `tests/web.rs`; E4.
 
 ### 20. Remind the owner weekly
 
@@ -306,8 +305,9 @@ What Windlass saved is only where it starts. After a restart:
 
 - **Tested:** core scenarios start from saved rows
   (`downloads_added_in_the_last_hour_count_against_the_limit_after_a_restart`,
-  the running-download tests); nothing restarts a whole Windlass mid-flow.
-- **Missing end to end:** E6.
+  the running-download tests); E5 and E5b restart a whole Windlass mid-download.
+  The recent-downloads count after a restart is proven in the core only: end to
+  end, new downloads wait for the seedbox registration first.
 
 ## Planned end-to-end tests
 
@@ -316,17 +316,14 @@ and a fake qBittorrent, driven over HTTP.
 
 | Test | Flows | Status |
 | --- | --- | --- |
-| E1. A pasted cookie leads to a registered seedbox and a wedged download | 9, 10, 12, 13, 18 | Exists |
-| E2. A refused session is reported and stops requests | 9 | Exists |
-| E3. A snatched bookmark waits; "Download again" downloads it | 11, 12, 13 | Planned |
-| E4. An uncertain purchase is settled from the dashboard; upload credit is bought | 18, 19 | Planned |
-| E5. A freeleech download needs no wedge; when freeleech ends it is wedged; with no wedge left it stops and resumes | 12, 14 | Planned |
-| E6. A restart mid-download: recent downloads count, and running downloads are checked before anything else | 14, 22 | Planned |
-| E7. The bookmark listing, not single lookups, re-checks running downloads (request count in the fake's journal) | 11, 14 | Planned |
+| E1. A pasted cookie leads to a registered seedbox and a wedged download | 9, 10, 12, 13, 18 | `a_pasted_cookie_leads_to_a_registered_seedbox_and_a_wedged_download` |
+| E2. A refused session is reported and stops requests | 9 | `a_refused_session_is_reported_and_stops_requests` |
+| E3. A snatched bookmark waits; "Download again" downloads it | 11, 12, 13 | `a_snatched_bookmark_waits_until_the_owner_downloads_it_again` |
+| E4. An uncertain purchase is settled from the dashboard; upload credit is bought | 18, 19 | `an_uncertain_purchase_is_settled_on_the_dashboard` |
+| E5. A freeleech download needs no wedge; after its freeleech ends and Windlass restarts, the bookmark listing shows it and it is wedged, without registering again within the hour | 10, 12, 14, 22 | `a_download_whose_freeleech_ends_is_wedged_after_a_restart` |
+| E5b. A download no longer free and no longer bookmarked is looked up by itself, stopped with no wedge left, and resumed once free | 14, 22 | `a_download_that_cannot_be_wedged_stops_and_resumes_when_free` |
+| E6, E7. Restarts and request counts are checked inside E5 and E5b: no lookup for a bookmarked download, one for an un-bookmarked one, no second registration, no broken rule | 10, 14, 22 | (in E5, E5b) |
 | E8. Account flags and the client list produce notices and holds | 15, 16 | Planned, after the client list capture |
 
-The fakes need a little more. The fake MAM can already delay an answer past
-Windlass's 30-second timeout, which loses it, but slowly; a dropped connection
-would do it at once. Its torrents' site-wide freeleech can already be changed by
-the test. The fake qBittorrent records adds and stops; it also needs to record
-starts and to report a torrent as unfinished.
+Each test starts Windlass, which waits a minute before its first IP lookup, so
+the end-to-end tests take about three minutes in all.

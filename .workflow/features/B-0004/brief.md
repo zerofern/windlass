@@ -58,6 +58,10 @@ Acceptance:
 - During registration cooldown, show unconfirmed status and the next eligible time.
 - Reconsider queued registration using the latest observation. IP changes must
   not accumulate updates.
+- Implemented: IP lookups are sent at most once a minute, and the first after a
+  start waits a minute, since a previous run may have sent one moments before.
+  Requests that need the cookie wait until MAM has shown which IP and ASN it
+  sees, after a start or a server switch, since the session is locked to an ASN.
 - Implemented: the time of each registration attempt is saved before the request
   is sent, so restarts keep the hour; a failed save sends nothing. Pause, VPN loss,
   a server switch, or a cookie change discards the outstanding request, ignores

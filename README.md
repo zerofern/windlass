@@ -102,8 +102,10 @@ Requests share a small token bucket, wait for one another, and name
 `Windlass/<version>` as their User-Agent. When MAM sends a replacement cookie,
 Windlass saves it and uses it from then on.
 
-- It looks up the IP and ASN MAM sees every five minutes and registers that IP as
-  the seedbox when it changes, at most once an hour, counting every attempt across
+- It looks up the IP and ASN MAM sees every five minutes, never twice within a
+  minute (so the first lookup after a start waits a minute), and uses the cookie
+  only once MAM has shown which IP and ASN it sees. It registers that IP as the
+  seedbox when it changes, at most once an hour, counting every attempt across
   restarts.
 - It reads the account every 15 minutes, and its client list every 30.
 - It keeps VIP, renewing it within 14 days of expiry, and buys upload credit in

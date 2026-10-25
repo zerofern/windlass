@@ -328,6 +328,14 @@ impl Account {
         Some(record.purchase)
     }
 
+    /// Whether the last purchase's outcome is unknown until the next reading.
+    #[must_use]
+    pub fn purchase_uncertain(&self) -> bool {
+        self.last_purchase
+            .as_ref()
+            .is_some_and(|record| record.outcome == Some(PurchaseOutcome::Uncertain))
+    }
+
     /// The purchase waiting for the owner, if one does.
     #[must_use]
     pub fn unresolved_purchase(&self) -> Option<Purchase> {

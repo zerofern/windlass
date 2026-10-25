@@ -38,14 +38,14 @@ pub use connectability::{
     Connectability, Connection, Findings, IpFinding, PortFinding, REPAIR_SETTLES_AFTER,
 };
 pub use network::{
-    LastAttempt, Network, OBSERVE_EVERY, Observed, REGISTRATION_SPACING, RegistrationAllowance,
-    RegistrationFailure, Seedbox, SeedboxStatus, Session,
+    LOOKUP_SPACING, LastAttempt, Network, OBSERVE_EVERY, Observed, REGISTRATION_SPACING,
+    RegistrationAllowance, RegistrationFailure, Seedbox, SeedboxStatus, Session,
 };
 
 use self::acquisition::{Facts, Next};
 use super::{
     Action, ApiCookie, ClientVersion, ClockReading, Desired, MamRequestsStatus, MamTorrentId,
-    Notice, Registry, TimerId, TimerName, timer::Timers,
+    Notice, Records, Registry, TimerId, TimerName, timer::Timers,
 };
 
 /// The owner is reminded to visit MAM this often.
@@ -237,6 +237,8 @@ impl Mam {
         match event {
             MamEvent::Enable => {
                 self.enabled = true;
+                // A previous run may have looked the IP up moments ago.
+                self.network.sent(now.monotonic);
                 (Vec::new(), None)
             }
             // The state is read once, at startup, before anything changes it.
@@ -555,20 +557,7 @@ impl Mam {
             Registry::Loaded(records) => Some(records),
             _ => None,
         };
-        let recent = records.map_or(0, |records| {
-            records
-                .downloads()
-                .filter(|download| acquisition::recent(download, now.wall))
-                .count()
-        });
-        self.acquisition.watched = records.map_or_else(Vec::new, |records| {
-            self.acquisition.watch_all(
-                records.downloads(),
-                self.account.data(),
-                now.monotonic,
-                now.wall,
-            )
-        });
+        let recent = self.watch_downloads(now, records);
         let facts = Facts {
             now: now.monotonic,
             wall: now.wall,
@@ -576,7 +565,7 @@ impl Mam {
             seedbox_confirmed: self.seedbox.confirms(observed.as_ref()),
             client_ready: context.client_ready,
             client: self.client,
-            recent: u32::try_from(recent).unwrap_or(u32::MAX),
+            recent,
             account: &self.account,
         };
         let next = records.map_or(Next::Idle, |records| {
@@ -588,7 +577,10 @@ impl Mam {
             Next::NeedReading if self.account.reading.is_none() => Some(Hold::AccountUnknown),
             _ => None,
         };
-        let early = next == Next::NeedReading || watching == Next::NeedReading;
+        // An uncertain purchase is settled by the next reading, which comes early.
+        let early = next == Next::NeedReading
+            || watching == Next::NeedReading
+            || self.account.purchase_uncertain();
         if available && self.outstanding.is_none() {
             let wanted = self.wanted(
                 now,
@@ -608,6 +600,7 @@ impl Mam {
                 }
                 (Some(Wanted::Request(request)), _) if self.budget.take(now.monotonic) => {
                     match &request {
+                        MamRequest::LookUpIp => self.network.sent(now.monotonic),
                         MamRequest::LoadUserData { .. } => self.account.requested(now.monotonic),
                         MamRequest::Buy(purchase) => {
                             self.account.buying(*purchase, now.monotonic, now.wall);
@@ -641,6 +634,26 @@ impl Mam {
     /// Whether a new forwarded-port lease is wanted, once.
     pub(super) const fn take_lease_renewal(&mut self) -> bool {
         std::mem::replace(&mut self.renew_lease, false)
+    }
+
+    /// Note what Windlass knows about each running download it added; how many
+    /// downloads qBittorrent added in the last hour, or will add.
+    fn watch_downloads(&mut self, now: ClockReading, records: Option<&Records>) -> u32 {
+        let Some(records) = records else {
+            self.acquisition.watched = Vec::new();
+            return 0;
+        };
+        self.acquisition.watched = self.acquisition.watch_all(
+            records.downloads(),
+            self.account.data(),
+            now.monotonic,
+            now.wall,
+        );
+        let recent = records
+            .downloads()
+            .filter(|download| acquisition::recent(download, now.wall))
+            .count();
+        u32::try_from(recent).unwrap_or(u32::MAX)
     }
 
     /// Apply what Windlass knows about each running download it added: a
@@ -749,7 +762,10 @@ impl Mam {
         if self.network.due(now.monotonic) {
             return Some(Wanted::Request(MamRequest::LookUpIp));
         }
-        if !cookie {
+        // The session is locked to an ASN, so it is used only once MAM has shown
+        // which IP and ASN it sees now: after a start or a server switch, the
+        // IP lookup comes first.
+        if !cookie || self.network.current().is_none() {
             return None;
         }
         if self.seedbox.wanted(now.wall, self.network.current()) {
@@ -758,7 +774,17 @@ impl Mam {
         if let Some(client_stats) = self.account.wanted(now.monotonic, early) {
             return Some(Wanted::Request(MamRequest::LoadUserData { client_stats }));
         }
-        if let Some(request) = acquisition_request(watching) {
+        // A due listing refreshes every bookmark's flags in one request, so it
+        // comes before looking a single torrent up.
+        let listing = self.acquisition.bookmarks.wanted(now.monotonic);
+        let single = |next: Next| match (next, listing) {
+            (Next::LookUp(_), Some(_)) => None,
+            (next, _) => acquisition_request(next),
+        };
+        if let (Next::LookUp(_), Some(start)) = (watching, listing) {
+            return Some(Wanted::Request(MamRequest::ListBookmarks { start }));
+        }
+        if let Some(request) = single(watching) {
             return Some(Wanted::Request(request));
         }
         if let Some(purchase) = reserve.and_then(|reserve| {
@@ -767,14 +793,7 @@ impl Mam {
         }) {
             return Some(Wanted::Request(MamRequest::Buy(purchase)));
         }
-        // A due listing refreshes every bookmark's flags in one request, so it
-        // comes before looking a single torrent up.
-        let listing = self.acquisition.bookmarks.wanted(now.monotonic);
-        let next = match (next, listing) {
-            (Next::LookUp(_), Some(_)) => Next::Idle,
-            (next, _) => next,
-        };
-        if let Some(request) = acquisition_request(next) {
+        if let Some(request) = single(next) {
             return Some(Wanted::Request(request));
         }
         listing.map(|start| Wanted::Request(MamRequest::ListBookmarks { start }))
@@ -852,7 +871,7 @@ impl Mam {
         };
         let waiting = self.available && self.outstanding.is_none();
         let work = [
-            self.network.next_lookup,
+            self.network.next_due(),
             registration,
             self.account.next_due(early),
             self.acquisition.bookmarks.next_due(),
