@@ -3,16 +3,25 @@
 //! Windlass reaches the web UI on loopback inside the VPN namespace, where the
 //! NixOS module disables web UI authentication for local clients.
 
-use std::time::{Duration, SystemTime};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
-use reqwest::{Client as HttpClient, Response, Url};
+use reqwest::{
+    Client as HttpClient, Response, Url,
+    multipart::{Form, Part},
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::core::{
-    ByteSize, Port, Progress, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, Ratio,
-    SyncPosition, SyncUpdate, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
+    ByteSize, MamTorrentId, Port, Progress, QbittorrentEvent, QbittorrentFailure,
+    QbittorrentPreferences, QueuePreferences, Ratio, SyncPosition, SyncUpdate, TorrentCommand,
+    TorrentHash, TorrentState, TorrentUpdate,
 };
+
+use super::storage;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -23,6 +32,7 @@ pub(super) enum Request {
     Sync(SyncPosition),
     ReadPreferences,
     SetListenPort(Port),
+    SetQueue(QueuePreferences),
     Command(TorrentCommand),
 }
 
@@ -34,6 +44,7 @@ impl Request {
             Self::Sync(_) => QbittorrentEvent::SyncFailed { reason },
             Self::ReadPreferences => QbittorrentEvent::PreferencesReadFailed { reason },
             Self::SetListenPort(_) => QbittorrentEvent::ListenPortSetFailed { reason },
+            Self::SetQueue(_) => QbittorrentEvent::QueueSetFailed { reason },
             Self::Command(_) => QbittorrentEvent::CommandFailed { reason },
         }
     }
@@ -53,12 +64,14 @@ pub(super) async fn execute(client: Option<&Client>, request: Request) -> Qbitto
 pub(super) struct Client {
     http: HttpClient,
     base: Url,
+    /// Where fetched torrent files are kept.
+    database: PathBuf,
 }
 
 type Outcome<T> = Result<T, QbittorrentFailure>;
 
 impl Client {
-    pub(super) fn new(base: Url) -> Self {
+    pub(super) fn new(base: Url, database: PathBuf) -> Self {
         // Building fails only if the TLS backend cannot initialise; plain HTTP
         // to loopback does not need it, so fall back to the default client.
         let http = HttpClient::builder()
@@ -66,7 +79,11 @@ impl Client {
             .no_proxy()
             .build()
             .unwrap_or_default();
-        Self { http, base }
+        Self {
+            http,
+            base,
+            database,
+        }
     }
 
     async fn perform(&self, request: &Request) -> Outcome<QbittorrentEvent> {
@@ -81,6 +98,10 @@ impl Client {
                 .set_listen_port(*port)
                 .await
                 .map(|()| QbittorrentEvent::ListenPortSet),
+            Request::SetQueue(queue) => self
+                .set_queue(*queue)
+                .await
+                .map(|()| QbittorrentEvent::QueueSet),
             Request::Command(command) => self
                 .command(command)
                 .await
@@ -134,11 +155,13 @@ impl Client {
 
     async fn preferences(&self) -> Outcome<QbittorrentPreferences> {
         let raw: RawPreferences = self.json("api/v2/app/preferences").await?;
+        let queue = raw.queue();
         Ok(QbittorrentPreferences {
             listen_port: raw.listen_port.and_then(Port::new),
             interface: raw
                 .current_network_interface
                 .filter(|interface| !interface.is_empty()),
+            queue,
         })
     }
 
@@ -160,6 +183,21 @@ impl Client {
             .await
     }
 
+    async fn set_queue(&self, queue: QueuePreferences) -> Outcome<()> {
+        // qBittorrent takes -1 for no limit.
+        let limit = |limit: Option<u32>| limit.map_or(-1, i64::from);
+        let preferences = serde_json::json!({
+            "queueing_enabled": queue.queueing,
+            "max_active_downloads": limit(queue.max_downloading),
+            "max_active_torrents": limit(queue.max_active),
+            "max_active_uploads": limit(queue.max_seeding),
+            "dont_count_slow_torrents": queue.idle_not_counted,
+        })
+        .to_string();
+        self.post("api/v2/app/setPreferences", &[("json", preferences)])
+            .await
+    }
+
     async fn command(&self, command: &TorrentCommand) -> Outcome<()> {
         let hashes = |hashes: &[TorrentHash]| {
             hashes
@@ -173,6 +211,22 @@ impl Client {
                 self.post("api/v2/torrents/start", &[("hashes", hashes(started))])
                     .await
             }
+            TorrentCommand::Stop(stopped) => {
+                self.post("api/v2/torrents/stop", &[("hashes", hashes(stopped))])
+                    .await
+            }
+            TorrentCommand::ForceStart(forced) => {
+                let form = [("hashes", hashes(forced)), ("value", String::from("true"))];
+                self.post("api/v2/torrents/setForceStart", &form).await
+            }
+            TorrentCommand::EndForceStart(released) => {
+                let form = [
+                    ("hashes", hashes(released)),
+                    ("value", String::from("false")),
+                ];
+                self.post("api/v2/torrents/setForceStart", &form).await
+            }
+            TorrentCommand::Add { mam, .. } => self.add(*mam).await,
             TorrentCommand::Remove(removed) => {
                 let form = [
                     ("hashes", hashes(removed)),
@@ -199,10 +253,53 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Add a kept torrent file; qBittorrent starts it at once.
+    async fn add(&self, mam: MamTorrentId) -> Outcome<()> {
+        let database = self.database.clone();
+        let file = tokio::task::spawn_blocking(move || storage::kept_torrent_file(&database, mam))
+            .await
+            .ok()
+            .flatten()
+            .ok_or(QbittorrentFailure::Malformed)?;
+        let part = Part::bytes(file)
+            .file_name(format!("{}.torrent", mam.get()))
+            .mime_str("application/x-bittorrent")
+            .map_err(|_| QbittorrentFailure::Malformed)?;
+        let form = Form::new().part("torrents", part);
+        let response = self
+            .http
+            .post(self.url("api/v2/torrents/add")?)
+            .multipart(form)
+            .send()
+            .await;
+        Self::checked(response).map(drop)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawPreferences {
     listen_port: Option<u16>,
     current_network_interface: Option<String>,
+    queueing_enabled: Option<bool>,
+    max_active_downloads: Option<i64>,
+    max_active_torrents: Option<i64>,
+    max_active_uploads: Option<i64>,
+    dont_count_slow_torrents: Option<bool>,
+}
+
+impl RawPreferences {
+    /// The queue, when qBittorrent reports all of it; a negative limit is none.
+    fn queue(&self) -> Option<QueuePreferences> {
+        let limit = |limit: Option<i64>| limit.map(|limit| u32::try_from(limit).ok());
+        Some(QueuePreferences {
+            queueing: self.queueing_enabled?,
+            max_downloading: limit(self.max_active_downloads)?,
+            max_active: limit(self.max_active_torrents)?,
+            max_seeding: limit(self.max_active_uploads)?,
+            idle_not_counted: self.dont_count_slow_torrents?,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +369,7 @@ fn torrent_update(fields: &Value) -> TorrentUpdate {
         completed_at: time("completion_on"),
         content_path: path("content_path"),
         save_path: path("save_path"),
+        force_start: fields.get("force_start").and_then(Value::as_bool),
     }
 }
 
@@ -328,6 +426,12 @@ mod tests {
                 QbittorrentEvent::ListenPortSetFailed { reason },
             ),
             (
+                Request::SetQueue(crate::core::QueuePreferences::for_limits(
+                    crate::core::TorrentLimits::default(),
+                )),
+                QbittorrentEvent::QueueSetFailed { reason },
+            ),
+            (
                 Request::Command(TorrentCommand::Start(Vec::new())),
                 QbittorrentEvent::CommandFailed { reason },
             ),
@@ -337,14 +441,62 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_queue_is_read_only_when_qbittorrent_reports_all_of_it() -> Result<(), serde_json::Error> {
+        let full = json!({
+            "queueing_enabled": true,
+            "max_active_downloads": 2,
+            "max_active_torrents": -1,
+            "max_active_uploads": 4,
+            "dont_count_slow_torrents": true
+        });
+        let raw: super::RawPreferences = serde_json::from_value(full.clone())?;
+        assert_eq!(
+            raw.queue(),
+            Some(crate::core::QueuePreferences {
+                queueing: true,
+                max_downloading: Some(2),
+                max_active: None,
+                max_seeding: Some(4),
+                idle_not_counted: true,
+            })
+        );
+        for missing in [
+            "queueing_enabled",
+            "max_active_downloads",
+            "max_active_torrents",
+            "max_active_uploads",
+            "dont_count_slow_torrents",
+        ] {
+            let partial: serde_json::Map<String, serde_json::Value> = full
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(name, _)| *name != missing)
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let raw: super::RawPreferences =
+                serde_json::from_value(serde_json::Value::Object(partial))?;
+            assert_eq!(raw.queue(), None, "{missing}");
+        }
+        Ok(())
+    }
+
+    /// A compile-time torrent ID: its unreachable branch is not run code.
+    const MAM: crate::core::MamTorrentId = match crate::core::MamTorrentId::new(7) {
+        Some(id) => id,
+        None => unreachable!(),
+    };
+
     #[tokio::test]
     async fn commands_to_a_closed_web_ui_fail_as_unreachable() -> Result<(), Box<dyn Error>> {
         // Nothing listens on the discard port.
-        let client = Client::new("http://127.0.0.1:9/".parse()?);
+        let client = Client::new("http://127.0.0.1:9/".parse()?, "/nonexistent".into());
         let hash = TorrentHash::parse(&"a".repeat(40)).ok_or("hash")?;
         for command in [
             TorrentCommand::SelectAllFiles(hash.clone()),
-            TorrentCommand::Remove(vec![hash]),
+            TorrentCommand::Remove(vec![hash.clone()]),
+            TorrentCommand::Stop(vec![hash.clone()]),
         ] {
             assert_eq!(
                 execute(Some(&client), Request::Command(command)).await,
@@ -353,6 +505,18 @@ mod tests {
                 }
             );
         }
+        // Without a kept file there is nothing to add.
+        let mam = MAM;
+        assert_eq!(
+            execute(
+                Some(&client),
+                Request::Command(TorrentCommand::Add { mam, hash })
+            )
+            .await,
+            QbittorrentEvent::CommandFailed {
+                reason: QbittorrentFailure::Malformed
+            }
+        );
         Ok(())
     }
 

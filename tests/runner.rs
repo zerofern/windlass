@@ -154,13 +154,24 @@ async fn producers_share_one_runner_and_shutdown_drains_follow_up_writes() -> Te
             row.get(0)
         })?;
     assert_eq!(saved, "paused");
-    assert_eq!(
-        console_observations
-            .borrow()
-            .clone()
-            .last_event
-            .map(|event| event.event),
-        Some(Event::MamPause(MamPauseEvent::Written))
+    // Shutdown drained the follow-up writes: the pause, the MAM visit
+    // reminder count started at the first run, and the start notice, in any
+    // order.
+    let last = console_observations
+        .borrow()
+        .clone()
+        .last_event
+        .map(|event| event.event);
+    assert!(
+        matches!(
+            last,
+            Some(
+                Event::MamPause(MamPauseEvent::Written)
+                    | Event::Mam(windlass::core::MamEvent::ReminderSaved)
+                    | Event::Notification(windlass::core::NotificationEvent::Saved)
+            )
+        ),
+        "{last:?}"
     );
     let rejected = api_events
         .send(Event::MamPause(MamPauseEvent::Delete))
@@ -198,10 +209,8 @@ async fn storage_failures_are_observable_without_a_console() -> TestResult {
             .as_deref()
             .is_some_and(|detail| detail.contains("write rejected"))
     );
-    assert_eq!(
-        failed.last_event.map(|event| event.event),
-        Some(Event::MamPause(MamPauseEvent::WriteFailed))
-    );
+    // Which event came last is not checked: other startup writes, such as
+    // saving the notice of this failure, can finish after it.
     events.shutdown().await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), worker).await???,

@@ -63,11 +63,15 @@ Acceptance:
 - Windlass reaches ntfy through the host relay of
   [ADR-0003](../../decisions/adr/0003-vpn-namespace-confinement.md); the server's
   name resolves to the relay, so HTTPS verifies ntfy's certificate end to end.
-- Each notice has a title, a priority, tags, and a link to the dashboard page
-  that explains it (`services.windlass.dashboard.url`).
-- Notices carry conditions and counts only, never book titles or account
-  details.
-- One notice is delivered at a time. A failed delivery is retried after 30
+- Every notice is kept on the dashboard's notifications page (B-0013), with a
+  title, its words, when it was given, and a link to the dashboard page that
+  explains it. The page keeps the last 1000.
+- Urgent notices are also pushed. A push carries no words about the notice:
+  the title "Windlass", a fixed sentence, the notice's priority, and a link to
+  its entry on the notifications page (`services.windlass.dashboard.url`).
+  Notices that report something going back to normal, or going as planned, are
+  only on the page.
+- One push is delivered at a time. A failed delivery is retried after 30
   seconds, then 1, 2, 4, and 8 minutes, then every 10 minutes. At most 50 notices
   wait; beyond that the oldest are dropped and counted.
 - The status page shows the last delivery result, failed attempts, notices
@@ -106,3 +110,5 @@ add their own conditions.
 
 Agreed with the owner: the conditions, events, and grace periods above; the topic
 on the settings page; a notice at every start; a dashboard link in every notice.
+Changed by B-0013: pushes carry only a link to the notice's entry, and the
+notice at every start is only on the notifications page.

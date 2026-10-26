@@ -30,18 +30,21 @@ use tokio_stream::{Stream, StreamExt, wrappers::WatchStream};
 
 use crate::{
     core::{
-        ApiCookie, Event, HistoryLimit, HistoryState, MamPauseEvent, MamRequestMode,
-        NotificationEvent, NtfyTopic, SettingsEvent, StartupEvent, StartupMode, State,
+        ActiveLimit, ApiCookie, DownloadingLimit, Event, HistoryLimit, HistoryState, MamEvent,
+        MamPauseEvent, MamRequestMode, NotificationEvent, NtfyTopic, PointsReserve, RecordId,
+        RegistryEvent, SettingsEvent, StartupEvent, StartupMode, State, TorrentLimits,
     },
     runner::{Observation, Runner},
     shell::{
         EventSender, Integrations, ShellError, ShellResult,
         describe::CATEGORIES,
         history::{self, HistoryQuery, Page},
+        storage,
     },
 };
 
 mod guard;
+mod mam_pages;
 mod pages;
 
 use pages::{Location, SettingsForm};
@@ -117,6 +120,7 @@ pub fn router(
     };
     Router::new()
         .route("/", get(status_page))
+        .route("/notifications", get(notifications_page))
         .route("/history", get(history_page))
         .route("/settings", get(settings_page))
         .route("/live", get(live))
@@ -127,7 +131,11 @@ pub fn router(
         .route("/settings/api-cookie/clear", post(clear_api_cookie))
         .route("/settings/ntfy-topic", post(set_ntfy_topic))
         .route("/settings/ntfy-topic/clear", post(clear_ntfy_topic))
+        .route("/settings/points-reserve", post(set_points_reserve))
+        .route("/settings/torrent-limits", post(set_torrent_limits))
         .route("/notifications/test", post(send_test_notification))
+        .route("/torrents/redownload", post(redownload))
+        .route("/mam/purchase/checked", post(purchase_checked))
         .route("/static/app.css", get(stylesheet))
         .route("/static/app.js", get(script))
         .route("/favicon.ico", get(StatusCode::NO_CONTENT))
@@ -280,6 +288,73 @@ async fn set_history_limit(AppState(app): AppState<App>, Form(form): Form<LimitF
 }
 
 #[derive(Debug, Deserialize)]
+struct ReserveForm {
+    reserve: String,
+}
+
+async fn set_points_reserve(
+    AppState(app): AppState<App>,
+    Form(form): Form<ReserveForm>,
+) -> Response {
+    let reserve = form
+        .reserve
+        .trim()
+        .replace([',', '_', ' '], "")
+        .parse::<u64>()
+        .ok()
+        .and_then(|reserve| PointsReserve::try_new(reserve).ok());
+    match reserve {
+        Some(reserve) => send_setting(&app, SettingsEvent::SetPointsReserve { reserve }).await,
+        None => rejected(
+            &app,
+            &SettingsForm {
+                points_reserve: Some(form.reserve),
+                points_reserve_error: Some(String::from(
+                    "Enter a whole number of points up to 100000000. The saved reserve is still in use.",
+                )),
+                ..SettingsForm::default()
+            },
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitsForm {
+    downloading: String,
+    active: String,
+}
+
+async fn set_torrent_limits(
+    AppState(app): AppState<App>,
+    Form(form): Form<LimitsForm>,
+) -> Response {
+    let number = |value: &str| value.trim().parse::<u32>().ok();
+    let downloading =
+        number(&form.downloading).and_then(|limit| DownloadingLimit::try_new(limit).ok());
+    let active = number(&form.active).and_then(|limit| ActiveLimit::try_new(limit).ok());
+    let limits = match downloading.zip(active) {
+        Some((downloading, active)) => {
+            TorrentLimits::new(downloading, active).map_err(|error| error.to_string())
+        }
+        None => Err(String::from(
+            "Enter whole numbers: 1 to 100 downloading, 1 to 1000 active.",
+        )),
+    };
+    match limits {
+        Ok(limits) => send_setting(&app, SettingsEvent::SetTorrentLimits { limits }).await,
+        Err(error) => rejected(
+            &app,
+            &SettingsForm {
+                max_downloading: Some(form.downloading),
+                max_active: Some(form.active),
+                torrent_limits_error: Some(format!("{error} The saved limits are still in use.")),
+                ..SettingsForm::default()
+            },
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct CookieForm {
     cookie: String,
 }
@@ -331,6 +406,44 @@ async fn send_test_notification(AppState(app): AppState<App>) -> Response {
         .await
     {
         Ok(()) => back(Some(Location::Settings.path())).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckedForm {
+    made: String,
+}
+
+async fn purchase_checked(AppState(app): AppState<App>, Form(form): Form<CheckedForm>) -> Response {
+    let made = match form.made.as_str() {
+        "yes" => true,
+        "no" => false,
+        _ => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    match app
+        .send(Event::Mam(MamEvent::PurchaseChecked { made }))
+        .await
+    {
+        Ok(()) => back(Some(Location::Status.path())).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RedownloadForm {
+    record: u64,
+}
+
+async fn redownload(AppState(app): AppState<App>, Form(form): Form<RedownloadForm>) -> Response {
+    let Some(record) = RecordId::new(form.record) else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
+    match app
+        .send(Event::Registry(RegistryEvent::Redownload(record)))
+        .await
+    {
+        Ok(()) => back(Some(Location::Status.path())).into_response(),
         Err(response) => response,
     }
 }
@@ -401,6 +514,20 @@ async fn history_page(
         HistoryState::Closed | HistoryState::Opening(_) | HistoryState::Unavailable => None,
     };
     pages::history(&observation, &query, &result, retained)
+}
+
+/// How many notices the notifications page shows.
+const NOTICES_SHOWN: u32 = 200;
+
+async fn notifications_page(AppState(app): AppState<App>) -> Markup {
+    let database = app.deployment.database.clone();
+    let result =
+        tokio::task::spawn_blocking(move || storage::read_notices(&database, NOTICES_SHOWN))
+            .await
+            .map_err(ShellError::from)
+            .and_then(|read| read)
+            .map_err(|error| error.to_string());
+    pages::notifications(&app.observation(), &result)
 }
 
 /// What `windlass serve` runs.

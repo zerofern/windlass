@@ -6,8 +6,8 @@ use tokio::sync::watch;
 
 use crate::{
     core::{
-        Core, HistoryState, Notifications, PortForwarding, Qbittorrent, Registry, SettingsState,
-        State, TimedEvent, Tunnel,
+        Core, HistoryState, Mam, Notifications, PortForwarding, Qbittorrent, Registry,
+        SettingsState, State, TimedEvent, Tunnel,
     },
     shell::{EventSender, Integrations, Shell, ShellResult, read_clock},
 };
@@ -31,6 +31,8 @@ pub struct Observation {
     pub tunnel: Tunnel,
     /// Notifications and their delivery.
     pub notifications: Notifications,
+    /// Windlass's work with MAM.
+    pub mam: Mam,
     /// The most recently handled event, absent before the first input.
     pub last_event: Option<TimedEvent>,
     /// The latest storage error, retained across subsequent state updates.
@@ -48,6 +50,7 @@ impl Observation {
             registry: core.registry().clone(),
             tunnel: core.tunnel().clone(),
             notifications: core.notifications().clone(),
+            mam: core.mam().clone(),
             last_event,
             storage_error,
         }

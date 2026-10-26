@@ -38,12 +38,18 @@ struct FakeTorrent {
     state: &'static str,
     size: u64,
     total_size: u64,
+    /// When it completed, in Unix seconds; -1 when unknown.
+    completion_on: i64,
+    seeding_time: u64,
+    force_start: bool,
 }
 
 #[derive(Debug, Default)]
 struct FakeQbittorrent {
     listen_port: u16,
     port_changes: Vec<u16>,
+    /// Queue preferences, as qBittorrent names them; none when it reports none.
+    queue: Option<serde_json::Map<String, Value>>,
     torrents: BTreeMap<String, FakeTorrent>,
     commands: Vec<String>,
 }
@@ -66,6 +72,9 @@ const fn complete(state: &'static str) -> FakeTorrent {
         state,
         size: 1_073_741_824,
         total_size: 1_073_741_824,
+        completion_on: -1,
+        seeding_time: 3600,
+        force_start: false,
     }
 }
 
@@ -86,23 +95,37 @@ async fn version() -> &'static str {
 }
 
 async fn preferences(State(fake): State<Shared>) -> Json<Value> {
-    let port = fake.lock().map_or(0, |fake| fake.listen_port);
-    Json(json!({ "listen_port": port, "current_network_interface": "wg0" }))
+    let (port, queue) = fake
+        .lock()
+        .map(|fake| (fake.listen_port, fake.queue.clone()))
+        .unwrap_or_default();
+    let mut preferences = json!({ "listen_port": port, "current_network_interface": "wg0" });
+    if let (Some(preferences), Some(queue)) = (preferences.as_object_mut(), queue) {
+        preferences.extend(queue);
+    }
+    Json(preferences)
 }
 
 async fn set_preferences(State(fake): State<Shared>, Form(form): Form<Preferences>) -> StatusCode {
-    let port = serde_json::from_str::<Value>(&form.json)
-        .ok()
-        .and_then(|value| value.get("listen_port").and_then(Value::as_u64))
-        .and_then(|port| u16::try_from(port).ok());
-    match (port, fake.lock()) {
-        (Some(port), Ok(mut fake)) => {
-            fake.listen_port = port;
-            fake.port_changes.push(port);
-            StatusCode::OK
-        }
-        _ => StatusCode::BAD_REQUEST,
+    let changes = serde_json::from_str::<serde_json::Map<String, Value>>(&form.json);
+    let (Ok(changes), Ok(mut fake)) = (changes, fake.lock()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if let Some(port) = changes
+        .get("listen_port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+    {
+        fake.listen_port = port;
+        fake.port_changes.push(port);
+    } else if let Some(queue) = &mut fake.queue {
+        queue.extend(changes.clone());
+        let command = format!("queue {}", Value::Object(changes));
+        fake.commands.push(command);
+    } else {
+        return StatusCode::BAD_REQUEST;
     }
+    StatusCode::OK
 }
 
 /// Every answer is a full list, which qBittorrent may send at any time.
@@ -123,9 +146,10 @@ async fn maindata(State(fake): State<Shared>, Query(rid): Query<Rid>) -> Json<Va
                 "completed": torrent.size,
                 "uploaded": 2048,
                 "ratio": 1.5,
-                "seeding_time": 3600,
+                "seeding_time": torrent.seeding_time,
                 "added_on": 1_700_000_000,
-                "completion_on": -1,
+                "completion_on": torrent.completion_on,
+                "force_start": torrent.force_start,
                 "content_path": "/srv/books/A Synthetic Audiobook",
                 "save_path": "/srv/books"
             });
@@ -172,6 +196,23 @@ async fn start(State(fake): State<Shared>, Form(form): Form<Hashes>) {
     });
 }
 
+#[derive(Deserialize)]
+struct ForceStart {
+    hashes: String,
+    value: bool,
+}
+
+async fn set_force_start(State(fake): State<Shared>, Form(form): Form<ForceStart>) {
+    record(&fake, |fake| {
+        for hash in form.hashes.split('|') {
+            if let Some(torrent) = fake.torrents.get_mut(hash) {
+                torrent.force_start = form.value;
+            }
+        }
+        format!("forceStart {} {}", form.hashes, form.value)
+    });
+}
+
 async fn delete(State(fake): State<Shared>, Form(form): Form<Hashes>) {
     record(&fake, |fake| {
         for hash in form.hashes.split('|') {
@@ -207,6 +248,7 @@ async fn fake_qbittorrent(fake: Shared) -> TestResult<SocketAddr> {
         .route("/api/v2/app/setPreferences", post(set_preferences))
         .route("/api/v2/sync/maindata", get(maindata))
         .route("/api/v2/torrents/start", post(start))
+        .route("/api/v2/torrents/setForceStart", post(set_force_start))
         .route("/api/v2/torrents/delete", post(delete))
         .route("/api/v2/torrents/files", get(files))
         .route("/api/v2/torrents/filePrio", post(file_priority))
@@ -314,6 +356,7 @@ async fn qbittorrent_listens_on_the_forwarded_port() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -345,6 +388,87 @@ async fn qbittorrent_listens_on_the_forwarded_port() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_queue_follows_the_limits_and_unsatisfied_seeds_always_run() -> TestResult {
+    const SATISFIED: &str = "89abcdef0123456789abcdef0123456789abcdef";
+    let unsatisfied = FakeTorrent {
+        completion_on: 1_700_000_600,
+        ..complete("queuedUP")
+    };
+    let satisfied = FakeTorrent {
+        completion_on: 1_700_000_600,
+        seeding_time: 100 * 3600,
+        force_start: true,
+        ..complete("forcedUP")
+    };
+    let fake = FakeQbittorrent::with(&[(HASH, unsatisfied), (SATISFIED, satisfied)]);
+    if let Ok(mut fake) = fake.lock() {
+        // qBittorrent's own defaults.
+        fake.queue = json!({
+            "queueing_enabled": false,
+            "max_active_downloads": 3,
+            "max_active_torrents": 5,
+            "max_active_uploads": -1,
+            "dont_count_slow_torrents": false
+        })
+        .as_object()
+        .cloned();
+    }
+    let webui = fake_qbittorrent(Arc::clone(&fake)).await?;
+    let running = run(Integrations {
+        tunnel: None,
+        ntfy_server: None,
+        ntfy_relay: None,
+        dashboard_url: None,
+        mam: None,
+        qbittorrent: Some(format!("http://{webui}/").parse()?),
+        nat_pmp_gateway: None,
+    })
+    .await?;
+    let wanted = windlass::core::QueuePreferences {
+        queueing: true,
+        max_downloading: Some(5),
+        max_active: Some(10),
+        max_seeding: Some(10),
+        idle_not_counted: true,
+    };
+    running
+        .wait(|observation| match &observation.qbittorrent {
+            Qbittorrent::Connected(session) => {
+                let forced = |hash: &str| {
+                    TorrentHash::parse(hash)
+                        .and_then(|hash| session.torrents.get(&hash))
+                        .map(|torrent| torrent.force_start)
+                };
+                session.preferences.queue == Some(wanted)
+                    && forced(HASH) == Some(true)
+                    && forced(SATISFIED) == Some(false)
+            }
+            _ => false,
+        })
+        .await?;
+    let commands = fake
+        .lock()
+        .map(|fake| fake.commands.clone())
+        .unwrap_or_default();
+    assert!(
+        commands.iter().any(|command| command.starts_with("queue ")
+            && command.contains("\"max_active_downloads\":5")
+            && command.contains("\"max_active_uploads\":10")),
+        "{commands:?}"
+    );
+    assert!(
+        commands.contains(&format!("forceStart {HASH} true")),
+        "{commands:?}"
+    );
+    assert!(
+        commands.contains(&format!("forceStart {SATISFIED} false")),
+        "{commands:?}"
+    );
+    running.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn unavailable_services_are_reported_and_retried() -> TestResult {
     // Nothing listens on these: an unused TCP port and a gateway that refuses.
     let closed = {
@@ -357,6 +481,7 @@ async fn unavailable_services_are_reported_and_retried() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: Some(format!("http://{closed}/").parse()?),
         nat_pmp_gateway: Some(gateway),
     })
@@ -429,6 +554,7 @@ async fn rejected_and_malformed_answers_are_distinguished() -> TestResult {
             ntfy_server: None,
             ntfy_relay: None,
             dashboard_url: None,
+            mam: None,
             qbittorrent: Some(format!("http://{webui}/").parse()?),
             nat_pmp_gateway: None,
         })
@@ -452,6 +578,7 @@ async fn silent_gateways_time_out() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: None,
         nat_pmp_gateway: Some(match silent.local_addr()? {
             SocketAddr::V4(address) => address,
@@ -491,6 +618,7 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
         ntfy_server: None,
         ntfy_relay: None,
         dashboard_url: None,
+        mam: None,
         qbittorrent: Some(format!("http://{webui}/").parse()?),
         nat_pmp_gateway: None,
     };
@@ -512,6 +640,7 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
                 state: "stoppedDL",
                 size: 5,
                 total_size: 10,
+                ..complete("stoppedDL")
             },
         );
     }

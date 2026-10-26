@@ -324,6 +324,71 @@ fn stopped_active_torrents_are_started_without_repeating_too_soon() {
 }
 
 #[test]
+fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult {
+    let mam = MamTorrentId::new(5).ok_or("zero id")?;
+    let ours = record(
+        1,
+        Identity::Linked {
+            mam,
+            hash: hash('b'),
+        },
+        Desired::Active,
+    )?;
+    let mut harness = Harness::new(vec![ours]);
+    let untouched = TorrentUpdate {
+        state: Some(TorrentState::Stopped { complete: false }),
+        progress: Some(Progress::default()),
+        downloaded: Some(ByteSize(0)),
+        ..TorrentUpdate::default()
+    };
+    // A torrent found stopped that has downloaded nothing stays stopped;
+    // Windlass's own download, admitted against the limit, is started.
+    let actions = harness.sync(vec![(hash('a'), untouched.clone()), (hash('b'), untouched)]);
+    assert_eq!(
+        command(&actions),
+        Some(&TorrentCommand::Start(vec![hash('b')]))
+    );
+    let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::CommandDone));
+    let seeded = |hours: u64, forced: bool| TorrentUpdate {
+        state: Some(TorrentState::SeedQueued),
+        progress: Some(Progress::from_fraction(1.0)),
+        completed_at: Some(Some(SystemTime::UNIX_EPOCH)),
+        seeding_time: Some(Duration::from_hours(hours)),
+        force_start: Some(forced),
+        ..TorrentUpdate::default()
+    };
+    // Past MAM's 72 hours but short of the 96-hour target: still forced.
+    let actions = harness.sync(vec![
+        (
+            hash('b'),
+            TorrentUpdate {
+                state: Some(TorrentState::Downloading),
+                ..TorrentUpdate::default()
+            },
+        ),
+        (hash('c'), seeded(80, false)),
+        (hash('d'), seeded(97, true)),
+    ]);
+    assert_eq!(
+        command(&actions),
+        Some(&TorrentCommand::ForceStart(vec![hash('c')]))
+    );
+    let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::CommandDone));
+    let actions = harness.sync(vec![(hash('c'), seeded(80, true))]);
+    assert_eq!(
+        command(&actions),
+        Some(&TorrentCommand::EndForceStart(vec![hash('d')]))
+    );
+    assert_eq!(
+        windlass::core::SEEDING_TARGET,
+        Duration::from_hours(96),
+        "a day beyond MAM's {:?}",
+        windlass::core::SEEDING_REQUIRED
+    );
+    Ok(())
+}
+
+#[test]
 fn partial_torrents_get_every_file_once_metadata_is_known() {
     let mut harness = Harness::new(Vec::new());
     let actions = harness.sync(vec![
@@ -399,6 +464,7 @@ fn the_listen_port_comes_before_registry_commands() {
         QbittorrentPreferences {
             listen_port: Some(forwarded),
             interface: None,
+            queue: None,
         },
     )));
     harness.poll(&actions);

@@ -1,8 +1,11 @@
-//! Decide what the user is told through ntfy, and when.
+//! Decide what the user is told, and when.
 //!
 //! Lasting conditions notify once they have held for their grace period and
-//! again when they clear. One-off events notify as they happen. Notices wait in
-//! a bounded outbox and are delivered one at a time, with retries.
+//! again when they clear. One-off events notify as they happen. Every notice is
+//! kept in the notifications log, which the dashboard shows. Urgent notices are
+//! also pushed through ntfy; a push carries only a link to the notice's entry.
+//! Pushes wait in a bounded outbox and are delivered one at a time, with
+//! retries.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -13,13 +16,21 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    Action, ClockReading, Desired, EntryCount, Failover, Port, PortForwarding, Protection,
-    Qbittorrent, QbittorrentFailure, Registry, SettingsState, StartupMode, SwitchAllowance,
-    TimerId, TimerName, TorrentState, Tunnel, VpnServer, timer::Timers,
+    Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
+    Hold, Mam, MamSession, Points, Port, PortForwarding, Protection, Purchase, Qbittorrent,
+    QbittorrentFailure, Registry, SeedboxStatus, SessionRejection, SettingsState, StartupMode,
+    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer, registry::SEEDING_TARGET,
+    timer::Timers,
 };
+
+/// A torrent completed this long ago must have reached the seeding target by
+/// now, or soon may not reach MAM's 72 hours within its 30 days.
+const SEEDING_DEADLINE_WARNING: Duration = Duration::from_hours(20 * 24);
 
 /// How many notices wait for delivery before the oldest are dropped.
 pub const OUTBOX_LIMIT: usize = 50;
+/// How many notices the log keeps; older ones are forgotten.
+pub const LOG_KEPT: u64 = 1_000;
 /// The first retry delay after a failed delivery; it doubles up to the maximum.
 const RETRY_FIRST: Duration = Duration::from_secs(30);
 /// The longest retry delay.
@@ -36,6 +47,8 @@ pub enum SettingName {
     ApiCookie,
     /// The ntfy topic.
     NtfyTopic,
+    /// The bonus points reserve.
+    PointsReserve,
 }
 
 /// Why an automatic VPN server switch cannot start.
@@ -49,8 +62,84 @@ pub enum SwitchBlock {
     NoOtherServer,
 }
 
-/// Something the user is told. Notices name conditions and counts, never book
-/// titles or account details.
+/// A notice's place in the notifications log, counting from 1 across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct NoticeId(u64);
+
+impl NoticeId {
+    const FIRST: Self = Self(1);
+
+    /// The id stored for a logged notice.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// The number the log stores and links name.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    const fn following(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+/// Where a notice reaches the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Reach {
+    /// Something is wrong or needs the owner: pushed, and on the dashboard.
+    Push,
+    /// Something went back to normal or went as planned: only on the dashboard.
+    Dashboard,
+}
+
+/// A notice as the log keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Logged {
+    /// Its place in the log.
+    pub id: NoticeId,
+    /// When it was decided.
+    pub at: SystemTime,
+    /// What it says.
+    pub notice: Notice,
+    /// Whether it is pushed.
+    pub reach: Reach,
+}
+
+/// A notice waiting to be pushed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Push {
+    /// Its entry in the log, which the push links to; without one, the push
+    /// links to the log itself.
+    pub entry: Option<NoticeId>,
+    /// The notice.
+    pub notice: Notice,
+}
+
+/// Whether notices can be given their place in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeLog {
+    /// The last stored id is not known yet; notices wait for it, in order.
+    Waiting(Vec<(SystemTime, Notice)>),
+    /// The next notice takes this id.
+    Ready {
+        /// The next id.
+        next: NoticeId,
+    },
+    /// The log cannot be read; urgent notices are still pushed.
+    Unavailable,
+}
+
+impl Default for NoticeLog {
+    fn default() -> Self {
+        Self::Waiting(Vec::new())
+    }
+}
+
+/// Something the user is told. Pushed notices carry no words at all; the log
+/// stays on the owner's network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Notice {
     /// Windlass started.
@@ -157,6 +246,234 @@ pub enum Notice {
     },
     /// The user asked for a test notification.
     Test,
+    /// MAM refused the API session.
+    MamSessionRejected {
+        /// Why.
+        rejection: SessionRejection,
+    },
+    /// MAM accepted the API session again.
+    MamSessionAccepted,
+    /// MAM has not registered the seedbox IP.
+    SeedboxNotRegistered,
+    /// MAM registered the seedbox IP.
+    SeedboxRegistered {
+        /// The registered IP.
+        ip: IpAddr,
+    },
+    /// Windlass cannot learn which IP MAM sees.
+    MamIpUnknown {
+        /// Failed lookups in a row.
+        failures: u32,
+    },
+    /// Windlass learns which IP MAM sees again.
+    MamIpKnown,
+    /// Saved MAM state could not be read, so registration waits.
+    MamStateUnreadable,
+    /// The ratio is below 2.0, so downloads are held.
+    RatioLow {
+        /// The ratio in thousandths.
+        ratio: u64,
+        /// Whether it is below 1.1.
+        urgent: bool,
+    },
+    /// The ratio is 2.0 or more again.
+    RatioRestored,
+    /// Unsatisfied torrents reached 80% of MAM's limit.
+    UnsatisfiedNearLimit {
+        /// MAM's count.
+        count: u32,
+        /// MAM's limit.
+        limit: u32,
+    },
+    /// Unsatisfied torrents are below 80% of the limit again.
+    UnsatisfiedBelowLimit,
+    /// MAM counts unsatisfied torrents that are not seeding.
+    UnsatisfiedNotSeeding {
+        /// How many.
+        count: u32,
+    },
+    /// Every unsatisfied torrent seeds again.
+    UnsatisfiedSeeding,
+    /// MAM flags a partial download, tracker errors, or other red categories.
+    MamFlagged {
+        /// Whether MAM sees a partial download.
+        partial: bool,
+        /// Important tracker errors.
+        tracker_errors: u32,
+        /// Torrents in other red categories, such as duplicate peers.
+        flagged: u32,
+    },
+    /// MAM flags nothing any more.
+    MamFlagsCleared,
+    /// MAM has notifications for the owner; their text is not read.
+    MamMessages {
+        /// How many.
+        count: u32,
+        /// Whether one warns that MAM is about to stop accepting a client.
+        client_warning: bool,
+    },
+    /// Bookmarked torrents wait.
+    DownloadsHeld {
+        /// Why.
+        hold: Hold,
+    },
+    /// Bookmarked torrents download again.
+    DownloadsResumed,
+    /// Torrents wait for a wedge and none is left.
+    NoWedgesLeft,
+    /// The points balance is below the reserve.
+    PointsBelowReserve {
+        /// The balance.
+        points: Points,
+        /// The reserve.
+        reserve: Points,
+    },
+    /// VIP ends within 7 days and has not been renewed.
+    VipEnding {
+        /// When it ends.
+        until: SystemTime,
+    },
+    /// MAM refused a download, so downloads are held.
+    DownloadsRefused,
+    /// Torrents completed 20 or more days ago have not seeded 96 hours.
+    SeedingBehind {
+        /// How many.
+        count: usize,
+    },
+    /// Every torrent is on track to seed 96 hours.
+    SeedingOnTrack,
+    /// A bonus store purchase went through.
+    PurchaseMade {
+        /// What was bought.
+        purchase: Purchase,
+        /// The points left.
+        points: Points,
+    },
+    /// MAM refused a purchase.
+    PurchaseRefused {
+        /// What Windlass tried to buy.
+        purchase: Purchase,
+    },
+    /// A purchase's outcome is unknown; nothing more is bought until MAM's
+    /// figures are read again.
+    PurchaseUncertain {
+        /// What Windlass tried to buy.
+        purchase: Purchase,
+    },
+    /// A download's wedge was not spent, so the torrent is stopped.
+    WedgeNotSpent,
+    /// A running download is no longer free for the owner.
+    DownloadNotFree {
+        /// Whether Windlass stopped it: no wedge was left, or MAM no longer
+        /// lists it. Otherwise it finished before Windlass could tell.
+        stopped: bool,
+    },
+    /// A running download's freeleech ended, so Windlass spent a wedge on it.
+    WedgedMidDownload,
+    /// An uncertain purchase was settled, from the next reading or by the owner.
+    PurchaseSettled {
+        /// What Windlass tried to buy.
+        purchase: Purchase,
+        /// Whether MAM sold it.
+        made: bool,
+    },
+    /// The next reading could not tell whether an uncertain purchase went
+    /// through; nothing more is bought until the owner checks on MAM.
+    PurchaseNeedsChecking {
+        /// What Windlass tried to buy.
+        purchase: Purchase,
+    },
+    /// MAM's client list does not show the running qBittorrent as allowed, so
+    /// downloads are held.
+    MamClientNotListed {
+        /// What the list says.
+        standing: ClientStanding,
+    },
+    /// MAM lists the running qBittorrent again.
+    MamClientListed,
+    /// MAM still cannot reach qBittorrent after Windlass's repair and a fresh
+    /// reading.
+    NotConnectable {
+        /// What Windlass checked and found.
+        findings: Findings,
+    },
+    /// MAM reaches qBittorrent again.
+    ConnectableAgain,
+    /// A weekly reminder to visit MAM.
+    MamVisitReminder,
+}
+
+impl Notice {
+    /// Whether the notice is pushed, or only kept on the dashboard.
+    #[must_use]
+    pub const fn reach(&self) -> Reach {
+        match self {
+            Self::Started { .. }
+            | Self::VpnProtectionRestored { .. }
+            | Self::FailoverStarted { .. }
+            | Self::FailoverSucceeded { .. }
+            | Self::ForwardedPortRestored { .. }
+            | Self::QbittorrentReachable
+            | Self::QbittorrentVersionAllowed { .. }
+            | Self::TorrentErrorsCleared
+            | Self::FilesMissingCleared
+            | Self::TorrentsMissingCleared
+            | Self::RegistrySaved
+            | Self::MamSessionAccepted
+            | Self::SeedboxRegistered { .. }
+            | Self::MamIpKnown
+            | Self::RatioRestored
+            | Self::UnsatisfiedBelowLimit
+            | Self::UnsatisfiedSeeding
+            | Self::MamFlagsCleared
+            | Self::DownloadsResumed
+            | Self::SeedingOnTrack
+            | Self::PurchaseMade { .. }
+            | Self::WedgedMidDownload
+            | Self::PurchaseSettled { .. }
+            | Self::MamClientListed
+            | Self::ConnectableAgain => Reach::Dashboard,
+            Self::StartupFailed
+            | Self::VpnProtectionLost { .. }
+            | Self::FailoverFailed { .. }
+            | Self::FailoverBlocked { .. }
+            | Self::ForwardedPortLost
+            | Self::QbittorrentUnreachable { .. }
+            | Self::QbittorrentVersionNotAllowed { .. }
+            | Self::TorrentErrors { .. }
+            | Self::FilesMissing { .. }
+            | Self::TorrentsMissing { .. }
+            | Self::RegistryNotSaved
+            | Self::RegistryUnreadable
+            | Self::SettingNotSaved { .. }
+            | Self::HistoryUnavailable
+            | Self::HistoryEntriesLost { .. }
+            | Self::Test
+            | Self::MamSessionRejected { .. }
+            | Self::SeedboxNotRegistered
+            | Self::MamIpUnknown { .. }
+            | Self::MamStateUnreadable
+            | Self::RatioLow { .. }
+            | Self::UnsatisfiedNearLimit { .. }
+            | Self::UnsatisfiedNotSeeding { .. }
+            | Self::MamFlagged { .. }
+            | Self::MamMessages { .. }
+            | Self::DownloadsHeld { .. }
+            | Self::NoWedgesLeft
+            | Self::PointsBelowReserve { .. }
+            | Self::VipEnding { .. }
+            | Self::DownloadsRefused
+            | Self::SeedingBehind { .. }
+            | Self::PurchaseRefused { .. }
+            | Self::PurchaseUncertain { .. }
+            | Self::WedgeNotSpent
+            | Self::DownloadNotFree { .. }
+            | Self::PurchaseNeedsChecking { .. }
+            | Self::MamClientNotListed { .. }
+            | Self::NotConnectable { .. }
+            | Self::MamVisitReminder => Reach::Push,
+        }
+    }
 }
 
 /// Why a delivery failed.
@@ -183,6 +500,17 @@ pub enum NotificationEvent {
         /// Why.
         reason: DeliveryFailure,
     },
+    /// The notifications log was read at startup.
+    LogRead {
+        /// The newest stored notice, if any.
+        last: Option<NoticeId>,
+    },
+    /// The notifications log could not be read.
+    LogReadFailed,
+    /// A notice was saved to the log.
+    Saved,
+    /// Saving a notice failed; it is still pushed if urgent.
+    SaveFailed,
 }
 
 /// A lasting condition worth telling the user about.
@@ -206,6 +534,40 @@ pub enum Condition {
     TorrentsMissing,
     /// The registry keeps failing to save.
     RegistrySave,
+    /// MAM refuses the API session.
+    MamSession,
+    /// The seedbox IP is not registered.
+    SeedboxRegistration,
+    /// The IP MAM sees is unknown.
+    MamIp,
+    /// The ratio is low.
+    Ratio,
+    /// Unsatisfied torrents near the limit.
+    UnsatisfiedLimit,
+    /// Unsatisfied torrents not seeding.
+    UnsatisfiedNotSeeding,
+    /// MAM flags something.
+    MamFlags,
+    /// MAM has notifications.
+    MamMessages,
+    /// Downloads wait.
+    DownloadsHeld,
+    /// No wedge is left for waiting torrents.
+    Wedges,
+    /// Points are below the reserve.
+    PointsReserve,
+    /// VIP ends soon.
+    VipEnding,
+    /// MAM refused a download.
+    DownloadsRefused,
+    /// Torrents behind on seeding.
+    SeedingBehind,
+    /// MAM's client list does not show qBittorrent as allowed.
+    MamClient,
+    /// MAM cannot reach qBittorrent after a repair.
+    Connectable,
+    /// An uncertain purchase waits for the owner.
+    PurchaseUnresolved,
 }
 
 impl Condition {
@@ -213,9 +575,25 @@ impl Condition {
     #[must_use]
     pub const fn grace(self) -> Duration {
         match self {
-            Self::VpnProtection | Self::FailoverBlocked | Self::QbittorrentVersion => {
-                Duration::ZERO
-            }
+            Self::VpnProtection
+            | Self::FailoverBlocked
+            | Self::QbittorrentVersion
+            | Self::MamSession
+            | Self::SeedboxRegistration
+            | Self::Ratio
+            | Self::UnsatisfiedLimit
+            | Self::MamFlags
+            | Self::MamMessages
+            | Self::Wedges
+            | Self::PointsReserve
+            | Self::VipEnding
+            | Self::DownloadsRefused
+            | Self::SeedingBehind
+            | Self::MamClient
+            | Self::Connectable
+            | Self::PurchaseUnresolved => Duration::ZERO,
+            Self::MamIp => Duration::from_mins(15),
+            Self::UnsatisfiedNotSeeding | Self::DownloadsHeld => Duration::from_mins(30),
             Self::RegistrySave => Duration::from_mins(2),
             Self::ForwardedPort | Self::QbittorrentReachable | Self::TorrentErrors => {
                 Duration::from_mins(5)
@@ -254,12 +632,12 @@ pub enum Delivery {
     /// Nothing is being sent.
     #[default]
     Idle,
-    /// The shell is sending this notice.
-    Sending(Notice),
+    /// The shell is sending this push.
+    Sending(Push),
     /// Sending failed; it is sent again when the timer expires.
     Retrying {
-        /// The notice.
-        notice: Notice,
+        /// The push.
+        push: Push,
         /// The retry timer.
         timer: TimerId,
     },
@@ -279,8 +657,10 @@ pub struct Outcome {
 pub struct Notifications {
     /// Conditions holding now, by how far they have progressed.
     pub conditions: BTreeMap<Condition, Phase>,
-    /// Notices waiting to be sent, oldest first.
-    pub outbox: VecDeque<Notice>,
+    /// Whether notices can be logged.
+    pub log: NoticeLog,
+    /// Pushes waiting to be sent, oldest first.
+    pub outbox: VecDeque<Push>,
     /// The notice being sent.
     pub delivery: Delivery,
     /// The latest delivery result.
@@ -323,12 +703,15 @@ pub(super) struct Facts<'a> {
     pub(super) port_forwarding: &'a PortForwarding,
     pub(super) qbittorrent: &'a Qbittorrent,
     pub(super) registry: &'a Registry,
+    pub(super) mam: &'a Mam,
+    pub(super) reserve: Option<Points>,
 }
 
 impl Notifications {
     pub(super) const fn new() -> Self {
         Self {
             conditions: BTreeMap::new(),
+            log: NoticeLog::Waiting(Vec::new()),
             outbox: VecDeque::new(),
             delivery: Delivery::Idle,
             last_outcome: None,
@@ -342,7 +725,8 @@ impl Notifications {
     /// Notices for what an event reports, taken before it is handled.
     pub(super) fn reported(&mut self, event: &super::Event) -> Vec<Notice> {
         use super::{
-            Event, HistoryEvent, MamPauseEvent, RegistryEvent, SettingsEvent, StartupEvent,
+            Event, HistoryEvent, MamEvent, MamPauseEvent, RegistryEvent, SettingsEvent,
+            StartupEvent,
         };
 
         let notice = match event {
@@ -366,6 +750,12 @@ impl Notifications {
             Event::Settings(SettingsEvent::NtfyTopicWriteFailed) => Some(Notice::SettingNotSaved {
                 setting: SettingName::NtfyTopic,
             }),
+            Event::Settings(SettingsEvent::PointsReserveWriteFailed) => {
+                Some(Notice::SettingNotSaved {
+                    setting: SettingName::PointsReserve,
+                })
+            }
+            Event::Mam(MamEvent::StateReadFailed) => Some(Notice::MamStateUnreadable),
             Event::History(HistoryEvent::OpenFailed) => Some(Notice::HistoryUnavailable),
             Event::History(HistoryEvent::EntriesLost { count, .. }) => {
                 Some(Notice::HistoryEntriesLost { count: *count })
@@ -419,15 +809,70 @@ impl Notifications {
         settings: &SettingsState,
         timers: &mut Timers,
     ) -> Vec<Action> {
+        let mut notices = Vec::new();
         for (condition, status) in assess(now.wall, facts) {
-            self.track(now.monotonic, condition, status);
+            notices.extend(self.track(now.monotonic, condition, status));
         }
-        for notice in happened {
-            self.enqueue(notice);
-        }
-        let mut actions = self.schedule_grace(now.monotonic, timers);
+        notices.extend(happened);
+        let mut actions: Vec<Action> = notices
+            .into_iter()
+            .filter_map(|notice| self.record(now.wall, notice))
+            .collect();
+        actions.extend(self.schedule_grace(now.monotonic, timers));
         actions.extend(self.send(settings));
         actions
+    }
+
+    /// Start reading the log's newest id, once storage is open.
+    pub(super) fn start_reading() -> Vec<Action> {
+        vec![Action::ReadNoticeLog]
+    }
+
+    /// Storage cannot be used: waiting notices are pushed without an entry.
+    pub(super) fn log_unavailable(&mut self) {
+        if let NoticeLog::Waiting(waiting) =
+            std::mem::replace(&mut self.log, NoticeLog::Unavailable)
+        {
+            for (at, notice) in waiting {
+                let _ = self.record(at, notice);
+            }
+        }
+    }
+
+    /// Give a notice its place in the log, and queue it for pushing if urgent.
+    fn record(&mut self, at: SystemTime, notice: Notice) -> Option<Action> {
+        let reach = notice.reach();
+        let entry = match &mut self.log {
+            NoticeLog::Waiting(waiting) => {
+                waiting.push((at, notice));
+                return None;
+            }
+            NoticeLog::Ready { next } => {
+                let id = *next;
+                *next = id.following();
+                Some(id)
+            }
+            NoticeLog::Unavailable => None,
+        };
+        if reach == Reach::Push {
+            self.enqueue(Push {
+                entry,
+                notice: notice.clone(),
+            });
+        }
+        entry.map(|id| Action::SaveNotice {
+            entry: Logged {
+                id,
+                at,
+                notice,
+                reach,
+            },
+            forget_through: id
+                .get()
+                .checked_sub(LOG_KEPT)
+                .filter(|through| *through > 0)
+                .map(NoticeId::new),
+        })
     }
 
     pub(super) fn handle(
@@ -436,11 +881,37 @@ impl Notifications {
         event: &NotificationEvent,
         timers: &mut Timers,
     ) -> Vec<Action> {
-        let Delivery::Sending(notice) = &self.delivery else {
+        match event {
+            // The log is read once, at startup.
+            NotificationEvent::LogRead { last } => {
+                let NoticeLog::Waiting(waiting) = &mut self.log else {
+                    return Vec::new();
+                };
+                let waiting = std::mem::take(waiting);
+                self.log = NoticeLog::Ready {
+                    next: last.map_or(NoticeId::FIRST, NoticeId::following),
+                };
+                return waiting
+                    .into_iter()
+                    .filter_map(|(at, notice)| self.record(at, notice))
+                    .collect();
+            }
+            NotificationEvent::LogReadFailed => {
+                self.log_unavailable();
+                return Vec::new();
+            }
+            _ => {}
+        }
+        let Delivery::Sending(push) = &self.delivery else {
             return Vec::new();
         };
         match event {
-            NotificationEvent::SendTest => Vec::new(),
+            // Handled above, or nothing to do with the push being sent.
+            NotificationEvent::SendTest
+            | NotificationEvent::LogRead { .. }
+            | NotificationEvent::LogReadFailed
+            | NotificationEvent::Saved
+            | NotificationEvent::SaveFailed => Vec::new(),
             NotificationEvent::Delivered => {
                 self.delivery = Delivery::Idle;
                 self.failures = 0;
@@ -451,7 +922,7 @@ impl Notifications {
                 Vec::new()
             }
             NotificationEvent::DeliveryFailed { reason } => {
-                let notice = notice.clone();
+                let push = push.clone();
                 self.failures = self.failures.saturating_add(1);
                 self.last_outcome = Some(Outcome {
                     at: now.wall,
@@ -462,7 +933,7 @@ impl Notifications {
                     .saturating_mul(2_u32.saturating_pow(self.failures - 1))
                     .min(RETRY_MAX);
                 let (timer, deadline) = timers.schedule(now.monotonic, after);
-                self.delivery = Delivery::Retrying { notice, timer };
+                self.delivery = Delivery::Retrying { push, timer };
                 vec![Action::StartTimer {
                     name: TimerName::NotificationRetry,
                     id: timer,
@@ -477,49 +948,50 @@ impl Notifications {
         if self.grace_timer.is_some_and(|(timer, _)| timer == id) {
             self.grace_timer = None;
         }
-        if let Delivery::Retrying { notice, timer, .. } = &self.delivery
+        if let Delivery::Retrying { push, timer, .. } = &self.delivery
             && *timer == id
         {
-            self.outbox.push_front(notice.clone());
+            self.outbox.push_front(push.clone());
             self.delivery = Delivery::Idle;
         }
     }
 
-    fn enqueue(&mut self, notice: Notice) {
+    fn enqueue(&mut self, push: Push) {
         if self.outbox.len() >= OUTBOX_LIMIT {
             self.outbox.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.outbox.push_back(notice);
+        self.outbox.push_back(push);
     }
 
-    fn track(&mut self, now: Instant, condition: Condition, status: Status) {
+    /// Follow a condition; the notice to give, if any.
+    fn track(&mut self, now: Instant, condition: Condition, status: Status) -> Option<Notice> {
         match (self.conditions.get(&condition).copied(), status) {
             (None, Status::Active(notice)) => {
                 if condition.grace().is_zero() {
                     self.conditions.insert(condition, Phase::Raised);
-                    self.enqueue(notice);
+                    Some(notice)
                 } else {
                     self.conditions
                         .insert(condition, Phase::Pending { since: now });
+                    None
                 }
             }
             (Some(Phase::Pending { since }), Status::Active(notice))
                 if now.duration_since(since) >= condition.grace() =>
             {
                 self.conditions.insert(condition, Phase::Raised);
-                self.enqueue(notice);
+                Some(notice)
             }
             (Some(Phase::Pending { .. }), Status::Clear(_)) => {
                 self.conditions.remove(&condition);
+                None
             }
             (Some(Phase::Raised), Status::Clear(notice)) => {
                 self.conditions.remove(&condition);
-                if let Some(notice) = notice {
-                    self.enqueue(notice);
-                }
+                notice
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -548,8 +1020,8 @@ impl Notifications {
         }]
     }
 
-    /// Send the oldest notice once settings name a topic; without one, notices
-    /// are discarded.
+    /// Push the oldest waiting notice once settings name a topic; without one,
+    /// pushes are discarded.
     fn send(&mut self, settings: &SettingsState) -> Vec<Action> {
         let topic = match settings {
             SettingsState::Unread | SettingsState::Reading => return Vec::new(),
@@ -566,16 +1038,20 @@ impl Notifications {
         if self.delivery != Delivery::Idle {
             return Vec::new();
         }
-        let Some(notice) = self.outbox.pop_front() else {
+        let Some(push) = self.outbox.pop_front() else {
             return Vec::new();
         };
-        self.delivery = Delivery::Sending(notice.clone());
-        vec![Action::SendNotification { topic, notice }]
+        self.delivery = Delivery::Sending(push.clone());
+        vec![Action::SendNotification { topic, push }]
     }
 }
 
 /// Read every lasting condition from core state.
-fn assess(now: SystemTime, facts: Facts<'_>) -> [(Condition, Status); 9] {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one entry per condition reads best as one table"
+)]
+fn assess(now: SystemTime, facts: Facts<'_>) -> Vec<(Condition, Status)> {
     let session = match facts.qbittorrent {
         Qbittorrent::Connected(session) => Some(&**session),
         _ => None,
@@ -607,7 +1083,7 @@ fn assess(now: SystemTime, facts: Facts<'_>) -> [(Condition, Status); 9] {
         None => Status::Unchanged,
     };
     let (vpn, blocked) = vpn(now, facts.tunnel);
-    [
+    let mut conditions = vec![
         (Condition::VpnProtection, vpn),
         (Condition::FailoverBlocked, blocked),
         (
@@ -668,6 +1144,223 @@ fn assess(now: SystemTime, facts: Facts<'_>) -> [(Condition, Status); 9] {
                 }
                 Registry::Loaded(_) => Status::Clear(Some(Notice::RegistrySaved)),
                 _ => Status::Unchanged,
+            },
+        ),
+        (
+            Condition::SeedingBehind,
+            counted(
+                seeding_behind(now, facts.registry),
+                |count| Notice::SeedingBehind { count },
+                Notice::SeedingOnTrack,
+            ),
+        ),
+    ];
+    conditions.extend(mam(now, facts.mam, facts.reserve));
+    conditions
+}
+
+/// Active torrents completed 20 or more days ago with less than the seeding
+/// target seeded.
+fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<usize> {
+    let Registry::Loaded(records) = registry else {
+        return None;
+    };
+    Some(
+        records
+            .records()
+            .filter(|record| record.desired == Desired::Active)
+            .filter_map(|record| record.observation.as_ref())
+            .filter(|observation| {
+                observation.torrent.seeding_time < SEEDING_TARGET
+                    && observation.torrent.completed_at.is_some_and(|completed| {
+                        now.duration_since(completed)
+                            .is_ok_and(|since| since >= SEEDING_DEADLINE_WARNING)
+                    })
+            })
+            .count(),
+    )
+}
+
+/// The account's lasting conditions, as MAM reports them.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one entry per condition reads best as one table"
+)]
+fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, Status)> {
+    let read = |active: Option<Notice>, cleared: Option<Notice>| match (mam.account.data(), active)
+    {
+        (None, _) => Status::Unchanged,
+        (Some(_), Some(notice)) => Status::Active(notice),
+        (Some(_), None) => Status::Clear(cleared),
+    };
+    let account = &mam.account;
+    let hold = mam.acquisition.hold;
+    vec![
+        (
+            Condition::MamSession,
+            match mam.session {
+                MamSession::Rejected { rejection, .. } => {
+                    Status::Active(Notice::MamSessionRejected { rejection })
+                }
+                MamSession::Verified { .. } => Status::Clear(Some(Notice::MamSessionAccepted)),
+                MamSession::Unverified => Status::Unchanged,
+            },
+        ),
+        (
+            Condition::SeedboxRegistration,
+            match &mam.seedbox.status {
+                SeedboxStatus::Failed {
+                    failure: super::RegistrationFailure::Mam(super::MamFailure::TooSoon { .. }),
+                    ..
+                }
+                | SeedboxStatus::Unconfirmed => Status::Unchanged,
+                SeedboxStatus::Failed { .. } => Status::Active(Notice::SeedboxNotRegistered),
+                SeedboxStatus::Confirmed { ip, .. } => {
+                    Status::Clear(Some(Notice::SeedboxRegistered { ip: *ip }))
+                }
+            },
+        ),
+        (
+            Condition::MamIp,
+            if mam.network.failures > 0 {
+                Status::Active(Notice::MamIpUnknown {
+                    failures: mam.network.failures,
+                })
+            } else if mam.network.current().is_some() {
+                Status::Clear(Some(Notice::MamIpKnown))
+            } else {
+                Status::Unchanged
+            },
+        ),
+        (
+            Condition::Ratio,
+            read(
+                account
+                    .ratio_low()
+                    .map(|(ratio, urgent)| Notice::RatioLow { ratio, urgent }),
+                Some(Notice::RatioRestored),
+            ),
+        ),
+        (
+            Condition::UnsatisfiedLimit,
+            read(
+                account
+                    .unsatisfied_near_limit()
+                    .map(|(count, limit)| Notice::UnsatisfiedNearLimit { count, limit }),
+                Some(Notice::UnsatisfiedBelowLimit),
+            ),
+        ),
+        (
+            Condition::UnsatisfiedNotSeeding,
+            read(
+                account
+                    .not_seeding_unsatisfied()
+                    .filter(|count| *count > 0)
+                    .map(|count| Notice::UnsatisfiedNotSeeding { count }),
+                Some(Notice::UnsatisfiedSeeding),
+            ),
+        ),
+        (
+            Condition::MamFlags,
+            read(
+                account
+                    .attention()
+                    .filter(super::Attention::any)
+                    .map(|attention| Notice::MamFlagged {
+                        partial: attention.partial,
+                        tracker_errors: attention.tracker_errors,
+                        flagged: attention.flagged,
+                    }),
+                Some(Notice::MamFlagsCleared),
+            ),
+        ),
+        (
+            Condition::MamMessages,
+            read(
+                account
+                    .data()
+                    .and_then(|data| data.notices)
+                    .filter(|notices| notices.total() > 0)
+                    .map(|notices| Notice::MamMessages {
+                        count: notices.total(),
+                        client_warning: notices.about_to_drop_client > 0,
+                    }),
+                None,
+            ),
+        ),
+        (
+            Condition::DownloadsHeld,
+            match hold {
+                Some(Hold::MamUnavailable) => Status::Unchanged,
+                Some(hold) => Status::Active(Notice::DownloadsHeld { hold }),
+                None => Status::Clear(Some(Notice::DownloadsResumed)),
+            },
+        ),
+        (
+            Condition::Wedges,
+            if hold == Some(Hold::NoWedge) {
+                Status::Active(Notice::NoWedgesLeft)
+            } else {
+                Status::Clear(None)
+            },
+        ),
+        (
+            Condition::PointsReserve,
+            read(
+                account
+                    .data()
+                    .zip(reserve)
+                    .filter(|(data, reserve)| data.points < *reserve)
+                    .map(|(data, reserve)| Notice::PointsBelowReserve {
+                        points: data.points,
+                        reserve,
+                    }),
+                None,
+            ),
+        ),
+        (
+            Condition::VipEnding,
+            read(
+                account
+                    .vip_ending(now)
+                    .map(|until| Notice::VipEnding { until }),
+                None,
+            ),
+        ),
+        (
+            Condition::MamClient,
+            match mam.client {
+                ClientStanding::Unknown | ClientStanding::NoneListed => Status::Unchanged,
+                ClientStanding::Listed => Status::Clear(Some(Notice::MamClientListed)),
+                standing => Status::Active(Notice::MamClientNotListed { standing }),
+            },
+        ),
+        (
+            Condition::PurchaseUnresolved,
+            account
+                .unresolved_purchase()
+                .map_or(Status::Clear(None), |purchase| {
+                    Status::Active(Notice::PurchaseNeedsChecking { purchase })
+                }),
+        ),
+        (
+            Condition::Connectable,
+            match &mam.connectability {
+                Connectability::Fine => Status::Clear(Some(Notice::ConnectableAgain)),
+                Connectability::Repaired { .. } => Status::Unchanged,
+                Connectability::Unresolved { findings, .. } => {
+                    Status::Active(Notice::NotConnectable {
+                        findings: findings.clone(),
+                    })
+                }
+            },
+        ),
+        (
+            Condition::DownloadsRefused,
+            if mam.acquisition.refused.is_some() {
+                Status::Active(Notice::DownloadsRefused)
+            } else {
+                Status::Clear(None)
             },
         ),
     ]

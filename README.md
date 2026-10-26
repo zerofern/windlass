@@ -8,6 +8,8 @@ SQLite persistence, and native systemd services on NixOS.
 - [Application foundation](.workflow/features/B-0008/brief.md) is ready for Design.
 - [Web dashboard and MAM pause control](.workflow/features/B-0003/brief.md) is ready for Design.
 - [Feature Briefs](.workflow/features/) contain the agreed and proposed flows.
+- [Flows](docs/flows.md) maps what Windlass does, flow by flow, with how each is
+  tested and the end-to-end tests still planned.
 - [Project instructions](AGENTS.md) define coding and testing conventions.
 
 ## Proof of concept
@@ -35,6 +37,8 @@ the VPN carries traffic, with `--vpn-server <name>` for each server Windlass may
 fail over to and `--vpn-current-file <path>` naming the one connected now. Use
 `--ntfy-server <url>`, `--ntfy-relay <address>`, and `--dashboard-url <url>` set
 where notifications go, the relay that reaches it, and the dashboard link they carry.
+Add `--mam-site https://www.myanonamouse.net/ --mam-tracker https://t.myanonamouse.net/`
+to let Windlass work with MAM; without them it never contacts MAM.
 Use `resume` instead of `initialise` to restart an
 existing instance. Repeat `--listen` for each LAN or Tailscale address, and add
 `--allowed-host <name>` for host names such as a Tailscale name. Requests naming
@@ -58,27 +62,99 @@ times; it works without the script, without live updates. It shows:
   the network interface, the listen port against the forwarded port, and the lease.
 - **Torrents:** every torrent in the registry with what Windlass wants for it, its
   state, progress, size, upload, and completion, marking torrents missing from
-  qBittorrent and content missing on disk. Windlass adopts torrents it finds,
+  qBittorrent and content missing on disk. Bookmarks snatched before have a
+  "Download again" button. Windlass adopts torrents it finds,
   starts stopped ones, selects every file, and removes those marked removed.
+  It keeps qBittorrent's queue to the torrent limits set on the settings page (by
+  default 5 downloading and 10 active, where idle seeds do not count) and
+  force-starts any complete torrent short of 96 hours of seeding (MAM requires
+  72; Windlass adds a day), so a limit never stops one. A torrent you add to
+  qBittorrent stopped, that has downloaded nothing, stays stopped: starting it
+  would add an unsatisfied torrent on MAM without Windlass checking the limit.
+- **MAM:** whether the API session works, the IP and ASN MAM sees, the seedbox
+  registration and when it may next be renewed; the account as MAM last reported
+  it (ratio, upload buffer, points, wedges, VIP, unsatisfied torrents, and flagged
+  categories as counts); the last purchase; and the bookmark list, with why the
+  next queued torrent is held.
 - **Notifications:** whether the last delivery succeeded, notices waiting, and
-  problems reported but not yet resolved.
-- **Settings:** the MAM API cookie, the ntfy topic with a test button, and the
-  history size limit, each confirmed only once saved, plus the read-only
+  problems reported but not yet resolved. The notifications page lists every
+  notice, newest first.
+- **Settings:** the MAM API cookie, the ntfy topic with a test button, the bonus
+  points reserve, the torrent limits, and the history size limit, each confirmed only once saved, plus the read-only
   deployment settings.
 
 Windlass sends notifications to an ntfy topic set on the settings page: when it
 starts, when VPN protection is lost or restored, when it switches servers or cannot,
 when qBittorrent stops responding or runs a version MAM does not allow, when
 torrents have errors, missing files, or are missing from qBittorrent, and when
-storage fails. Lasting problems notify only after a grace period, from immediately
-to 10 minutes, and again when they clear. Each notification links to the dashboard
-page that explains it and never names books.
+storage fails. For MAM it reports a refused session, an unregistered seedbox, a low
+ratio, unsatisfied torrents near the limit or not seeding, flagged categories and
+MAM notifications as counts, held or refused downloads, no wedges left, points
+below the reserve, VIP ending, purchases, and a wedge that was not spent. Once a
+week it reminds you to visit MAM, linking to MAM's main page, to keep the account
+active and read announcements about allowed clients. Lasting problems notify only after a grace period, from immediately
+to 10 minutes, and again when they clear.
+
+Every notice is kept on the dashboard's notifications page, which keeps the last
+1000. Urgent ones are also pushed, but a push says only "Windlass has a new notice"
+and links to that notice's entry, so nothing about your account or torrents goes
+to ntfy. Notices that something went back to normal or went as planned, such as
+a start, a recovery, or a settled purchase, are only on the page.
 
 History lives in the same SQLite file. The core counts entries and asks the shell to
 remove the oldest when the limit (10000 by default) is exceeded. Entries that could
 not be saved are reported as a gap once saving works again. The API cookie is stored
-unencrypted in the SQLite file, so keep that file private. Windlass does not
-contact MAM yet, so authentication and registration remain unverified.
+unencrypted in the SQLite file, so keep that file private.
+
+## Working with MAM
+
+Windlass contacts MAM only while MAM requests are resumed, the VPN tunnel is
+proven to work, and, for everything but the IP lookup, an API cookie is saved.
+Requests share a small token bucket, wait for one another, and name
+`Windlass/<version>` as their User-Agent. When MAM sends a replacement cookie,
+Windlass saves it and uses it from then on.
+
+- It looks up the IP and ASN MAM sees every five minutes, never twice within a
+  minute (so the first lookup after a start waits a minute), and uses the cookie
+  only once MAM has shown which IP and ASN it sees. It registers that IP as the
+  seedbox when it changes, at most once an hour, counting every attempt across
+  restarts.
+- It reads the account every 15 minutes, and its client list every 30.
+- It keeps VIP, renewing it within 14 days of expiry, and buys upload credit in
+  50 GiB steps when the upload buffer falls below 25 GiB or the ratio below 3.0.
+  Purchases never take points below the reserve set on the settings page, 20,000
+  by default, and an uncertain purchase stops further buying until MAM is read again.
+- It lists your bookmarks every 15 minutes and queues them. Bookmarks MAM reports
+  as snatched before are listed under Torrents but wait for you to press
+  "Download again". It admits
+  the oldest queued torrent once the seedbox is confirmed, qBittorrent is ready,
+  the account was read in the last five minutes, the ratio is at least 2.0, and an
+  unsatisfied slot is free after a reserve of two, counting downloads qBittorrent
+  added in the last hour, and MAM's client list shows the running qBittorrent (or
+  lists nothing yet). Its flags must be at most 5 minutes old: from the bookmark
+  listing, or else from looking the torrent up on MAM. It spends a wedge only when the torrent is not already free for you
+  (freeleech for everyone, a personal freeleech, or VIP while you are VIP) and
+  MAM's bonus history shows none spent on it; afterwards the history must list
+  the wedge, or the torrent is stopped and you are told.
+- Every running download must stay free for you. Each bookmark listing, every 15
+  minutes, re-checks all of them at once. When a download's freeleech or VIP ends,
+  Windlass spends a wedge on it; with none left, it stops the torrent and tells
+  you, and resumes it once it is free again. After a restart, Windlass checks all
+  of this with MAM and qBittorrent before downloading anything.
+- When MAM cannot reach qBittorrent, Windlass checks the listen port, the forwarded
+  port, the IP MAM sees, and the seedbox registration, renews the lease, and
+  registers again when allowed. If MAM still cannot reach it 30 minutes later, you
+  are told what it found.
+- A purchase whose answer was lost is settled from the next account reading; when
+  that cannot tell, the dashboard asks you to check MAM and say whether it went
+  through, and nothing is bought until you do.
+
+MAM's rules come first: Windlass calls only documented API functions, never logs
+in with a password, and never gifts points or wedges. The feature briefs for
+[MAM initialization](.workflow/features/B-0004/brief.md),
+[acquisition](.workflow/features/B-0005/brief.md), and
+[account safety](.workflow/features/B-0011/brief.md) record the rules and what
+remains open.
 
 ## Deploy on NixOS
 
@@ -119,9 +195,12 @@ interfaces, the ntfy.sh relay, and qBittorrent bound to the tunnel. Windlass che
 the tunnel through `vpn.exitIpService` (by default `https://ipv4.icanhazip.com/`)
 and, after three failed checks, starts `windlass-wireguard@<server>.service` for
 the next server in name order, at most once an hour; polkit allows nothing else.
+Windlass works with MAM's real hosts unless `mam.enable` is false; `mam.site` and
+`mam.tracker` point it elsewhere.
 
 `nix build` builds and tests the package. `just vm-test` boots the module with fake
-WireGuard servers and checks the privacy boundary and automatic failover. It needs KVM for reasonable
+WireGuard servers and checks the privacy boundary, automatic failover, and that MAM sees the VPN's
+exit IP when Windlass registers the seedbox. It needs KVM for reasonable
 speed; without it, the test driver falls back to software emulation.
 
 ## Inspect the core and shell
@@ -177,7 +256,7 @@ The core schedules named timers with deadlines from supplied time. The shell
 sleeps until each deadline and reports the expiry; a replaced timer's expiry is
 recognised by its identity and ignored.
 
-Task cancellation, MAM requests, and torrent submission remain to be built. The
+Task cancellation remains to be built. The
 console is for reviewing the operating model; it does not implement the full
 service.
 

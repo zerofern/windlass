@@ -54,7 +54,9 @@ fn ready(saved: Option<Mode>) -> Core {
             Action::ReadSettings,
             Action::OpenHistory,
             Action::ReadTorrentRegistry,
-            Action::ReadLastVpnSwitch
+            Action::ReadLastVpnSwitch,
+            Action::ReadMamState,
+            Action::ReadNoticeLog
         ]
     );
     assert_eq!(

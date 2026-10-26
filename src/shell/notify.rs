@@ -1,4 +1,6 @@
-//! Publish notices to ntfy, with a link to the dashboard page that explains them.
+//! Push notices to ntfy. A push carries no words about the notice, only a link
+//! to its entry on the dashboard's notifications page, so nothing about the
+//! owner's torrents or account leaves their network.
 //!
 //! Inside the VPN namespace, ntfy is reached through the host's relay. The
 //! server's name is resolved to the relay, so HTTPS still verifies ntfy's
@@ -9,10 +11,18 @@ use std::{net::SocketAddr, time::Duration};
 use reqwest::{Client as HttpClient, Url};
 
 use crate::core::{
-    DeliveryFailure, Notice, NotificationEvent, NtfyTopic, SettingName, StartupMode, SwitchBlock,
+    DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Push, SettingName, StartupMode,
+    SwitchBlock,
 };
 
-use super::describe::{qbittorrent_failure, timestamp};
+use super::describe::{hold, purchase, qbittorrent_failure, rejection, timestamp};
+
+/// MAM's main page, where the visit reminder leads.
+const MAM_HOME: &str = "https://www.myanonamouse.net/";
+
+/// What every push says.
+const PUSH_TITLE: &str = "Windlass";
+const PUSH_BODY: &str = "Windlass has a new notice. Open it to read it on the dashboard.";
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -56,49 +66,46 @@ pub(super) struct Message {
     pub(super) body: String,
     /// ntfy's priority, from 1 (min) to 5 (urgent).
     pub(super) priority: u8,
-    pub(super) tags: &'static str,
     /// The dashboard page that explains it.
     pub(super) page: &'static str,
 }
 
-/// Publish a notice and report the outcome.
-pub(super) async fn send(
-    channel: &Channel,
-    topic: &NtfyTopic,
-    notice: &Notice,
-) -> NotificationEvent {
-    match deliver(channel, topic, notice).await {
+/// Push a notice and report the outcome.
+pub(super) async fn send(channel: &Channel, topic: &NtfyTopic, push: &Push) -> NotificationEvent {
+    match deliver(channel, topic, push).await {
         Ok(()) => NotificationEvent::Delivered,
         Err(reason) => NotificationEvent::DeliveryFailed { reason },
     }
 }
 
-async fn deliver(
-    channel: &Channel,
-    topic: &NtfyTopic,
-    notice: &Notice,
-) -> Result<(), DeliveryFailure> {
+/// The notice's entry on the notifications page, or the page itself.
+pub(super) fn entry_page(push: &Push) -> String {
+    push.entry.map_or_else(
+        || String::from("/notifications"),
+        |id| format!("/notifications#notice-{}", id.get()),
+    )
+}
+
+async fn deliver(channel: &Channel, topic: &NtfyTopic, push: &Push) -> Result<(), DeliveryFailure> {
     let url = channel
         .server
         .as_ref()
         .and_then(|server| server.join(topic.expose_secret()).ok())
         .ok_or(DeliveryFailure::Unreachable)?;
-    let message = message(notice);
     let mut request = channel
         .http
         .post(url)
-        .header("Title", message.title)
-        .header("Priority", message.priority.to_string())
-        .header("Tags", message.tags);
-    if let Some(link) = channel
+        .header("Title", PUSH_TITLE)
+        .header("Priority", message(&push.notice).priority.to_string());
+    let link = channel
         .dashboard
         .as_ref()
-        .and_then(|dashboard| dashboard.join(message.page).ok())
-    {
+        .and_then(|dashboard| dashboard.join(&entry_page(push)).ok());
+    if let Some(link) = link {
         request = request.header("Click", link.as_str());
     }
     let response = request
-        .body(message.body)
+        .body(PUSH_BODY)
         .send()
         .await
         .map_err(|_| DeliveryFailure::Unreachable)?;
@@ -126,6 +133,7 @@ const fn setting(setting: SettingName) -> &'static str {
         SettingName::HistoryLimit => "The history limit",
         SettingName::ApiCookie => "The MAM API cookie",
         SettingName::NtfyTopic => "The notification topic",
+        SettingName::PointsReserve => "The bonus points reserve",
     }
 }
 
@@ -149,13 +157,13 @@ fn blocked(reason: SwitchBlock) -> String {
     reason = "one arm per notice reads best as one table"
 )]
 pub(super) fn message(notice: &Notice) -> Message {
-    let message = |title, body: String, priority, tags, page| Message {
+    let message = |title, body: String, priority, page| Message {
         title,
         body,
         priority,
-        tags,
         page,
     };
+    let at_mam = |title, body, priority| message(title, body, priority, "/#mam");
     match notice {
         Notice::Started { mode } => message(
             "Windlass started",
@@ -164,7 +172,6 @@ pub(super) fn message(notice: &Notice) -> Message {
                 StartupMode::Resume => "Windlass started and resumed its saved state.",
             }),
             2,
-            "arrow_forward",
             "/",
         ),
         Notice::StartupFailed => message(
@@ -173,14 +180,12 @@ pub(super) fn message(notice: &Notice) -> Message {
                 "Startup failed, so Windlass does nothing until it is restarted. The dashboard shows the storage error.",
             ),
             5,
-            "rotating_light",
             "/",
         ),
         Notice::VpnProtectionLost { failures } => message(
             "VPN not working",
             format!("The last {failures} tunnel checks failed, so torrent traffic is stopped."),
             4,
-            "warning",
             "/#tunnel",
         ),
         Notice::VpnProtectionRestored { exit_ip, server } => message(
@@ -192,35 +197,30 @@ pub(super) fn message(notice: &Notice) -> Message {
                     .map_or_else(|| String::from("the VPN"), ToString::to_string)
             ),
             3,
-            "white_check_mark",
             "/#tunnel",
         ),
         Notice::FailoverStarted { server } => message(
             "Switching VPN server",
             format!("The tunnel stopped working, so Windlass is switching to {server}."),
             4,
-            "arrows_counterclockwise",
             "/#tunnel",
         ),
         Notice::FailoverSucceeded { server } => message(
             "VPN server switched",
             format!("Windlass now uses {server} and is checking the tunnel."),
             3,
-            "white_check_mark",
             "/#tunnel",
         ),
         Notice::FailoverFailed { server } => message(
             "VPN server switch failed",
             format!("Switching to {server} failed. Windlass keeps checking the tunnel."),
             5,
-            "rotating_light",
             "/#tunnel",
         ),
         Notice::FailoverBlocked { reason } => message(
             "VPN switch blocked",
             format!("The tunnel is not working. {}", blocked(*reason)),
             5,
-            "rotating_light",
             "/#tunnel",
         ),
         Notice::ForwardedPortLost => message(
@@ -229,56 +229,48 @@ pub(super) fn message(notice: &Notice) -> Message {
                 "ProtonVPN has not granted a forwarded port for 5 minutes, so peers cannot connect in.",
             ),
             3,
-            "warning",
             "/#port-forwarding",
         ),
         Notice::ForwardedPortRestored { port } => message(
             "Forwarded port back",
             format!("Peers can connect in on port {} again.", port.get()),
             2,
-            "white_check_mark",
             "/#port-forwarding",
         ),
         Notice::QbittorrentUnreachable { reason } => message(
             "qBittorrent not responding",
             format!("{} for 5 minutes.", qbittorrent_failure(*reason)),
             4,
-            "warning",
             "/#qbittorrent",
         ),
         Notice::QbittorrentReachable => message(
             "qBittorrent responding again",
             String::from("Windlass is in contact with qBittorrent again."),
             2,
-            "white_check_mark",
             "/#qbittorrent",
         ),
         Notice::QbittorrentVersionNotAllowed { version } => message(
             "qBittorrent version not allowed",
             format!("MAM does not allow qBittorrent {version}. Use a 5.0.1 to 5.2.x release."),
             5,
-            "rotating_light",
             "/#qbittorrent",
         ),
         Notice::QbittorrentVersionAllowed { version } => message(
             "qBittorrent version allowed",
             format!("MAM allows qBittorrent {version}."),
             2,
-            "white_check_mark",
             "/#qbittorrent",
         ),
         Notice::TorrentErrors { count } => message(
             "Torrents with errors",
             format!("qBittorrent reports errors for {}.", torrents(*count)),
             4,
-            "warning",
             "/#torrents",
         ),
         Notice::TorrentErrorsCleared => message(
             "Torrent errors cleared",
             String::from("No torrent reports an error."),
             2,
-            "white_check_mark",
             "/#torrents",
         ),
         Notice::FilesMissing { count } => message(
@@ -289,14 +281,12 @@ pub(super) fn message(notice: &Notice) -> Message {
                 if *count == 1 { "has" } else { "have" }
             ),
             4,
-            "warning",
             "/#torrents",
         ),
         Notice::FilesMissingCleared => message(
             "Missing files resolved",
             String::from("No torrent has missing files."),
             2,
-            "white_check_mark",
             "/#torrents",
         ),
         Notice::TorrentsMissing { count } => message(
@@ -307,14 +297,12 @@ pub(super) fn message(notice: &Notice) -> Message {
                 if *count == 1 { "is" } else { "are" }
             ),
             4,
-            "warning",
             "/#torrents",
         ),
         Notice::TorrentsMissingCleared => message(
             "Torrents back in qBittorrent",
             String::from("Every torrent Windlass manages is in qBittorrent."),
             2,
-            "white_check_mark",
             "/#torrents",
         ),
         Notice::RegistryNotSaved => message(
@@ -323,14 +311,12 @@ pub(super) fn message(notice: &Notice) -> Message {
                 "Windlass has not saved its torrent records for 2 minutes and keeps retrying.",
             ),
             4,
-            "warning",
             "/#torrents",
         ),
         Notice::RegistrySaved => message(
             "Torrent records saved",
             String::from("Windlass saves its torrent records again."),
             2,
-            "white_check_mark",
             "/#torrents",
         ),
         Notice::RegistryUnreadable => message(
@@ -339,38 +325,333 @@ pub(super) fn message(notice: &Notice) -> Message {
                 "Windlass could not read its torrent records, so torrents are shown but not managed.",
             ),
             5,
-            "rotating_light",
             "/#torrents",
         ),
         Notice::SettingNotSaved { setting: name } => message(
             "Setting not saved",
             format!("{} could not be saved.", setting(*name)),
             4,
-            "warning",
             "/settings",
         ),
         Notice::HistoryUnavailable => message(
             "History unavailable",
             String::from("History storage could not be opened, so events are not recorded."),
             4,
-            "warning",
             "/history",
         ),
         Notice::HistoryEntriesLost { count } => message(
             "History incomplete",
             format!("{} history entries could not be saved.", count.get()),
             3,
-            "warning",
             "/history",
         ),
         Notice::Test => message(
             "Test notification",
             String::from("Notifications from Windlass reach this topic."),
             3,
-            "bell",
             "/settings",
         ),
+        Notice::MamSessionRejected { rejection: reason } => at_mam(
+            "MAM refused the API session",
+            format!(
+                "MAM requests that need the cookie have stopped: {}. Create a new session from the VPN and enter it on the settings page.",
+                rejection(*reason)
+            ),
+            5,
+        ),
+        Notice::MamSessionAccepted => at_mam(
+            "MAM session working",
+            String::from("MAM accepts the API session again."),
+            2,
+        ),
+        Notice::SeedboxNotRegistered => at_mam(
+            "Seedbox IP not registered",
+            String::from(
+                "MAM has not registered the VPN's IP as the seedbox, so new downloads wait. The dashboard shows why and when Windlass tries again.",
+            ),
+            4,
+        ),
+        Notice::SeedboxRegistered { ip } => at_mam(
+            "Seedbox IP registered",
+            format!("MAM has {ip} as the seedbox IP."),
+            2,
+        ),
+        Notice::MamIpUnknown { failures } => at_mam(
+            "Cannot see MAM's view of the IP",
+            format!("The last {failures} IP lookups at MAM failed, so new downloads wait."),
+            3,
+        ),
+        Notice::MamIpKnown => at_mam(
+            "MAM IP lookups working",
+            String::from("Windlass sees the IP MAM sees again."),
+            2,
+        ),
+        Notice::MamStateUnreadable => at_mam(
+            "MAM state unreadable",
+            String::from(
+                "Windlass could not read when it last registered the seedbox IP, so it will not register until restarted.",
+            ),
+            5,
+        ),
+        Notice::RatioLow {
+            ratio: value,
+            urgent,
+        } => at_mam(
+            "Ratio below 2.0",
+            format!(
+                "MAM reports a ratio of {}. Every download is held until you find out why.",
+                ratio(*value)
+            ),
+            if *urgent { 5 } else { 4 },
+        ),
+        Notice::RatioRestored => at_mam(
+            "Ratio back above 2.0",
+            String::from("MAM reports a ratio of 2.0 or more."),
+            2,
+        ),
+        Notice::UnsatisfiedNearLimit { count, limit } => at_mam(
+            "Unsatisfied torrents near the limit",
+            format!("MAM counts {count} unsatisfied torrents of a limit of {limit}."),
+            4,
+        ),
+        Notice::UnsatisfiedBelowLimit => at_mam(
+            "Unsatisfied torrents below 80%",
+            String::from("MAM's unsatisfied count is below 80% of the limit again."),
+            2,
+        ),
+        Notice::UnsatisfiedNotSeeding { count } => at_mam(
+            "Unsatisfied torrents not seeding",
+            format!(
+                "MAM sees {count} unsatisfied torrents that are not seeding. They must seed 72 hours within 30 days."
+            ),
+            4,
+        ),
+        Notice::UnsatisfiedSeeding => at_mam(
+            "Unsatisfied torrents seeding",
+            String::from("MAM sees every unsatisfied torrent seeding."),
+            2,
+        ),
+        Notice::MamFlagged {
+            partial,
+            tracker_errors,
+            flagged,
+        } => at_mam(
+            "MAM flags the account's torrents",
+            format!(
+                "MAM reports{}{}{}.",
+                if *partial { " a partial download;" } else { "" },
+                if *tracker_errors > 0 {
+                    format!(" {tracker_errors} tracker errors;")
+                } else {
+                    String::new()
+                },
+                if *flagged > 0 {
+                    format!(" {flagged} torrents in categories it marks red")
+                } else {
+                    String::new()
+                }
+            ),
+            4,
+        ),
+        Notice::MamFlagsCleared => at_mam(
+            "MAM flags cleared",
+            String::from("MAM no longer flags any of the account's torrents."),
+            2,
+        ),
+        Notice::MamMessages {
+            count,
+            client_warning,
+        } => at_mam(
+            if *client_warning {
+                "MAM warns about a client"
+            } else {
+                "MAM has notifications"
+            },
+            format!(
+                "MAM has {count} notifications for you{}. Windlass does not read them.",
+                if *client_warning {
+                    ", including a warning that it is about to stop accepting a client"
+                } else {
+                    ""
+                }
+            ),
+            if *client_warning { 5 } else { 3 },
+        ),
+        Notice::DownloadsHeld { hold: reason } => at_mam(
+            "Downloads held",
+            format!(
+                "Bookmarked torrents wait for 30 minutes now: {}.",
+                hold(*reason)
+            ),
+            3,
+        ),
+        Notice::DownloadsResumed => at_mam(
+            "Downloads resumed",
+            String::from("Bookmarked torrents download again."),
+            2,
+        ),
+        Notice::NoWedgesLeft => at_mam(
+            "No wedges left",
+            String::from(
+                "Torrents that are not freeleech for you wait, because no wedge is left and the store does not sell them through the API.",
+            ),
+            4,
+        ),
+        Notice::PointsBelowReserve { points, reserve } => at_mam(
+            "Bonus points below the reserve",
+            format!(
+                "MAM reports {points} points, below the reserve of {reserve}. Windlass buys nothing."
+            ),
+            3,
+        ),
+        Notice::VipEnding { until } => at_mam(
+            "VIP ending",
+            format!(
+                "VIP ends at {} and Windlass has not renewed it, usually because the points would fall below the reserve.",
+                timestamp(*until)
+            ),
+            4,
+        ),
+        Notice::DownloadsRefused => at_mam(
+            "MAM refused a download",
+            String::from(
+                "MAM answered a download without a torrent file, so downloads are held until Windlass restarts or the cookie changes.",
+            ),
+            5,
+        ),
+        Notice::SeedingBehind { count } => at_mam(
+            "Torrents behind on seeding",
+            format!(
+                "{} completed 20 or more days ago {} not seeded 96 hours yet. MAM requires 72 within 30 days; Windlass aims a day higher.",
+                torrents(*count),
+                if *count == 1 { "has" } else { "have" }
+            ),
+            4,
+        ),
+        Notice::SeedingOnTrack => at_mam(
+            "Seeding on track",
+            String::from("Every torrent is on track to seed 96 hours, a day more than MAM's 72."),
+            2,
+        ),
+        Notice::PurchaseMade {
+            purchase: bought,
+            points,
+        } => at_mam(
+            "Bonus points spent",
+            format!(
+                "Windlass bought {}; {points} points are left.",
+                purchase(*bought)
+            ),
+            3,
+        ),
+        Notice::PurchaseRefused { purchase: wanted } => at_mam(
+            "Purchase refused",
+            format!(
+                "MAM refused to sell {}. Windlass waits 6 hours before trying again.",
+                purchase(*wanted)
+            ),
+            4,
+        ),
+        Notice::PurchaseUncertain { purchase: wanted } => at_mam(
+            "Purchase uncertain",
+            format!(
+                "Windlass does not know whether MAM sold {}, so it buys nothing until it reads MAM's figures again.",
+                purchase(*wanted)
+            ),
+            4,
+        ),
+        Notice::DownloadNotFree { stopped: true } => at_mam(
+            "Download stopped",
+            String::from(
+                "A download is no longer free for you, and no wedge could be spent on it, so Windlass stopped it to protect the ratio. It resumes if it becomes free or a wedge is available.",
+            ),
+            4,
+        ),
+        Notice::DownloadNotFree { stopped: false } => at_mam(
+            "Download may have cost ratio",
+            String::from(
+                "A download finished before Windlass could confirm it was free for you. Check your ratio on MAM.",
+            ),
+            4,
+        ),
+        Notice::WedgedMidDownload => at_mam(
+            "Wedge spent on a running download",
+            String::from(
+                "A download's freeleech ended before it finished, so Windlass spent a wedge on it.",
+            ),
+            2,
+        ),
+        Notice::PurchaseSettled {
+            purchase: wanted,
+            made,
+        } => at_mam(
+            "Purchase settled",
+            format!(
+                "The uncertain purchase of {} {}; Windlass buys again only as needed.",
+                purchase(*wanted),
+                if *made {
+                    "went through"
+                } else {
+                    "did not go through"
+                }
+            ),
+            3,
+        ),
+        Notice::PurchaseNeedsChecking { purchase: wanted } => at_mam(
+            "Check a purchase on MAM",
+            format!(
+                "MAM's figures do not show whether it sold {}. Check your bonus points on MAM, then say on the dashboard whether it went through; Windlass buys nothing until then.",
+                purchase(*wanted)
+            ),
+            4,
+        ),
+        Notice::WedgeNotSpent => at_mam(
+            "Wedge not spent",
+            String::from(
+                "MAM's bonus history shows no wedge spent on a wedged download, so Windlass stopped the torrent to protect the ratio.",
+            ),
+            5,
+        ),
+        Notice::MamClientNotListed { standing } => at_mam(
+            "qBittorrent not listed by MAM",
+            format!(
+                "Downloads are held: {}. Check MAM's client list on its site.",
+                super::describe::client_standing(*standing)
+            ),
+            4,
+        ),
+        Notice::MamClientListed => at_mam(
+            "qBittorrent listed by MAM",
+            String::from("MAM lists the running qBittorrent again."),
+            2,
+        ),
+        Notice::NotConnectable { findings } => at_mam(
+            "qBittorrent not connectable",
+            format!(
+                "MAM still cannot reach qBittorrent after Windlass's repair. {}. Check that the namespace firewall admits the forwarded port.",
+                super::describe::findings(findings)
+            ),
+            4,
+        ),
+        Notice::ConnectableAgain => at_mam(
+            "qBittorrent connectable",
+            String::from("MAM reaches qBittorrent again."),
+            2,
+        ),
+        Notice::MamVisitReminder => message(
+            "Visit MAM",
+            String::from(
+                "Your weekly reminder: visit MAM to keep the account active, and read its announcements about approved clients.",
+            ),
+            3,
+            MAM_HOME,
+        ),
     }
+}
+
+/// A ratio in thousandths, with two decimals.
+fn ratio(thousandths: u64) -> String {
+    format!("{}.{:02}", thousandths / 1000, thousandths % 1000 / 10)
 }
 
 #[cfg(test)]
@@ -387,9 +668,11 @@ mod tests {
         routing::post,
     };
 
+    use super::{PUSH_BODY, PUSH_TITLE};
     use crate::core::{
-        DeliveryFailure, EntryCount, Notice, NotificationEvent, NtfyTopic, Port,
-        QbittorrentFailure, SettingName, StartupMode, SwitchBlock, VpnServer,
+        ClientStanding, DeliveryFailure, EntryCount, Hold, Notice, NotificationEvent, NtfyTopic,
+        Points, Port, Purchase, Push, QbittorrentFailure, SessionRejection, SettingName,
+        StartupMode, SwitchBlock, UploadCredit, VpnServer,
     };
 
     use super::{Channel, message, send};
@@ -469,8 +752,154 @@ mod tests {
                 SettingName::HistoryLimit,
                 SettingName::ApiCookie,
                 SettingName::NtfyTopic,
+                SettingName::PointsReserve,
             ]
             .map(|setting| Notice::SettingNotSaved { setting }),
+        );
+        notices.extend(mam_notices()?);
+        Ok(notices)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one list of every MAM notice reads best together"
+    )]
+    fn mam_notices() -> Result<Vec<Notice>, Box<dyn Error + Send + Sync>> {
+        let upload = Purchase::Upload(UploadCredit::try_new(50)?);
+        let mut notices = vec![
+            Notice::MamSessionAccepted,
+            Notice::SeedboxNotRegistered,
+            Notice::SeedboxRegistered {
+                ip: std::net::IpAddr::from([192, 0, 2, 10]),
+            },
+            Notice::MamIpUnknown { failures: 3 },
+            Notice::MamIpKnown,
+            Notice::MamStateUnreadable,
+            Notice::RatioLow {
+                ratio: 1500,
+                urgent: false,
+            },
+            Notice::RatioLow {
+                ratio: 1050,
+                urgent: true,
+            },
+            Notice::RatioRestored,
+            Notice::UnsatisfiedNearLimit {
+                count: 121,
+                limit: 150,
+            },
+            Notice::UnsatisfiedBelowLimit,
+            Notice::UnsatisfiedNotSeeding { count: 2 },
+            Notice::UnsatisfiedSeeding,
+            Notice::MamFlagged {
+                partial: true,
+                tracker_errors: 1,
+                flagged: 2,
+            },
+            Notice::MamFlagged {
+                partial: false,
+                tracker_errors: 0,
+                flagged: 1,
+            },
+            Notice::MamFlagged {
+                partial: false,
+                tracker_errors: 2,
+                flagged: 0,
+            },
+            Notice::MamFlagsCleared,
+            Notice::MamMessages {
+                count: 2,
+                client_warning: false,
+            },
+            Notice::MamMessages {
+                count: 1,
+                client_warning: true,
+            },
+            Notice::DownloadsResumed,
+            Notice::NoWedgesLeft,
+            Notice::PointsBelowReserve {
+                points: Points(10_000),
+                reserve: Points(20_000),
+            },
+            Notice::VipEnding {
+                until: SystemTime::UNIX_EPOCH,
+            },
+            Notice::DownloadsRefused,
+            Notice::SeedingBehind { count: 1 },
+            Notice::SeedingBehind { count: 3 },
+            Notice::SeedingOnTrack,
+            Notice::PurchaseMade {
+                purchase: upload,
+                points: Points(35_000),
+            },
+            Notice::PurchaseMade {
+                purchase: Purchase::Vip,
+                points: Points(35_000),
+            },
+            Notice::PurchaseRefused { purchase: upload },
+            Notice::PurchaseUncertain { purchase: upload },
+            Notice::WedgeNotSpent,
+            Notice::MamVisitReminder,
+            Notice::MamClientListed,
+            Notice::ConnectableAgain,
+            Notice::PurchaseSettled {
+                purchase: Purchase::Vip,
+                made: true,
+            },
+            Notice::PurchaseSettled {
+                purchase: Purchase::Vip,
+                made: false,
+            },
+            Notice::PurchaseNeedsChecking {
+                purchase: Purchase::Vip,
+            },
+            Notice::DownloadNotFree { stopped: true },
+            Notice::DownloadNotFree { stopped: false },
+            Notice::WedgedMidDownload,
+            Notice::NotConnectable {
+                findings: crate::core::Findings {
+                    listen_port: crate::core::PortFinding::NoForwardedPort,
+                    lease_renewed: false,
+                    exit_ip: crate::core::IpFinding::Unknown,
+                    registered: false,
+                    interface: Some(String::from("wg0")),
+                },
+            },
+        ];
+        notices.extend(
+            [
+                ClientStanding::NotListed,
+                ClientStanding::Refused,
+                ClientStanding::NotUnderstood,
+            ]
+            .map(|standing| Notice::MamClientNotListed { standing }),
+        );
+        notices.extend(
+            [
+                SessionRejection::InvalidCookie,
+                SessionRejection::IpMismatch,
+                SessionRejection::AsnMismatch,
+                SessionRejection::NotAllowed,
+                SessionRejection::Other,
+            ]
+            .map(|rejection| Notice::MamSessionRejected { rejection }),
+        );
+        notices.extend(
+            [
+                Hold::SeedboxUnconfirmed,
+                Hold::DownloadsRefused,
+                Hold::ClientUnavailable,
+                Hold::AccountUnknown,
+                Hold::RatioLow,
+                Hold::UnsatisfiedLimit {
+                    count: 148,
+                    limit: 150,
+                },
+                Hold::NoWedge,
+                Hold::NotBookmarked,
+                Hold::MamUnavailable,
+            ]
+            .map(|hold| Notice::DownloadsHeld { hold }),
         );
         Ok(notices)
     }
@@ -486,7 +915,10 @@ mod tests {
                 "{notice:?}"
             );
             assert!((1..=5).contains(&message.priority), "{notice:?}");
-            assert!(message.page.starts_with('/'), "{notice:?}");
+            assert!(
+                message.page.starts_with('/') || message.page == super::MAM_HOME,
+                "{notice:?}"
+            );
             bodies.insert(message.body);
         }
         assert_eq!(
@@ -545,33 +977,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notices_reach_ntfy_through_the_relay_with_a_dashboard_link() -> TestResult {
-        let (relay, received) = ntfy(StatusCode::OK).await?;
+    async fn pushes_reach_ntfy_through_the_relay_with_only_a_link() -> TestResult {
+        let (relay, recorded) = ntfy(StatusCode::OK).await?;
         let channel = Channel::new(
             Some("http://ntfy.test/".parse()?),
             Some(relay),
             Some("http://windlass.test:8740/".parse()?),
         );
         let topic = NtfyTopic::parse("windlass-alerts")?;
+        let push = Push {
+            entry: Some(crate::core::NoticeId::new(42)),
+            notice: Notice::FilesMissing { count: 2 },
+        };
         assert_eq!(
-            send(&channel, &topic, &Notice::FilesMissing { count: 2 }).await,
+            send(&channel, &topic, &push).await,
             NotificationEvent::Delivered
         );
-        let received = std::mem::take(&mut *received.lock().map_err(|_| "poisoned")?);
+        let received = std::mem::take(&mut *recorded.lock().map_err(|_| "poisoned")?);
         assert_eq!(received.host.as_deref(), Some("ntfy.test"));
         assert_eq!(received.path, "windlass-alerts");
-        let header = |name: &str| {
-            received
-                .headers
-                .iter()
-                .find(|(header, _)| header == name)
-                .map(|(_, value)| value.as_str())
+        assert_eq!(
+            received.headers,
+            [
+                (String::from("Title"), String::from(PUSH_TITLE)),
+                (String::from("Priority"), String::from("4")),
+                (
+                    String::from("Click"),
+                    String::from("http://windlass.test:8740/notifications#notice-42")
+                ),
+            ]
+        );
+        assert_eq!(received.body, PUSH_BODY);
+
+        // Without an entry, the push leads to the notifications page.
+        let push = Push {
+            entry: None,
+            notice: Notice::MamVisitReminder,
         };
-        assert_eq!(header("Title"), Some("Files missing on disk"));
-        assert_eq!(header("Priority"), Some("4"));
-        assert_eq!(header("Tags"), Some("warning"));
-        assert_eq!(header("Click"), Some("http://windlass.test:8740/#torrents"));
-        assert!(received.body.starts_with("2 torrents have missing files"));
+        assert_eq!(
+            send(&channel, &topic, &push).await,
+            NotificationEvent::Delivered
+        );
+        let received = std::mem::take(&mut *recorded.lock().map_err(|_| "poisoned")?);
+        assert!(received.headers.contains(&(
+            String::from("Click"),
+            String::from("http://windlass.test:8740/notifications")
+        )));
         Ok(())
     }
 
@@ -589,8 +1040,12 @@ mod tests {
             (closed, DeliveryFailure::Unreachable),
             (unconfigured, DeliveryFailure::Unreachable),
         ] {
+            let push = Push {
+                entry: None,
+                notice: Notice::Test,
+            };
             assert_eq!(
-                send(&channel, &topic, &Notice::Test).await,
+                send(&channel, &topic, &push).await,
                 NotificationEvent::DeliveryFailed { reason }
             );
         }

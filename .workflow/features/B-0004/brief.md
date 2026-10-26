@@ -19,7 +19,8 @@ Acceptance:
 
 - A paused instance or unavailable VPN protection produces no new MAM requests.
 - The API cookie is a user-supplied credential, used like an API key and sent
-  as `mam_id`. Windlass changes it only through user configuration.
+  as `mam_id`. Windlass changes it only through user configuration, or by saving
+  a replacement MAM sends in a response ([B-0011 A18](../B-0011/brief.md#automation-boundaries)).
 - No email/password login or undocumented session-check endpoint is used.
 - The dashboard distinguishes unverified authentication, a rejected session,
   confirmed registration, and failed or deferred registration.
@@ -29,6 +30,13 @@ MAM requests are not paused, VPN protection is available, a cookie is
 configured, and shared and endpoint limits permit. Only documented successful `Completed` and
 `No Change` outcomes confirm registration; an error's returned IP does not.
 Without a cookie, show setup required and make no MAM requests.
+
+- Implemented: requests leave only while MAM requests are resumed, VPN protection
+  is available, and the core's shared token bucket (10 requests, one more every 3
+  seconds) has a token; one request is outstanding at a time. The IP lookup needs
+  no cookie; every other request needs the saved cookie and a session not
+  refused. The dashboard's MAM access panel shows the session as unverified,
+  accepted, or refused, and registration as confirmed, failed, or not yet allowed.
 
 ### S2: Keep registration current
 
@@ -50,6 +58,14 @@ Acceptance:
 - During registration cooldown, show unconfirmed status and the next eligible time.
 - Reconsider queued registration using the latest observation. IP changes must
   not accumulate updates.
+- Implemented: IP lookups are sent at most once a minute, and the first after a
+  start waits a minute, since a previous run may have sent one moments before.
+  Requests that need the cookie wait until MAM has shown which IP and ASN it
+  sees, after a start or a server switch, since the session is locked to an ASN.
+- Implemented: the time of each registration attempt is saved before the request
+  is sent, so restarts keep the hour; a failed save sends nothing. Pause, VPN loss,
+  a server switch, or a cookie change discards the outstanding request, ignores
+  its late answer, and makes the session and registration unconfirmed.
 
 ### S3: Explain failures
 
@@ -83,6 +99,10 @@ or cancelled requests. Restart, cookie replacement, and pause/resume cannot shor
 retries require MAM requests to remain unpaused and VPN protection to be available.
 Show the failure and next eligible attempt time without requiring user intervention.
 
+- Implemented as in the table. A refused session stops cookie requests until MAM
+  sees another IP or ASN, for a mismatch, or the cookie changes. A permission
+  refusal (`session type`) blocks registration only. 429 honours `Retry-After`.
+
 ### S4: Replace the API cookie
 
 Story: The user replaces a nonworking API cookie and can correct a failed update.
@@ -96,11 +116,15 @@ Acceptance:
 - A saved replacement requires fresh registration confirmation. Rejection reports
   an error so the user can correct or retry it, without using the old cookie.
 - Cookie updates and user retries preserve pause and all request limits.
+- Implemented. A replacement MAM sends is saved through the same setting; if that
+  save fails, Windlass keeps using the saved cookie and reports the failure.
 
 ## Feature-wide constraints and acceptance
 
 - Apply [Direction](../../direction.md), including manual requests and retries.
-- Exercise HTTP behaviour against the local fake MAM server using synthetic data.
+- Exercise HTTP behaviour against the local fake MAM server using synthetic data
+  ([B-0012](../B-0012/brief.md)); the NixOS VM test also checks that registration
+  leaves through the tunnel.
 
 ### External API calls
 
@@ -138,7 +162,7 @@ and VPN implementation.
 ## Open questions and assumptions
 
 - How should failed cookie replacement recover across restart when the old value
-  remains in storage?
+  remains in storage? Until decided, the stored value is used after a restart.
 - Which changes should allow another attempt after each documented 403 rejection?
 - How should server-directed delays without a usable deadline be handled?
 - What should happen if a cooldown cannot be saved or restored, or another tool

@@ -6,7 +6,9 @@ use std::{
 
 use serde::Serialize;
 
-use super::{Action, ClockReading, Port, TimerId, TimerName, timer::Timers};
+use super::{
+    Action, ClockReading, MamTorrentId, Port, TimerId, TimerName, TorrentLimits, timer::Timers,
+};
 
 /// How often qBittorrent's state is read.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -247,6 +249,8 @@ torrent_fields! {
     content_path: Option<String>,
     /// The directory the content is saved under.
     save_path: Option<String>,
+    /// Whether it runs regardless of qBittorrent's queue.
+    force_start: bool,
 }
 
 /// A change qBittorrent must make so that it matches the torrent registry.
@@ -258,6 +262,19 @@ pub enum TorrentCommand {
     SelectAllFiles(TorrentHash),
     /// Remove these torrents and their files.
     Remove(Vec<TorrentHash>),
+    /// Stop these torrents.
+    Stop(Vec<TorrentHash>),
+    /// Run these torrents regardless of qBittorrent's queue.
+    ForceStart(Vec<TorrentHash>),
+    /// Let qBittorrent's queue manage these torrents again.
+    EndForceStart(Vec<TorrentHash>),
+    /// Add this fetched torrent from its kept torrent file.
+    Add {
+        /// The torrent on MAM, whose file Windlass kept.
+        mam: MamTorrentId,
+        /// Its info hash.
+        hash: TorrentHash,
+    },
 }
 
 /// qBittorrent's position in its stream of incremental updates.
@@ -284,6 +301,39 @@ pub struct QbittorrentPreferences {
     pub listen_port: Option<Port>,
     /// The network interface qBittorrent is bound to, if any.
     pub interface: Option<String>,
+    /// How qBittorrent queues torrents, when it reports it.
+    pub queue: Option<QueuePreferences>,
+}
+
+/// How qBittorrent queues torrents. A limit that is absent is unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct QueuePreferences {
+    /// Whether torrents beyond the limits wait in a queue.
+    pub queueing: bool,
+    /// How many torrents may download at once.
+    pub max_downloading: Option<u32>,
+    /// How many torrents may be active at once.
+    pub max_active: Option<u32>,
+    /// How many torrents may seed at once.
+    pub max_seeding: Option<u32>,
+    /// Whether torrents moving almost no data are left out of the counts.
+    pub idle_not_counted: bool,
+}
+
+impl QueuePreferences {
+    /// The queue that keeps qBittorrent within these limits. Seeds count
+    /// only while peers download from them, so idle seeds keep seeding.
+    #[must_use]
+    pub fn for_limits(limits: TorrentLimits) -> Self {
+        let active = limits.active().into_inner();
+        Self {
+            queueing: true,
+            max_downloading: Some(limits.downloading().into_inner()),
+            max_active: Some(active),
+            max_seeding: Some(active),
+            idle_not_counted: true,
+        }
+    }
 }
 
 /// Why a qBittorrent request failed.
@@ -338,6 +388,13 @@ pub enum QbittorrentEvent {
         /// Why.
         reason: QbittorrentFailure,
     },
+    /// qBittorrent accepted new queue settings.
+    QueueSet,
+    /// Setting the queue failed.
+    QueueSetFailed {
+        /// Why.
+        reason: QbittorrentFailure,
+    },
     /// qBittorrent accepted a registry command.
     CommandDone,
     /// A registry command failed.
@@ -345,6 +402,15 @@ pub enum QbittorrentEvent {
         /// Why.
         reason: QbittorrentFailure,
     },
+}
+
+/// The qBittorrent settings Windlass wants, where it knows them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Wanted {
+    /// The forwarded port, for qBittorrent to listen on.
+    pub listen_port: Option<Port>,
+    /// The queue that keeps torrents within the owner's limits.
+    pub queue: Option<QueuePreferences>,
 }
 
 /// The single request outstanding with a connected qBittorrent.
@@ -358,6 +424,8 @@ pub enum Activity {
     ReadingPreferences,
     /// Setting the listen port.
     SettingListenPort(Port),
+    /// Setting the queue.
+    SettingQueue,
     /// Applying a registry command.
     Commanding,
     /// Choosing the next request; never visible outside a step.
@@ -468,12 +536,20 @@ impl Qbittorrent {
                 session.activity = Activity::ReadingPreferences;
                 vec![Action::ReadQbittorrentPreferences]
             }
+            (Self::Connected(session), QbittorrentEvent::QueueSet)
+                if session.activity == Activity::SettingQueue =>
+            {
+                // Confirm the change rather than assume it.
+                session.activity = Activity::ReadingPreferences;
+                vec![Action::ReadQbittorrentPreferences]
+            }
             (Self::Connecting, QbittorrentEvent::ConnectFailed { reason })
             | (
                 Self::Connected(_),
                 QbittorrentEvent::SyncFailed { reason }
                 | QbittorrentEvent::PreferencesReadFailed { reason }
                 | QbittorrentEvent::ListenPortSetFailed { reason }
+                | QbittorrentEvent::QueueSetFailed { reason }
                 | QbittorrentEvent::CommandFailed { reason },
             ) => {
                 let (retry, deadline) = timers.schedule(now.monotonic, POLL_INTERVAL);
@@ -516,13 +592,13 @@ impl Qbittorrent {
         }
     }
 
-    /// Choose the next request: the listen port first, then an update, or after
-    /// one a registry command, preferences, or the next poll.
+    /// Choose the next request: the listen port and queue first, then an
+    /// update, or after one a registry command, preferences, or the next poll.
     pub(super) fn decide(
         &mut self,
         now: ClockReading,
         timers: &mut Timers,
-        forwarded_port: Option<Port>,
+        wanted: Wanted,
         command: impl FnOnce(&Session) -> Option<TorrentCommand>,
     ) -> Vec<Action> {
         let Self::Connected(session) = self else {
@@ -531,7 +607,7 @@ impl Qbittorrent {
         let Activity::Deciding { after_sync } = session.activity else {
             return Vec::new();
         };
-        if let Some(actions) = session.set_listen_port(forwarded_port) {
+        if let Some(actions) = session.set_preferences(wanted) {
             return actions;
         }
         if !after_sync {
@@ -552,11 +628,11 @@ impl Qbittorrent {
         session.wait(now, timers)
     }
 
-    /// Move qBittorrent to the forwarded port as soon as it is idle.
-    pub(super) fn follow_forwarded_port(&mut self, forwarded_port: Option<Port>) -> Vec<Action> {
+    /// Move qBittorrent to the wanted settings as soon as it is idle.
+    pub(super) fn follow_preferences(&mut self, wanted: Wanted) -> Vec<Action> {
         match self {
             Self::Connected(session) if matches!(session.activity, Activity::Waiting(_)) => {
-                session.set_listen_port(forwarded_port).unwrap_or_default()
+                session.set_preferences(wanted).unwrap_or_default()
             }
             _ => Vec::new(),
         }
@@ -584,10 +660,24 @@ impl Session {
         self.position = update.position;
     }
 
-    fn set_listen_port(&mut self, forwarded_port: Option<Port>) -> Option<Vec<Action>> {
-        let port = forwarded_port.filter(|port| self.preferences.listen_port != Some(*port))?;
-        self.activity = Activity::SettingListenPort(port);
-        Some(vec![Action::SetQbittorrentListenPort { port }])
+    /// Change the first setting that differs from what Windlass wants: the
+    /// listen port, then the queue. A queue qBittorrent does not report is left
+    /// alone, since a change could not be confirmed.
+    fn set_preferences(&mut self, wanted: Wanted) -> Option<Vec<Action>> {
+        if let Some(port) = wanted
+            .listen_port
+            .filter(|port| self.preferences.listen_port != Some(*port))
+        {
+            self.activity = Activity::SettingListenPort(port);
+            return Some(vec![Action::SetQbittorrentListenPort { port }]);
+        }
+        let queue = wanted.queue.filter(|queue| {
+            self.preferences
+                .queue
+                .is_some_and(|current| current != *queue)
+        })?;
+        self.activity = Activity::SettingQueue;
+        Some(vec![Action::SetQbittorrentQueue { queue }])
     }
 
     fn wait(&mut self, now: ClockReading, timers: &mut Timers) -> Vec<Action> {

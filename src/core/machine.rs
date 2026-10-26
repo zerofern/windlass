@@ -1,7 +1,9 @@
 use super::{
-    Action, ClockReading, Event, HistoryState, MamPreferencePersistence, MamPreferenceState,
-    MamPreferenceUpdate, Notifications, PortForwarding, PortForwardingEvent, Qbittorrent, Registry,
-    SettingsState, Step, TimerName, Tunnel, TunnelEvent, mam_pause,
+    Action, ClockReading, Event, HistoryState, Mam, MamApproval, MamPreferencePersistence,
+    MamPreferenceState, MamPreferenceUpdate, Notifications, PortForwarding, PortForwardingEvent,
+    Protection, Qbittorrent, Registry, SettingsState, Step, TimerName, Tunnel, TunnelEvent,
+    mam::Context,
+    mam_pause,
     notifications::{Facts, Glance},
     settings, startup,
     timer::Timers,
@@ -17,6 +19,7 @@ pub struct Core {
     qbittorrent: Qbittorrent,
     registry: Registry,
     tunnel: Tunnel,
+    mam: Mam,
     notifications: Notifications,
     timers: Timers,
     step: Step,
@@ -71,6 +74,7 @@ impl Core {
             qbittorrent: Qbittorrent::Disabled,
             registry: Registry::Unread,
             tunnel: Tunnel::new(),
+            mam: Mam::new(),
             notifications: Notifications::new(),
             timers: Timers::new(),
             step: Step::ZERO,
@@ -87,17 +91,7 @@ impl Core {
         let mut notices = self.notifications.reported(&event);
         let before = self.glance();
         let mut actions = match event {
-            Event::Startup(event) => {
-                let opening = matches!(self.state, State::OpeningStorage { .. });
-                let mut actions = startup::handle(&mut self.state, occurred_at, event);
-                if opening && matches!(self.state, State::ReadingMamPreference { .. }) {
-                    actions.extend(self.settings.start_reading());
-                    actions.extend(self.history.open(self.step));
-                    actions.extend(self.registry.start_reading());
-                    actions.extend(self.tunnel.start_reading());
-                }
-                actions
-            }
+            Event::Startup(event) => self.handle_startup(occurred_at, event),
             Event::MamPause(event) => mam_pause::handle(&mut self.state, occurred_at, event),
             Event::Settings(event) => settings::handle(&mut self.settings, event),
             Event::History(event) => {
@@ -110,6 +104,10 @@ impl Core {
                 TimerName::TunnelCheck => self.tunnel.timer_expired(occurred_at, id),
                 TimerName::NotificationGrace | TimerName::NotificationRetry => {
                     self.notifications.timer_expired(id);
+                    Vec::new()
+                }
+                TimerName::Mam => {
+                    self.mam.timer_expired(id);
                     Vec::new()
                 }
             },
@@ -132,9 +130,10 @@ impl Core {
                 let switched = matches!(event, TunnelEvent::Switched);
                 let previous = self.tunnel.current().cloned();
                 let mut actions = self.tunnel.handle(occurred_at, event, &mut self.timers);
-                // A new server has a new gateway and forwarded port.
+                // A new server has a new gateway, forwarded port, and exit IP.
                 if switched && self.tunnel.current() != previous.as_ref() {
                     actions.extend(self.port_forwarding.renew());
+                    self.mam.vpn_switched();
                 }
                 actions
             }
@@ -142,32 +141,44 @@ impl Core {
                 self.notifications
                     .handle(occurred_at, &event, &mut self.timers)
             }
+            Event::Mam(event) => self.handle_mam(occurred_at, event),
         };
         self.port_forwarding.expire(occurred_at.monotonic);
         if let Some((session, true)) = self.qbittorrent.deciding() {
             actions.extend(self.registry.observe(occurred_at, session));
         }
+        actions.extend(self.decide_mam(occurred_at));
+        if self.mam.take_lease_renewal() {
+            actions.extend(self.port_forwarding.renew());
+        }
         let registry = &mut self.registry;
-        actions.extend(self.qbittorrent.decide(
-            occurred_at,
-            &mut self.timers,
-            self.port_forwarding.forwarded_port(),
-            |session| registry.command(occurred_at.monotonic, session),
-        ));
+        let wanted = super::Wanted {
+            listen_port: self.port_forwarding.forwarded_port(),
+            queue: self
+                .settings
+                .torrent_limits()
+                .map(super::QueuePreferences::for_limits),
+        };
         actions.extend(
             self.qbittorrent
-                .follow_forwarded_port(self.port_forwarding.forwarded_port()),
+                .decide(occurred_at, &mut self.timers, wanted, |session| {
+                    registry.command(occurred_at.monotonic, session)
+                }),
         );
+        actions.extend(self.qbittorrent.follow_preferences(wanted));
         actions.extend(
             self.history
                 .after_step(self.step, self.settings.history_limit()),
         );
         notices.extend(self.notifications.changed(&before, &self.glance()));
+        notices.extend(self.mam.take_notices());
         let facts = Facts {
             tunnel: &self.tunnel,
             port_forwarding: &self.port_forwarding,
             qbittorrent: &self.qbittorrent,
             registry: &self.registry,
+            mam: &self.mam,
+            reserve: self.settings.points_reserve(),
         };
         actions.extend(self.notifications.after_step(
             occurred_at,
@@ -177,6 +188,82 @@ impl Core {
             &mut self.timers,
         ));
         actions
+    }
+
+    /// Once storage opens, every stored part of the state is read.
+    fn handle_startup(&mut self, now: ClockReading, event: super::StartupEvent) -> Vec<Action> {
+        let opening = matches!(self.state, State::OpeningStorage { .. });
+        let mut actions = startup::handle(&mut self.state, now, event);
+        if opening && matches!(self.state, State::ReadingMamPreference { .. }) {
+            actions.extend(self.settings.start_reading());
+            actions.extend(self.history.open(self.step));
+            actions.extend(self.registry.start_reading());
+            actions.extend(self.tunnel.start_reading());
+            actions.extend(self.mam.start_reading());
+            actions.extend(Notifications::start_reading());
+        }
+        if matches!(self.state, State::Failed) {
+            self.notifications.log_unavailable();
+        }
+        actions
+    }
+
+    /// A new cookie MAM issued is saved through settings.
+    fn handle_mam(&mut self, now: ClockReading, event: super::MamEvent) -> Vec<Action> {
+        let (mut actions, rotated) = self.mam.handle(now, event, &mut self.registry);
+        if let Some(cookie) = rotated {
+            actions.extend(settings::rotate(&mut self.settings, cookie));
+        }
+        actions
+    }
+
+    /// Let MAM work choose its next request from the rest of the core's state.
+    fn decide_mam(&mut self, now: ClockReading) -> Vec<Action> {
+        let loaded = self.settings.loaded();
+        let session = match &self.qbittorrent {
+            Qbittorrent::Connected(session) => Some(&**session),
+            _ => None,
+        };
+        let context = Context {
+            requests: self.state.mam_requests(),
+            protected: self
+                .tunnel
+                .watch
+                .as_ref()
+                .is_some_and(|watch| matches!(watch.protection, Protection::Available { .. })),
+            cookie: loaded.and_then(super::Settings::usable_api_cookie),
+            requested_cookie: loaded.and_then(|settings| settings.api_cookie.requested.as_ref()),
+            reserve: self.settings.points_reserve(),
+            client_ready: match &self.qbittorrent {
+                Qbittorrent::Connected(session) => {
+                    session.listed() && session.approval != MamApproval::NotAllowed
+                }
+                _ => false,
+            },
+            client_version: session
+                .and_then(|session| super::ClientVersion::parse(&session.version)),
+            connection: super::Connection {
+                listen_port: session.and_then(|session| session.preferences.listen_port),
+                forwarded_port: self.port_forwarding.forwarded_port(),
+                tunnel_ip: self
+                    .tunnel
+                    .watch
+                    .as_ref()
+                    .and_then(|watch| match watch.protection {
+                        Protection::Available { exit_ip, .. } => Some(exit_ip),
+                        _ => None,
+                    }),
+                interface: session.and_then(|session| session.preferences.interface.clone()),
+            },
+            // Until settings are read, the default limits apply.
+            downloading_limit: self
+                .settings
+                .torrent_limits()
+                .unwrap_or_default()
+                .downloading(),
+            registry: &self.registry,
+        };
+        self.mam.decide(now, &context, &mut self.timers)
     }
 
     fn glance(&self) -> Glance {
@@ -221,6 +308,12 @@ impl Core {
     #[must_use]
     pub const fn tunnel(&self) -> &Tunnel {
         &self.tunnel
+    }
+
+    /// Inspect Windlass's work with MAM.
+    #[must_use]
+    pub const fn mam(&self) -> &Mam {
+        &self.mam
     }
 
     /// Inspect the torrent registry.

@@ -28,6 +28,13 @@ Acceptance:
   no free unsatisfied-torrent slot, is recorded as *Queued* in the
   [torrent registry](../../decisions/adr/0004-torrent-registry.md) and admitted
   when a slot frees.
+- Implemented: bookmarks are listed every 15 minutes, 100 to a page and at most
+  10 pages, with the accepted `"searchIn": "bookmarks"` JSON POST. Bookmarks
+  already in the registry are skipped. New ones are saved as *Queued*, or, when
+  MAM reports them snatched, as *Snatched*: known, shown on the dashboard, and
+  not downloaded until the owner presses "Download again", which queues the row
+  with origin *Redownload*. A later listing that no longer says snatched does
+  not queue it.
 
 ### S2: Admit and acquire a torrent
 
@@ -38,9 +45,20 @@ Acceptance:
 
 - Require confirmed MAM access and seedbox registration, client availability,
   account eligibility, sufficient space, and the duplicate/history checks.
+  Account eligibility is defined by the invariants and admission order of
+  [account safety](../B-0011/brief.md).
 - Insufficient space holds new downloads while existing torrents keep seeding
   under the VPN boundary. Follow the [cleanup policy](../../direction.md#disk-space).
 - Fetching torrent metadata is distinct from client acceptance and book completion.
+- Implemented without the space check, which waits for
+  [B-0001](../../backlog.md#b-0001-disk-space-monitoring-and-download-holds).
+  The oldest queued bookmark is admitted when the gates of
+  [B-0011](../B-0011/brief.md#admission-from-bookmark-to-download) hold. Torrents
+  admitted in the last hour count against the unsatisfied limit until MAM's count
+  catches up. The fetched file must be a valid torrent; it is kept in SQLite, the
+  registry row is linked to its info hash as *Active*, and the file is then added
+  to qBittorrent. Just before each download the torrent is looked up on MAM by
+  its ID, so its flags are current; see B-0011's admission order. A refused download closes the gate until restart or a new cookie.
 
 Proposed ordering, pending agreement:
 
@@ -101,7 +119,8 @@ blocks acquisition. `clientStats` has a 30-minute cache and cannot prove current
 client availability. No bonus purchases are implied.
 
 Torrent fetch must return valid metadata, not HTML/JSON with HTTP success.
-Proposed default: omit `fl`, which can spend a wedge even on VIP torrents.
+`fl` is used only as the [spending policy](../B-0011/brief.md) decides; it can
+spend a wedge even on VIP torrents.
 Prefer authenticated download by ID without requesting credential-bearing `dlLink`.
 Endpoint-specific limits and error contracts are incomplete in the supplied docs.
 
@@ -111,7 +130,8 @@ Bookmarks, admission, metadata acquisition, durable history, and client handoff.
 
 ## Non-goals
 
-General title searches, automatic content recommendations, spending policy,
+General title searches, automatic content recommendations, spending policy
+([B-0011](../B-0011/brief.md)),
 client API implementation, library organisation, and cleanup implementation.
 
 ## Related records

@@ -3,10 +3,12 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use windlass::core::{
-    Action, Activity, ByteSize, ClientVersion, ClockReading, Core, Event, LEASE_LIFETIME,
-    MamApproval, MappingFailure, POLL_INTERVAL, Port, PortForwarding, PortForwardingEvent,
-    Progress, Qbittorrent, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences,
-    SyncPosition, SyncUpdate, TimerId, TimerName, TorrentHash, TorrentState, TorrentUpdate,
+    Action, ActiveLimit, Activity, ByteSize, ClientVersion, ClockReading, Core, DownloadingLimit,
+    Event, LEASE_LIFETIME, MamApproval, MappingFailure, POLL_INTERVAL, Port, PortForwarding,
+    PortForwardingEvent, Progress, Qbittorrent, QbittorrentEvent, QbittorrentFailure,
+    QbittorrentPreferences, QueuePreferences, SettingsEvent, StartupEvent, StartupMode,
+    SyncPosition, SyncUpdate, TimerId, TimerName, TorrentHash, TorrentLimits, TorrentState,
+    TorrentUpdate,
 };
 
 /// A core with a clock that only moves when told to.
@@ -94,6 +96,7 @@ fn preferences(listen: u16) -> QbittorrentPreferences {
     QbittorrentPreferences {
         listen_port: Port::new(listen),
         interface: Some(String::from("wg0")),
+        queue: None,
     }
 }
 
@@ -404,6 +407,126 @@ fn qbittorrent_follows_the_forwarded_port() {
         harness.qbittorrent(QbittorrentEvent::Synced(SyncUpdate::default())),
         vec![Action::SetQbittorrentListenPort { port: port(42000) }]
     );
+}
+
+/// qBittorrent's preferences with this queue.
+fn queued(downloading: u32, active: u32) -> QbittorrentPreferences {
+    QbittorrentPreferences {
+        queue: Some(QueuePreferences {
+            queueing: true,
+            max_downloading: Some(downloading),
+            max_active: Some(active),
+            max_seeding: Some(active),
+            idle_not_counted: true,
+        }),
+        ..preferences(6881)
+    }
+}
+
+/// Limits for these counts; invalid counts fall back to the defaults, which no
+/// test uses.
+fn limits(downloading: u32, active: u32) -> TorrentLimits {
+    match (
+        DownloadingLimit::try_new(downloading),
+        ActiveLimit::try_new(active),
+    ) {
+        (Ok(downloading), Ok(active)) => {
+            TorrentLimits::new(downloading, active).unwrap_or_default()
+        }
+        _ => TorrentLimits::default(),
+    }
+}
+
+#[test]
+fn qbittorrents_queue_follows_the_saved_limits() {
+    let mut harness = Harness::new();
+    for event in [
+        Event::Startup(StartupEvent::Start {
+            mode: StartupMode::Initialise,
+        }),
+        Event::Startup(StartupEvent::StorageOpened),
+        Event::Settings(SettingsEvent::Read {
+            history_limit: None,
+            api_cookie: None,
+            ntfy_topic: None,
+            points_reserve: None,
+            torrent_limits: Some(limits(2, 4)),
+        }),
+    ] {
+        let _ = harness.send(event);
+    }
+    let _ = harness.qbittorrent(QbittorrentEvent::Enable);
+    let _ = harness.qbittorrent(QbittorrentEvent::Connected {
+        version: String::from("v5.2.2"),
+        preferences: QbittorrentPreferences {
+            queue: Some(QueuePreferences {
+                queueing: false,
+                max_downloading: Some(3),
+                max_active: Some(5),
+                max_seeding: None,
+                idle_not_counted: false,
+            }),
+            ..preferences(6881)
+        },
+    });
+    let wanted = QueuePreferences::for_limits(limits(2, 4));
+    assert_eq!(Some(wanted), queued(2, 4).queue);
+    assert_eq!(
+        harness.qbittorrent(QbittorrentEvent::Synced(SyncUpdate::default())),
+        vec![Action::SetQbittorrentQueue { queue: wanted }]
+    );
+    assert_eq!(session(&harness).activity, Activity::SettingQueue);
+    assert_eq!(
+        harness.qbittorrent(QbittorrentEvent::QueueSet),
+        vec![Action::ReadQbittorrentPreferences],
+        "the change is confirmed by reading it back"
+    );
+    let _ = timer(
+        &harness.qbittorrent(QbittorrentEvent::PreferencesRead(queued(2, 4))),
+        TimerName::QbittorrentPoll,
+        POLL_INTERVAL,
+    );
+    // New limits apply once saved, while qBittorrent is idle.
+    let requested = harness.send(Event::Settings(SettingsEvent::SetTorrentLimits {
+        limits: limits(1, 3),
+    }));
+    assert_eq!(
+        requested,
+        vec![Action::WriteTorrentLimits {
+            limits: limits(1, 3)
+        }]
+    );
+    assert_eq!(
+        harness.send(Event::Settings(SettingsEvent::TorrentLimitsWritten)),
+        vec![Action::SetQbittorrentQueue {
+            queue: QueuePreferences::for_limits(limits(1, 3))
+        }]
+    );
+    // A failed save keeps the saved limits.
+    let _ = harness.send(Event::Settings(SettingsEvent::SetTorrentLimits {
+        limits: limits(4, 4),
+    }));
+    let failed = harness.send(Event::Settings(SettingsEvent::TorrentLimitsWriteFailed));
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(
+        harness
+            .core
+            .settings()
+            .torrent_limits()
+            .map(|saved| saved == limits(1, 3)),
+        Some(true)
+    );
+    let retry = harness.qbittorrent(QbittorrentEvent::QueueSetFailed {
+        reason: QbittorrentFailure::Rejected { status: 400 },
+    });
+    let _ = timer(&retry, TimerName::QbittorrentPoll, POLL_INTERVAL);
+    assert!(matches!(
+        harness.core.qbittorrent(),
+        Qbittorrent::Unreachable {
+            reason: QbittorrentFailure::Rejected { status: 400 },
+            ..
+        }
+    ));
 }
 
 #[test]

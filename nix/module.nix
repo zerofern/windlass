@@ -94,6 +94,7 @@ let
           cfg.dashboard.url != null
         ) "--dashboard-url ${lib.escapeShellArg cfg.dashboard.url}"
       } \
+      ${lib.optionalString cfg.mam.enable "--mam-site ${lib.escapeShellArg cfg.mam.site} --mam-tracker ${lib.escapeShellArg cfg.mam.tracker}"} \
       ${
         lib.concatMapStringsSep " " (server: "--vpn-server ${lib.escapeShellArg server}") (
           lib.attrNames cfg.vpn.servers
@@ -245,6 +246,29 @@ in
         type = lib.types.str;
         default = "ntfy.sh:443";
         description = "The only destination the relay connects to.";
+      };
+    };
+
+    mam = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Whether Windlass talks to MAM: it observes the IP MAM sees, registers
+          it as a seedbox, reads the account, and downloads bookmarks. Requests
+          leave through the tunnel only, and start once an API cookie is saved
+          and MAM requests are resumed on the dashboard.
+        '';
+      };
+      site = lib.mkOption {
+        type = lib.types.str;
+        default = "https://www.myanonamouse.net/";
+        description = "MAM's site, for the account, bookmarks, torrent files, and the store.";
+      };
+      tracker = lib.mkOption {
+        type = lib.types.str;
+        default = "https://t.myanonamouse.net/";
+        description = "MAM's tracker host, for IP lookups and seedbox registration.";
       };
     };
 

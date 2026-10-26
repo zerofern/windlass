@@ -81,6 +81,44 @@
   [MAM initialization](#b-0004-mam-initialization-loop) and the forwarded port to
   [qBittorrent integration](#b-0007-qbittorrent-integration).
 
+## B-0011: MAM account safety and bonus points
+
+- Status: Needs Direction
+- Value: Keep the account inside every MAM rule on ratio, unsatisfied torrents,
+  seeding, clients, IPs, and automation, as MAM itself reports them, while
+  Windlass acquires bookmarked torrents unattended without spending ratio; keep
+  qBittorrent connectable; and spend bonus points on wedges, VIP, and upload
+  credit when needed.
+- Direction: [MAM API compliance](direction.md#mam-api-compliance)
+- Feature Brief: [MAM account safety and bonus points](features/B-0011/brief.md)
+- Relationships: Gates [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop)
+  and [cleanup](#b-0006-permission-based-disk-cleanup); adds conditions to
+  [notifications](#b-0002-important-event-notifications).
+
+## B-0012: Fake MAM server
+
+- Status: Needs Direction
+- Value: Let integration tests prove Windlass keeps MAM's rules against a local
+  stand-in that answers as MAM was observed to, without contacting MAM.
+- Direction: [MAM API compliance](direction.md#mam-api-compliance)
+- Feature Brief: [Fake MAM server](features/B-0012/brief.md)
+- Relationships: Supports [MAM initialization](#b-0004-mam-initialization-loop),
+  [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop), and
+  [account safety](#b-0011-mam-account-safety-and-bonus-points).
+
+## B-0013: Download queue, torrent limits, and narrated notices
+
+- Status: Needs Direction
+- Value: Bookmarked torrents download in an order the owner can see and change,
+  within configurable downloading and active limits that keep the connection
+  usable, and every unexpected event is reported with what Windlass did.
+- Direction: [MAM API compliance](direction.md#mam-api-compliance),
+  [Notifications](direction.md#notifications)
+- Feature Brief: [Download queue, torrent limits, and what Windlass did](features/B-0013/brief.md)
+- Relationships: Extends [MAM acquisition](#b-0005-mam-search-and-torrent-queueing-loop),
+  [account safety](#b-0011-mam-account-safety-and-bonus-points), and
+  [notifications](#b-0002-important-event-notifications).
+
 ## B-0009: Audiobookshelf integration
 
 - Status: Needs Direction

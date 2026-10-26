@@ -57,8 +57,8 @@ Prior tools and the proof of concept are not evidence that a behaviour is allowe
 The documented dynamicSeedbox limit means at most one request per rolling hour
 for Windlass, including requests that might return `No Change`.
 
-All Windlass requests to MAM share an additional token bucket with capacity five.
-Each request consumes one token; one token is restored every ten seconds, up to
+All Windlass requests to MAM share an additional token bucket with capacity ten.
+Each request consumes one token; one token is restored every three seconds, up to
 capacity. The bucket starts full. Endpoint-specific restrictions still apply.
 Requests blocked only by token availability or endpoint cooldowns wait in a
 queue. Requests with the same operation and parameters are identical; only one

@@ -9,19 +9,22 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 
 use crate::core::{
-    ApiCookie, ByteSize, Desired, Event, HistoryLimit, Identity, MamPauseEvent, MamRequestMode,
-    MamTorrentId, NtfyTopic, Observation, Origin, Progress, Ratio, RecordId, RegistryEvent,
-    SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash, TorrentRecord, TorrentState,
-    TunnelEvent, VpnServer, VpnSwitch,
+    ActiveLimit, ApiCookie, ByteSize, Desired, DownloadingLimit, Event, HistoryLimit, Identity,
+    Logged, MamEvent, MamPauseEvent, MamRequestMode, MamTorrentId, NoticeId, NotificationEvent,
+    NtfyTopic, Observation, Origin, PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent,
+    SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentRecord,
+    TorrentState, TunnelEvent, VpnServer, VpnSwitch,
 };
 
-use super::qbittorrent::torrent_state;
+use super::{notify, qbittorrent::torrent_state};
 
 /// The schema version written by this build. Version 1 held only the MAM
 /// preference; version 2 added settings and history; version 3 marks routine
 /// history entries; version 4 adds the torrent registry and VPN state; version 5
-/// adds the ntfy topic.
-const SCHEMA_VERSION: i64 = 5;
+/// adds the ntfy topic; version 6 adds held torrents, kept torrent files, MAM
+/// state, and the points reserve; version 7 adds snatched bookmarks; version 8
+/// adds the notifications log; version 9 adds the torrent limits.
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_V1: &str = "CREATE TABLE mam_configuration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -80,8 +83,97 @@ CREATE TABLE vpn_state (
 
 const SCHEMA_V5: &str = "ALTER TABLE settings ADD COLUMN ntfy_topic TEXT;";
 
+/// `SQLite` cannot change a check constraint, so the registry table is rebuilt to
+/// allow held torrents.
+const SCHEMA_V6: &str = "CREATE TABLE torrents_v6 (
+    id INTEGER PRIMARY KEY,
+    mam_id INTEGER,
+    hash TEXT UNIQUE,
+    origin TEXT NOT NULL CHECK (origin IN ('bookmark', 'redownload', 'adopted')),
+    desired TEXT NOT NULL CHECK (desired IN ('queued', 'active', 'held', 'removed')),
+    save_path TEXT,
+    deletion_allowed INTEGER NOT NULL,
+    name TEXT,
+    state TEXT,
+    progress_permille INTEGER,
+    size INTEGER,
+    total_size INTEGER,
+    downloaded INTEGER,
+    uploaded INTEGER,
+    ratio_thousandths INTEGER,
+    seeding_seconds INTEGER,
+    added_at INTEGER,
+    completed_at INTEGER,
+    content_path TEXT,
+    observed_save_path TEXT,
+    last_seen INTEGER,
+    CHECK (mam_id IS NOT NULL OR hash IS NOT NULL)
+);
+INSERT INTO torrents_v6 SELECT id, mam_id, hash, origin, desired, save_path, deletion_allowed,
+    name, state, progress_permille, size, total_size, downloaded, uploaded, ratio_thousandths,
+    seeding_seconds, added_at, completed_at, content_path, observed_save_path, last_seen
+    FROM torrents;
+DROP TABLE torrents;
+ALTER TABLE torrents_v6 RENAME TO torrents;
+CREATE TABLE torrent_files (
+    mam_id INTEGER PRIMARY KEY,
+    hash TEXT NOT NULL,
+    file BLOB NOT NULL
+);
+CREATE TABLE mam_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    last_registration_at INTEGER,
+    last_reminder_at INTEGER
+);
+ALTER TABLE settings ADD COLUMN points_reserve INTEGER;";
+
+/// The registry table is rebuilt again to allow snatched bookmarks.
+const SCHEMA_V7: &str = "CREATE TABLE torrents_v7 (
+    id INTEGER PRIMARY KEY,
+    mam_id INTEGER,
+    hash TEXT UNIQUE,
+    origin TEXT NOT NULL CHECK (origin IN ('bookmark', 'redownload', 'adopted')),
+    desired TEXT NOT NULL CHECK (desired IN ('queued', 'snatched', 'active', 'held', 'removed')),
+    save_path TEXT,
+    deletion_allowed INTEGER NOT NULL,
+    name TEXT,
+    state TEXT,
+    progress_permille INTEGER,
+    size INTEGER,
+    total_size INTEGER,
+    downloaded INTEGER,
+    uploaded INTEGER,
+    ratio_thousandths INTEGER,
+    seeding_seconds INTEGER,
+    added_at INTEGER,
+    completed_at INTEGER,
+    content_path TEXT,
+    observed_save_path TEXT,
+    last_seen INTEGER,
+    CHECK (mam_id IS NOT NULL OR hash IS NOT NULL)
+);
+INSERT INTO torrents_v7 SELECT * FROM torrents;
+DROP TABLE torrents;
+ALTER TABLE torrents_v7 RENAME TO torrents;";
+
+/// The notifications log keeps each notice's words as they were when it was
+/// given. Times are Unix seconds.
+const SCHEMA_V8: &str = "CREATE TABLE notices (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    urgent INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    page TEXT NOT NULL
+);";
+
+const SCHEMA_V9: &str = "ALTER TABLE settings ADD COLUMN max_downloading INTEGER;
+ALTER TABLE settings ADD COLUMN max_active INTEGER;";
+
 /// The changes from each version to the next, starting from version 1.
-const UPGRADES: [&str; 4] = [SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+const UPGRADES: [&str; 8] = [
+    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+];
 
 type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -106,6 +198,14 @@ pub(super) enum Operation {
     SaveTorrents(Vec<TorrentRecord>),
     ReadLastVpnSwitch,
     SaveVpnSwitch(VpnSwitch),
+    WritePointsReserve(PointsReserve),
+    WriteTorrentLimits(TorrentLimits),
+    WriteRotatedApiCookie(ApiCookie),
+    ReadMamState,
+    SaveRegistrationAttempt(SystemTime),
+    SaveReminder(SystemTime),
+    ReadNoticeLog,
+    SaveNotice(Logged, Option<NoticeId>),
 }
 
 pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, FailedAction> {
@@ -153,6 +253,39 @@ pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, Failed
         Operation::SaveVpnSwitch(switch) => (
             save_switch(path, &switch),
             Event::Tunnel(TunnelEvent::SwitchSaveFailed),
+        ),
+        Operation::WritePointsReserve(reserve) => (
+            write_points_reserve(path, reserve),
+            Event::Settings(SettingsEvent::PointsReserveWriteFailed),
+        ),
+        Operation::WriteTorrentLimits(limits) => (
+            write_torrent_limits(path, limits),
+            Event::Settings(SettingsEvent::TorrentLimitsWriteFailed),
+        ),
+        Operation::WriteRotatedApiCookie(cookie) => (
+            write_api_cookie(path, Some(&cookie))
+                .map(|_| Event::Settings(SettingsEvent::RotatedApiCookieWritten)),
+            Event::Settings(SettingsEvent::RotatedApiCookieWriteFailed),
+        ),
+        Operation::ReadMamState => (read_mam_state(path), Event::Mam(MamEvent::StateReadFailed)),
+        Operation::SaveRegistrationAttempt(at) => (
+            save_mam_time(path, "last_registration_at", at)
+                .map(|()| Event::Mam(MamEvent::RegistrationAttemptSaved)),
+            Event::Mam(MamEvent::RegistrationAttemptSaveFailed),
+        ),
+        Operation::SaveReminder(at) => (
+            save_mam_time(path, "last_reminder_at", at)
+                .map(|()| Event::Mam(MamEvent::ReminderSaved)),
+            Event::Mam(MamEvent::ReminderSaveFailed),
+        ),
+        Operation::ReadNoticeLog => (
+            read_notice_log(path),
+            Event::Notification(NotificationEvent::LogReadFailed),
+        ),
+        Operation::SaveNotice(entry, forget_through) => (
+            save_notice(path, &entry, forget_through)
+                .map(|()| Event::Notification(NotificationEvent::Saved)),
+            Event::Notification(NotificationEvent::SaveFailed),
         ),
     };
     result.map_err(|error| FailedAction {
@@ -249,15 +382,32 @@ fn invalid_data(detail: &'static str) -> io::Error {
 }
 
 fn read_settings(path: &Path) -> StorageResult<Event> {
-    type Stored = (Option<i64>, Option<String>, Option<String>);
+    type Stored = (
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
     let stored: Option<Stored> = connection(path)?
         .query_row(
-            "SELECT history_limit, api_cookie, ntfy_topic FROM settings WHERE singleton = 1",
+            "SELECT history_limit, api_cookie, ntfy_topic, points_reserve, max_downloading, \
+             max_active FROM settings WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()?;
-    let (limit, cookie, topic) = stored.unwrap_or_default();
+    let (limit, cookie, topic, reserve, downloading, active) = stored.unwrap_or_default();
     let history_limit = limit
         .map(|limit| {
             u32::try_from(limit)
@@ -272,11 +422,191 @@ fn read_settings(path: &Path) -> StorageResult<Event> {
     let ntfy_topic = topic
         .map(|topic| NtfyTopic::parse(&topic).map_err(|_| invalid_data("invalid ntfy topic")))
         .transpose()?;
+    let points_reserve = reserve
+        .map(|reserve| {
+            u64::try_from(reserve)
+                .ok()
+                .and_then(|reserve| PointsReserve::try_new(reserve).ok())
+                .ok_or_else(|| invalid_data("invalid points reserve"))
+        })
+        .transpose()?;
+    let torrent_limits = match (downloading, active) {
+        (Some(downloading), Some(active)) => Some(torrent_limits(downloading, active)?),
+        _ => None,
+    };
     Ok(Event::Settings(SettingsEvent::Read {
         history_limit,
         api_cookie,
         ntfy_topic,
+        points_reserve,
+        torrent_limits,
     }))
+}
+
+fn torrent_limits(downloading: i64, active: i64) -> StorageResult<TorrentLimits> {
+    let downloading = u32::try_from(downloading)
+        .ok()
+        .and_then(|limit| DownloadingLimit::try_new(limit).ok());
+    let active = u32::try_from(active)
+        .ok()
+        .and_then(|limit| ActiveLimit::try_new(limit).ok());
+    downloading
+        .zip(active)
+        .and_then(|(downloading, active)| TorrentLimits::new(downloading, active).ok())
+        .ok_or_else(|| invalid_data("invalid torrent limits").into())
+}
+
+fn write_torrent_limits(path: &Path, limits: TorrentLimits) -> StorageResult<Event> {
+    connection(path)?.execute(
+        "INSERT INTO settings(singleton, max_downloading, max_active) VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET max_downloading = excluded.max_downloading,
+             max_active = excluded.max_active",
+        [
+            limits.downloading().into_inner(),
+            limits.active().into_inner(),
+        ],
+    )?;
+    Ok(Event::Settings(SettingsEvent::TorrentLimitsWritten))
+}
+
+fn write_points_reserve(path: &Path, reserve: PointsReserve) -> StorageResult<Event> {
+    connection(path)?.execute(
+        "INSERT INTO settings(singleton, points_reserve) VALUES (1, ?1)
+         ON CONFLICT(singleton) DO UPDATE SET points_reserve = excluded.points_reserve",
+        [integer(reserve.into_inner())],
+    )?;
+    Ok(Event::Settings(SettingsEvent::PointsReserveWritten))
+}
+
+fn read_mam_state(path: &Path) -> StorageResult<Event> {
+    let stored: Option<(Option<i64>, Option<i64>)> = connection(path)?
+        .query_row(
+            "SELECT last_registration_at, last_reminder_at FROM mam_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (registration, reminder) = stored.unwrap_or_default();
+    Ok(Event::Mam(MamEvent::StateRead {
+        last_registration: registration.map(time_from_seconds).transpose()?,
+        last_reminder: reminder.map(time_from_seconds).transpose()?,
+    }))
+}
+
+/// Save one of the MAM state times; `column` is one of this module's names.
+fn save_mam_time(path: &Path, column: &'static str, at: SystemTime) -> StorageResult<()> {
+    connection(path)?.execute(
+        &format!(
+            "INSERT INTO mam_state(singleton, {column}) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET {column} = excluded.{column}"
+        ),
+        [seconds(at)],
+    )?;
+    Ok(())
+}
+
+fn read_notice_log(path: &Path) -> StorageResult<Event> {
+    let last: Option<i64> =
+        connection(path)?.query_row("SELECT MAX(id) FROM notices", [], |row| row.get(0))?;
+    let last = last
+        .map(|id| u64::try_from(id).map(NoticeId::new))
+        .transpose()?;
+    Ok(Event::Notification(NotificationEvent::LogRead { last }))
+}
+
+/// Save a notice's words, and forget the oldest ones.
+fn save_notice(path: &Path, entry: &Logged, forget_through: Option<NoticeId>) -> StorageResult<()> {
+    let message = notify::message(&entry.notice);
+    let mut connection = connection(path)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO notices(id, at, urgent, title, body, page) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            integer(entry.id.get()),
+            seconds(entry.at),
+            entry.reach == Reach::Push,
+            message.title,
+            message.body,
+            message.page,
+        ],
+    )?;
+    if let Some(through) = forget_through {
+        transaction.execute(
+            "DELETE FROM notices WHERE id <= ?1",
+            [integer(through.get())],
+        )?;
+    }
+    transaction.commit().map_err(Into::into)
+}
+
+/// A notice as the notifications page shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StoredNotice {
+    pub(super) id: NoticeId,
+    pub(super) at: SystemTime,
+    /// Whether it is pushed to the owner's phone when a topic is set.
+    pub(super) urgent: bool,
+    pub(super) title: String,
+    pub(super) body: String,
+    /// The dashboard page, or the site, that explains it.
+    pub(super) page: String,
+}
+
+/// The newest notices, newest first.
+pub(super) fn read_notices(path: &Path, limit: u32) -> StorageResult<Vec<StoredNotice>> {
+    let connection = connection(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, at, urgent, title, body, page FROM notices ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, at, urgent, title, body, page) = row?;
+        Ok(StoredNotice {
+            id: NoticeId::new(u64::try_from(id)?),
+            at: time_from_seconds(at)?,
+            urgent,
+            title,
+            body,
+            page,
+        })
+    })
+    .collect()
+}
+
+/// Keep a fetched torrent file until qBittorrent has it; it holds the owner's
+/// passkey, so it stays in Windlass's storage like the API cookie.
+pub(super) fn keep_torrent_file(
+    path: &Path,
+    mam: MamTorrentId,
+    hash: &TorrentHash,
+    file: &[u8],
+) -> StorageResult<()> {
+    connection(path)?.execute(
+        "INSERT OR REPLACE INTO torrent_files(mam_id, hash, file) VALUES (?1, ?2, ?3)",
+        params![integer(mam.get()), hash.as_str(), file],
+    )?;
+    Ok(())
+}
+
+/// A kept torrent file, if there is one.
+pub(super) fn kept_torrent_file(path: &Path, mam: MamTorrentId) -> Option<Vec<u8>> {
+    connection(path)
+        .ok()?
+        .query_row(
+            "SELECT file FROM torrent_files WHERE mam_id = ?1",
+            [integer(mam.get())],
+            |row| row.get(0),
+        )
+        .ok()
 }
 
 fn write_ntfy_topic(path: &Path, topic: Option<&NtfyTopic>) -> StorageResult<Event> {
@@ -353,7 +683,9 @@ fn torrent_record(row: &Row<'_>) -> StorageResult<TorrentRecord> {
     };
     let desired = match row.get::<_, String>(4)?.as_str() {
         "queued" => Desired::Queued,
+        "snatched" => Desired::Snatched,
         "active" => Desired::Active,
+        "held" => Desired::Held,
         "removed" => Desired::Removed,
         _ => return Err(invalid_data("invalid desired torrent state").into()),
     };
@@ -401,6 +733,8 @@ fn observation(row: &Row<'_>, last_seen: i64) -> StorageResult<Observation> {
             completed_at: time(17)?,
             content_path: row.get(18)?,
             save_path: row.get(19)?,
+            // Not saved; qBittorrent's next full update says.
+            force_start: false,
         },
         last_seen: time_from_seconds(last_seen)?,
     })
@@ -433,7 +767,9 @@ fn save_torrents(path: &Path, records: &[TorrentRecord]) -> StorageResult<Event>
                 },
                 match record.desired {
                     Desired::Queued => "queued",
+                    Desired::Snatched => "snatched",
                     Desired::Active => "active",
+                    Desired::Held => "held",
                     Desired::Removed => "removed",
                 },
                 record.save_path,
@@ -542,7 +878,7 @@ mod tests {
         TunnelEvent, VpnServer, VpnSwitch,
     };
 
-    use super::{Operation, execute, state_name, torrent_state};
+    use super::{Operation, execute, notify, read_notices, state_name, torrent_state};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -558,6 +894,7 @@ mod tests {
     constant!(FIRST: RecordId = RecordId::new(1));
     constant!(SECOND: RecordId = RecordId::new(2));
     constant!(THIRD: RecordId = RecordId::new(3));
+    constant!(KEPT: MamTorrentId = MamTorrentId::new(42));
     constant!(MAM: MamTorrentId = MamTorrentId::new(77));
     constant!(DONE: Progress = Progress::from_permille(1000));
 
@@ -580,6 +917,7 @@ mod tests {
                 completed_at: Some(at(1_700_000_600)),
                 content_path: Some(String::from("/srv/books/A Synthetic Audiobook")),
                 save_path: Some(String::from("/srv/books")),
+                force_start: false,
             },
             last_seen: at(1_700_001_000),
         };
@@ -842,6 +1180,8 @@ mod tests {
                     history_limit: Some(HistoryLimit::default()),
                     api_cookie: cookie,
                     ntfy_topic: topic,
+                    points_reserve: None,
+                    torrent_limits: None,
                 }),
             ),
             (
@@ -854,6 +1194,137 @@ mod tests {
             ),
         ] {
             assert_eq!(outcome(path, operation), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the log's round trip and each way reading or saving it fails"
+    )]
+    fn the_notices_log_keeps_words_and_forgets_the_oldest() -> TestResult {
+        use crate::core::{Logged, Notice, NoticeId, NotificationEvent, Reach, StartupMode};
+
+        let storage = storage()?;
+        let path = &storage.path;
+        let entry = |id, notice: Notice| Logged {
+            id: NoticeId::new(id),
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(id),
+            reach: notice.reach(),
+            notice,
+        };
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogRead { last: None })
+        );
+        let started = Notice::Started {
+            mode: StartupMode::Resume,
+        };
+        for (logged, forget) in [
+            (entry(1, Notice::Test), None),
+            (entry(2, started), None),
+            (entry(3, Notice::MamVisitReminder), Some(NoticeId::new(1))),
+        ] {
+            assert_eq!(
+                outcome(path, Operation::SaveNotice(logged, forget)),
+                Event::Notification(NotificationEvent::Saved)
+            );
+        }
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogRead {
+                last: Some(NoticeId::new(3))
+            })
+        );
+        let notices = read_notices(path, 10).unwrap_or_default();
+        assert_eq!(
+            notices
+                .iter()
+                .map(|notice| (notice.id.get(), notice.urgent))
+                .collect::<Vec<_>>(),
+            [(3, true), (2, false)],
+            "newest first, and the first is forgotten"
+        );
+        assert_eq!(
+            notices
+                .first()
+                .map(|newest| (newest.title.as_str(), newest.page.as_str(), newest.at)),
+            Some((
+                notify::message(&Notice::MamVisitReminder).title,
+                "https://www.myanonamouse.net/",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(3)
+            ))
+        );
+        assert_eq!(
+            read_notices(path, 1).map(|notices| notices.len()).ok(),
+            Some(1)
+        );
+        // An id already taken fails the save.
+        assert_eq!(
+            outcome(path, Operation::SaveNotice(entry(3, Notice::Test), None)),
+            Event::Notification(NotificationEvent::SaveFailed)
+        );
+        assert_eq!(Reach::Push, Notice::Test.reach());
+        // Unreadable or refused notices fail.
+        let sql = |batch: &str| storage.connection.execute_batch(batch).is_ok();
+        assert!(sql("UPDATE notices SET at = -1 WHERE id = 3;"));
+        assert!(read_notices(path, 10).is_err(), "a time before 1970");
+        assert!(sql("UPDATE notices SET at = 3, id = -3 WHERE id = 3;"));
+        assert!(read_notices(path, 10).is_err(), "a negative id");
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogRead {
+                last: Some(NoticeId::new(2))
+            })
+        );
+        // Each column holding the wrong kind of value fails the read.
+        for values in [
+            "'later', 1, 't', 'b', 'p'",
+            "1, 'yes', 't', 'b', 'p'",
+            "1, 1, x'ff', 'b', 'p'",
+            "1, 1, 't', x'ff', 'p'",
+            "1, 1, 't', 'b', x'ff'",
+        ] {
+            assert!(sql(&format!(
+                "DELETE FROM notices WHERE id = 100; INSERT INTO notices VALUES (100, {values});"
+            )));
+            assert!(read_notices(path, 10).is_err(), "{values}");
+        }
+        assert!(sql("DELETE FROM notices WHERE id > 0;"));
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogReadFailed),
+            "only a negative id is left"
+        );
+        // A full log cannot forget, so the save fails as a whole.
+        let refuse = "CREATE TRIGGER keep BEFORE DELETE ON notices \
+                      BEGIN SELECT RAISE(ABORT, 'kept'); END;";
+        assert!(sql(refuse));
+        assert_eq!(
+            outcome(
+                path,
+                Operation::SaveNotice(entry(8, Notice::Test), Some(NoticeId::new(7)))
+            ),
+            Event::Notification(NotificationEvent::SaveFailed)
+        );
+        assert_eq!(
+            outcome(path, Operation::ReadNoticeLog),
+            Event::Notification(NotificationEvent::LogReadFailed),
+            "nothing was saved"
+        );
+        assert!(sql("DROP TABLE notices;"));
+        let missing = path.with_file_name("missing.sqlite");
+        for path in [path, &missing] {
+            assert_eq!(
+                outcome(path, Operation::ReadNoticeLog),
+                Event::Notification(NotificationEvent::LogReadFailed)
+            );
+            assert_eq!(
+                outcome(path, Operation::SaveNotice(entry(9, Notice::Test), None)),
+                Event::Notification(NotificationEvent::SaveFailed)
+            );
+            assert!(read_notices(path, 10).is_err());
         }
         Ok(())
     }
@@ -910,6 +1381,190 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of every MAM storage operation and its failure"
+    )]
+    fn mam_state_reserve_and_torrent_files_round_trip() -> TestResult {
+        use crate::core::{ApiCookie, MamEvent, PointsReserve, SettingsEvent, TorrentLimits};
+
+        let storage = storage()?;
+        let path = &storage.path;
+        let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        let cookie = ApiCookie::parse("rotated-cookie")?;
+        let reserve = PointsReserve::try_new(30_000)?;
+        let limits = TorrentLimits::default();
+        for (operation, expected) in [
+            (
+                Operation::ReadMamState,
+                Event::Mam(MamEvent::StateRead {
+                    last_registration: None,
+                    last_reminder: None,
+                }),
+            ),
+            (
+                Operation::SaveRegistrationAttempt(at(1_000)),
+                Event::Mam(MamEvent::RegistrationAttemptSaved),
+            ),
+            (
+                Operation::SaveReminder(at(2_000)),
+                Event::Mam(MamEvent::ReminderSaved),
+            ),
+            (
+                Operation::ReadMamState,
+                Event::Mam(MamEvent::StateRead {
+                    last_registration: Some(at(1_000)),
+                    last_reminder: Some(at(2_000)),
+                }),
+            ),
+            (
+                Operation::WritePointsReserve(reserve),
+                Event::Settings(SettingsEvent::PointsReserveWritten),
+            ),
+            (
+                Operation::WriteRotatedApiCookie(cookie.clone()),
+                Event::Settings(SettingsEvent::RotatedApiCookieWritten),
+            ),
+            (
+                Operation::WriteTorrentLimits(limits),
+                Event::Settings(SettingsEvent::TorrentLimitsWritten),
+            ),
+            (
+                Operation::ReadSettings,
+                Event::Settings(SettingsEvent::Read {
+                    history_limit: None,
+                    api_cookie: Some(cookie),
+                    ntfy_topic: None,
+                    points_reserve: Some(reserve),
+                    torrent_limits: Some(limits),
+                }),
+            ),
+        ] {
+            assert_eq!(outcome(path, operation), expected);
+        }
+
+        let mam = KEPT;
+        let hash = TorrentHash::parse(&"d".repeat(40)).ok_or("hash")?;
+        assert_eq!(super::kept_torrent_file(path, mam), None);
+        assert!(super::keep_torrent_file(path, mam, &hash, b"d4:infode").is_ok());
+        assert_eq!(
+            super::kept_torrent_file(path, mam),
+            Some(b"d4:infode".to_vec())
+        );
+
+        let mut held = records();
+        for record in &mut held {
+            record.desired = Desired::Held;
+        }
+        assert_eq!(
+            outcome(path, Operation::SaveTorrents(held.clone())),
+            Event::Registry(RegistryEvent::Saved)
+        );
+        assert_eq!(
+            outcome(path, Operation::ReadTorrentRegistry),
+            Event::Registry(RegistryEvent::Read(held))
+        );
+
+        let mut snatched = records();
+        for record in &mut snatched {
+            record.desired = Desired::Snatched;
+        }
+        assert_eq!(
+            outcome(path, Operation::SaveTorrents(snatched.clone())),
+            Event::Registry(RegistryEvent::Saved)
+        );
+        assert_eq!(
+            outcome(path, Operation::ReadTorrentRegistry),
+            Event::Registry(RegistryEvent::Read(snatched))
+        );
+
+        // Values no build could write are refused.
+        for corrupt in [
+            "max_downloading = 9, max_active = 3",
+            "max_active = -1",
+            "max_downloading = 'x'",
+            "max_downloading = 3, max_active = 'x'",
+        ] {
+            assert!(
+                storage
+                    .connection
+                    .execute_batch(&format!("UPDATE settings SET {corrupt};"))
+                    .is_ok()
+            );
+            assert_eq!(
+                outcome(path, Operation::ReadSettings),
+                Event::Settings(SettingsEvent::ReadFailed),
+                "{corrupt}"
+            );
+        }
+        let restore = "UPDATE settings SET max_downloading = 5, max_active = 10;";
+        assert!(storage.connection.execute_batch(restore).is_ok());
+        let corrupt = "UPDATE settings SET points_reserve = -1; \
+                       UPDATE mam_state SET last_reminder_at = -5;";
+        assert!(storage.connection.execute_batch(corrupt).is_ok());
+        assert_eq!(
+            outcome(path, Operation::ReadSettings),
+            Event::Settings(SettingsEvent::ReadFailed)
+        );
+        assert_eq!(
+            outcome(path, Operation::ReadMamState),
+            Event::Mam(MamEvent::StateReadFailed)
+        );
+
+        let missing = path.with_file_name("missing.sqlite");
+        for (operation, expected) in [
+            (
+                Operation::ReadMamState,
+                Event::Mam(MamEvent::StateReadFailed),
+            ),
+            (
+                Operation::SaveRegistrationAttempt(at(1)),
+                Event::Mam(MamEvent::RegistrationAttemptSaveFailed),
+            ),
+            (
+                Operation::SaveReminder(at(1)),
+                Event::Mam(MamEvent::ReminderSaveFailed),
+            ),
+            (
+                Operation::WritePointsReserve(reserve),
+                Event::Settings(SettingsEvent::PointsReserveWriteFailed),
+            ),
+            (
+                Operation::WriteRotatedApiCookie(ApiCookie::parse("other")?),
+                Event::Settings(SettingsEvent::RotatedApiCookieWriteFailed),
+            ),
+            (
+                Operation::WriteTorrentLimits(limits),
+                Event::Settings(SettingsEvent::TorrentLimitsWriteFailed),
+            ),
+        ] {
+            assert_eq!(outcome(&missing, operation), expected);
+        }
+        assert!(super::keep_torrent_file(&missing, mam, &hash, b"x").is_err());
+        assert_eq!(super::kept_torrent_file(&missing, mam), None);
+
+        // Storage that opens but has lost what is written fails the write.
+        let broken = "DROP TABLE mam_state; DROP TABLE torrent_files; \
+                      ALTER TABLE settings DROP COLUMN points_reserve; \
+                      ALTER TABLE settings DROP COLUMN max_active;";
+        assert!(storage.connection.execute_batch(broken).is_ok());
+        assert_eq!(
+            outcome(path, Operation::SaveReminder(at(1))),
+            Event::Mam(MamEvent::ReminderSaveFailed)
+        );
+        assert_eq!(
+            outcome(path, Operation::WritePointsReserve(reserve)),
+            Event::Settings(SettingsEvent::PointsReserveWriteFailed)
+        );
+        assert_eq!(
+            outcome(path, Operation::WriteTorrentLimits(limits)),
+            Event::Settings(SettingsEvent::TorrentLimitsWriteFailed)
+        );
+        assert!(super::keep_torrent_file(path, mam, &hash, b"x").is_err());
         Ok(())
     }
 }

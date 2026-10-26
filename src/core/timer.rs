@@ -15,6 +15,8 @@ pub enum TimerName {
     NotificationGrace,
     /// Send a notice whose delivery failed again.
     NotificationRetry,
+    /// MAM work becomes due.
+    Mam,
 }
 
 /// One scheduled instance of a timer. Replacing a timer gives it a new
