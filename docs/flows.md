@@ -141,9 +141,12 @@ core scenarios with simulated time, and end to end only for their wiring.
   downloading, 10 active): queueing on, the same downloading and active limits,
   as many seeding as active, and idle torrents not counted, so a seed nobody
   downloads from keeps seeding. Changes are read back to confirm them; a queue
-  qBittorrent does not report is left alone. A complete torrent short of MAM's
-  72 hours of seeding is force-started so the queue never holds it, and goes back
-  to the queue once it has seeded long enough. Windlass starts no new download
+  qBittorrent does not report is left alone. A complete torrent short of 96
+  hours of seeding (MAM's 72, plus a day, since qBittorrent's count is not
+  MAM's) is force-started so the queue never holds it, and goes back to the
+  queue once it has seeded 96 hours. Nothing here adds an unsatisfied torrent:
+  force start only touches complete torrents, which MAM counts already, and a
+  torrent found stopped that has downloaded nothing is left stopped. Windlass starts no new download
   while its own running downloads reach the downloading limit.
 - **Where:** `core/qbittorrent.rs` (`set_preferences`, `QueuePreferences`),
   `core/registry.rs` (`reconcile`), `core/mam/acquisition.rs` (`next`),
@@ -245,7 +248,7 @@ core scenarios with simulated time, and end to end only for their wiring.
 - **Does:** reports a ratio below 2.0 (urgent below 1.1), unsatisfied torrents at
   80% of MAM's limit, unsatisfied torrents not seeding, partial downloads, tracker
   errors and other red categories, MAM notification counts, points below the
-  reserve, VIP ending, and torrents at day 20 without 72 hours seeded.
+  reserve, VIP ending, and torrents at day 20 without 96 hours seeded.
 - **Where:** `core/mam/account.rs`, `core/notifications.rs` (`mam`).
 - **Tested:** `tests/mam_core.rs`, `tests/notifications_core.rs`.
 - **Missing end to end:** one fake-MAM account with red flags producing the

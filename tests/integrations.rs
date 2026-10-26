@@ -396,7 +396,7 @@ async fn the_queue_follows_the_limits_and_unsatisfied_seeds_always_run() -> Test
     };
     let satisfied = FakeTorrent {
         completion_on: 1_700_000_600,
-        seeding_time: 80 * 3600,
+        seeding_time: 100 * 3600,
         force_start: true,
         ..complete("forcedUP")
     };

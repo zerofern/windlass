@@ -209,14 +209,8 @@ async fn storage_failures_are_observable_without_a_console() -> TestResult {
             .as_deref()
             .is_some_and(|detail| detail.contains("write rejected"))
     );
-    // The notice of the failure may already be saved.
-    assert!(matches!(
-        failed.last_event.map(|event| event.event),
-        Some(
-            Event::MamPause(MamPauseEvent::WriteFailed)
-                | Event::Notification(windlass::core::NotificationEvent::Saved)
-        )
-    ));
+    // Which event came last is not checked: other startup writes, such as
+    // saving the notice of this failure, can finish after it.
     events.shutdown().await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), worker).await???,

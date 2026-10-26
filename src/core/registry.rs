@@ -9,7 +9,10 @@ use std::{
 
 use serde::Serialize;
 
-use super::{Action, ClockReading, Session, Torrent, TorrentCommand, TorrentHash, TorrentState};
+use super::{
+    Action, ByteSize, ClockReading, Progress, Session, Torrent, TorrentCommand, TorrentHash,
+    TorrentState,
+};
 
 /// How often changed upload totals, progress, and seeding time are saved.
 pub const COUNTER_SAVE_INTERVAL: Duration = Duration::from_mins(15);
@@ -18,6 +21,9 @@ const COMMAND_REPEAT_AFTER: Duration = Duration::from_mins(1);
 /// MAM requires 72 hours of seeding; until then a torrent is unsatisfied and
 /// stopping it risks a hit-and-run.
 pub const SEEDING_REQUIRED: Duration = Duration::from_hours(72);
+/// Windlass seeds a day beyond MAM's requirement, since the seeding time
+/// qBittorrent reports is not MAM's own count.
+pub const SEEDING_TARGET: Duration = SEEDING_REQUIRED.saturating_add(Duration::from_hours(24));
 
 /// A registry row's identity, allocated by the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -584,8 +590,14 @@ impl Records {
 
     /// The first change needed: removals, whole content, held torrents
     /// stopped, fetched torrents added, starts, then force starts: a complete
-    /// torrent short of MAM's seeding runs regardless of qBittorrent's queue,
-    /// and goes back to the queue once it has seeded long enough.
+    /// torrent short of the seeding target runs regardless of qBittorrent's
+    /// queue, and goes back to the queue once it has seeded long enough.
+    ///
+    /// Nothing here adds an unsatisfied torrent on MAM: a torrent that already
+    /// downloaded something is counted already, and a torrent found stopped
+    /// that has downloaded nothing is left stopped, since starting it would
+    /// pass the unsatisfied limit's check. Windlass's own downloads passed it
+    /// when they were admitted.
     fn reconcile(&self, session: &Session) -> Option<TorrentCommand> {
         let present = |desired: Desired| {
             self.records()
@@ -627,15 +639,24 @@ impl Records {
         if missing.is_some() {
             return missing;
         }
-        let stopped: Vec<TorrentHash> = present(Desired::Active)
-            .filter(|(_, torrent)| matches!(torrent.state, TorrentState::Stopped { .. }))
-            .map(|(hash, _)| hash.clone())
+        let stopped: Vec<TorrentHash> = self
+            .records()
+            .filter(|record| record.desired == Desired::Active)
+            .filter_map(|record| {
+                let hash = record.identity.hash()?;
+                let torrent = session.torrents.get(hash)?;
+                let untouched =
+                    torrent.progress == Progress::default() && torrent.downloaded == ByteSize(0);
+                (matches!(torrent.state, TorrentState::Stopped { .. })
+                    && !(record.origin == Origin::Adopted && untouched))
+                    .then(|| hash.clone())
+            })
             .collect();
         if !stopped.is_empty() {
             return Some(TorrentCommand::Start(stopped));
         }
         let unsatisfied = |torrent: &Torrent| {
-            torrent.completed_at.is_some() && torrent.seeding_time < SEEDING_REQUIRED
+            torrent.completed_at.is_some() && torrent.seeding_time < SEEDING_TARGET
         };
         let force: Vec<TorrentHash> = present(Desired::Active)
             .filter(|(_, torrent)| unsatisfied(torrent) && !torrent.force_start)

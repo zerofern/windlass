@@ -830,7 +830,7 @@ fn limits_form(settings: &Settings, form: &SettingsForm) -> Markup {
             }
             p.hint {
                 "How many torrents may download at once, and how many may be active: downloading, or seeding while peers download from them. "
-                "Windlass sets qBittorrent's queue to match, and torrents still short of MAM's 72 hours of seeding always run. Defaults 5 and 10."
+                "Windlass sets qBittorrent's queue to match, and torrents short of 96 hours of seeding (MAM's 72, plus a day) always run. Defaults 5 and 10."
             }
             div.row {
                 label for="max-downloading" { "Downloading" }

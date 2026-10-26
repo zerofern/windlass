@@ -19,12 +19,12 @@ use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
     Hold, Mam, MamSession, Points, Port, PortForwarding, Protection, Purchase, Qbittorrent,
     QbittorrentFailure, Registry, SeedboxStatus, SessionRejection, SettingsState, StartupMode,
-    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer,
-    registry::SEEDING_REQUIRED, timer::Timers,
+    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer, registry::SEEDING_TARGET,
+    timer::Timers,
 };
 
-/// A torrent completed this long ago must have seeded 72 hours by now, or soon
-/// will not within MAM's 30 days.
+/// A torrent completed this long ago must have reached the seeding target by
+/// now, or soon may not reach MAM's 72 hours within its 30 days.
 const SEEDING_DEADLINE_WARNING: Duration = Duration::from_hours(20 * 24);
 
 /// How many notices wait for delivery before the oldest are dropped.
@@ -335,12 +335,12 @@ pub enum Notice {
     },
     /// MAM refused a download, so downloads are held.
     DownloadsRefused,
-    /// Torrents completed 20 or more days ago have not seeded 72 hours.
+    /// Torrents completed 20 or more days ago have not seeded 96 hours.
     SeedingBehind {
         /// How many.
         count: usize,
     },
-    /// Every torrent is on track to seed 72 hours.
+    /// Every torrent is on track to seed 96 hours.
     SeedingOnTrack,
     /// A bonus store purchase went through.
     PurchaseMade {
@@ -1159,7 +1159,8 @@ fn assess(now: SystemTime, facts: Facts<'_>) -> Vec<(Condition, Status)> {
     conditions
 }
 
-/// Active torrents completed 20 or more days ago with less than 72 hours seeded.
+/// Active torrents completed 20 or more days ago with less than the seeding
+/// target seeded.
 fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<usize> {
     let Registry::Loaded(records) = registry else {
         return None;
@@ -1170,7 +1171,7 @@ fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<usize> {
             .filter(|record| record.desired == Desired::Active)
             .filter_map(|record| record.observation.as_ref())
             .filter(|observation| {
-                observation.torrent.seeding_time < SEEDING_REQUIRED
+                observation.torrent.seeding_time < SEEDING_TARGET
                     && observation.torrent.completed_at.is_some_and(|completed| {
                         now.duration_since(completed)
                             .is_ok_and(|since| since >= SEEDING_DEADLINE_WARNING)

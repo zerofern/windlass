@@ -518,11 +518,11 @@ fn torrent_command(command: &TorrentCommand) -> String {
         }
         TorrentCommand::Stop(hashes) => format!("Stop {} held torrents", hashes.len()),
         TorrentCommand::ForceStart(hashes) => format!(
-            "Force-start {} torrents still short of MAM's 72 hours of seeding",
+            "Force-start {} torrents still short of 96 hours of seeding",
             hashes.len()
         ),
         TorrentCommand::EndForceStart(hashes) => format!(
-            "Return {} torrents that have seeded 72 hours to qBittorrent's queue",
+            "Return {} torrents that have seeded 96 hours to qBittorrent's queue",
             hashes.len()
         ),
         TorrentCommand::Add { mam, hash } => format!(

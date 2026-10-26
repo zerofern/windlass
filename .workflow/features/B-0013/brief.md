@@ -28,7 +28,8 @@ Acceptance:
 - Windlass sets qBittorrent's queue to match: queueing on, the same downloading
   and active limits, and idle torrents not counted. qBittorrent then pauses
   (queues) torrents above the limits, and resumes them as others go idle.
-- A torrent still short of MAM's 72 hours of seeding is never held in the queue:
+- A torrent short of 96 hours of seeding (MAM's 72, plus a day, since
+  qBittorrent's count is not MAM's) is never held in the queue:
   Windlass force-starts it, so a limit can never make it a hit-and-run.
 - Windlass sets every other qBittorrent setting it depends on (listen port,
   interface, queue), and puts back any that drift.
@@ -38,8 +39,11 @@ Acceptance:
   two limits, as many seeding as active, and slow torrents not counted. It sets
   the queue after the listen port, reads it back, and puts it back when it
   drifts; a queue qBittorrent does not report is left alone. Complete torrents
-  with less than 72 hours of seeding time are force-started and released once
-  they have it. Admission holds with `Hold::DownloadingLimit` while Windlass's
+  with less than 96 hours of seeding time are force-started and released once
+  they have it. Force start never adds an unsatisfied torrent on MAM: it only
+  touches complete torrents. A torrent found stopped in qBittorrent that has
+  downloaded nothing is not started, since that would add one without the
+  limit check. Admission holds with `Hold::DownloadingLimit` while Windlass's
   own running downloads reach the limit. The interface is still set by the NixOS
   module, not by Windlass.
 

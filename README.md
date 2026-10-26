@@ -67,8 +67,10 @@ times; it works without the script, without live updates. It shows:
   starts stopped ones, selects every file, and removes those marked removed.
   It keeps qBittorrent's queue to the torrent limits set on the settings page (by
   default 5 downloading and 10 active, where idle seeds do not count) and
-  force-starts any complete torrent still short of MAM's 72 hours of seeding, so
-  a limit never stops one.
+  force-starts any complete torrent short of 96 hours of seeding (MAM requires
+  72; Windlass adds a day), so a limit never stops one. A torrent you add to
+  qBittorrent stopped, that has downloaded nothing, stays stopped: starting it
+  would add an unsatisfied torrent on MAM without Windlass checking the limit.
 - **MAM:** whether the API session works, the IP and ASN MAM sees, the seedbox
   registration and when it may next be renewed; the account as MAM last reported
   it (ratio, upload buffer, points, wedges, VIP, unsatisfied torrents, and flagged

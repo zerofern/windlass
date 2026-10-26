@@ -522,7 +522,7 @@ pub(super) fn message(notice: &Notice) -> Message {
         Notice::SeedingBehind { count } => at_mam(
             "Torrents behind on seeding",
             format!(
-                "{} completed 20 or more days ago {} not seeded 72 hours yet.",
+                "{} completed 20 or more days ago {} not seeded 96 hours yet. MAM requires 72 within 30 days; Windlass aims a day higher.",
                 torrents(*count),
                 if *count == 1 { "has" } else { "have" }
             ),
@@ -530,7 +530,7 @@ pub(super) fn message(notice: &Notice) -> Message {
         ),
         Notice::SeedingOnTrack => at_mam(
             "Seeding on track",
-            String::from("Every torrent is on track to seed 72 hours within 30 days."),
+            String::from("Every torrent is on track to seed 96 hours, a day more than MAM's 72."),
             2,
         ),
         Notice::PurchaseMade {

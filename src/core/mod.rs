@@ -262,7 +262,7 @@ pub use qbittorrent::{
 };
 pub use registry::{
     COUNTER_SAVE_INTERVAL, Desired, Download, Identity, MamTorrentId, Observation, Origin,
-    RecordId, Records, Registry, RegistryEvent, SEEDING_REQUIRED, TorrentRecord,
+    RecordId, Records, Registry, RegistryEvent, SEEDING_REQUIRED, SEEDING_TARGET, TorrentRecord,
 };
 pub use settings::{
     ActiveLimit, ActiveLimitError, ApiCookie, DownloadingLimit, DownloadingLimitError, EntryCount,
