@@ -5,12 +5,12 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
-    Action, ByteSize, ClientStanding, DeliveryFailure, Event, ExitIpFailure, Findings,
-    HistoryEvent, Hold, IpFinding, MamEvent, MamFailure, MamPauseEvent, MamReply, MamRequest,
-    MamRequestMode, MappingFailure, NotificationEvent, PersonalFreeleech, PortFinding,
+    Action, Bookmark, ByteSize, ClientStanding, DeliveryFailure, Event, ExitIpFailure, Findings,
+    Freeleech, HistoryEvent, Hold, IpFinding, MamEvent, MamFailure, MamPauseEvent, MamReply,
+    MamRequest, MamRequestMode, MappingFailure, NotificationEvent, PersonalFreeleech, PortFinding,
     PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure, Registration,
-    RegistryEvent, SessionRejection, SettingsEvent, StartupEvent, StartupMode, TimerName,
-    TorrentCommand, TunnelEvent,
+    RegistryEvent, SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode, TimerName,
+    TorrentCommand, TunnelEvent, VipTorrent,
 };
 
 /// History categories, used for filtering.
@@ -219,6 +219,31 @@ pub(super) fn hold(hold: Hold) -> String {
     }
 }
 
+/// A torrent as MAM lists it now.
+fn looked_up(listing: &Bookmark) -> String {
+    format!(
+        "MAM torrent {} looked up: {}{}{}{}",
+        listing.id.get(),
+        match listing.freeleech {
+            Freeleech::ForEveryone => "freeleech, ",
+            Freeleech::No => "",
+        },
+        match listing.vip {
+            VipTorrent::No => "",
+            VipTorrent::Indefinitely | VipTorrent::Until(_) => "VIP, ",
+        },
+        match listing.personal {
+            PersonalFreeleech::No => "not free for you",
+            PersonalFreeleech::ThroughVip => "free for you through VIP",
+            PersonalFreeleech::ThroughWedge => "free for you through a wedge",
+        },
+        match listing.snatched {
+            Snatched::Before => ", snatched before",
+            Snatched::Never => "",
+        }
+    )
+}
+
 pub(super) fn purchase(purchase: Purchase) -> String {
     match purchase {
         Purchase::Upload(amount) => format!("{amount} GiB of upload credit"),
@@ -266,8 +291,14 @@ fn mam(event: &MamEvent) -> String {
         MamEvent::Answered { result, rotated } => {
             let answer = match result {
                 Ok(MamReply::Ip(observed)) => format!(
-                    "MAM sees IP {} in {} ({})",
-                    observed.ip, observed.asn, observed.provider
+                    "MAM sees IP {} in {}{}",
+                    observed.ip,
+                    observed.asn,
+                    observed
+                        .provider
+                        .as_ref()
+                        .map(|name| format!(" ({name})"))
+                        .unwrap_or_default()
                 ),
                 Ok(MamReply::Registered {
                     registration: Registration::Completed,
@@ -303,22 +334,7 @@ fn mam(event: &MamEvent) -> String {
                 Ok(MamReply::Purchased { points }) => {
                     format!("Purchase made; {points} points left")
                 }
-                Ok(MamReply::Torrent(Some(listing))) => format!(
-                    "MAM torrent {} looked up: {}{}{}{}",
-                    listing.id.get(),
-                    if listing.free { "freeleech, " } else { "" },
-                    if listing.vip { "VIP, " } else { "" },
-                    match listing.personal {
-                        PersonalFreeleech::No => "not free for you",
-                        PersonalFreeleech::ThroughVip => "free for you through VIP",
-                        PersonalFreeleech::ThroughWedge => "free for you through a wedge",
-                    },
-                    if listing.snatched {
-                        ", snatched before"
-                    } else {
-                        ""
-                    }
-                ),
+                Ok(MamReply::Torrent(Some(listing))) => looked_up(listing),
                 Ok(MamReply::Torrent(None)) => String::from("MAM no longer lists the torrent"),
                 Ok(MamReply::WedgeHistory(spent)) => {
                     format!("Bonus history read: {} wedges spent", spent.len())
@@ -1362,10 +1378,20 @@ mod tests {
             uploaded: ByteSize(3 << 30),
             downloaded: ByteSize(1 << 30),
             points: Points(1),
-            wedges: 2,
-            class: String::from("VIP"),
+            wedges: crate::core::WedgeCount::new(2),
+            class: crate::core::UserClass::Vip,
             vip_until: None,
-            summary: Some(crate::core::SnatchSummary::default()),
+            summary: Some(crate::core::SnatchSummary {
+                unsatisfied: crate::core::UnsatisfiedCount::default(),
+                unsatisfied_limit: crate::core::UnsatisfiedLimit::new(150),
+                unsatisfied_not_seeding: crate::core::TorrentCount::default(),
+                hit_and_run_not_seeding: crate::core::TorrentCount::default(),
+                partial: crate::core::Partials::NotSeen,
+                duplicates: crate::core::TorrentCount::default(),
+                tracker_errors: crate::core::TorrentCount::default(),
+                connectable: crate::core::Connectable::Offline,
+                red: Vec::new(),
+            }),
             notices: None,
             clients: None,
         };
@@ -1389,12 +1415,12 @@ mod tests {
             routine(MamReply::Ip(IpObservation {
                 ip,
                 asn: Asn(1),
-                provider: String::from("Provider"),
+                provider: crate::core::NetworkName::try_new("Provider").ok(),
             })),
             routine(MamReply::UserData(Box::new(data))),
             routine(MamReply::UserData(Box::new(without_summary))),
             routine(MamReply::Bookmarks(BookmarkPage {
-                found: 0,
+                found: crate::core::BookmarkCount::new(0),
                 bookmarks: Vec::new(),
             })),
             (Event::Mam(MamEvent::ReminderSaved), "mam", true),
@@ -1419,36 +1445,33 @@ mod tests {
                 answered(Ok(MamReply::Torrent(Some(Box::new(
                     crate::core::Bookmark {
                         id: torrent,
-                        title: String::from("Synthetic"),
-                        vip: true,
-                        free: true,
+                        title: crate::core::BookTitle::try_new("Synthetic")?,
+                        vip: crate::core::VipTorrent::Indefinitely,
+                        freeleech: crate::core::Freeleech::ForEveryone,
                         personal: crate::core::PersonalFreeleech::ThroughWedge,
-                        snatched: true,
-                        vip_expires: None,
+                        snatched: crate::core::Snatched::Before,
                         bookmarked_at: None,
                     },
                 ))))),
                 answered(Ok(MamReply::Torrent(Some(Box::new(
                     crate::core::Bookmark {
                         id: torrent,
-                        title: String::from("Synthetic"),
-                        vip: false,
-                        free: false,
+                        title: crate::core::BookTitle::try_new("Synthetic")?,
+                        vip: crate::core::VipTorrent::No,
+                        freeleech: crate::core::Freeleech::No,
                         personal: crate::core::PersonalFreeleech::ThroughVip,
-                        snatched: false,
-                        vip_expires: None,
+                        snatched: crate::core::Snatched::Never,
                         bookmarked_at: None,
                     },
                 ))))),
                 answered(Ok(MamReply::Torrent(Some(Box::new(
                     crate::core::Bookmark {
                         id: torrent,
-                        title: String::from("Synthetic"),
-                        vip: false,
-                        free: false,
+                        title: crate::core::BookTitle::try_new("Synthetic")?,
+                        vip: crate::core::VipTorrent::No,
+                        freeleech: crate::core::Freeleech::No,
                         personal: crate::core::PersonalFreeleech::No,
-                        snatched: false,
-                        vip_expires: None,
+                        snatched: crate::core::Snatched::Never,
                         bookmarked_at: None,
                     },
                 ))))),
@@ -1477,7 +1500,7 @@ mod tests {
                 },
                 MamFailure::Refused { message: None },
                 MamFailure::Refused {
-                    message: Some(String::from("No")),
+                    message: crate::core::MamMessage::try_new("No").ok(),
                 },
                 MamFailure::NotKept,
                 MamFailure::Rejected { status: 500 },
@@ -1606,7 +1629,10 @@ mod tests {
             Hold::ClientUnavailable,
             Hold::AccountUnknown,
             Hold::RatioLow,
-            Hold::UnsatisfiedLimit { count: 1, limit: 2 },
+            Hold::UnsatisfiedLimit {
+                count: crate::core::UnsatisfiedCount::new(1),
+                limit: crate::core::UnsatisfiedLimit::new(2),
+            },
             Hold::DownloadingLimit {
                 downloading: 5,
                 limit: crate::core::DownloadingLimit::default(),

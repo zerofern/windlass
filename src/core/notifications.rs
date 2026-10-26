@@ -17,10 +17,10 @@ use serde::Serialize;
 
 use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
-    Hold, Mam, MamSession, Points, Port, PortForwarding, Protection, Purchase, Qbittorrent,
-    QbittorrentFailure, Registry, SeedboxStatus, SessionRejection, SettingsState, StartupMode,
-    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer, registry::SEEDING_TARGET,
-    timer::Timers,
+    Hold, Mam, MamSession, NoticeCount, Partials, Points, Port, PortForwarding, Protection,
+    Purchase, Qbittorrent, QbittorrentFailure, Registry, SeedboxStatus, SessionRejection,
+    SettingsState, StartupMode, SwitchAllowance, TimerId, TimerName, TorrentCount, TorrentState,
+    Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer, registry::SEEDING_TARGET, timer::Timers,
 };
 
 /// A torrent completed this long ago must have reached the seeding target by
@@ -281,34 +281,34 @@ pub enum Notice {
     /// Unsatisfied torrents reached 80% of MAM's limit.
     UnsatisfiedNearLimit {
         /// MAM's count.
-        count: u32,
+        count: UnsatisfiedCount,
         /// MAM's limit.
-        limit: u32,
+        limit: UnsatisfiedLimit,
     },
     /// Unsatisfied torrents are below 80% of the limit again.
     UnsatisfiedBelowLimit,
     /// MAM counts unsatisfied torrents that are not seeding.
     UnsatisfiedNotSeeding {
         /// How many.
-        count: u32,
+        count: TorrentCount,
     },
     /// Every unsatisfied torrent seeds again.
     UnsatisfiedSeeding,
     /// MAM flags a partial download, tracker errors, or other red categories.
     MamFlagged {
         /// Whether MAM sees a partial download.
-        partial: bool,
+        partial: Partials,
         /// Important tracker errors.
-        tracker_errors: u32,
+        tracker_errors: TorrentCount,
         /// Torrents in other red categories, such as duplicate peers.
-        flagged: u32,
+        flagged: TorrentCount,
     },
     /// MAM flags nothing any more.
     MamFlagsCleared,
     /// MAM has notifications for the owner; their text is not read.
     MamMessages {
         /// How many.
-        count: u32,
+        count: NoticeCount,
         /// Whether one warns that MAM is about to stop accepting a client.
         client_warning: bool,
     },
@@ -1255,7 +1255,7 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
             read(
                 account
                     .not_seeding_unsatisfied()
-                    .filter(|count| *count > 0)
+                    .filter(|count| !count.is_zero())
                     .map(|count| Notice::UnsatisfiedNotSeeding { count }),
                 Some(Notice::UnsatisfiedSeeding),
             ),
@@ -1280,10 +1280,10 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
                 account
                     .data()
                     .and_then(|data| data.notices)
-                    .filter(|notices| notices.total() > 0)
+                    .filter(|notices| !notices.total().is_zero())
                     .map(|notices| Notice::MamMessages {
                         count: notices.total(),
-                        client_warning: notices.about_to_drop_client > 0,
+                        client_warning: !notices.about_to_drop_client.is_zero(),
                     }),
                 None,
             ),

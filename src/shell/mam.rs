@@ -1,20 +1,16 @@
 //! MAM's API over HTTPS: send the request the core chose, and translate the
 //! answer into core terms. Every request names Windlass and its version.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use reqwest::{StatusCode, Url, header};
-use serde_json::{Map, Value, json};
-use time::{PrimitiveDateTime, macros::format_description};
+use serde_json::json;
 
 use crate::core::{
-    ApiCookie, Bookmark, BookmarkPage, ByteSize, ClientVersion, Connectable, FetchedTorrent,
-    IpObservation, ListedClient, MamFailure, MamNotices, MamReply, MamRequest, MamTorrentId,
-    PersonalFreeleech, Points, Purchase, RedCategory, Registration, SessionRejection,
-    SnatchSummary, UserData, WedgeSpent,
+    ApiCookie, FetchedTorrent, MamFailure, MamReply, MamRequest, Purchase, SessionRejection,
 };
 
-use super::torrent_file;
+use super::{mam_reply as reply, torrent_file};
 
 /// MAM's User-Agent asks for the tool and its version, so MAM can block a
 /// faulty release.
@@ -205,14 +201,12 @@ fn interpret(
     retry_after: Option<Duration>,
     body: &[u8],
 ) -> (Result<MamReply, MamFailure>, Option<Vec<u8>>) {
-    let json = || serde_json::from_slice::<Value>(body).map_err(|_| MamFailure::Malformed);
-    let understood = |reply: Option<MamReply>| reply.ok_or(MamFailure::Malformed);
     let result = match request {
-        _ if signed_out(body) => Err(MamFailure::Session(rejection(&String::from_utf8_lossy(
-            body,
-        )))),
+        _ if reply::signed_out(body) => Err(MamFailure::Session(reply::rejection(
+            &String::from_utf8_lossy(body),
+        ))),
         _ if status == StatusCode::TOO_MANY_REQUESTS => Err(MamFailure::TooSoon { retry_after }),
-        MamRequest::RegisterSeedbox => registration(status, body),
+        MamRequest::RegisterSeedbox => reply::registration(status, body),
         _ if !status.is_success() => Err(MamFailure::Rejected {
             status: status.as_u16(),
         }),
@@ -228,348 +222,31 @@ fn interpret(
                 },
             );
         }
-        MamRequest::LookUpIp => {
-            json().and_then(|value| understood(ip_observation(&value).map(MamReply::Ip)))
-        }
-        MamRequest::LoadUserData { .. } => json().and_then(|value| {
-            understood(user_data(&value).map(|data| MamReply::UserData(Box::new(data))))
-        }),
-        MamRequest::ListBookmarks { .. } => {
-            json().and_then(|value| understood(bookmarks(&value).map(MamReply::Bookmarks)))
-        }
-        MamRequest::Buy(_) => json().and_then(|value| purchase(&value)),
-        MamRequest::LookUpTorrent { id } => json().and_then(|value| {
-            understood(bookmarks(&value).map(|page| {
+        MamRequest::LookUpIp => reply::ip_observation(body)
+            .map(MamReply::Ip)
+            .map_err(MamFailure::from),
+        MamRequest::LoadUserData { .. } => reply::user_data(body)
+            .map(|data| MamReply::UserData(Box::new(data)))
+            .map_err(MamFailure::from),
+        MamRequest::ListBookmarks { .. } => reply::bookmark_page(body)
+            .map(MamReply::Bookmarks)
+            .map_err(MamFailure::from),
+        MamRequest::Buy(_) => reply::purchase(body),
+        MamRequest::LookUpTorrent { id } => reply::bookmark_page(body)
+            .map(|page| {
                 MamReply::Torrent(
                     page.bookmarks
                         .into_iter()
                         .find(|listing| listing.id == *id)
                         .map(Box::new),
                 )
-            }))
-        }),
-        MamRequest::WedgeHistory => {
-            json().and_then(|value| understood(wedge_history(&value).map(MamReply::WedgeHistory)))
-        }
+            })
+            .map_err(MamFailure::from),
+        MamRequest::WedgeHistory => reply::wedge_history(body)
+            .map(MamReply::WedgeHistory)
+            .map_err(MamFailure::from),
     };
     (result, None)
-}
-
-/// Whether the body is MAM's plain-text answer to a refused session, such as
-/// `Error, you are not signed in <br />Session ASN mismatch`.
-fn signed_out(body: &[u8]) -> bool {
-    body.trim_ascii_start()
-        .starts_with(b"Error, you are not signed in")
-}
-
-fn rejection(message: &str) -> SessionRejection {
-    let message = message.to_ascii_lowercase();
-    if message.contains("asn mismatch") {
-        SessionRejection::AsnMismatch
-    } else if message.contains("ip mismatch") {
-        SessionRejection::IpMismatch
-    } else if message.contains("session type") {
-        SessionRejection::NotAllowed
-    } else if message.contains("cookie") {
-        SessionRejection::InvalidCookie
-    } else {
-        SessionRejection::Other
-    }
-}
-
-/// The seedbox registration's answer, which says what MAM did in `msg`.
-fn registration(status: StatusCode, body: &[u8]) -> Result<MamReply, MamFailure> {
-    let value: Value = serde_json::from_slice(body).unwrap_or_default();
-    let message = text(&value, "msg").unwrap_or_default();
-    let registration = match (status, message.to_ascii_lowercase().as_str()) {
-        (StatusCode::FORBIDDEN, _) => return Err(MamFailure::Session(rejection(&message))),
-        (status, _) if !status.is_success() => {
-            return Err(MamFailure::Rejected {
-                status: status.as_u16(),
-            });
-        }
-        (_, "completed") => Registration::Completed,
-        (_, "no change") => Registration::NoChange,
-        _ => return Err(MamFailure::Malformed),
-    };
-    let ip = text(&value, "ip").and_then(|ip| ip.parse().ok());
-    ip.map(|ip| MamReply::Registered { registration, ip })
-        .ok_or(MamFailure::Malformed)
-}
-
-/// The store's answer: the balance after a sale, or why it refused.
-fn purchase(value: &Value) -> Result<MamReply, MamFailure> {
-    let balance = value.get("seedbonus").and_then(float);
-    match (value.get("success").and_then(Value::as_bool), balance) {
-        (Some(true), Some(balance)) => Ok(MamReply::Purchased {
-            points: Points::from_balance(balance),
-        }),
-        (Some(false), _) => Err(MamFailure::Refused {
-            message: text(value, "error"),
-        }),
-        _ => Err(MamFailure::Malformed),
-    }
-}
-
-/// User Bonus History: a list, newest first. Only personal freeleech wedges
-/// that name a torrent are kept.
-fn wedge_history(value: &Value) -> Option<Vec<WedgeSpent>> {
-    let entries = value.as_array()?;
-    Some(
-        entries
-            .iter()
-            .filter(|entry| text(entry, "type").as_deref() == Some("wedgePF"))
-            .filter_map(|entry| {
-                Some(WedgeSpent {
-                    torrent: MamTorrentId::new(number(entry.get("tid")?)?)?,
-                    at: SystemTime::UNIX_EPOCH.checked_add(
-                        Duration::try_from_secs_f64(float(entry.get("timestamp")?)?).ok()?,
-                    )?,
-                })
-            })
-            .collect(),
-    )
-}
-
-fn ip_observation(value: &Value) -> Option<IpObservation> {
-    Some(IpObservation {
-        ip: text(value, "ip")?.parse().ok()?,
-        asn: crate::core::Asn(u32::try_from(number(value.get("ASN")?)?).ok()?),
-        provider: text(value, "AS").unwrap_or_default(),
-    })
-}
-
-fn user_data(value: &Value) -> Option<UserData> {
-    let count = |name: &str| number(value.get(name)?);
-    Some(UserData {
-        uploaded: ByteSize(count("uploaded_bytes")?),
-        downloaded: ByteSize(count("downloaded_bytes")?),
-        points: Points::from_balance(float(value.get("seedbonus")?)?),
-        wedges: u32::try_from(count("wedges")?).ok()?,
-        class: text(value, "classname")?,
-        vip_until: text(value, "vip_until").and_then(|until| utc(&until)),
-        summary: value
-            .get("snatch_summary")
-            .and_then(Value::as_object)
-            .map(snatch_summary),
-        notices: value.get("notifs").and_then(Value::as_object).map(notices),
-        clients: value.get("clientStats").and_then(clients),
-    })
-}
-
-/// MAM's client list: a list, or an object of entries. An entry's shape is not
-/// yet captured, so each is searched for what Windlass needs.
-fn clients(value: &Value) -> Option<Vec<ListedClient>> {
-    let entries: Vec<&Value> = match value {
-        Value::Array(entries) => entries.iter().collect(),
-        Value::Object(entries) => entries.values().collect(),
-        _ => return None,
-    };
-    Some(entries.into_iter().map(listed_client).collect())
-}
-
-fn listed_client(entry: &Value) -> ListedClient {
-    let fields: Vec<(&str, &Value)> = match entry {
-        Value::Object(fields) => fields
-            .iter()
-            .map(|(key, value)| (key.as_str(), value))
-            .collect(),
-        other => vec![("", other)],
-    };
-    let qbittorrent = fields
-        .iter()
-        .filter_map(|(_, value)| value.as_str())
-        .find_map(qbittorrent_version);
-    let connectable = fields
-        .iter()
-        .find(|(key, _)| key.to_ascii_lowercase().contains("connect"))
-        .and_then(|(_, value)| match value {
-            Value::String(text) => Some(Connectable::parse(text)),
-            Value::Bool(true) => Some(Connectable::Yes),
-            Value::Bool(false) => Some(Connectable::No),
-            Value::Number(number) => Some(if number.as_u64() == Some(0) {
-                Connectable::No
-            } else {
-                Connectable::Yes
-            }),
-            _ => None,
-        });
-    let refused = fields.iter().any(|(key, value)| {
-        let key = key.to_ascii_lowercase();
-        match value {
-            Value::String(text) => refusal(text),
-            Value::Bool(flag) => {
-                (*flag && refusal(&key))
-                    || (!*flag && ["allowed", "approved", "authorized"].contains(&key.as_str()))
-            }
-            _ => false,
-        }
-    });
-    ListedClient {
-        qbittorrent,
-        connectable,
-        refused,
-    }
-}
-
-/// Whether text says a client is not allowed.
-fn refusal(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    [
-        "not allowed",
-        "disallowed",
-        "unauthori",
-        "banned",
-        "blocked",
-    ]
-    .iter()
-    .any(|word| text.contains(word))
-}
-
-/// A qBittorrent version named in text, such as `qBittorrent 5.1.2`,
-/// `qBittorrent/v5.1.2`, or the peer ID prefix `-qB5120-`.
-fn qbittorrent_version(text: &str) -> Option<ClientVersion> {
-    let lower = text.to_ascii_lowercase();
-    if let Some(at) = lower.find("qbittorrent") {
-        let rest = lower.get(at + "qbittorrent".len()..)?;
-        let version: String = rest
-            .trim_start_matches([' ', '/', 'v', '-', ':'])
-            .chars()
-            .take_while(|character| character.is_ascii_digit() || *character == '.')
-            .collect();
-        return ClientVersion::parse(version.trim_end_matches('.'));
-    }
-    let at = text.find("-qB")?;
-    let digits = text.get(at + 3..at + 7)?;
-    let mut parts = digits.chars().map(|digit| digit.to_digit(10));
-    let (Some(Some(major)), Some(Some(minor)), Some(Some(patch))) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    ClientVersion::parse(&format!("{major}.{minor}.{patch}"))
-}
-
-fn snatch_summary(summary: &Map<String, Value>) -> SnatchSummary {
-    let field = |category: &str, name: &str| {
-        summary
-            .get(category)
-            .and_then(|category| category.get(name))
-            .and_then(number)
-            .and_then(|count| u32::try_from(count).ok())
-            .unwrap_or_default()
-    };
-    let red = summary
-        .values()
-        .filter_map(|category| {
-            let red = category.get("red").and_then(Value::as_bool)?;
-            let count = category
-                .get("count")
-                .and_then(number)
-                .and_then(|count| u32::try_from(count).ok())?;
-            (red && count > 0).then(|| RedCategory {
-                name: text(category, "name").unwrap_or_default(),
-                count,
-            })
-        })
-        .collect();
-    SnatchSummary {
-        unsatisfied: field("unsat", "count"),
-        unsatisfied_limit: field("unsat", "limit"),
-        unsatisfied_not_seeding: field("inactUnsat", "count"),
-        hit_and_run_not_seeding: field("inactHnr", "count"),
-        partial: summary
-            .get("partial")
-            .and_then(Value::as_bool)
-            .unwrap_or_default(),
-        duplicates: field("duplicates", "count"),
-        tracker_errors: field("ite", "count"),
-        connectable: summary
-            .get("connectable")
-            .and_then(Value::as_str)
-            .map(Connectable::parse)
-            .unwrap_or_default(),
-        red,
-    }
-}
-
-fn notices(notices: &Map<String, Value>) -> MamNotices {
-    let count = |name: &str| {
-        notices
-            .get(name)
-            .and_then(number)
-            .and_then(|count| u32::try_from(count).ok())
-            .unwrap_or_default()
-    };
-    MamNotices {
-        messages: count("pms"),
-        tickets: count("tickets"),
-        waiting_tickets: count("waiting_tickets"),
-        requests: count("requests"),
-        topics: count("topics"),
-        about_to_drop_client: count("aboutToDropClient"),
-    }
-}
-
-fn bookmarks(value: &Value) -> Option<BookmarkPage> {
-    let found = u32::try_from(number(value.get("found")?)?).ok()?;
-    let bookmarks = value
-        .get("data")
-        .and_then(Value::as_array)
-        .map(|entries| entries.iter().filter_map(bookmark).collect())
-        .unwrap_or_default();
-    Some(BookmarkPage { found, bookmarks })
-}
-
-fn bookmark(value: &Value) -> Option<Bookmark> {
-    let flag = |name: &str| {
-        value
-            .get(name)
-            .and_then(number)
-            .is_some_and(|flag| flag != 0)
-    };
-    let time = |name: &str| {
-        value
-            .get(name)
-            .and_then(number)
-            .filter(|seconds| *seconds > 0)
-            .and_then(|seconds| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
-    };
-    Some(Bookmark {
-        id: MamTorrentId::new(number(value.get("id")?)?)?,
-        title: text(value, "title").unwrap_or_default(),
-        vip: flag("vip"),
-        free: flag("free"),
-        personal: PersonalFreeleech::from_flags(flag("personal_freeleech"), flag("fl_vip")),
-        snatched: flag("my_snatched"),
-        vip_expires: time("vip_expire"),
-        bookmarked_at: time("bookmarked"),
-    })
-}
-
-/// A whole number MAM sends as a number or as text.
-fn number(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
-}
-
-/// A number with a possible fraction, sent as a number or as text.
-fn float(value: &Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
-}
-
-fn text(value: &Value, name: &str) -> Option<String> {
-    value.get(name).and_then(Value::as_str).map(str::to_owned)
-}
-
-/// MAM's `YYYY-MM-DD HH:MM:SS`, which is UTC.
-fn utc(value: &str) -> Option<SystemTime> {
-    let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    let time = PrimitiveDateTime::parse(value.trim(), format).ok()?;
-    Some(time.assume_utc().into())
 }
 
 #[cfg(test)]
@@ -581,10 +258,12 @@ mod tests {
     };
 
     use crate::core::{
-        ApiCookie, Asn, Bookmark, BookmarkPage, ByteSize, Connectable, FetchedTorrent,
-        IpObservation, MamFailure, MamNotices, MamReply, MamRequest, MamTorrentId,
-        PersonalFreeleech, Points, Purchase, RedCategory, Registration, SessionRejection,
-        SnatchSummary, TorrentHash, UploadCredit, UserData,
+        ApiCookie, Asn, BookTitle, Bookmark, BookmarkCount, BookmarkPage, ByteSize, CategoryName,
+        Connectable, FetchedTorrent, Freeleech, IpObservation, MamFailure, MamMessage, MamNotices,
+        MamReply, MamRequest, MamTorrentId, NetworkName, Partials, PersonalFreeleech, Points,
+        Purchase, RedCategory, RedKind, Registration, SessionRejection, SnatchSummary, Snatched,
+        TorrentCount, TorrentHash, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserClass,
+        UserData, VipTorrent, WedgeCount,
     };
 
     use super::super::fake_mam::{FakeMam, Fault, Host, Torrent};
@@ -642,110 +321,20 @@ mod tests {
         Ok((fake, client, ApiCookie::parse("fake-session")?))
     }
 
-    #[test]
-    fn bonus_history_keeps_wedges_spent_on_torrents() {
-        use serde_json::json;
-
-        let history = json!([
-            {"timestamp": 1_790_000_000.5, "amount": -1, "type": "wedgePF", "tid": 330_896},
-            {"timestamp": 1_641_914_230.1, "amount": -1, "type": "giftWedge", "tid": null},
-            {"timestamp": 1_610_486_584.1, "amount": -10, "type": "wedgeGFL", "tid": 220_870},
-            {"timestamp": "not a time", "type": "wedgePF", "tid": 5},
-            {"timestamp": 1.0, "type": "wedgePF", "tid": 0},
-            {"timestamp": 1.0e19, "type": "wedgePF", "tid": 6},
-        ]);
-        let spent = super::wedge_history(&history).unwrap_or_default();
-        assert_eq!(spent.len(), 1);
-        assert_eq!(
-            spent.first().map(|entry| entry.torrent.get()),
-            Some(330_896)
-        );
-        assert_eq!(super::wedge_history(&json!({"error": "no"})), None);
-    }
-
-    #[test]
-    fn client_entries_are_searched_for_what_windlass_needs() {
-        use serde_json::json;
-
-        use crate::core::{ClientVersion, Connectable, ListedClient};
-
-        let version = |text| ClientVersion::parse(text);
-        let list = json!([
-            {"client": "qBittorrent 5.1.2", "connectable": "yes", "torrents": 3},
-            {"agent": "qBittorrent/v5.0.4", "connectable": false, "status": "Not allowed"},
-            {"peer_id": "-qB5200-abcdefghijkl", "connectable": 0},
-            {"client": "Transmission 4.0", "isConnectable": 1, "banned": true},
-            {"client": "qbittorrent", "allowed": false},
-            "qBittorrent 5.1.1",
-            {"client": "-qB52x0-"},
-            {"client": "qBittorrent 5.1.3", "connectable": true},
-        ]);
-        let clients = super::clients(&list).unwrap_or_default();
-        assert_eq!(
-            clients,
-            [
-                ListedClient {
-                    qbittorrent: version("5.1.2"),
-                    connectable: Some(Connectable::Yes),
-                    refused: false,
-                },
-                ListedClient {
-                    qbittorrent: version("5.0.4"),
-                    connectable: Some(Connectable::No),
-                    refused: true,
-                },
-                ListedClient {
-                    qbittorrent: version("5.2.0"),
-                    connectable: Some(Connectable::No),
-                    refused: false,
-                },
-                ListedClient {
-                    qbittorrent: None,
-                    connectable: Some(Connectable::Yes),
-                    refused: true,
-                },
-                ListedClient {
-                    qbittorrent: None,
-                    connectable: None,
-                    refused: true,
-                },
-                ListedClient {
-                    qbittorrent: version("5.1.1"),
-                    connectable: None,
-                    refused: false,
-                },
-                ListedClient {
-                    qbittorrent: None,
-                    connectable: None,
-                    refused: false,
-                },
-                ListedClient {
-                    qbittorrent: version("5.1.3"),
-                    connectable: Some(Connectable::Yes),
-                    refused: false,
-                },
-            ]
-        );
-        let keyed = json!({"1": {"client": "qBittorrent 5.1.2", "connectable": null}});
-        assert_eq!(super::clients(&keyed).map(|clients| clients.len()), Some(1));
-        assert_eq!(super::clients(&json!("none")), None);
-    }
-
     async fn ask(client: &Client, request: MamRequest, cookie: &ApiCookie) -> Answer {
         perform(Some(client), &request, Some(cookie)).await
     }
 
-    fn bookmark(id: MamTorrentId, title: &str) -> Bookmark {
-        Bookmark {
+    fn bookmark(id: MamTorrentId, title: &str) -> Result<Bookmark, Box<dyn Error>> {
+        Ok(Bookmark {
             id,
-            title: title.to_owned(),
-            vip: false,
-            free: false,
+            title: BookTitle::try_new(title)?,
+            vip: VipTorrent::No,
+            freeleech: Freeleech::No,
             personal: PersonalFreeleech::No,
-            snatched: false,
-            vip_expires: None,
+            snatched: Snatched::Never,
             bookmarked_at: Some(SystemTime::UNIX_EPOCH + BOOKMARKED),
-        }
+        })
     }
 
     #[tokio::test]
@@ -763,7 +352,7 @@ mod tests {
             Ok(MamReply::Ip(IpObservation {
                 ip,
                 asn: Asn(209_103),
-                provider: String::from("ProtonVPN Proton AG"),
+                provider: NetworkName::try_new("ProtonVPN Proton AG").ok(),
             }))
         );
         assert_eq!(answer.rotated, None, "the IP lookup sends no cookie");
@@ -775,32 +364,34 @@ mod tests {
         }
         fake.with(|world| world.clock = None);
 
+        let red = |name: &str, kind, count| -> Result<RedCategory, Box<dyn Error>> {
+            Ok(RedCategory {
+                name: CategoryName::try_new(name)?,
+                kind,
+                count: TorrentCount::new(count),
+            })
+        };
+        let red = vec![
+            red("Duplicate peer entries", RedKind::Other, 1)?,
+            red("Not Seeding - Not Yet Satisfied", RedKind::NotSeeding, 2)?,
+        ];
         let user = |clients| UserData {
             uploaded: ByteSize(80 << 30),
             downloaded: ByteSize(0),
             points: Points(60_000),
-            wedges: 200,
-            class: String::from("VIP"),
+            wedges: WedgeCount::new(200),
+            class: UserClass::Vip,
             vip_until: Some(SystemTime::UNIX_EPOCH + VIP_UNTIL),
             summary: Some(SnatchSummary {
-                unsatisfied: 0,
-                unsatisfied_limit: 150,
-                unsatisfied_not_seeding: 2,
-                hit_and_run_not_seeding: 0,
-                partial: false,
-                duplicates: 1,
-                tracker_errors: 0,
+                unsatisfied: UnsatisfiedCount::new(0),
+                unsatisfied_limit: UnsatisfiedLimit::new(150),
+                unsatisfied_not_seeding: TorrentCount::new(2),
+                hit_and_run_not_seeding: TorrentCount::new(0),
+                partial: Partials::NotSeen,
+                duplicates: TorrentCount::new(1),
+                tracker_errors: TorrentCount::new(0),
                 connectable: Connectable::Offline,
-                red: vec![
-                    RedCategory {
-                        name: String::from("Duplicate peer entries"),
-                        count: 1,
-                    },
-                    RedCategory {
-                        name: String::from("Not Seeding - Not Yet Satisfied"),
-                        count: 2,
-                    },
-                ],
+                red: red.clone(),
             }),
             notices: Some(MamNotices::default()),
             clients,
@@ -817,7 +408,7 @@ mod tests {
                 crate::core::ListedClient {
                     qbittorrent: crate::core::ClientVersion::parse("5.2.2"),
                     connectable: Some(Connectable::Yes),
-                    refused: false,
+                    refusal: crate::core::ClientRefusal::NotRefused,
                 }
             ])))))
         );
@@ -834,19 +425,18 @@ mod tests {
         assert_eq!(answer.result, Ok(MamReply::UserData(Box::new(user(None)))));
 
         let answer = ask(&client, MamRequest::ListBookmarks { start: 0 }, &cookie).await;
-        let mut vip = bookmark(VIP_ID, "A VIP Book");
-        vip.vip = true;
-        vip.free = true;
+        let mut vip = bookmark(VIP_ID, "A VIP Book")?;
+        vip.vip = VipTorrent::Until(SystemTime::UNIX_EPOCH + VIP_UNTIL);
+        vip.freeleech = Freeleech::ForEveryone;
         vip.personal = PersonalFreeleech::ThroughVip;
-        vip.vip_expires = Some(SystemTime::UNIX_EPOCH + VIP_UNTIL);
-        let mut wedged = bookmark(WEDGED_ID, "A Wedged Book");
+        let mut wedged = bookmark(WEDGED_ID, "A Wedged Book")?;
         wedged.personal = PersonalFreeleech::ThroughWedge;
-        wedged.snatched = true;
+        wedged.snatched = Snatched::Before;
         assert_eq!(
             answer.result,
             Ok(MamReply::Bookmarks(BookmarkPage {
-                found: 3,
-                bookmarks: vec![wedged, vip, bookmark(BOOK_ID, "Synthetic Book")],
+                found: BookmarkCount::new(3),
+                bookmarks: vec![wedged, vip, bookmark(BOOK_ID, "Synthetic Book")?],
             }))
         );
 
@@ -857,7 +447,7 @@ mod tests {
             Ok(MamReply::Torrent(Some(Box::new(bookmark(
                 BOOK_ID,
                 "Synthetic Book"
-            )))))
+            )?))))
         );
         let answer = ask(
             &client,
@@ -1031,7 +621,7 @@ mod tests {
         assert_eq!(
             failure(ask(&client, upload, &cookie).await),
             Some(MamFailure::Refused {
-                message: Some(String::from("Not enough points"))
+                message: MamMessage::try_new("Not enough points").ok()
             })
         );
 
@@ -1058,7 +648,7 @@ mod tests {
 
         let body = |text: &str| Fault::Body(200, text.to_owned());
         // Accounts missing each required field in turn, then a bookmark page
-        // whose entries are skipped for want of an ID.
+        // with an entry that has no ID: not understood as a whole.
         let accounts = [
             "{\"uploaded_bytes\":1}",
             "{\"uploaded_bytes\":1,\"downloaded_bytes\":0}",
@@ -1089,13 +679,8 @@ mod tests {
             Some(MamFailure::Malformed)
         );
         assert_eq!(
-            ask(&client, MamRequest::ListBookmarks { start: 0 }, &cookie)
-                .await
-                .result,
-            Ok(MamReply::Bookmarks(BookmarkPage {
-                found: 2,
-                bookmarks: Vec::new()
-            }))
+            failure(ask(&client, MamRequest::ListBookmarks { start: 0 }, &cookie).await),
+            Some(MamFailure::Malformed)
         );
         fake.with(|world| {
             world.fail("/jsonLoad.php", Fault::TooSoon, 1);
@@ -1175,53 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn mam_texts_are_read_as_mam_means_them() -> TestResult {
-        use super::{float, number, rejection, signed_out, utc};
-
-        // Some numbers arrive as text.
-        assert_eq!(number(&serde_json::json!(" 12 ")), Some(12));
-        assert_eq!(float(&serde_json::json!("1.5")), Some(1.5));
-        assert_eq!(number(&serde_json::json!(null)), None);
-
-        for (message, expected) in [
-            (
-                "Invalid session - IP mismatch",
-                SessionRejection::IpMismatch,
-            ),
-            (
-                "Invalid session - ASN mismatch",
-                SessionRejection::AsnMismatch,
-            ),
-            (
-                "Invalid session - Invalid Cookie",
-                SessionRejection::InvalidCookie,
-            ),
-            ("No Session Cookie", SessionRejection::InvalidCookie),
-            (
-                "Incorrect session type - non-API session",
-                SessionRejection::NotAllowed,
-            ),
-            ("Invalid session - Other", SessionRejection::Other),
-        ] {
-            assert_eq!(rejection(message), expected, "{message}");
-        }
-        assert!(signed_out(
-            b"  Error, you are not signed in <br />Invalid/missing cookie"
-        ));
-        assert!(!signed_out(b"{\"ok\":true}"));
-        assert_eq!(
-            utc("2026-12-09 10:14:13"),
-            Some(SystemTime::UNIX_EPOCH + VIP_UNTIL)
-        );
-        assert_eq!(utc("soon"), None);
-        for (text, expected) in [
-            ("yes", Connectable::Yes),
-            ("No", Connectable::No),
-            (" offline ", Connectable::Offline),
-            ("maybe", Connectable::Unrecognised(String::from("maybe"))),
-        ] {
-            assert_eq!(Connectable::parse(text), expected);
-        }
+    fn hosts_that_cannot_carry_mams_paths_make_no_client() -> TestResult {
         let unusable = MamHosts {
             site: "mailto:owner@example.org".parse()?,
             tracker: "mailto:owner@example.org".parse()?,

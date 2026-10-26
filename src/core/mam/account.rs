@@ -5,7 +5,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
-use super::{ListedClient, MamFailure, Points, Purchase, UploadCredit, UserData};
+use super::{
+    ClientRefusal, ListedClient, MamFailure, MamMessage, Partials, Points, Purchase, RedKind,
+    TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserData,
+};
 use crate::core::{ByteSize, ClientVersion};
 
 /// How often the account is read.
@@ -15,7 +18,7 @@ pub const CLIENT_STATS_EVERY: Duration = Duration::from_mins(30);
 /// A reading this recent may admit a download or allow a purchase.
 pub const ACCOUNT_FRESH_FOR: Duration = Duration::from_mins(5);
 /// Unsatisfied slots kept free below MAM's limit.
-pub const UNSATISFIED_RESERVE: u32 = 2;
+pub const UNSATISFIED_RESERVE: UnsatisfiedCount = UnsatisfiedCount::new(2);
 /// Uploaded minus downloaded is kept at least this high.
 pub const UPLOAD_BUFFER: ByteSize = ByteSize(25 << 30);
 /// Upload credit is bought to keep the ratio at this, in thousandths.
@@ -94,8 +97,8 @@ impl ClientStanding {
 pub enum PurchaseOutcome {
     /// MAM sold it; the points left.
     Made(Points),
-    /// MAM refused it.
-    Refused(Option<String>),
+    /// MAM refused it, with its message if it gave one.
+    Refused(Option<MamMessage>),
     /// The outcome is unknown; nothing else is bought until the next reading
     /// settles it.
     Uncertain,
@@ -191,18 +194,18 @@ impl Account {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Attention {
     /// Whether MAM sees a partial download.
-    pub partial: bool,
+    pub partial: Partials,
     /// Important tracker errors.
-    pub tracker_errors: u32,
+    pub tracker_errors: TorrentCount,
     /// Torrents in other categories MAM marks red, such as duplicate peers.
-    pub flagged: u32,
+    pub flagged: TorrentCount,
 }
 
 impl Attention {
     /// Whether anything needs the owner.
     #[must_use]
-    pub const fn any(&self) -> bool {
-        self.partial || self.tracker_errors > 0 || self.flagged > 0
+    pub fn any(&self) -> bool {
+        self.partial == Partials::Seen || !self.tracker_errors.is_zero() || !self.flagged.is_zero()
     }
 }
 
@@ -375,7 +378,10 @@ impl Account {
             return ClientStanding::Unknown;
         };
         let ours: Vec<&ListedClient> = self.running_client(running).collect();
-        if ours.iter().any(|client| client.refused) {
+        if ours
+            .iter()
+            .any(|client| client.refusal == ClientRefusal::Refused)
+        {
             ClientStanding::Refused
         } else if !ours.is_empty() {
             ClientStanding::Listed
@@ -408,20 +414,20 @@ impl Account {
 
     /// The unsatisfied count and limit, once 80% of the limit is reached.
     #[must_use]
-    pub fn unsatisfied_near_limit(&self) -> Option<(u32, u32)> {
+    pub fn unsatisfied_near_limit(&self) -> Option<(UnsatisfiedCount, UnsatisfiedLimit)> {
         let summary = self.data()?.summary.as_ref()?;
         let (count, limit) = (summary.unsatisfied, summary.unsatisfied_limit);
-        (u64::from(count) * 5 >= u64::from(limit) * 4 && limit > 0).then_some((count, limit))
+        limit.nearly_reached_by(count).then_some((count, limit))
     }
 
     /// Unsatisfied torrents MAM sees not seeding.
     #[must_use]
-    pub fn not_seeding_unsatisfied(&self) -> Option<u32> {
+    pub fn not_seeding_unsatisfied(&self) -> Option<TorrentCount> {
         let summary = self.data()?.summary.as_ref()?;
         Some(
             summary
                 .unsatisfied_not_seeding
-                .saturating_add(summary.hit_and_run_not_seeding),
+                .plus(summary.hit_and_run_not_seeding),
         )
     }
 
@@ -435,9 +441,9 @@ impl Account {
             flagged: summary
                 .red
                 .iter()
-                .filter(|category| !category.name.starts_with("Not Seeding"))
+                .filter(|category| category.kind == RedKind::Other)
                 .map(|category| category.count)
-                .fold(0, u32::saturating_add),
+                .fold(TorrentCount::default(), TorrentCount::plus),
         })
     }
 

@@ -7,9 +7,9 @@ use maud::{Markup, html};
 
 use crate::{
     core::{
-        Attention, Connectability, Connectable, DownloadWatch, LastAttempt, Mam, MamSession,
-        Points, PurchaseOutcome, PurchaseRecord, RegistrationAllowance, RegistrationFailure,
-        SeedboxStatus, SettingsState, SettledBy, UPLOAD_BUFFER,
+        Attention, ClientRefusal, Connectability, Connectable, DownloadWatch, LastAttempt, Mam,
+        MamSession, Partials, Points, PurchaseOutcome, PurchaseRecord, RegistrationAllowance,
+        RegistrationFailure, SeedboxStatus, SettingsState, SettledBy, UPLOAD_BUFFER,
     },
     shell::describe::{client_standing, findings, gib, hold, mam_failure, purchase, rejection},
 };
@@ -59,7 +59,9 @@ fn access_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup 
                     @match &mam.network.observed {
                         Some(observed) => {
                             span.mono { (observed.observation.ip) }
-                            " in " (observed.observation.asn) " (" (observed.observation.provider) "), "
+                            " in " (observed.observation.asn)
+                            @if let Some(name) = &observed.observation.provider { " (" (name) ")" }
+                            ", "
                             (time(observed.at, "full"))
                             @if !observed.current { " · unconfirmed" }
                         }
@@ -161,8 +163,9 @@ fn account_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup
                     dt { "Unsatisfied" }
                     dd {
                         (summary.unsatisfied) " of " (summary.unsatisfied_limit)
-                        @if summary.unsatisfied_not_seeding + summary.hit_and_run_not_seeding > 0 {
-                            " · " (summary.unsatisfied_not_seeding + summary.hit_and_run_not_seeding) " not seeding"
+                        @let not_seeding = summary.unsatisfied_not_seeding.plus(summary.hit_and_run_not_seeding);
+                        @if !not_seeding.is_zero() {
+                            " · " (not_seeding) " not seeding"
                         }
                     }
                     dt { "Connectable" }
@@ -180,12 +183,12 @@ fn account_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup
                 @if let Some(attention) = account.attention().filter(Attention::any) {
                     dt { "Flagged by MAM" }
                     dd {
-                        @if attention.partial { "A partial download. " }
-                        @if attention.tracker_errors > 0 { (attention.tracker_errors) " tracker errors. " }
-                        @if attention.flagged > 0 { (attention.flagged) " torrents in red categories." }
+                        @if attention.partial == Partials::Seen { "A partial download. " }
+                        @if !attention.tracker_errors.is_zero() { (attention.tracker_errors) " tracker errors. " }
+                        @if !attention.flagged.is_zero() { (attention.flagged) " torrents in red categories." }
                     }
                 }
-                @if let Some(notices) = data.notices.filter(|notices| notices.total() > 0) {
+                @if let Some(notices) = data.notices.filter(|notices| !notices.total().is_zero()) {
                     dt { "MAM notifications" } dd { (notices.total()) ", not read by Windlass" }
                 }
                 @if let Some(cost) = account.vip_cost(data, now) {
@@ -238,7 +241,7 @@ fn client_list(mam: &Mam) -> Markup {
                         Some(Connectable::No) => " · not connectable",
                         _ => "",
                     }
-                    @if client.refused { " · marked not allowed" }
+                    @if client.refusal == ClientRefusal::Refused { " · marked not allowed" }
                 }
             }
         }
@@ -357,6 +360,10 @@ mod tests {
         RedCategory, RegistrationFailure, SeedboxStatus, SessionRejection, Setting,
         SettingPersistence, Settings, SettingsState, SnatchSummary, UserData,
     };
+    use crate::core::{
+        BookmarkCount, CategoryName, ClientRefusal, MamMessage, NetworkName, NoticeCount, Partials,
+        RedKind, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UserClass, WedgeCount,
+    };
 
     use super::{outcome, panels};
 
@@ -371,7 +378,7 @@ mod tests {
                 "made; 5 points left",
             ),
             (
-                Some(PurchaseOutcome::Refused(Some(String::from("No")))),
+                Some(PurchaseOutcome::Refused(MamMessage::try_new("No").ok())),
                 "refused: No",
             ),
             (Some(PurchaseOutcome::Refused(None)), "refused"),
@@ -437,30 +444,49 @@ mod tests {
         panels(mam, &settings(cookie), SystemTime::UNIX_EPOCH).into_string()
     }
 
+    /// A summary with nothing flagged, for a VIP account's limit of 150.
+    fn summary() -> SnatchSummary {
+        SnatchSummary {
+            unsatisfied: UnsatisfiedCount::default(),
+            unsatisfied_limit: UnsatisfiedLimit::new(150),
+            unsatisfied_not_seeding: TorrentCount::default(),
+            hit_and_run_not_seeding: TorrentCount::default(),
+            partial: Partials::NotSeen,
+            duplicates: TorrentCount::default(),
+            tracker_errors: TorrentCount::default(),
+            connectable: Connectable::Offline,
+            red: Vec::new(),
+        }
+    }
+
     fn data() -> UserData {
         UserData {
             uploaded: ByteSize(1 << 30),
             downloaded: ByteSize(1 << 30),
             points: Points(100),
-            wedges: 3,
-            class: String::from("Power User"),
+            wedges: WedgeCount::new(3),
+            class: UserClass::PowerUser,
             vip_until: Some(SystemTime::UNIX_EPOCH + Duration::from_hours(24)),
             summary: Some(SnatchSummary {
-                unsatisfied: 140,
-                unsatisfied_limit: 150,
-                unsatisfied_not_seeding: 1,
-                hit_and_run_not_seeding: 1,
-                partial: true,
-                duplicates: 1,
-                tracker_errors: 2,
+                unsatisfied: UnsatisfiedCount::new(140),
+                unsatisfied_not_seeding: TorrentCount::new(1),
+                hit_and_run_not_seeding: TorrentCount::new(1),
+                partial: Partials::Seen,
+                duplicates: TorrentCount::new(1),
+                tracker_errors: TorrentCount::new(2),
                 connectable: Connectable::No,
-                red: vec![RedCategory {
-                    name: String::from("Duplicate peer entries"),
-                    count: 1,
-                }],
+                red: CategoryName::try_new("Duplicate peer entries")
+                    .map(|name| RedCategory {
+                        name,
+                        kind: RedKind::Other,
+                        count: TorrentCount::new(1),
+                    })
+                    .into_iter()
+                    .collect(),
+                ..summary()
             }),
             notices: Some(MamNotices {
-                messages: 2,
+                messages: NoticeCount::new(2),
                 ..MamNotices::default()
             }),
             clients: Some(Vec::new()),
@@ -568,17 +594,17 @@ mod tests {
                 ListedClient {
                     qbittorrent: ClientVersion::parse("5.1.0"),
                     connectable: Some(Connectable::Yes),
-                    refused: true,
+                    refusal: ClientRefusal::Refused,
                 },
                 ListedClient {
                     qbittorrent: None,
                     connectable: Some(Connectable::No),
-                    refused: false,
+                    refusal: ClientRefusal::NotRefused,
                 },
                 ListedClient {
                     qbittorrent: None,
                     connectable: None,
-                    refused: false,
+                    refusal: ClientRefusal::NotRefused,
                 },
             ],
             at: SystemTime::UNIX_EPOCH,
@@ -620,7 +646,7 @@ mod tests {
         let observation = IpObservation {
             ip: IpAddr::from([192, 0, 2, 10]),
             asn: Asn(209_103),
-            provider: String::from("ProtonVPN Proton AG"),
+            provider: NetworkName::try_new("ProtonVPN Proton AG").ok(),
         };
         mam.network.observed = Some(Observed {
             observation,
@@ -667,7 +693,7 @@ mod tests {
         mam.acquisition.bookmarks.latest = Some(Listed {
             at: SystemTime::UNIX_EPOCH,
             taken: std::time::Instant::now(),
-            found: 7,
+            found: BookmarkCount::new(7),
             bookmarks: Vec::new(),
         });
         mam.account.reading = Some(Reading {
@@ -701,9 +727,8 @@ mod tests {
         quiet.vip_until = None;
         quiet.notices = None;
         quiet.summary = Some(SnatchSummary {
-            unsatisfied_limit: 150,
             connectable: Connectable::Yes,
-            ..SnatchSummary::default()
+            ..summary()
         });
         mam.account.reading = Some(Reading {
             data: quiet.clone(),
@@ -736,7 +761,7 @@ mod tests {
         ] {
             quiet.summary = Some(SnatchSummary {
                 connectable,
-                ..SnatchSummary::default()
+                ..summary()
             });
             mam.account.reading = Some(Reading {
                 data: quiet.clone(),
@@ -747,9 +772,8 @@ mod tests {
         }
         let mut flagged = quiet;
         flagged.summary = Some(SnatchSummary {
-            unsatisfied_limit: 150,
-            tracker_errors: 1,
-            ..SnatchSummary::default()
+            tracker_errors: TorrentCount::new(1),
+            ..summary()
         });
         mam.account.reading = Some(Reading {
             data: flagged,

@@ -117,6 +117,14 @@ yet built: admission step 7, disk space, which waits for B-0001.
   restarted Windlass buys only from a fresh reading. For wedges, see S2: the
   bonus history read before each wedged download, and after it, keeps a wedge
   from being spent twice, also after a lost answer or a restart.
+- **Reading MAM's answers.** Every field Windlass relies on is required. An
+  answer missing one, or holding a value outside its type (a flag other than 0
+  or 1, a negative balance, an unparsable date, a bookmark without an ID or
+  title, a wedge entry without a torrent), is not understood as a whole, so
+  the account reading or listing fails and downloads hold. Nothing is replaced
+  by a default: before this, a snatch summary without its unsatisfied count
+  read as zero, which would have opened the gate A2 must keep closed. The
+  client list (A5) stays the exception until its shape is captured.
 - **Verify before acting.** Nothing Windlass decides about downloads rests on
   state saved before a restart: recent downloads come from qBittorrent's added
   times, each torrent's flags from a lookup by ID just before it is downloaded,

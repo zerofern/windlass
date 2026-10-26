@@ -695,7 +695,7 @@ fn registry_table(records: &Records, session: Option<&Session>, bookmarks: &Book
                     record.identity.mam_id().map_or_else(String::new, |id| {
                         bookmarks.find(id).map_or_else(
                             || format!("MAM torrent {}", id.get()),
-                            |bookmark| bookmark.title.clone(),
+                            |bookmark| bookmark.title.to_string(),
                         )
                     })
                 },
@@ -1868,15 +1868,15 @@ mod tests {
         bookmarks.latest = Some(Listed {
             at: SystemTime::UNIX_EPOCH,
             taken: std::time::Instant::now(),
-            found: 1,
+            found: crate::core::BookmarkCount::new(1),
             bookmarks: vec![Bookmark {
                 id: mam,
-                title: String::from("A Book Snatched Before"),
-                vip: false,
-                free: false,
+                title: crate::core::BookTitle::try_new("A Book Snatched Before")
+                    .map_err(|_| "title")?,
+                vip: crate::core::VipTorrent::No,
+                freeleech: crate::core::Freeleech::No,
                 personal: PersonalFreeleech::No,
-                snatched: true,
-                vip_expires: None,
+                snatched: crate::core::Snatched::Before,
                 bookmarked_at: None,
             }],
         });

@@ -11,8 +11,8 @@ use std::{net::SocketAddr, time::Duration};
 use reqwest::{Client as HttpClient, Url};
 
 use crate::core::{
-    DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Push, SettingName, StartupMode,
-    SwitchBlock,
+    DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Partials, Push, SettingName,
+    StartupMode, SwitchBlock,
 };
 
 use super::describe::{hold, purchase, qbittorrent_failure, rejection, timestamp};
@@ -439,16 +439,19 @@ pub(super) fn message(notice: &Notice) -> Message {
             "MAM flags the account's torrents",
             format!(
                 "MAM reports{}{}{}.",
-                if *partial { " a partial download;" } else { "" },
-                if *tracker_errors > 0 {
-                    format!(" {tracker_errors} tracker errors;")
-                } else {
-                    String::new()
+                match partial {
+                    Partials::Seen => " a partial download;",
+                    Partials::NotSeen => "",
                 },
-                if *flagged > 0 {
-                    format!(" {flagged} torrents in categories it marks red")
-                } else {
+                if tracker_errors.is_zero() {
                     String::new()
+                } else {
+                    format!(" {tracker_errors} tracker errors;")
+                },
+                if flagged.is_zero() {
+                    String::new()
+                } else {
+                    format!(" {flagged} torrents in categories it marks red")
                 }
             ),
             4,
@@ -674,6 +677,7 @@ mod tests {
         Points, Port, Purchase, Push, QbittorrentFailure, SessionRejection, SettingName,
         StartupMode, SwitchBlock, UploadCredit, VpnServer,
     };
+    use crate::core::{NoticeCount, Partials, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit};
 
     use super::{Channel, message, send};
 
@@ -785,34 +789,36 @@ mod tests {
             },
             Notice::RatioRestored,
             Notice::UnsatisfiedNearLimit {
-                count: 121,
-                limit: 150,
+                count: UnsatisfiedCount::new(121),
+                limit: UnsatisfiedLimit::new(150),
             },
             Notice::UnsatisfiedBelowLimit,
-            Notice::UnsatisfiedNotSeeding { count: 2 },
+            Notice::UnsatisfiedNotSeeding {
+                count: TorrentCount::new(2),
+            },
             Notice::UnsatisfiedSeeding,
             Notice::MamFlagged {
-                partial: true,
-                tracker_errors: 1,
-                flagged: 2,
+                partial: Partials::Seen,
+                tracker_errors: TorrentCount::new(1),
+                flagged: TorrentCount::new(2),
             },
             Notice::MamFlagged {
-                partial: false,
-                tracker_errors: 0,
-                flagged: 1,
+                partial: Partials::NotSeen,
+                tracker_errors: TorrentCount::new(0),
+                flagged: TorrentCount::new(1),
             },
             Notice::MamFlagged {
-                partial: false,
-                tracker_errors: 2,
-                flagged: 0,
+                partial: Partials::NotSeen,
+                tracker_errors: TorrentCount::new(2),
+                flagged: TorrentCount::new(0),
             },
             Notice::MamFlagsCleared,
             Notice::MamMessages {
-                count: 2,
+                count: NoticeCount::new(2),
                 client_warning: false,
             },
             Notice::MamMessages {
-                count: 1,
+                count: NoticeCount::new(1),
                 client_warning: true,
             },
             Notice::DownloadsResumed,
@@ -892,8 +898,8 @@ mod tests {
                 Hold::AccountUnknown,
                 Hold::RatioLow,
                 Hold::UnsatisfiedLimit {
-                    count: 148,
-                    limit: 150,
+                    count: UnsatisfiedCount::new(148),
+                    limit: UnsatisfiedLimit::new(150),
                 },
                 Hold::NoWedge,
                 Hold::NotBookmarked,

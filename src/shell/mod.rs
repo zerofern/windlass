@@ -26,6 +26,7 @@ mod fake_mam;
 mod history;
 mod ingress;
 mod mam;
+mod mam_reply;
 mod natpmp;
 mod notify;
 mod qbittorrent;

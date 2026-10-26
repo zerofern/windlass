@@ -28,10 +28,13 @@ pub use acquisition::{
     WEDGE_RECORDED_AFTER, WedgeHistory,
 };
 pub use api::{
-    Asn, Bookmark, BookmarkPage, Connectable, FetchedTorrent, IpObservation, ListedClient,
-    MamFailure, MamNotices, MamReply, MamRequest, PersonalFreeleech, Points, Purchase, RedCategory,
-    Registration, SessionRejection, SnatchSummary, UploadCredit, UploadCreditError, UserData,
-    WedgeSpent,
+    Asn, BookTitle, BookTitleError, Bookmark, BookmarkCount, BookmarkPage, CategoryName,
+    CategoryNameError, ClassName, ClassNameError, ClientRefusal, Connectable, FetchedTorrent,
+    Freeleech, IpObservation, ListedClient, MamFailure, MamMessage, MamMessageError, MamNotices,
+    MamReply, MamRequest, NetworkName, NetworkNameError, NoticeCount, Partials, PersonalFreeleech,
+    Points, Purchase, RedCategory, RedKind, Registration, SessionRejection, SnatchSummary,
+    Snatched, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UploadCreditError,
+    UserClass, UserData, VipTorrent, WedgeCount, WedgeSpent,
 };
 pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL};
 pub use connectability::{
@@ -366,7 +369,9 @@ impl Mam {
                 Vec::new()
             }
             (MamRequest::LookUpTorrent { id }, Ok(MamReply::Torrent(listing))) if current => {
-                let snatched = listing.as_ref().is_some_and(|listing| listing.snatched);
+                let snatched = listing
+                    .as_ref()
+                    .is_some_and(|listing| listing.snatched == Snatched::Before);
                 self.acquisition
                     .looked_up(now.monotonic, *id, listing.map(|listing| *listing));
                 let mut actions = match registry.records_mut() {
@@ -513,7 +518,11 @@ impl Mam {
         };
         // A queued bookmark MAM now reports snatched waits for the owner.
         let mut actions = Vec::new();
-        for bookmark in listed.bookmarks.iter().filter(|bookmark| bookmark.snatched) {
+        for bookmark in listed
+            .bookmarks
+            .iter()
+            .filter(|bookmark| bookmark.snatched == Snatched::Before)
+        {
             actions.extend(records.snatched(now.monotonic, bookmark.id));
         }
         let new: Vec<(MamTorrentId, Desired)> = listed
@@ -521,10 +530,9 @@ impl Mam {
             .iter()
             .filter(|bookmark| !records.knows(bookmark.id))
             .map(|bookmark| {
-                let desired = if bookmark.snatched {
-                    Desired::Snatched
-                } else {
-                    Desired::Queued
+                let desired = match bookmark.snatched {
+                    Snatched::Before => Desired::Snatched,
+                    Snatched::Never => Desired::Queued,
                 };
                 (bookmark.id, desired)
             })
@@ -649,10 +657,14 @@ impl Mam {
 
     /// Note what Windlass knows about each running download it added; how many
     /// downloads qBittorrent added in the last hour, or will add.
-    fn watch_downloads(&mut self, now: ClockReading, records: Option<&Records>) -> u32 {
+    fn watch_downloads(
+        &mut self,
+        now: ClockReading,
+        records: Option<&Records>,
+    ) -> UnsatisfiedCount {
         let Some(records) = records else {
             self.acquisition.watched = Vec::new();
-            return 0;
+            return UnsatisfiedCount::default();
         };
         self.acquisition.watched = self.acquisition.watch_all(
             records.downloads(),
@@ -664,7 +676,7 @@ impl Mam {
             .downloads()
             .filter(|download| acquisition::recent(download, now.wall))
             .count();
-        u32::try_from(recent).unwrap_or(u32::MAX)
+        UnsatisfiedCount::new(u32::try_from(recent).unwrap_or(u32::MAX))
     }
 
     /// Apply what Windlass knows about each running download it added: a
@@ -680,7 +692,10 @@ impl Mam {
             now.monotonic,
             now.wall,
         );
-        let no_wedges = self.account.data().is_some_and(|data| data.wedges == 0);
+        let no_wedges = self
+            .account
+            .data()
+            .is_some_and(|data| data.wedges.is_zero());
         let mut actions = Vec::new();
         for (download, watch) in &watched {
             let notice = match *watch {
