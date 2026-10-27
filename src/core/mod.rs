@@ -258,10 +258,12 @@ pub use port_forwarding::{
     LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, Port, PortForwarding, PortForwardingEvent,
 };
 pub use qbittorrent::{
-    Activity, ByteSize, ClientVersion, MamApproval, POLL_INTERVAL, Progress, Qbittorrent,
-    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, QueuePreferences, Ratio, Session,
-    SyncPosition, SyncUpdate, Torrent, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
-    Wanted,
+    Activity, ByteSize, ClientVersion, Completion, ContentPath, ContentPathError, ForceStart,
+    IdleTorrents, MamApproval, NetworkInterface, NetworkInterfaceError, POLL_INTERVAL, Progress,
+    Qbittorrent, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, QueueLimit,
+    QueuePreferences, Queueing, Ratio, ReportedVersion, SavePath, SavePathError, Session,
+    SyncPosition, SyncScope, SyncUpdate, Torrent, TorrentCommand, TorrentHash, TorrentName,
+    TorrentNameError, TorrentState, TorrentUpdate, VersionText, VersionTextError, Wanted,
 };
 pub use registry::{
     COUNTER_SAVE_INTERVAL, Desired, Download, Identity, MamTorrentId, Observation, Origin,

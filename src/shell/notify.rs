@@ -686,7 +686,8 @@ mod tests {
     fn notices() -> Result<Vec<Notice>, Box<dyn Error + Send + Sync>> {
         let server = VpnServer::try_new("two")?;
         let ip = std::net::IpAddr::from([192, 0, 2, 7]);
-        let version = String::from("v5.0.0");
+        let version =
+            crate::core::ReportedVersion::Release(crate::core::ClientVersion::new(5, 0, 0));
         let mut notices = vec![
             Notice::Started {
                 mode: StartupMode::Initialise,
@@ -868,7 +869,7 @@ mod tests {
                     lease_renewed: false,
                     exit_ip: crate::core::IpFinding::Unknown,
                     registered: false,
-                    interface: Some(String::from("wg0")),
+                    interface: crate::core::NetworkInterface::try_new("wg0").ok(),
                 },
             },
         ];

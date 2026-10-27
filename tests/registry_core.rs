@@ -4,11 +4,11 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use windlass::core::{
-    Action, ByteSize, COUNTER_SAVE_INTERVAL, ClockReading, Core, Desired, Event, Identity,
-    LEASE_LIFETIME, MamTorrentId, POLL_INTERVAL, Port, PortForwardingEvent, Progress,
-    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, RecordId, Records, Registry,
-    RegistryEvent, StartupEvent, StartupMode, SyncPosition, SyncUpdate, TimerName, TorrentCommand,
-    TorrentHash, TorrentRecord, TorrentState, TorrentUpdate,
+    Action, ByteSize, COUNTER_SAVE_INTERVAL, ClockReading, Completion, Core, Desired, Event,
+    ForceStart, Identity, LEASE_LIFETIME, MamTorrentId, POLL_INTERVAL, Port, PortForwardingEvent,
+    Progress, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, RecordId, Records,
+    Registry, RegistryEvent, StartupEvent, StartupMode, SyncPosition, SyncUpdate, TimerName,
+    TorrentCommand, TorrentHash, TorrentRecord, TorrentState, TorrentUpdate,
 };
 
 type TestResult = Result<(), &'static str>;
@@ -43,7 +43,9 @@ impl Harness {
         );
         let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Enable));
         let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Connected {
-            version: String::from("v5.2.2"),
+            version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+                5, 2, 2,
+            )),
             preferences: QbittorrentPreferences::default(),
         }));
         harness
@@ -77,7 +79,11 @@ impl Harness {
         self.position += 1;
         self.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
             position: SyncPosition(self.position),
-            full: self.position == 1,
+            scope: if self.position == 1 {
+                windlass::core::SyncScope::Full
+            } else {
+                windlass::core::SyncScope::Changes
+            },
             torrents,
             removed: Vec::new(),
         })))
@@ -117,12 +123,12 @@ fn hash(fill: char) -> TorrentHash {
 
 fn torrent(state: TorrentState, size: u64, total_size: u64) -> TorrentUpdate {
     TorrentUpdate {
-        name: Some(String::from("A Synthetic Audiobook")),
+        name: Some(windlass::core::TorrentName::try_new("A Synthetic Audiobook").ok()),
         state: Some(state),
-        progress: Some(Progress::from_fraction(0.5)),
+        progress: Progress::from_fraction(0.5),
         size: Some(ByteSize(size)),
         total_size: Some(ByteSize(total_size)),
-        save_path: Some(Some(String::from("/srv/books"))),
+        save_path: Some(windlass::core::SavePath::try_new("/srv/books").ok()),
         ..TorrentUpdate::default()
     }
 }
@@ -170,7 +176,10 @@ fn unknown_torrents_are_adopted_as_active() {
     for row in &rows {
         assert_eq!(row.origin, windlass::core::Origin::Adopted);
         assert_eq!(row.desired, Desired::Active);
-        assert_eq!(row.save_path.as_deref(), Some("/srv/books"));
+        assert_eq!(
+            row.save_path,
+            windlass::core::SavePath::try_new("/srv/books").ok()
+        );
         assert!(!row.deletion_allowed);
         assert_eq!(row.identity.mam_id(), None);
     }
@@ -287,7 +296,7 @@ fn one_batch_is_saved_at_a_time_and_failures_are_retried() {
 #[test]
 fn stopped_active_torrents_are_started_without_repeating_too_soon() {
     let mut harness = Harness::new(Vec::new());
-    let stopped = torrent(TorrentState::Stopped { complete: true }, 10, 10);
+    let stopped = torrent(TorrentState::Stopped(Completion::Complete), 10, 10);
     let actions = harness.sync(vec![(hash('a'), stopped)]);
     assert_eq!(
         command(&actions),
@@ -336,7 +345,7 @@ fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult 
     )?;
     let mut harness = Harness::new(vec![ours]);
     let untouched = TorrentUpdate {
-        state: Some(TorrentState::Stopped { complete: false }),
+        state: Some(TorrentState::Stopped(Completion::Incomplete)),
         progress: Some(Progress::default()),
         downloaded: Some(ByteSize(0)),
         ..TorrentUpdate::default()
@@ -349,9 +358,9 @@ fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult 
         Some(&TorrentCommand::Start(vec![hash('b')]))
     );
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::CommandDone));
-    let seeded = |hours: u64, forced: bool| TorrentUpdate {
+    let seeded = |hours: u64, forced: ForceStart| TorrentUpdate {
         state: Some(TorrentState::SeedQueued),
-        progress: Some(Progress::from_fraction(1.0)),
+        progress: Progress::from_fraction(1.0),
         completed_at: Some(Some(SystemTime::UNIX_EPOCH)),
         seeding_time: Some(Duration::from_hours(hours)),
         force_start: Some(forced),
@@ -366,15 +375,15 @@ fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult 
                 ..TorrentUpdate::default()
             },
         ),
-        (hash('c'), seeded(80, false)),
-        (hash('d'), seeded(97, true)),
+        (hash('c'), seeded(80, ForceStart::NotForced)),
+        (hash('d'), seeded(97, ForceStart::Forced)),
     ]);
     assert_eq!(
         command(&actions),
         Some(&TorrentCommand::ForceStart(vec![hash('c')]))
     );
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::CommandDone));
-    let actions = harness.sync(vec![(hash('c'), seeded(80, true))]);
+    let actions = harness.sync(vec![(hash('c'), seeded(80, ForceStart::Forced))]);
     assert_eq!(
         command(&actions),
         Some(&TorrentCommand::EndForceStart(vec![hash('d')]))
@@ -455,7 +464,7 @@ fn the_listen_port_comes_before_registry_commands() {
         udp: forwarded,
         lifetime: LEASE_LIFETIME,
     }));
-    let stopped = torrent(TorrentState::Stopped { complete: false }, 10, 10);
+    let stopped = torrent(TorrentState::Stopped(Completion::Incomplete), 10, 10);
     let actions = harness.sync(vec![(hash('a'), stopped)]);
     assert!(actions.contains(&Action::SetQbittorrentListenPort { port: forwarded }));
     assert_eq!(command(&actions), None);
@@ -482,7 +491,7 @@ fn nothing_is_managed_before_the_full_list_or_without_the_registry() {
     harness.position = 1;
     let actions = harness.sync(vec![(
         hash('a'),
-        torrent(TorrentState::Stopped { complete: true }, 1, 1),
+        torrent(TorrentState::Stopped(Completion::Complete), 1, 1),
     )]);
     assert!(saved(&actions).is_empty(), "the list is incomplete");
     assert_eq!(command(&actions), None);
@@ -510,7 +519,9 @@ fn nothing_is_managed_before_the_full_list_or_without_the_registry() {
     let _ = core.handle(
         now,
         Event::Qbittorrent(QbittorrentEvent::Connected {
-            version: String::from("v5.2.2"),
+            version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+                5, 2, 2,
+            )),
             preferences: QbittorrentPreferences::default(),
         }),
     );
@@ -518,10 +529,10 @@ fn nothing_is_managed_before_the_full_list_or_without_the_registry() {
         now,
         Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
             position: SyncPosition(1),
-            full: true,
+            scope: windlass::core::SyncScope::Full,
             torrents: vec![(
                 hash('a'),
-                torrent(TorrentState::Stopped { complete: true }, 1, 1),
+                torrent(TorrentState::Stopped(Completion::Complete), 1, 1),
             )],
             removed: Vec::new(),
         })),

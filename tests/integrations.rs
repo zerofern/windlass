@@ -375,9 +375,15 @@ async fn qbittorrent_listens_on_the_forwarded_port() -> TestResult {
         return Err("qBittorrent is not connected".into());
     };
     assert_eq!(session.approval, MamApproval::Recommended);
-    assert_eq!(session.preferences.interface.as_deref(), Some("wg0"));
+    assert_eq!(
+        session.preferences.interface,
+        windlass::core::NetworkInterface::try_new("wg0").ok()
+    );
     let torrent = session.torrents.values().next().ok_or("no torrent")?;
-    assert_eq!(torrent.name, "A Synthetic Audiobook");
+    assert_eq!(
+        torrent.name,
+        windlass::core::TorrentName::try_new("A Synthetic Audiobook").ok()
+    );
     assert_eq!(torrent.state, TorrentState::SeedStalled);
     assert_eq!(
         fake.lock().map(|fake| fake.port_changes.clone()).ok(),
@@ -425,11 +431,11 @@ async fn the_queue_follows_the_limits_and_unsatisfied_seeds_always_run() -> Test
     })
     .await?;
     let wanted = windlass::core::QueuePreferences {
-        queueing: true,
-        max_downloading: Some(5),
-        max_active: Some(10),
-        max_seeding: Some(10),
-        idle_not_counted: true,
+        queueing: windlass::core::Queueing::On,
+        max_downloading: windlass::core::QueueLimit::At(windlass::core::TorrentCount::new(5)),
+        max_active: windlass::core::QueueLimit::At(windlass::core::TorrentCount::new(10)),
+        max_seeding: windlass::core::QueueLimit::At(windlass::core::TorrentCount::new(10)),
+        idle: windlass::core::IdleTorrents::NotCounted,
     };
     running
         .wait(|observation| match &observation.qbittorrent {
@@ -440,8 +446,8 @@ async fn the_queue_follows_the_limits_and_unsatisfied_seeds_always_run() -> Test
                         .map(|torrent| torrent.force_start)
                 };
                 session.preferences.queue == Some(wanted)
-                    && forced(HASH) == Some(true)
-                    && forced(SATISFIED) == Some(false)
+                    && forced(HASH) == Some(windlass::core::ForceStart::Forced)
+                    && forced(SATISFIED) == Some(windlass::core::ForceStart::NotForced)
             }
             _ => false,
         })
@@ -681,7 +687,10 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
     assert_eq!(seen.torrent.seeding_time, Duration::from_hours(1));
     assert_eq!(seen.torrent.completed_at, None);
     assert!(seen.torrent.added_at.is_some());
-    assert_eq!(seen.torrent.save_path.as_deref(), Some("/srv/books"));
+    assert_eq!(
+        seen.torrent.save_path,
+        windlass::core::SavePath::try_new("/srv/books").ok()
+    );
     let directory = running.stop_keeping().await?;
     let rows: i64 = rusqlite::Connection::open(database(directory.path()))?.query_row(
         "SELECT count(*) FROM torrents WHERE observed_save_path = '/srv/books'",

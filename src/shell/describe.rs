@@ -6,11 +6,11 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
     Action, Bookmark, ByteSize, ClientStanding, DeliveryFailure, Event, ExitIpFailure, Findings,
-    Freeleech, HistoryEvent, Hold, IpFinding, MamEvent, MamFailure, MamPauseEvent, MamReply,
-    MamRequest, MamRequestMode, MappingFailure, NotificationEvent, PersonalFreeleech, PortFinding,
-    PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure, Registration,
-    RegistryEvent, SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode, TimerName,
-    TorrentCommand, TunnelEvent, VipTorrent,
+    Freeleech, HistoryEvent, Hold, IdleTorrents, IpFinding, MamEvent, MamFailure, MamPauseEvent,
+    MamReply, MamRequest, MamRequestMode, MappingFailure, NotificationEvent, PersonalFreeleech,
+    PortFinding, PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure, Registration,
+    RegistryEvent, SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode, SyncScope,
+    TimerName, TorrentCommand, TunnelEvent, VipTorrent,
 };
 
 /// History categories, used for filtering.
@@ -73,7 +73,9 @@ pub(super) const fn is_routine(event: &Event) -> bool {
             },
         ) => true,
         Event::Qbittorrent(QbittorrentEvent::Synced(update)) => {
-            !update.full && update.torrents.is_empty() && update.removed.is_empty()
+            matches!(update.scope, SyncScope::Changes)
+                && update.torrents.is_empty()
+                && update.removed.is_empty()
         }
         _ => false,
     }
@@ -577,7 +579,10 @@ fn qbittorrent(event: &QbittorrentEvent) -> String {
             "qBittorrent update: {} torrents changed, {} removed{}",
             update.torrents.len(),
             update.removed.len(),
-            if update.full { " (full list)" } else { "" }
+            match update.scope {
+                SyncScope::Full => " (full list)",
+                SyncScope::Changes => "",
+            }
         ),
         QbittorrentEvent::SyncFailed { reason } => {
             format!(
@@ -590,7 +595,10 @@ fn qbittorrent(event: &QbittorrentEvent) -> String {
             preferences
                 .listen_port
                 .map_or_else(|| String::from("none"), |port| port.get().to_string()),
-            preferences.interface.as_deref().unwrap_or("any")
+            preferences
+                .interface
+                .as_ref()
+                .map_or_else(|| String::from("any"), ToString::to_string)
         ),
         QbittorrentEvent::PreferencesReadFailed { reason } => format!(
             "Reading qBittorrent preferences failed: {}",
@@ -791,18 +799,14 @@ pub(super) fn action(action: &Action) -> String {
             limits.active()
         ),
         Action::SetQbittorrentQueue { queue } => {
-            let limit = |limit: Option<u32>| {
-                limit.map_or_else(|| String::from("no limit"), |limit| limit.to_string())
-            };
             format!(
                 "Set qBittorrent's queue: {} downloading, {} active, {} seeding, idle torrents {}",
-                limit(queue.max_downloading),
-                limit(queue.max_active),
-                limit(queue.max_seeding),
-                if queue.idle_not_counted {
-                    "not counted"
-                } else {
-                    "counted"
+                queue.max_downloading,
+                queue.max_active,
+                queue.max_seeding,
+                match queue.idle {
+                    IdleTorrents::NotCounted => "not counted",
+                    IdleTorrents::Counted => "counted",
                 }
             )
         }
@@ -1021,7 +1025,9 @@ mod tests {
             qbittorrent(QbittorrentEvent::Enable, false),
             qbittorrent(
                 QbittorrentEvent::Connected {
-                    version: String::from("v5.2.2"),
+                    version: crate::core::ReportedVersion::Release(
+                        crate::core::ClientVersion::new(5, 2, 2),
+                    ),
                     preferences: QbittorrentPreferences::default(),
                 },
                 false,
@@ -1029,7 +1035,7 @@ mod tests {
             qbittorrent(QbittorrentEvent::Synced(SyncUpdate::default()), true),
             qbittorrent(
                 QbittorrentEvent::Synced(SyncUpdate {
-                    full: true,
+                    scope: crate::core::SyncScope::Full,
                     ..SyncUpdate::default()
                 }),
                 false,
@@ -1037,7 +1043,7 @@ mod tests {
             qbittorrent(
                 QbittorrentEvent::PreferencesRead(QbittorrentPreferences {
                     listen_port: Some(PORT),
-                    interface: Some(String::from("wg0")),
+                    interface: crate::core::NetworkInterface::try_new("wg0").ok(),
                     queue: None,
                 }),
                 true,
@@ -1577,11 +1583,11 @@ mod tests {
             },
             Action::SetQbittorrentQueue {
                 queue: crate::core::QueuePreferences {
-                    queueing: false,
-                    max_downloading: None,
-                    max_active: None,
-                    max_seeding: None,
-                    idle_not_counted: false,
+                    queueing: crate::core::Queueing::Off,
+                    max_downloading: crate::core::QueueLimit::Unlimited,
+                    max_active: crate::core::QueueLimit::Unlimited,
+                    max_seeding: crate::core::QueueLimit::Unlimited,
+                    idle: crate::core::IdleTorrents::Counted,
                 },
             },
             Action::QbittorrentCommand {
@@ -1688,7 +1694,7 @@ mod tests {
                 lease_renewed: true,
                 exit_ip,
                 registered: true,
-                interface: Some(String::from("wg0")),
+                interface: crate::core::NetworkInterface::try_new("wg0").ok(),
             };
             let described = super::findings(&found);
             assert!(described.contains(text), "{described}");

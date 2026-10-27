@@ -4,11 +4,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use windlass::core::{
     Action, ActiveLimit, Activity, ByteSize, ClientVersion, ClockReading, Core, DownloadingLimit,
-    Event, LEASE_LIFETIME, MamApproval, MappingFailure, POLL_INTERVAL, Port, PortForwarding,
-    PortForwardingEvent, Progress, Qbittorrent, QbittorrentEvent, QbittorrentFailure,
-    QbittorrentPreferences, QueuePreferences, SettingsEvent, StartupEvent, StartupMode,
-    SyncPosition, SyncUpdate, TimerId, TimerName, TorrentHash, TorrentLimits, TorrentState,
-    TorrentUpdate,
+    Event, IdleTorrents, LEASE_LIFETIME, MamApproval, MappingFailure, POLL_INTERVAL, Port,
+    PortForwarding, PortForwardingEvent, Progress, Qbittorrent, QbittorrentEvent,
+    QbittorrentFailure, QbittorrentPreferences, QueueLimit, QueuePreferences, Queueing,
+    SettingsEvent, StartupEvent, StartupMode, SyncPosition, SyncUpdate, TimerId, TimerName,
+    TorrentCount, TorrentHash, TorrentLimits, TorrentState, TorrentUpdate,
 };
 
 /// A core with a clock that only moves when told to.
@@ -95,7 +95,7 @@ fn mapped(number: u16) -> PortForwardingEvent {
 fn preferences(listen: u16) -> QbittorrentPreferences {
     QbittorrentPreferences {
         listen_port: Port::new(listen),
-        interface: Some(String::from("wg0")),
+        interface: windlass::core::NetworkInterface::try_new("wg0").ok(),
         queue: None,
     }
 }
@@ -246,7 +246,9 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
     assert_eq!(harness.core.qbittorrent(), &Qbittorrent::Connecting);
     assert_eq!(
         harness.qbittorrent(QbittorrentEvent::Connected {
-            version: String::from("v5.2.2"),
+            version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+                5, 2, 2
+            )),
             preferences: preferences(6881),
         }),
         vec![Action::SyncQbittorrent {
@@ -256,14 +258,14 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
     assert_eq!(session(&harness).approval, MamApproval::Recommended);
     let full = SyncUpdate {
         position: SyncPosition(1),
-        full: true,
+        scope: windlass::core::SyncScope::Full,
         torrents: vec![
             (
                 hash('a'),
                 TorrentUpdate {
-                    name: Some(String::from("first")),
+                    name: Some(windlass::core::TorrentName::try_new("first").ok()),
                     state: Some(TorrentState::Downloading),
-                    progress: Some(Progress::from_fraction(0.25)),
+                    progress: Progress::from_fraction(0.25),
                     size: Some(ByteSize(100)),
                     ..TorrentUpdate::default()
                 },
@@ -288,12 +290,12 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
     );
     let partial = SyncUpdate {
         position: SyncPosition(2),
-        full: false,
+        scope: windlass::core::SyncScope::Changes,
         torrents: vec![(
             hash('a'),
             TorrentUpdate {
                 state: Some(TorrentState::Seeding),
-                progress: Some(Progress::from_fraction(1.0)),
+                progress: Progress::from_fraction(1.0),
                 ..TorrentUpdate::default()
             },
         )],
@@ -309,7 +311,7 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
             torrent.size
         )),
         Some((
-            String::from("first"),
+            windlass::core::TorrentName::try_new("first").ok(),
             TorrentState::Seeding,
             1000,
             ByteSize(100)
@@ -318,7 +320,7 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
     assert!(!session(&harness).torrents.contains_key(&hash('b')));
     // An update arriving while none was requested is ignored.
     let _ = harness.qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-        full: true,
+        scope: windlass::core::SyncScope::Full,
         ..SyncUpdate::default()
     }));
     assert_eq!(session(&harness).torrents.len(), 1);
@@ -329,7 +331,9 @@ fn preferences_are_reread_periodically() {
     let mut harness = Harness::new();
     let _ = harness.qbittorrent(QbittorrentEvent::Enable);
     let _ = harness.qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.1.0"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 1, 0,
+        )),
         preferences: preferences(6881),
     });
     let mut actions = Vec::new();
@@ -357,7 +361,9 @@ fn qbittorrent_follows_the_forwarded_port() {
     let mut harness = Harness::new();
     let _ = harness.qbittorrent(QbittorrentEvent::Enable);
     let _ = harness.qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.2.2"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 2, 2,
+        )),
         preferences: preferences(6881),
     });
     let _ = harness.qbittorrent(QbittorrentEvent::Synced(SyncUpdate::default()));
@@ -413,11 +419,11 @@ fn qbittorrent_follows_the_forwarded_port() {
 fn queued(downloading: u32, active: u32) -> QbittorrentPreferences {
     QbittorrentPreferences {
         queue: Some(QueuePreferences {
-            queueing: true,
-            max_downloading: Some(downloading),
-            max_active: Some(active),
-            max_seeding: Some(active),
-            idle_not_counted: true,
+            queueing: Queueing::On,
+            max_downloading: QueueLimit::At(TorrentCount::new(downloading)),
+            max_active: QueueLimit::At(TorrentCount::new(active)),
+            max_seeding: QueueLimit::At(TorrentCount::new(active)),
+            idle: IdleTorrents::NotCounted,
         }),
         ..preferences(6881)
     }
@@ -457,14 +463,16 @@ fn qbittorrents_queue_follows_the_saved_limits() {
     }
     let _ = harness.qbittorrent(QbittorrentEvent::Enable);
     let _ = harness.qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.2.2"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 2, 2,
+        )),
         preferences: QbittorrentPreferences {
             queue: Some(QueuePreferences {
-                queueing: false,
-                max_downloading: Some(3),
-                max_active: Some(5),
-                max_seeding: None,
-                idle_not_counted: false,
+                queueing: Queueing::Off,
+                max_downloading: QueueLimit::At(TorrentCount::new(3)),
+                max_active: QueueLimit::At(TorrentCount::new(5)),
+                max_seeding: QueueLimit::Unlimited,
+                idle: IdleTorrents::Counted,
             }),
             ..preferences(6881)
         },
@@ -552,7 +560,8 @@ fn failures_make_qbittorrent_unreachable_until_it_answers() {
         vec![Action::ConnectQbittorrent]
     );
     let _ = harness.qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.2.2-dev"),
+        version: windlass::core::ReportedVersion::parse("v5.2.2-dev")
+            .unwrap_or_else(|| unreachable!("a version")),
         preferences: QbittorrentPreferences::default(),
     });
     assert_eq!(session(&harness).approval, MamApproval::NotAllowed);
@@ -578,7 +587,9 @@ fn failures_make_qbittorrent_unreachable_until_it_answers() {
         );
         let _ = harness.expire(TimerName::QbittorrentPoll, retry);
         let _ = harness.qbittorrent(QbittorrentEvent::Connected {
-            version: String::from("v5.2.2"),
+            version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+                5, 2, 2,
+            )),
             preferences: QbittorrentPreferences::default(),
         });
     }
@@ -613,8 +624,25 @@ fn hashes_and_progress_are_validated() {
     assert!(TorrentHash::parse(&"a".repeat(64)).is_some());
     assert!(TorrentHash::parse(&"a".repeat(41)).is_none());
     assert!(TorrentHash::parse(&"g".repeat(40)).is_none());
-    assert_eq!(Progress::from_fraction(-1.0).permille(), 0);
-    assert_eq!(Progress::from_fraction(2.0).permille(), 1000);
-    assert_eq!(Progress::from_fraction(0.1234).permille(), 123);
+    assert_eq!(Progress::from_fraction(-0.1), None);
+    assert_eq!(Progress::from_fraction(1.1), None);
+    assert_eq!(Progress::from_fraction(f64::NAN), None);
+    assert_eq!(
+        Progress::from_fraction(0.0).map(Progress::permille),
+        Some(0)
+    );
+    assert_eq!(
+        Progress::from_fraction(0.1234).map(Progress::permille),
+        Some(123)
+    );
     assert_eq!(Port::new(0), None);
+    assert_eq!(windlass::core::ReportedVersion::parse("  "), None);
+    assert_eq!(
+        windlass::core::ReportedVersion::parse("v5.1.0").and_then(|version| version.release()),
+        Some(ClientVersion::new(5, 1, 0))
+    );
+    assert_eq!(
+        windlass::core::ReportedVersion::parse(" nightly ").map(|version| version.to_string()),
+        Some(String::from("nightly"))
+    );
 }

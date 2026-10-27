@@ -18,9 +18,10 @@ use serde::Serialize;
 use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
     Hold, Mam, MamSession, NoticeCount, Partials, Points, Port, PortForwarding, Protection,
-    Purchase, Qbittorrent, QbittorrentFailure, Registry, SeedboxStatus, SessionRejection,
-    SettingsState, StartupMode, SwitchAllowance, TimerId, TimerName, TorrentCount, TorrentState,
-    Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer, registry::SEEDING_TARGET, timer::Timers,
+    Purchase, Qbittorrent, QbittorrentFailure, Registry, ReportedVersion, SeedboxStatus,
+    SessionRejection, SettingsState, StartupMode, SwitchAllowance, TimerId, TimerName,
+    TorrentCount, TorrentState, Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer,
+    registry::SEEDING_TARGET, timer::Timers,
 };
 
 /// A torrent completed this long ago must have reached the seeding target by
@@ -198,12 +199,12 @@ pub enum Notice {
     /// MAM does not allow the running qBittorrent version.
     QbittorrentVersionNotAllowed {
         /// The version.
-        version: String,
+        version: ReportedVersion,
     },
     /// The running qBittorrent version is allowed again.
     QbittorrentVersionAllowed {
         /// The version.
-        version: String,
+        version: ReportedVersion,
     },
     /// qBittorrent reports errors for some torrents.
     TorrentErrors {

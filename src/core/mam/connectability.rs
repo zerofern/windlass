@@ -9,7 +9,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::core::Port;
+use crate::core::{NetworkInterface, Port};
 
 /// A reading taken this long after a repair shows whether it worked; MAM caches
 /// what it reports about clients for 30 minutes.
@@ -25,7 +25,7 @@ pub struct Connection {
     /// The tunnel's exit IP, from the latest successful check.
     pub tunnel_ip: Option<IpAddr>,
     /// The network interface qBittorrent is bound to.
-    pub interface: Option<String>,
+    pub interface: Option<NetworkInterface>,
 }
 
 /// qBittorrent's listen port against the forwarded port.
@@ -73,7 +73,7 @@ pub struct Findings {
     /// Windlass registers again when allowed either way.
     pub registered: bool,
     /// The network interface qBittorrent is bound to, if any.
-    pub interface: Option<String>,
+    pub interface: Option<NetworkInterface>,
 }
 
 impl Findings {

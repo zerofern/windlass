@@ -9,11 +9,12 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 
 use crate::core::{
-    ActiveLimit, ApiCookie, ByteSize, Desired, DownloadingLimit, Event, HistoryLimit, Identity,
-    Logged, MamEvent, MamPauseEvent, MamRequestMode, MamTorrentId, NoticeId, NotificationEvent,
-    NtfyTopic, Observation, Origin, PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent,
-    SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentRecord,
-    TorrentState, TunnelEvent, VpnServer, VpnSwitch,
+    ActiveLimit, ApiCookie, ByteSize, Completion, ContentPath, Desired, DownloadingLimit, Event,
+    ForceStart, HistoryLimit, Identity, Logged, MamEvent, MamPauseEvent, MamRequestMode,
+    MamTorrentId, NoticeId, NotificationEvent, NtfyTopic, Observation, Origin, PointsReserve,
+    Progress, Ratio, Reach, RecordId, RegistryEvent, SavePath, SettingsEvent, StartupEvent,
+    StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentName, TorrentRecord, TorrentState,
+    TunnelEvent, VpnServer, VpnSwitch,
 };
 
 use super::{notify, qbittorrent::torrent_state};
@@ -698,10 +699,20 @@ fn torrent_record(row: &Row<'_>) -> StorageResult<TorrentRecord> {
         identity,
         origin,
         desired,
-        save_path: row.get(5)?,
+        save_path: text(row, 5, SavePath::try_new)?,
         deletion_allowed: row.get(6)?,
         observation,
     })
+}
+
+/// An optional text column, parsed into its type.
+fn text<T, E: Error + Send + Sync + 'static>(
+    row: &Row<'_>,
+    column: usize,
+    parse: impl FnOnce(String) -> Result<T, E>,
+) -> StorageResult<Option<T>> {
+    let value: Option<String> = row.get(column)?;
+    Ok(value.map(parse).transpose()?)
 }
 
 fn observation(row: &Row<'_>, last_seen: i64) -> StorageResult<Observation> {
@@ -720,7 +731,7 @@ fn observation(row: &Row<'_>, last_seen: i64) -> StorageResult<Observation> {
         .ok_or_else(|| invalid_data("invalid progress"))?;
     Ok(Observation {
         torrent: Torrent {
-            name: row.get(7)?,
+            name: text(row, 7, TorrentName::try_new)?,
             state: torrent_state(&state),
             progress,
             size: ByteSize(count(10)?),
@@ -731,10 +742,10 @@ fn observation(row: &Row<'_>, last_seen: i64) -> StorageResult<Observation> {
             seeding_time: Duration::from_secs(count(15)?),
             added_at: time(16)?,
             completed_at: time(17)?,
-            content_path: row.get(18)?,
-            save_path: row.get(19)?,
+            content_path: text(row, 18, ContentPath::try_new)?,
+            save_path: text(row, 19, SavePath::try_new)?,
             // Not saved; qBittorrent's next full update says.
-            force_start: false,
+            force_start: ForceStart::NotForced,
         },
         last_seen: time_from_seconds(last_seen)?,
     })
@@ -772,9 +783,9 @@ fn save_torrents(path: &Path, records: &[TorrentRecord]) -> StorageResult<Event>
                     Desired::Held => "held",
                     Desired::Removed => "removed",
                 },
-                record.save_path,
+                record.save_path.as_ref().map(ToString::to_string),
                 record.deletion_allowed,
-                torrent.map(|torrent| torrent.name.as_str()),
+                torrent.and_then(|torrent| torrent.name.as_ref().map(ToString::to_string)),
                 torrent.map(|torrent| state_name(torrent.state)),
                 torrent.map(|torrent| torrent.progress.permille()),
                 count(|torrent| torrent.size.0),
@@ -785,8 +796,8 @@ fn save_torrents(path: &Path, records: &[TorrentRecord]) -> StorageResult<Event>
                 count(|torrent| torrent.seeding_time.as_secs()),
                 time(|torrent| torrent.added_at),
                 time(|torrent| torrent.completed_at),
-                torrent.and_then(|torrent| torrent.content_path.as_deref()),
-                torrent.and_then(|torrent| torrent.save_path.as_deref()),
+                torrent.and_then(|torrent| torrent.content_path.as_ref().map(ToString::to_string)),
+                torrent.and_then(|torrent| torrent.save_path.as_ref().map(ToString::to_string)),
                 observed.map(|observation| seconds(observation.last_seen)),
             ])?;
         }
@@ -805,8 +816,8 @@ const fn state_name(state: TorrentState) -> &'static str {
         TorrentState::Seeding => "uploading",
         TorrentState::SeedStalled => "stalledUP",
         TorrentState::SeedQueued => "queuedUP",
-        TorrentState::Stopped { complete: true } => "stoppedUP",
-        TorrentState::Stopped { complete: false } => "stoppedDL",
+        TorrentState::Stopped(Completion::Complete) => "stoppedUP",
+        TorrentState::Stopped(Completion::Incomplete) => "stoppedDL",
         TorrentState::Checking => "checkingDL",
         TorrentState::Moving => "moving",
         TorrentState::MissingFiles => "missingFiles",
@@ -904,8 +915,8 @@ mod tests {
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let observed = Observation {
             torrent: Torrent {
-                name: String::from("A Synthetic Audiobook"),
-                state: TorrentState::Stopped { complete: true },
+                name: crate::core::TorrentName::try_new("A Synthetic Audiobook").ok(),
+                state: TorrentState::Stopped(crate::core::Completion::Complete),
                 progress: DONE,
                 size: ByteSize(10),
                 total_size: ByteSize(12),
@@ -915,9 +926,10 @@ mod tests {
                 seeding_time: Duration::from_hours(1),
                 added_at: Some(at(1_700_000_000)),
                 completed_at: Some(at(1_700_000_600)),
-                content_path: Some(String::from("/srv/books/A Synthetic Audiobook")),
-                save_path: Some(String::from("/srv/books")),
-                force_start: false,
+                content_path: crate::core::ContentPath::try_new("/srv/books/A Synthetic Audiobook")
+                    .ok(),
+                save_path: crate::core::SavePath::try_new("/srv/books").ok(),
+                force_start: crate::core::ForceStart::NotForced,
             },
             last_seen: at(1_700_001_000),
         };
@@ -926,7 +938,7 @@ mod tests {
             identity,
             origin,
             desired,
-            save_path: Some(String::from("/srv/books")),
+            save_path: crate::core::SavePath::try_new("/srv/books").ok(),
             deletion_allowed: id == SECOND,
             observation,
         };
@@ -1065,8 +1077,8 @@ mod tests {
             TorrentState::Seeding,
             TorrentState::SeedStalled,
             TorrentState::SeedQueued,
-            TorrentState::Stopped { complete: true },
-            TorrentState::Stopped { complete: false },
+            TorrentState::Stopped(crate::core::Completion::Complete),
+            TorrentState::Stopped(crate::core::Completion::Incomplete),
             TorrentState::Checking,
             TorrentState::Moving,
             TorrentState::MissingFiles,

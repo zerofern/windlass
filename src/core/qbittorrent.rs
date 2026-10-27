@@ -4,10 +4,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use derive_more::Display;
+use nutype::nutype;
 use serde::Serialize;
 
 use super::{
-    Action, ClockReading, MamTorrentId, Port, TimerId, TimerName, TorrentLimits, timer::Timers,
+    Action, ClockReading, MamTorrentId, Port, TimerId, TimerName, TorrentCount, TorrentLimits,
+    timer::Timers,
 };
 
 /// How often qBittorrent's state is read.
@@ -44,7 +47,9 @@ impl ClientVersion {
         }
     }
 
-    const fn new(major: u32, minor: u32, patch: u32) -> Self {
+    /// A release version from its parts.
+    #[must_use]
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
             minor,
@@ -74,6 +79,98 @@ impl fmt::Display for ClientVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
     }
+}
+
+/// The version qBittorrent reports, read once when Windlass connects.
+#[derive(Debug, Clone, PartialEq, Eq, Display, Serialize)]
+pub enum ReportedVersion {
+    /// A release version, such as 5.2.2.
+    Release(ClientVersion),
+    /// Anything else, such as an alpha or a development build.
+    Unrecognised(VersionText),
+}
+
+impl ReportedVersion {
+    /// Read the version text; blank text is no version.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        ClientVersion::parse(text).map_or_else(
+            || VersionText::try_new(text).ok().map(Self::Unrecognised),
+            |version| Some(Self::Release(version)),
+        )
+    }
+
+    /// The release version, if it is one.
+    #[must_use]
+    pub const fn release(&self) -> Option<ClientVersion> {
+        match self {
+            Self::Release(version) => Some(*version),
+            Self::Unrecognised(_) => None,
+        }
+    }
+
+    /// MAM's position on this version; only releases can be allowed.
+    #[must_use]
+    pub fn mam_approval(&self) -> MamApproval {
+        self.release()
+            .map_or(MamApproval::NotAllowed, ClientVersion::mam_approval)
+    }
+}
+
+/// Version text qBittorrent reports that is not a release version.
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct VersionText(String);
+
+/// A torrent's name in qBittorrent.
+#[nutype(
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct TorrentName(String);
+
+/// The directory a torrent's content is saved under.
+#[nutype(
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct SavePath(String);
+
+/// Where a torrent's content is stored: its file, or its top directory.
+#[nutype(
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct ContentPath(String);
+
+/// The network interface qBittorrent is bound to, such as `wg0`.
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct NetworkInterface(String);
+
+/// Whether a stopped torrent had downloaded all its selected content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Completion {
+    /// All selected content is downloaded.
+    Complete,
+    /// Some is still missing.
+    Incomplete,
+}
+
+/// Whether a torrent runs regardless of qBittorrent's queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum ForceStart {
+    /// The queue manages it.
+    #[default]
+    NotForced,
+    /// It runs regardless of the queue.
+    Forced,
 }
 
 /// MAM's position on a qBittorrent version, from its allowed client list.
@@ -126,10 +223,7 @@ pub enum TorrentState {
     /// Complete and waiting for an upload slot.
     SeedQueued,
     /// Stopped by the user or an application.
-    Stopped {
-        /// Whether all selected content was downloaded.
-        complete: bool,
-    },
+    Stopped(Completion),
     /// Verifying content on disk.
     Checking,
     /// Moving content to another location.
@@ -148,15 +242,17 @@ pub enum TorrentState {
 pub struct Progress(u16);
 
 impl Progress {
-    /// Progress from a fraction between 0 and 1; out-of-range values are clamped.
+    /// Progress from a fraction between 0 and 1; anything else is not one.
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "the value is clamped to 0..=1000 before conversion"
+        reason = "the fraction is checked to be within 0..=1, so the value is within 0..=1000"
     )]
-    pub fn from_fraction(fraction: f64) -> Self {
-        Self((fraction.clamp(0.0, 1.0) * 1000.0).round() as u16)
+    pub fn from_fraction(fraction: f64) -> Option<Self> {
+        (0.0..=1.0)
+            .contains(&fraction)
+            .then(|| Self((fraction * 1000.0).round() as u16))
     }
 
     /// Progress from tenths of a percent; values above 1000 are refused.
@@ -185,15 +281,16 @@ pub struct ByteSize(pub u64);
 pub struct Ratio(pub u64);
 
 impl Ratio {
-    /// A ratio from qBittorrent's floating-point value; negative values are zero.
+    /// A ratio from qBittorrent's floating-point value; a negative or
+    /// non-finite value is not one.
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "the value is clamped to be non-negative, and ratios far beyond u64 are not real"
+        reason = "the value is checked to be finite and non-negative; the cast saturates"
     )]
-    pub fn from_float(ratio: f64) -> Self {
-        Self((ratio.max(0.0) * 1000.0).round() as u64)
+    pub fn from_float(ratio: f64) -> Option<Self> {
+        (ratio.is_finite() && ratio >= 0.0).then(|| Self((ratio * 1000.0).round() as u64))
     }
 }
 
@@ -223,8 +320,8 @@ macro_rules! torrent_fields {
 }
 
 torrent_fields! {
-    /// The torrent's display name.
-    name: String,
+    /// The torrent's display name, once qBittorrent reports it.
+    name: Option<TorrentName>,
     /// What qBittorrent is doing with it.
     state: TorrentState,
     /// How much of the selected content is downloaded.
@@ -246,11 +343,11 @@ torrent_fields! {
     /// When the download completed.
     completed_at: Option<SystemTime>,
     /// Where the torrent's content is stored.
-    content_path: Option<String>,
+    content_path: Option<ContentPath>,
     /// The directory the content is saved under.
-    save_path: Option<String>,
+    save_path: Option<SavePath>,
     /// Whether it runs regardless of qBittorrent's queue.
-    force_start: bool,
+    force_start: ForceStart,
 }
 
 /// A change qBittorrent must make so that it matches the torrent registry.
@@ -281,13 +378,23 @@ pub enum TorrentCommand {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct SyncPosition(pub u64);
 
+/// Whether an update replaces the whole torrent list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum SyncScope {
+    /// Only what changed since the last update.
+    #[default]
+    Changes,
+    /// The whole list, replacing what Windlass knew.
+    Full,
+}
+
 /// One incremental update of qBittorrent's torrent list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SyncUpdate {
     /// The position to request next.
     pub position: SyncPosition,
     /// Whether this update replaces the whole list.
-    pub full: bool,
+    pub scope: SyncScope,
     /// New or changed torrents.
     pub torrents: Vec<(TorrentHash, TorrentUpdate)>,
     /// Torrents no longer in qBittorrent.
@@ -300,24 +407,54 @@ pub struct QbittorrentPreferences {
     /// The port qBittorrent listens on for peers.
     pub listen_port: Option<Port>,
     /// The network interface qBittorrent is bound to, if any.
-    pub interface: Option<String>,
+    pub interface: Option<NetworkInterface>,
     /// How qBittorrent queues torrents, when it reports it.
     pub queue: Option<QueuePreferences>,
 }
 
-/// How qBittorrent queues torrents. A limit that is absent is unlimited.
+/// Whether qBittorrent holds torrents beyond its limits in a queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Queueing {
+    /// Torrents beyond the limits wait.
+    On,
+    /// Every torrent runs.
+    Off,
+}
+
+/// One of qBittorrent's queue limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize)]
+pub enum QueueLimit {
+    /// No limit.
+    #[display("no limit")]
+    Unlimited,
+    /// At most this many torrents.
+    #[display("{_0}")]
+    At(TorrentCount),
+}
+
+/// Whether qBittorrent counts torrents moving almost no data against its
+/// limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum IdleTorrents {
+    /// They count.
+    Counted,
+    /// They are left out, so idle seeds keep seeding.
+    NotCounted,
+}
+
+/// How qBittorrent queues torrents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct QueuePreferences {
     /// Whether torrents beyond the limits wait in a queue.
-    pub queueing: bool,
+    pub queueing: Queueing,
     /// How many torrents may download at once.
-    pub max_downloading: Option<u32>,
+    pub max_downloading: QueueLimit,
     /// How many torrents may be active at once.
-    pub max_active: Option<u32>,
+    pub max_active: QueueLimit,
     /// How many torrents may seed at once.
-    pub max_seeding: Option<u32>,
-    /// Whether torrents moving almost no data are left out of the counts.
-    pub idle_not_counted: bool,
+    pub max_seeding: QueueLimit,
+    /// Whether torrents moving almost no data count against the limits.
+    pub idle: IdleTorrents,
 }
 
 impl QueuePreferences {
@@ -325,13 +462,13 @@ impl QueuePreferences {
     /// only while peers download from them, so idle seeds keep seeding.
     #[must_use]
     pub fn for_limits(limits: TorrentLimits) -> Self {
-        let active = limits.active().into_inner();
+        let active = QueueLimit::At(TorrentCount::new(limits.active().into_inner()));
         Self {
-            queueing: true,
-            max_downloading: Some(limits.downloading().into_inner()),
-            max_active: Some(active),
-            max_seeding: Some(active),
-            idle_not_counted: true,
+            queueing: Queueing::On,
+            max_downloading: QueueLimit::At(TorrentCount::new(limits.downloading().into_inner())),
+            max_active: active,
+            max_seeding: active,
+            idle: IdleTorrents::NotCounted,
         }
     }
 }
@@ -357,8 +494,8 @@ pub enum QbittorrentEvent {
     Enable,
     /// The web UI answered with its version and preferences.
     Connected {
-        /// The application version, such as `v5.2.2`.
-        version: String,
+        /// The application version.
+        version: ReportedVersion,
         /// The current preferences.
         preferences: QbittorrentPreferences,
     },
@@ -439,7 +576,7 @@ pub enum Activity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     /// The version qBittorrent reported.
-    pub version: String,
+    pub version: ReportedVersion,
     /// MAM's position on that version.
     pub approval: MamApproval,
     /// The latest preferences read.
@@ -491,8 +628,7 @@ impl Qbittorrent {
                     preferences,
                 },
             ) => {
-                let approval = ClientVersion::parse(&version)
-                    .map_or(MamApproval::NotAllowed, ClientVersion::mam_approval);
+                let approval = version.mam_approval();
                 *self = Self::Connected(Box::new(Session {
                     version,
                     approval,
@@ -647,7 +783,7 @@ impl Session {
     }
 
     fn apply(&mut self, update: SyncUpdate) {
-        if update.full {
+        if update.scope == SyncScope::Full {
             self.torrents.clear();
             self.listed = true;
         }

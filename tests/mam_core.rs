@@ -124,7 +124,9 @@ impl Harness {
             for event in [
                 Event::Qbittorrent(QbittorrentEvent::Enable),
                 Event::Qbittorrent(QbittorrentEvent::Connected {
-                    version: String::from("v5.2.2"),
+                    version: windlass::core::ReportedVersion::Release(
+                        windlass::core::ClientVersion::new(5, 2, 2),
+                    ),
                     preferences: QbittorrentPreferences::default(),
                 }),
             ] {
@@ -188,7 +190,11 @@ impl Harness {
         self.position += 1;
         self.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
             position: SyncPosition(self.position),
-            full: self.position == 1,
+            scope: if self.position == 1 {
+                windlass::core::SyncScope::Full
+            } else {
+                windlass::core::SyncScope::Changes
+            },
             torrents: torrents
                 .into_iter()
                 .map(|hash| (hash, windlass::core::TorrentUpdate::default()))
@@ -856,7 +862,7 @@ fn download_row(
         deletion_allowed: false,
         observation: Some(windlass::core::Observation {
             torrent: windlass::core::Torrent {
-                name: format!("Synthetic {id}"),
+                name: windlass::core::TorrentName::try_new(format!("Synthetic {id}")).ok(),
                 added_at: Some(now - ago),
                 completed_at: finished.then_some(now),
                 ..windlass::core::Torrent::default()
@@ -1183,10 +1189,12 @@ fn a_repair_records_a_matching_port_and_a_differing_exit_ip() {
         }),
         Event::Qbittorrent(QbittorrentEvent::Enable),
         Event::Qbittorrent(QbittorrentEvent::Connected {
-            version: String::from("v5.2.2"),
+            version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+                5, 2, 2,
+            )),
             preferences: QbittorrentPreferences {
                 listen_port: Some(forwarded),
-                interface: Some(String::from("wg0")),
+                interface: windlass::core::NetworkInterface::try_new("wg0").ok(),
                 queue: None,
             },
         }),
@@ -1216,7 +1224,7 @@ fn a_repair_records_a_matching_port_and_a_differing_exit_ip() {
             tunnel: ip(10),
         },
         registered: true,
-        interface: Some(String::from("wg0")),
+        interface: windlass::core::NetworkInterface::try_new("wg0").ok(),
     };
     assert!(
         matches!(

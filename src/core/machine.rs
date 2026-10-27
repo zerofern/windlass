@@ -240,8 +240,7 @@ impl Core {
                 }
                 _ => false,
             },
-            client_version: session
-                .and_then(|session| super::ClientVersion::parse(&session.version)),
+            client_version: session.and_then(|session| session.version.release()),
             connection: super::Connection {
                 listen_port: session.and_then(|session| session.preferences.listen_port),
                 forwarded_port: self.port_forwarding.forwarded_port(),

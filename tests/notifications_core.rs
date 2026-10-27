@@ -380,13 +380,17 @@ fn qbittorrent_outages_notify_after_five_minutes_and_on_recovery() -> Result<(),
     let _ = harness.delivered();
     reconnect(&mut harness, &first)?;
     let connected = harness.send(Event::Qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.0.0"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 0, 0,
+        )),
         preferences: QbittorrentPreferences::default(),
     }));
     assert_eq!(
         harness.deliver_all(&connected),
         vec![Notice::QbittorrentVersionNotAllowed {
-            version: String::from("v5.0.0")
+            version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+                5, 0, 0
+            ))
         }],
         "a version MAM does not allow is reported at once"
     );
@@ -418,7 +422,9 @@ fn short_outages_stay_quiet() -> Result<(), &'static str> {
     harness.advance(Duration::from_mins(1));
     reconnect(&mut harness, &failed)?;
     let actions = harness.send(Event::Qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.2.2"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 2, 2,
+        )),
         preferences: QbittorrentPreferences::default(),
     }));
     assert!(sent(&actions).is_empty());
@@ -577,7 +583,9 @@ fn torrent_problems_are_reported_after_their_grace_periods() -> Result<(), &'sta
     assert!(matches!(harness.core.registry(), Registry::Loaded(_)));
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Enable));
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.2.2"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 2, 2,
+        )),
         preferences: QbittorrentPreferences::default(),
     }));
     let torrent = |fill: char, state| {
@@ -600,7 +608,7 @@ fn torrent_problems_are_reported_after_their_grace_periods() -> Result<(), &'sta
     .ok_or("invalid hash")?;
     let synced = harness.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
         position: SyncPosition(1),
-        full: true,
+        scope: windlass::core::SyncScope::Full,
         torrents,
         removed: Vec::new(),
     })));

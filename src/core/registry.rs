@@ -10,8 +10,8 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    Action, ByteSize, ClockReading, Progress, Session, Torrent, TorrentCommand, TorrentHash,
-    TorrentState,
+    Action, ByteSize, ClockReading, ForceStart, Progress, SavePath, Session, Torrent,
+    TorrentCommand, TorrentHash, TorrentState,
 };
 
 /// How often changed upload totals, progress, and seeding time are saved.
@@ -181,7 +181,7 @@ pub struct TorrentRecord {
     /// What Windlass wants for it.
     pub desired: Desired,
     /// Where its content is saved.
-    pub save_path: Option<String>,
+    pub save_path: Option<SavePath>,
     /// Whether the user allows its content to be deleted for space.
     pub deletion_allowed: bool,
     /// What qBittorrent last reported, if it ever did.
@@ -617,7 +617,7 @@ impl Records {
             return Some(TorrentCommand::SelectAllFiles(hash.clone()));
         }
         let running: Vec<TorrentHash> = present(Desired::Held)
-            .filter(|(_, torrent)| !matches!(torrent.state, TorrentState::Stopped { .. }))
+            .filter(|(_, torrent)| !matches!(torrent.state, TorrentState::Stopped(_)))
             .map(|(hash, _)| hash.clone())
             .collect();
         if !running.is_empty() {
@@ -647,7 +647,7 @@ impl Records {
                 let torrent = session.torrents.get(hash)?;
                 let untouched =
                     torrent.progress == Progress::default() && torrent.downloaded == ByteSize(0);
-                (matches!(torrent.state, TorrentState::Stopped { .. })
+                (matches!(torrent.state, TorrentState::Stopped(_))
                     && !(record.origin == Origin::Adopted && untouched))
                     .then(|| hash.clone())
             })
@@ -659,14 +659,18 @@ impl Records {
             torrent.completed_at.is_some() && torrent.seeding_time < SEEDING_TARGET
         };
         let force: Vec<TorrentHash> = present(Desired::Active)
-            .filter(|(_, torrent)| unsatisfied(torrent) && !torrent.force_start)
+            .filter(|(_, torrent)| {
+                unsatisfied(torrent) && torrent.force_start == ForceStart::NotForced
+            })
             .map(|(hash, _)| hash.clone())
             .collect();
         if !force.is_empty() {
             return Some(TorrentCommand::ForceStart(force));
         }
         let release: Vec<TorrentHash> = present(Desired::Active)
-            .filter(|(_, torrent)| !unsatisfied(torrent) && torrent.force_start)
+            .filter(|(_, torrent)| {
+                !unsatisfied(torrent) && torrent.force_start == ForceStart::Forced
+            })
             .map(|(hash, _)| hash.clone())
             .collect();
         (!release.is_empty()).then_some(TorrentCommand::EndForceStart(release))
