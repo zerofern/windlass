@@ -94,7 +94,7 @@ const fn timer(name: TimerName) -> &'static str {
 
 /// A size in GiB with one decimal.
 pub(super) fn gib(size: ByteSize) -> String {
-    let tenths = u128::from(size.0) * 10 / (1 << 30);
+    let tenths = u128::from(size.bytes()) * 10 / (1 << 30);
     format!("{}.{} GiB", tenths / 10, tenths % 10)
 }
 
@@ -762,7 +762,7 @@ pub(super) fn action(action: &Action) -> String {
         }
         Action::ConnectQbittorrent => String::from("Connect to qBittorrent"),
         Action::SyncQbittorrent { position } => {
-            format!("Read qBittorrent changes since update {}", position.0)
+            format!("Read qBittorrent changes since update {position}")
         }
         Action::ReadQbittorrentPreferences => String::from("Read qBittorrent preferences"),
         Action::SetQbittorrentListenPort { port } => {
@@ -1107,7 +1107,7 @@ mod tests {
             },
             Action::ConnectQbittorrent,
             Action::SyncQbittorrent {
-                position: SyncPosition(1),
+                position: SyncPosition::new(1),
             },
             Action::ReadQbittorrentPreferences,
             Action::SetQbittorrentListenPort { port: PORT },
@@ -1145,7 +1145,7 @@ mod tests {
             Action::ReadNoticeLog,
             Action::SaveNotice {
                 entry: crate::core::Logged {
-                    id: crate::core::NoticeId::new(7),
+                    id: crate::core::NoticeId::new(7).unwrap_or(crate::core::NoticeId::FIRST),
                     at: SystemTime::UNIX_EPOCH,
                     notice: crate::core::Notice::Test,
                     reach: crate::core::Reach::Push,
@@ -1246,7 +1246,7 @@ mod tests {
             },
             NotificationEvent::LogRead { last: None },
             NotificationEvent::LogRead {
-                last: Some(crate::core::NoticeId::new(3)),
+                last: crate::core::NoticeId::new(3),
             },
             NotificationEvent::LogReadFailed,
             NotificationEvent::SaveFailed,
@@ -1342,7 +1342,7 @@ mod tests {
             },
             Action::ConnectQbittorrent,
             Action::SyncQbittorrent {
-                position: SyncPosition(3),
+                position: SyncPosition::new(3),
             },
             Action::ReadQbittorrentPreferences,
             Action::SetQbittorrentListenPort { port: PORT },
@@ -1381,9 +1381,9 @@ mod tests {
         let hash = TorrentHash::parse(&"c".repeat(40)).ok_or("hash")?;
         let torrent = MamTorrentId::new(9).ok_or("id")?;
         let data = UserData {
-            uploaded: ByteSize(3 << 30),
-            downloaded: ByteSize(1 << 30),
-            points: Points(1),
+            uploaded: ByteSize::new(3 << 30),
+            downloaded: ByteSize::new(1 << 30),
+            points: Points::new(1),
             wedges: crate::core::WedgeCount::new(2),
             class: crate::core::UserClass::Vip,
             vip_until: None,
@@ -1420,7 +1420,7 @@ mod tests {
             (Event::Mam(MamEvent::Enable), "mam", false),
             routine(MamReply::Ip(IpObservation {
                 ip,
-                asn: Asn(1),
+                asn: Asn::new(1),
                 provider: crate::core::NetworkName::try_new("Provider").ok(),
             })),
             routine(MamReply::UserData(Box::new(data))),
@@ -1443,9 +1443,11 @@ mod tests {
                 })),
                 answered(Ok(MamReply::Fetched(FetchedTorrent {
                     hash: hash.clone(),
-                    size: ByteSize(1 << 20),
+                    size: ByteSize::new(1 << 20),
                 }))),
-                answered(Ok(MamReply::Purchased { points: Points(2) })),
+                answered(Ok(MamReply::Purchased {
+                    points: Points::new(2),
+                })),
                 answered(Ok(MamReply::WedgeHistory(Vec::new()))),
                 answered(Ok(MamReply::Torrent(None))),
                 answered(Ok(MamReply::Torrent(Some(Box::new(
@@ -1660,7 +1662,7 @@ mod tests {
         ) {
             assert!(!super::hold(hold).is_empty());
         }
-        assert_eq!(super::gib(ByteSize(3 << 29)), "1.5 GiB");
+        assert_eq!(super::gib(ByteSize::new(3 << 29)), "1.5 GiB");
 
         let port = crate::core::Port::new(41000).ok_or("zero port")?;
         let other = crate::core::Port::new(6881).ok_or("zero port")?;

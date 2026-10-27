@@ -9,7 +9,7 @@ use super::{
     ClientRefusal, ListedClient, MamFailure, MamMessage, Partials, Points, Purchase, RedKind,
     TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserData,
 };
-use crate::core::{ByteSize, ClientVersion};
+use crate::core::{ByteSize, ClientVersion, Ratio};
 
 /// How often the account is read.
 pub const ACCOUNT_READ_EVERY: Duration = Duration::from_mins(15);
@@ -20,13 +20,13 @@ pub const ACCOUNT_FRESH_FOR: Duration = Duration::from_mins(5);
 /// Unsatisfied slots kept free below MAM's limit.
 pub const UNSATISFIED_RESERVE: UnsatisfiedCount = UnsatisfiedCount::new(2);
 /// Uploaded minus downloaded is kept at least this high.
-pub const UPLOAD_BUFFER: ByteSize = ByteSize(25 << 30);
-/// Upload credit is bought to keep the ratio at this, in thousandths.
-pub const RATIO_TARGET: u64 = 3000;
-/// Below this ratio, in thousandths, every download is held.
-pub const RATIO_FLOOR: u64 = 2000;
-/// Below this ratio, in thousandths, the notice is urgent.
-pub const RATIO_URGENT: u64 = 1100;
+pub const UPLOAD_BUFFER: ByteSize = ByteSize::gib(25);
+/// Upload credit is bought to keep the ratio at this.
+pub const RATIO_TARGET: Ratio = Ratio::from_thousandths(3000);
+/// Below this ratio every download is held.
+pub const RATIO_FLOOR: Ratio = Ratio::from_thousandths(2000);
+/// Below this ratio the notice is urgent.
+pub const RATIO_URGENT: Ratio = Ratio::from_thousandths(1100);
 /// VIP is renewed when less than this remains.
 pub const VIP_RENEW_WITHIN: Duration = Duration::from_hours(14 * 24);
 /// The owner is told when VIP ends within this and is not renewed.
@@ -36,10 +36,10 @@ pub const VIP_FILL: Duration = Duration::from_hours(90 * 24);
 /// Upload credit is bought in steps of this many GiB.
 pub const UPLOAD_STEP: u32 = 50;
 /// Points per GiB of upload credit, as observed on 2026-10-24.
-pub const UPLOAD_PRICE_PER_GIB: u64 = 500;
+pub const UPLOAD_PRICE_PER_GIB: Points = Points::new(500);
 /// Points per week of VIP, as observed on 2026-10-24, until a purchase shows
 /// another price.
-pub const VIP_PRICE_PER_WEEK: u64 = 1250;
+pub const VIP_PRICE_PER_WEEK: Points = Points::new(1250);
 /// A refused purchase is not tried again for this long.
 const REFUSAL_BACKOFF: Duration = Duration::from_hours(6);
 /// A reading wanted early is not requested more often than this.
@@ -159,7 +159,7 @@ pub struct Account {
     /// The latest purchase.
     pub last_purchase: Option<PurchaseRecord>,
     /// Points per week of VIP, from the last VIP purchase.
-    pub vip_price_per_week: u64,
+    pub vip_price_per_week: Points,
     /// MAM's client list.
     pub client_list: Option<ClientList>,
     client_stats_read: Option<Instant>,
@@ -298,10 +298,10 @@ impl Account {
             Purchase::Vip => Some(after.vip_until > before.vip_until),
             Purchase::Upload(amount) => {
                 let gib = u64::from(amount.into_inner());
-                let price = gib.saturating_mul(UPLOAD_PRICE_PER_GIB);
-                let spent = before.points.0.saturating_sub(after.points.0);
-                let credited = after.uploaded.0.saturating_sub(before.uploaded.0) >= gib << 30;
-                match (spent >= price / 2, credited) {
+                let price = UPLOAD_PRICE_PER_GIB.times(gib);
+                let spent = before.points.less(after.points);
+                let credited = after.uploaded.less(before.uploaded) >= ByteSize::gib(gib);
+                match (spent.times(2) >= price, credited) {
                     (false, _) => Some(false),
                     (true, true) => Some(true),
                     (true, false) => None,
@@ -398,15 +398,15 @@ impl Account {
         }
     }
 
-    /// The ratio in thousandths, if anything was downloaded.
+    /// The ratio, if anything was downloaded.
     #[must_use]
-    pub fn ratio(&self) -> Option<u64> {
-        self.data().and_then(UserData::ratio_thousandths)
+    pub fn ratio(&self) -> Option<Ratio> {
+        self.data().and_then(UserData::ratio)
     }
 
     /// Whether the ratio is below the floor, and whether urgently.
     #[must_use]
-    pub fn ratio_low(&self) -> Option<(u64, bool)> {
+    pub fn ratio_low(&self) -> Option<(Ratio, bool)> {
         self.ratio()
             .filter(|ratio| *ratio < RATIO_FLOOR)
             .map(|ratio| (ratio, ratio < RATIO_URGENT))
@@ -473,7 +473,7 @@ impl Account {
             )
         });
         let data = self.fresh(now, since).filter(|_| !waiting)?;
-        let affordable = |cost: u64| data.points.0 >= reserve.0.saturating_add(cost);
+        let affordable = |cost: Points| data.points >= reserve.plus(cost);
         let backed_off = |wanted: Purchase| {
             self.refused.is_some_and(|(refused, at)| {
                 same_kind(refused, wanted) && now.saturating_duration_since(at) < REFUSAL_BACKOFF
@@ -485,26 +485,24 @@ impl Account {
         {
             return Some(Purchase::Vip);
         }
-        let below_target = data.buffer() < UPLOAD_BUFFER
-            || data
-                .ratio_thousandths()
-                .is_some_and(|ratio| ratio < RATIO_TARGET);
+        let below_target =
+            data.buffer() < UPLOAD_BUFFER || data.ratio().is_some_and(|ratio| ratio < RATIO_TARGET);
         let upload = Purchase::Upload(UploadCredit::try_new(UPLOAD_STEP).ok()?);
         (below_target
-            && affordable(u64::from(UPLOAD_STEP) * UPLOAD_PRICE_PER_GIB)
+            && affordable(UPLOAD_PRICE_PER_GIB.times(u64::from(UPLOAD_STEP)))
             && !backed_off(upload))
         .then_some(upload)
     }
 
     /// The expected price of renewing VIP now, when it is due for renewal.
     #[must_use]
-    pub fn vip_cost(&self, data: &UserData, now: SystemTime) -> Option<u64> {
+    pub fn vip_cost(&self, data: &UserData, now: SystemTime) -> Option<Points> {
         let hundredths = vip_hundredths(data, now)?;
-        Some(
+        Some(Points::new(
             hundredths
-                .saturating_mul(self.vip_price_per_week)
+                .saturating_mul(self.vip_price_per_week.get())
                 .div_ceil(100),
-        )
+        ))
     }
 
     pub(super) fn buying(&mut self, purchase: Purchase, now: Instant, wall: SystemTime) {
@@ -545,10 +543,9 @@ impl Account {
             record.before,
             record.vip_hundredths,
         ) {
-            let price =
-                before.points.0.saturating_sub(after.0).saturating_mul(100) / hundredths.max(1);
-            self.vip_price_per_week = Some(price)
-                .filter(|price| *price > 0)
+            let price = before.points.less(*after).times(100).get() / hundredths.max(1);
+            self.vip_price_per_week = Some(Points::new(price))
+                .filter(|price| *price > Points::default())
                 .unwrap_or(self.vip_price_per_week);
         }
         if let PurchaseOutcome::Refused(_) = outcome {

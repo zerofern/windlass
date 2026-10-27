@@ -66,7 +66,7 @@ pub(super) fn read(bytes: &[u8]) -> Option<TorrentFile> {
         });
     Some(TorrentFile {
         hash: TorrentHash::parse(&hex)?,
-        size: ByteSize(size),
+        size: ByteSize::new(size),
     })
 }
 
@@ -158,7 +158,7 @@ mod tests {
                 file.as_ref().map(|file| file.hash.as_str().to_owned()),
                 Some(hex(info))
             );
-            assert_eq!(file.map(|file| file.size), Some(ByteSize(size)));
+            assert_eq!(file.map(|file| file.size), Some(ByteSize::new(size)));
         }
     }
 

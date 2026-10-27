@@ -163,7 +163,7 @@ impl Client {
 
     async fn sync(&self, position: SyncPosition) -> Outcome<SyncUpdate> {
         let raw: RawSync = self
-            .json(&format!("api/v2/sync/maindata?rid={}", position.0))
+            .json(&format!("api/v2/sync/maindata?rid={}", position.get()))
             .await?;
         raw.into_update()
     }
@@ -364,7 +364,7 @@ impl RawSync {
     fn into_update(self) -> Outcome<SyncUpdate> {
         let hash = |hash: &str| TorrentHash::parse(hash).ok_or(QbittorrentFailure::Malformed);
         Ok(SyncUpdate {
-            position: SyncPosition(self.rid),
+            position: SyncPosition::new(self.rid),
             scope: if self.full_update {
                 SyncScope::Full
             } else {
@@ -432,10 +432,10 @@ fn torrent_update(fields: Value) -> Outcome<TorrentUpdate> {
             .progress
             .map(|progress| Progress::from_fraction(progress).ok_or(QbittorrentFailure::Malformed))
             .transpose()?,
-        size: raw.size.map(ByteSize),
-        total_size: raw.total_size.map(ByteSize),
-        downloaded: raw.completed.map(ByteSize),
-        uploaded: raw.uploaded.map(ByteSize),
+        size: raw.size.map(ByteSize::new),
+        total_size: raw.total_size.map(ByteSize::new),
+        downloaded: raw.completed.map(ByteSize::new),
+        uploaded: raw.uploaded.map(ByteSize::new),
         ratio: raw
             .ratio
             .map(|ratio| Ratio::from_float(ratio).ok_or(QbittorrentFailure::Malformed))
@@ -496,7 +496,7 @@ mod tests {
         for (request, expected) in [
             (Request::Connect, QbittorrentEvent::ConnectFailed { reason }),
             (
-                Request::Sync(SyncPosition(0)),
+                Request::Sync(SyncPosition::new(0)),
                 QbittorrentEvent::SyncFailed { reason },
             ),
             (
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(update.name, None);
         assert_eq!(update.state, None);
         assert_eq!(update.progress, Progress::from_fraction(0.5));
-        assert_eq!(update.size, Some(ByteSize(10)));
+        assert_eq!(update.size, Some(ByteSize::new(10)));
         Ok(())
     }
 

@@ -13,6 +13,11 @@ use windlass::core::{
 
 const TOPIC: &str = "windlass-alerts";
 
+/// A notice id; ids in these tests count from 1.
+fn notice_id(id: u64) -> NoticeId {
+    NoticeId::new(id).unwrap_or_else(|| unreachable!("ids count from 1"))
+}
+
 /// How far the notifications log was read at startup.
 #[derive(Clone, Copy)]
 enum Log {
@@ -72,7 +77,7 @@ impl Harness {
         assert!(opened.contains(&Action::ReadNoticeLog));
         if let Log::Read(last) = log {
             let _ = harness.send(Event::Notification(NotificationEvent::LogRead {
-                last: last.map(NoticeId::new),
+                last: last.and_then(NoticeId::new),
             }));
         }
         harness
@@ -158,6 +163,13 @@ fn timer(actions: &[Action], expected: TimerName) -> Option<(TimerId, Duration)>
 }
 
 #[test]
+fn notice_ids_count_from_one() {
+    assert_eq!(NoticeId::new(0), None);
+    assert_eq!(NoticeId::new(1), Some(NoticeId::FIRST));
+    assert_eq!(notice_id(7).get(), 7);
+}
+
+#[test]
 fn every_notice_is_logged_and_only_urgent_ones_are_pushed_with_their_entry() {
     let mut harness = Harness::new(Some(TOPIC));
     let actions = harness.send(Event::Notification(NotificationEvent::SendTest));
@@ -171,7 +183,7 @@ fn every_notice_is_logged_and_only_urgent_ones_are_pushed_with_their_entry() {
     assert_eq!(
         pushes,
         [Push {
-            entry: Some(NoticeId::new(2)),
+            entry: Some(notice_id(2)),
             notice: Notice::Test
         }],
         "the start took the first entry"
@@ -179,7 +191,7 @@ fn every_notice_is_logged_and_only_urgent_ones_are_pushed_with_their_entry() {
     assert!(actions.iter().any(|action| matches!(
         action,
         Action::SaveNotice { entry, forget_through: None }
-            if entry.id == NoticeId::new(2) && entry.reach == Reach::Push
+            if entry.id == notice_id(2) && entry.reach == Reach::Push
     )));
     assert_eq!(
         Notice::Started {
@@ -199,7 +211,7 @@ fn ids_continue_from_the_log_and_old_notices_are_forgotten() {
     assert!(ready.iter().any(|action| matches!(
         action,
         Action::SaveNotice { entry, forget_through: Some(through) }
-            if entry.id == NoticeId::new(LOG_KEPT + 5) && *through == NoticeId::new(5)
+            if entry.id == notice_id(LOG_KEPT + 5) && *through == notice_id(5)
     )));
 }
 
@@ -212,18 +224,18 @@ fn notices_wait_for_the_log_to_be_read() {
     let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
     assert!(harness.notices().is_empty());
     let _ = harness.send(Event::Notification(NotificationEvent::LogRead {
-        last: Some(NoticeId::new(9)),
+        last: Some(notice_id(9)),
     }));
     assert_eq!(
         harness.logged,
         [
             (
-                NoticeId::new(10),
+                notice_id(10),
                 Notice::Started {
                     mode: StartupMode::Resume
                 }
             ),
-            (NoticeId::new(11), Notice::Test)
+            (notice_id(11), Notice::Test)
         ]
     );
     assert_eq!(
@@ -234,7 +246,7 @@ fn notices_wait_for_the_log_to_be_read() {
             .iter()
             .map(|push| push.entry)
             .collect::<Vec<_>>(),
-        [Some(NoticeId::new(11))]
+        [Some(notice_id(11))]
     );
     // A second read changes nothing.
     let again = harness.send(Event::Notification(NotificationEvent::LogRead {
@@ -243,7 +255,7 @@ fn notices_wait_for_the_log_to_be_read() {
     assert_eq!(
         harness.core.notifications().log,
         NoticeLog::Ready {
-            next: NoticeId::new(12)
+            next: notice_id(12)
         }
     );
     assert!(again.is_empty());
@@ -607,7 +619,7 @@ fn torrent_problems_are_reported_after_their_grace_periods() -> Result<(), &'sta
     .collect::<Option<Vec<_>>>()
     .ok_or("invalid hash")?;
     let synced = harness.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-        position: SyncPosition(1),
+        position: SyncPosition::new(1),
         scope: windlass::core::SyncScope::Full,
         torrents,
         removed: Vec::new(),

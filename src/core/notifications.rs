@@ -10,6 +10,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     net::IpAddr,
+    num::NonZeroU64,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -18,7 +19,7 @@ use serde::Serialize;
 use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
     Hold, Mam, MamSession, NoticeCount, Partials, Points, Port, PortForwarding, Protection,
-    Purchase, Qbittorrent, QbittorrentFailure, Registry, ReportedVersion, SeedboxStatus,
+    Purchase, Qbittorrent, QbittorrentFailure, Ratio, Registry, ReportedVersion, SeedboxStatus,
     SessionRejection, SettingsState, StartupMode, SwitchAllowance, TimerId, TimerName,
     TorrentCount, TorrentState, Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer,
     registry::SEEDING_TARGET, timer::Timers,
@@ -65,21 +66,25 @@ pub enum SwitchBlock {
 
 /// A notice's place in the notifications log, counting from 1 across restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct NoticeId(u64);
+pub struct NoticeId(NonZeroU64);
 
 impl NoticeId {
-    const FIRST: Self = Self(1);
+    /// The first notice ever logged.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
 
-    /// The id stored for a logged notice.
+    /// The id stored for a logged notice; ids count from 1.
     #[must_use]
-    pub const fn new(id: u64) -> Self {
-        Self(id)
+    pub const fn new(id: u64) -> Option<Self> {
+        match NonZeroU64::new(id) {
+            Some(id) => Some(Self(id)),
+            None => None,
+        }
     }
 
     /// The number the log stores and links name.
     #[must_use]
     pub const fn get(self) -> u64 {
-        self.0
+        self.0.get()
     }
 
     const fn following(self) -> Self {
@@ -272,8 +277,8 @@ pub enum Notice {
     MamStateUnreadable,
     /// The ratio is below 2.0, so downloads are held.
     RatioLow {
-        /// The ratio in thousandths.
-        ratio: u64,
+        /// The ratio.
+        ratio: Ratio,
         /// Whether it is below 1.1.
         urgent: bool,
     },
@@ -868,11 +873,7 @@ impl Notifications {
                 notice,
                 reach,
             },
-            forget_through: id
-                .get()
-                .checked_sub(LOG_KEPT)
-                .filter(|through| *through > 0)
-                .map(NoticeId::new),
+            forget_through: id.get().checked_sub(LOG_KEPT).and_then(NoticeId::new),
         })
     }
 

@@ -10,8 +10,8 @@ use crate::{
         Activity, Bookmarks, ByteSize, Completion, Condition, Delivery, Desired, EntryCount,
         Failover, HistoryState, MamApproval, MamRequestsStatus, MappingFailure, Notifications,
         NtfyTopic, Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding, Protection,
-        Qbittorrent, Ratio, Records, Registry, Session, Setting, SettingStatus, Settings,
-        SettingsState, SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
+        Qbittorrent, Records, Registry, Session, Setting, SettingStatus, Settings, SettingsState,
+        SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
     },
     runner::Observation,
     shell::{
@@ -547,7 +547,7 @@ fn qbittorrent_panel(qbittorrent: &Qbittorrent, forwarded: Option<Port>) -> Mark
 
 fn size(bytes: ByteSize) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes.0;
+    let mut value = bytes.bytes();
     let mut unit = 0;
     let mut tenths = 0;
     while value >= 1024 && unit + 1 < UNITS.len() {
@@ -585,10 +585,6 @@ const fn torrent_state(state: TorrentState) -> &'static str {
 fn progress(torrent: &Torrent) -> String {
     let permille = torrent.progress.permille();
     format!("{}.{}%", permille / 10, permille % 10)
-}
-
-fn ratio(ratio: Ratio) -> String {
-    format!("{}.{:02}", ratio.0 / 1000, ratio.0 % 1000 / 10)
 }
 
 /// The torrent registry, with what qBittorrent reports now; while the
@@ -750,7 +746,7 @@ fn registry_table(records: &Records, session: Option<&Session>, bookmarks: &Book
                                 Some(torrent) => {
                                     td.mono { (progress(torrent)) }
                                     td.mono { (size(torrent.size)) }
-                                    td.mono { (size(torrent.uploaded)) " · ratio " (ratio(torrent.ratio)) }
+                                    td.mono { (size(torrent.uploaded)) " · ratio " (torrent.ratio) }
                                     td {
                                         @match torrent.completed_at {
                                             Some(at) => (time(at, "full")),
@@ -1509,7 +1505,7 @@ mod tests {
                         name: Some(crate::core::TorrentName::try_new("A Synthetic Audiobook").ok()),
                         state: Some(TorrentState::Stopped(crate::core::Completion::Incomplete)),
                         progress: Progress::from_fraction(0.5),
-                        size: Some(ByteSize(1536)),
+                        size: Some(ByteSize::new(1536)),
                         ..TorrentUpdate::default()
                     },
                 ),
@@ -1573,9 +1569,9 @@ mod tests {
         }
         let reading = crate::core::Registry::Reading;
         assert!(render(torrent_list(&Qbittorrent::Disabled, &reading, &none)).is_empty());
-        assert_eq!(size(ByteSize(512)), "512 B");
-        assert_eq!(size(ByteSize(1536)), "1.5 KiB");
-        assert_eq!(size(ByteSize(5 * 1024 * 1024 * 1024)), "5.0 GiB");
+        assert_eq!(size(ByteSize::new(512)), "512 B");
+        assert_eq!(size(ByteSize::new(1536)), "1.5 KiB");
+        assert_eq!(size(ByteSize::new(5 * 1024 * 1024 * 1024)), "5.0 GiB");
         Ok(())
     }
 
@@ -1924,10 +1920,10 @@ mod tests {
             name: Some(crate::core::TorrentName::try_new(name).ok()),
             state: Some(state),
             progress: Progress::from_fraction(1.0),
-            size: Some(ByteSize(2048)),
-            total_size: Some(ByteSize(2048)),
-            uploaded: Some(ByteSize(4096)),
-            ratio: Some(Ratio(1500)),
+            size: Some(ByteSize::new(2048)),
+            total_size: Some(ByteSize::new(2048)),
+            uploaded: Some(ByteSize::new(4096)),
+            ratio: Some(Ratio::from_thousandths(1500)),
             completed_at: Some(Some(SystemTime::UNIX_EPOCH)),
             ..TorrentUpdate::default()
         };
@@ -1941,7 +1937,7 @@ mod tests {
                 preferences: QbittorrentPreferences::default(),
             }),
             Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-                position: SyncPosition(1),
+                position: SyncPosition::new(1),
                 scope: crate::core::SyncScope::Full,
                 torrents: vec![
                     (present, update("An Adopted Book", TorrentState::Seeding)),

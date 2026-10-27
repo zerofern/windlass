@@ -6,7 +6,6 @@
 //! to be valid.
 
 use std::{
-    fmt,
     net::IpAddr,
     time::{Duration, SystemTime},
 };
@@ -15,7 +14,7 @@ use derive_more::Display;
 use nutype::nutype;
 use serde::Serialize;
 
-use super::super::{ByteSize, ClientVersion, MamTorrentId, TorrentHash};
+use super::super::{ByteSize, ClientVersion, MamTorrentId, Ratio, TorrentHash};
 
 /// A request Windlass makes to MAM. Only one is outstanding at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,10 +76,40 @@ pub enum Purchase {
 }
 
 /// Bonus points, as a whole number; MAM's fractions are dropped.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct Points(pub u64);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Display, Serialize)]
+pub struct Points(u64);
 
 impl Points {
+    /// This many points.
+    #[must_use]
+    pub const fn new(points: u64) -> Self {
+        Self(points)
+    }
+
+    /// The number of points.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// These points and those, saturating.
+    #[must_use]
+    pub const fn plus(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+
+    /// These points less those, or none when those are more.
+    #[must_use]
+    pub const fn less(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+
+    /// These points this many times, saturating.
+    #[must_use]
+    pub const fn times(self, count: u64) -> Self {
+        Self(self.0.saturating_mul(count))
+    }
+
     /// Points from MAM's balance, which may carry a fraction; a negative or
     /// non-finite balance is not one.
     #[must_use]
@@ -324,19 +353,16 @@ impl UserClass {
     }
 }
 
-impl fmt::Display for Points {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
 /// An autonomous system number, which MAM uses to lock API sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Asn(pub u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, Serialize)]
+#[display("AS{_0}")]
+pub struct Asn(u32);
 
-impl fmt::Display for Asn {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "AS{}", self.0)
+impl Asn {
+    /// The system with this number.
+    #[must_use]
+    pub const fn new(number: u32) -> Self {
+        Self(number)
     }
 }
 
@@ -488,16 +514,13 @@ impl UserData {
     /// Uploaded minus downloaded bytes; zero when downloads exceed uploads.
     #[must_use]
     pub const fn buffer(&self) -> ByteSize {
-        ByteSize(self.uploaded.0.saturating_sub(self.downloaded.0))
+        self.uploaded.less(self.downloaded)
     }
 
-    /// The ratio in thousandths, or `None` when nothing was downloaded.
+    /// The ratio, or `None` when nothing was downloaded.
     #[must_use]
-    pub fn ratio_thousandths(&self) -> Option<u64> {
-        (self.downloaded.0 > 0).then(|| {
-            u64::try_from(u128::from(self.uploaded.0) * 1000 / u128::from(self.downloaded.0))
-                .unwrap_or(u64::MAX)
-        })
+    pub fn ratio(&self) -> Option<Ratio> {
+        Ratio::of(self.uploaded, self.downloaded)
     }
 
     /// Whether the account is VIP at this time.

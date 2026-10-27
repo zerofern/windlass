@@ -189,7 +189,7 @@ impl Harness {
     fn sync(&mut self, torrents: Vec<TorrentHash>) -> Vec<Action> {
         self.position += 1;
         self.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-            position: SyncPosition(self.position),
+            position: SyncPosition::new(self.position),
             scope: if self.position == 1 {
                 windlass::core::SyncScope::Full
             } else {
@@ -335,7 +335,7 @@ impl Harness {
 fn observation(last: u8, asn: u32) -> IpObservation {
     IpObservation {
         ip: ip(last),
-        asn: Asn(asn),
+        asn: Asn::new(asn),
         provider: windlass::core::NetworkName::try_new("ProtonVPN Proton AG").ok(),
     }
 }
@@ -372,9 +372,9 @@ fn timer(actions: &[Action], name: TimerName) -> Option<(TimerId, Duration)> {
 /// A healthy VIP account.
 fn account(now: SystemTime) -> UserData {
     UserData {
-        uploaded: ByteSize(80 * GIB),
-        downloaded: ByteSize(0),
-        points: Points(60_000),
+        uploaded: ByteSize::new(80 * GIB),
+        downloaded: ByteSize::new(0),
+        points: Points::new(60_000),
         wedges: WedgeCount::new(200),
         class: UserClass::Vip,
         vip_until: now.checked_add(60 * DAY),
@@ -909,7 +909,7 @@ fn a_bookmark_is_queued_wedged_fetched_and_added() {
     );
     let actions = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
         hash: hash('a'),
-        size: ByteSize(GIB),
+        size: ByteSize::new(GIB),
     })));
     assert_eq!(
         harness
@@ -1282,7 +1282,7 @@ fn a_wedge_the_bonus_history_does_not_show_stops_the_torrent() {
     assert_eq!(requests(&actions).len(), 1);
     let _ = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
         hash: hash('b'),
-        size: ByteSize(GIB),
+        size: ByteSize::new(GIB),
     })));
     // The download starts; MAM's bonus history must then show its wedge.
     let actions = harness.later(Duration::from_mins(1));
@@ -1366,7 +1366,7 @@ fn a_wedge_the_bonus_history_shows_spent_is_not_spent_again() {
     );
     let _ = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
         hash: hash('c'),
-        size: ByteSize(GIB),
+        size: ByteSize::new(GIB),
     })));
     assert_eq!(
         harness.record(1).map(|record| record.desired),
@@ -1669,7 +1669,7 @@ fn a_download_whose_freeleech_ends_is_wedged_while_it_runs() {
     );
     let _ = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
         hash: hash('a'),
-        size: ByteSize(GIB),
+        size: ByteSize::new(GIB),
     })));
     assert!(harness.notices().contains(&Notice::WedgedMidDownload));
     let actions = harness.later(Duration::from_mins(1));
@@ -1766,7 +1766,7 @@ fn vip_torrents_need_no_wedge_while_the_account_is_vip() {
     let mut lapsed = account(now);
     lapsed.vip_until = None;
     lapsed.class = UserClass::PowerUser;
-    lapsed.points = Points(1000);
+    lapsed.points = Points::new(1000);
     let actions = listed_with(&mut harness, lapsed, vec![vip]);
     assert_eq!(
         requests(&actions),
@@ -1805,7 +1805,7 @@ fn every_admission_rule_can_hold_a_download() {
     let mut no_wedges = account(now);
     no_wedges.wedges = WedgeCount::new(0);
     no_wedges.vip_until = None;
-    no_wedges.points = Points(1000);
+    no_wedges.points = Points::new(1000);
     check(&mut harness, no_wedges, Hold::NoWedge);
     let mut full = account(now);
     if let Some(summary) = &mut full.summary {
@@ -1820,9 +1820,9 @@ fn every_admission_rule_can_hold_a_download() {
         },
     );
     let mut low = account(now);
-    low.uploaded = ByteSize(GIB);
-    low.downloaded = ByteSize(GIB);
-    low.points = Points(0);
+    low.uploaded = ByteSize::new(GIB);
+    low.downloaded = ByteSize::new(GIB);
+    low.points = Points::new(0);
     check(&mut harness, low, Hold::RatioLow);
     let mut unknown = account(now);
     unknown.summary = None;
@@ -1857,13 +1857,13 @@ fn vip_is_kept_within_the_reserve() {
     assert_eq!(requests(&actions), [MamRequest::Buy(Purchase::Vip)]);
     // 80 days at 1,250 points a week cost 14,286 points; MAM charged 14,000.
     let actions = harness.answer(Ok(MamReply::Purchased {
-        points: Points(46_000),
+        points: Points::new(46_000),
     }));
     assert!(harness.notices().contains(&Notice::PurchaseMade {
         purchase: Purchase::Vip,
-        points: Points(46_000)
+        points: Points::new(46_000)
     }));
-    assert_eq!(harness.mam().account.vip_price_per_week, 1225);
+    assert_eq!(harness.mam().account.vip_price_per_week, Points::new(1225));
     // Nothing more is bought until a new reading.
     assert!(
         !requests(&actions)
@@ -1873,7 +1873,7 @@ fn vip_is_kept_within_the_reserve() {
 
     // Within the reserve, VIP is not renewed and the owner is told.
     let mut poor = ending;
-    poor.points = Points(25_000);
+    poor.points = Points::new(25_000);
     poor.vip_until = now.checked_add(5 * DAY);
     let actions = listed_with(&mut harness, poor, Vec::new());
     assert!(
@@ -1918,7 +1918,7 @@ fn an_uncertain_vip_purchase_is_settled_from_the_next_reading() {
     // VIP now ends later: MAM sold it, so nothing is bought again.
     let mut renewed = ending;
     renewed.vip_until = harness.wall().checked_add(90 * DAY);
-    renewed.points = Points(52_000);
+    renewed.points = Points::new(52_000);
     let actions = harness.answer(read(renewed));
     assert!(harness.notices().contains(&Notice::PurchaseSettled {
         purchase: Purchase::Vip,
@@ -1937,7 +1937,7 @@ fn a_purchase_the_reading_cannot_settle_waits_for_the_owner() {
     let actions = harness.register(&actions);
     assert_eq!(requests(&actions).len(), 1);
     let mut thin = account(harness.wall());
-    thin.uploaded = ByteSize(20 * GIB);
+    thin.uploaded = ByteSize::new(20 * GIB);
     let actions = harness.answer(read(thin.clone()));
     let Some(MamRequest::Buy(purchase)) = requests(&actions).first().cloned() else {
         unreachable!("no purchase in {actions:?}");
@@ -1952,7 +1952,7 @@ fn a_purchase_the_reading_cannot_settle_waits_for_the_owner() {
         Some(MamRequest::LoadUserData { .. })
     ));
     let mut spent = thin.clone();
-    spent.points = Points(35_000);
+    spent.points = Points::new(35_000);
     let actions = harness.answer(read(spent.clone()));
     let actions = without_bookmarks(&mut harness, actions);
     assert!(
@@ -1992,7 +1992,7 @@ fn a_purchase_the_reading_cannot_settle_waits_for_the_owner() {
         Some(MamRequest::LoadUserData { .. })
     ));
     let mut earned = spent;
-    earned.points = Points(60_000);
+    earned.points = Points::new(60_000);
     let actions = harness.answer(read(earned));
     assert!(matches!(
         requests(&actions).first(),
@@ -2008,8 +2008,8 @@ fn a_purchase_the_reading_cannot_settle_waits_for_the_owner() {
         Some(MamRequest::LoadUserData { .. })
     ));
     let mut credited = thin;
-    credited.points = Points(35_000);
-    credited.uploaded = ByteSize(70 * GIB);
+    credited.points = Points::new(35_000);
+    credited.uploaded = ByteSize::new(70 * GIB);
     let _ = harness.answer(read(credited));
     assert!(harness.notices().contains(&Notice::PurchaseSettled {
         purchase,
@@ -2023,7 +2023,7 @@ fn upload_credit_keeps_the_buffer_and_uncertain_purchases_wait() {
     let actions = harness.register(&actions);
     assert_eq!(requests(&actions).len(), 1);
     let mut thin = account(harness.wall());
-    thin.uploaded = ByteSize(20 * GIB);
+    thin.uploaded = ByteSize::new(20 * GIB);
     let actions = harness.answer(read(thin.clone()));
     let Some(MamRequest::Buy(Purchase::Upload(amount))) = requests(&actions).first().cloned()
     else {
@@ -2124,7 +2124,7 @@ fn the_account_watches_raise_notices() {
         about_to_drop_client: windlass::core::NoticeCount::new(1),
         ..MamNotices::default()
     });
-    troubled.points = Points(10_000);
+    troubled.points = Points::new(10_000);
     if let Some(summary) = &mut troubled.summary {
         summary.unsatisfied = UnsatisfiedCount::new(130);
         summary.unsatisfied_not_seeding = TorrentCount::new(2);
@@ -2139,13 +2139,13 @@ fn the_account_watches_raise_notices() {
             .into_iter()
             .collect();
     }
-    troubled.uploaded = ByteSize(GIB);
-    troubled.downloaded = ByteSize(GIB);
+    troubled.uploaded = ByteSize::new(GIB);
+    troubled.downloaded = ByteSize::new(GIB);
     let _ = listed_with(&mut harness, troubled, Vec::new());
     let notices = harness.notices();
     for expected in [
         Notice::RatioLow {
-            ratio: 1000,
+            ratio: windlass::core::Ratio::from_thousandths(1000),
             urgent: true,
         },
         Notice::UnsatisfiedNearLimit {
@@ -2162,8 +2162,8 @@ fn the_account_watches_raise_notices() {
             client_warning: true,
         },
         Notice::PointsBelowReserve {
-            points: Points(10_000),
-            reserve: Points(20_000),
+            points: Points::new(10_000),
+            reserve: Points::new(20_000),
         },
     ] {
         assert!(notices.contains(&expected), "{expected:?} in {notices:?}");
@@ -2307,8 +2307,8 @@ fn upload_credit_restores_a_ratio_below_three() {
     let actions = harness.register(&actions);
     assert_eq!(requests(&actions).len(), 1);
     let mut middling = account(harness.wall());
-    middling.uploaded = ByteSize(60 * GIB);
-    middling.downloaded = ByteSize(30 * GIB);
+    middling.uploaded = ByteSize::new(60 * GIB);
+    middling.downloaded = ByteSize::new(30 * GIB);
     let actions = harness.answer(read(middling));
     assert!(matches!(
         requests(&actions).first(),
@@ -2416,7 +2416,7 @@ fn a_fetched_torrent_already_in_qbittorrent_keeps_its_row() {
     );
     let _ = harness.answer(Ok(MamReply::Fetched(FetchedTorrent {
         hash: hash('e'),
-        size: ByteSize(GIB),
+        size: ByteSize::new(GIB),
     })));
     let Registry::Loaded(records) = harness.core.registry() else {
         unreachable!("loaded")
@@ -2514,7 +2514,7 @@ fn the_points_reserve_is_a_saved_setting() {
     let _ = harness.send(Event::Settings(SettingsEvent::PointsReserveWritten));
     assert_eq!(
         harness.core.settings().points_reserve(),
-        Some(Points(30_000))
+        Some(Points::new(30_000))
     );
 }
 

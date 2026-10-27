@@ -399,8 +399,7 @@ pub(super) fn message(notice: &Notice) -> Message {
         } => at_mam(
             "Ratio below 2.0",
             format!(
-                "MAM reports a ratio of {}. Every download is held until you find out why.",
-                ratio(*value)
+                "MAM reports a ratio of {value}. Every download is held until you find out why."
             ),
             if *urgent { 5 } else { 4 },
         ),
@@ -652,11 +651,6 @@ pub(super) fn message(notice: &Notice) -> Message {
     }
 }
 
-/// A ratio in thousandths, with two decimals.
-fn ratio(thousandths: u64) -> String {
-    format!("{}.{:02}", thousandths / 1000, thousandths % 1000 / 10)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -781,11 +775,11 @@ mod tests {
             Notice::MamIpKnown,
             Notice::MamStateUnreadable,
             Notice::RatioLow {
-                ratio: 1500,
+                ratio: crate::core::Ratio::from_thousandths(1500),
                 urgent: false,
             },
             Notice::RatioLow {
-                ratio: 1050,
+                ratio: crate::core::Ratio::from_thousandths(1050),
                 urgent: true,
             },
             Notice::RatioRestored,
@@ -825,8 +819,8 @@ mod tests {
             Notice::DownloadsResumed,
             Notice::NoWedgesLeft,
             Notice::PointsBelowReserve {
-                points: Points(10_000),
-                reserve: Points(20_000),
+                points: Points::new(10_000),
+                reserve: Points::new(20_000),
             },
             Notice::VipEnding {
                 until: SystemTime::UNIX_EPOCH,
@@ -837,11 +831,11 @@ mod tests {
             Notice::SeedingOnTrack,
             Notice::PurchaseMade {
                 purchase: upload,
-                points: Points(35_000),
+                points: Points::new(35_000),
             },
             Notice::PurchaseMade {
                 purchase: Purchase::Vip,
-                points: Points(35_000),
+                points: Points::new(35_000),
             },
             Notice::PurchaseRefused { purchase: upload },
             Notice::PurchaseUncertain { purchase: upload },
@@ -993,7 +987,7 @@ mod tests {
         );
         let topic = NtfyTopic::parse("windlass-alerts")?;
         let push = Push {
-            entry: Some(crate::core::NoticeId::new(42)),
+            entry: crate::core::NoticeId::new(42),
             notice: Notice::FilesMissing { count: 2 },
         };
         assert_eq!(

@@ -351,7 +351,7 @@ mod tests {
             answer.result,
             Ok(MamReply::Ip(IpObservation {
                 ip,
-                asn: Asn(209_103),
+                asn: Asn::new(209_103),
                 provider: NetworkName::try_new("ProtonVPN Proton AG").ok(),
             }))
         );
@@ -376,9 +376,9 @@ mod tests {
             red("Not Seeding - Not Yet Satisfied", RedKind::NotSeeding, 2)?,
         ];
         let user = |clients| UserData {
-            uploaded: ByteSize(80 << 30),
-            downloaded: ByteSize(0),
-            points: Points(60_000),
+            uploaded: ByteSize::new(80 << 30),
+            downloaded: ByteSize::new(0),
+            points: Points::new(60_000),
             wedges: WedgeCount::new(200),
             class: UserClass::Vip,
             vip_until: Some(SystemTime::UNIX_EPOCH + VIP_UNTIL),
@@ -475,7 +475,7 @@ mod tests {
             answer.result,
             Ok(MamReply::Fetched(FetchedTorrent {
                 hash: TorrentHash::parse(&hash).ok_or("hash")?,
-                size: ByteSize(1_048_576),
+                size: ByteSize::new(1_048_576),
             }))
         );
         assert_eq!(answer.file, Some(file));
@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(
             answer.result,
             Ok(MamReply::Purchased {
-                points: Points(35_000)
+                points: Points::new(35_000)
             })
         );
         let answer = ask(&client, MamRequest::Buy(Purchase::Vip), &cookie).await;

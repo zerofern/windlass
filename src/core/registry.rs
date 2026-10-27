@@ -645,8 +645,8 @@ impl Records {
             .filter_map(|record| {
                 let hash = record.identity.hash()?;
                 let torrent = session.torrents.get(hash)?;
-                let untouched =
-                    torrent.progress == Progress::default() && torrent.downloaded == ByteSize(0);
+                let untouched = torrent.progress == Progress::default()
+                    && torrent.downloaded == ByteSize::new(0);
                 (matches!(torrent.state, TorrentState::Stopped(_))
                     && !(record.origin == Origin::Adopted && untouched))
                     .then(|| hash.clone())

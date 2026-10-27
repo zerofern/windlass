@@ -681,9 +681,9 @@ async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
         .find(&partial)
         .and_then(|row| row.observation.clone())
         .ok_or("partial torrent not observed")?;
-    assert_eq!(seen.torrent.total_size, ByteSize(10));
-    assert_eq!(seen.torrent.uploaded, ByteSize(2048));
-    assert_eq!(seen.torrent.ratio, Ratio(1500));
+    assert_eq!(seen.torrent.total_size, ByteSize::new(10));
+    assert_eq!(seen.torrent.uploaded, ByteSize::new(2048));
+    assert_eq!(seen.torrent.ratio, Ratio::from_thousandths(1500));
     assert_eq!(seen.torrent.seeding_time, Duration::from_hours(1));
     assert_eq!(seen.torrent.completed_at, None);
     assert!(seen.torrent.added_at.is_some());

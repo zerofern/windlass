@@ -252,12 +252,12 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
             preferences: preferences(6881),
         }),
         vec![Action::SyncQbittorrent {
-            position: SyncPosition(0)
+            position: SyncPosition::new(0)
         }]
     );
     assert_eq!(session(&harness).approval, MamApproval::Recommended);
     let full = SyncUpdate {
-        position: SyncPosition(1),
+        position: SyncPosition::new(1),
         scope: windlass::core::SyncScope::Full,
         torrents: vec![
             (
@@ -266,7 +266,7 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
                     name: Some(windlass::core::TorrentName::try_new("first").ok()),
                     state: Some(TorrentState::Downloading),
                     progress: Progress::from_fraction(0.25),
-                    size: Some(ByteSize(100)),
+                    size: Some(ByteSize::new(100)),
                     ..TorrentUpdate::default()
                 },
             ),
@@ -285,11 +285,11 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
     assert_eq!(
         harness.expire(TimerName::QbittorrentPoll, poll),
         vec![Action::SyncQbittorrent {
-            position: SyncPosition(1)
+            position: SyncPosition::new(1)
         }]
     );
     let partial = SyncUpdate {
-        position: SyncPosition(2),
+        position: SyncPosition::new(2),
         scope: windlass::core::SyncScope::Changes,
         torrents: vec![(
             hash('a'),
@@ -314,7 +314,7 @@ fn qbittorrent_is_polled_and_its_torrents_are_merged() {
             windlass::core::TorrentName::try_new("first").ok(),
             TorrentState::Seeding,
             1000,
-            ByteSize(100)
+            ByteSize::new(100)
         ))
     );
     assert!(!session(&harness).torrents.contains_key(&hash('b')));
@@ -339,7 +339,7 @@ fn preferences_are_reread_periodically() {
     let mut actions = Vec::new();
     for poll in 1..=6 {
         actions = harness.qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-            position: SyncPosition(poll),
+            position: SyncPosition::new(poll),
             ..SyncUpdate::default()
         }));
         if poll < 6 {
@@ -389,7 +389,7 @@ fn qbittorrent_follows_the_forwarded_port() {
     assert_eq!(
         harness.expire(TimerName::QbittorrentPoll, poll),
         vec![Action::SyncQbittorrent {
-            position: SyncPosition(0)
+            position: SyncPosition::new(0)
         }]
     );
     // A new lease during a sync is applied once the sync completes.

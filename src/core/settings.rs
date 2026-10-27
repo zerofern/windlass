@@ -44,7 +44,7 @@ impl PointsReserve {
     /// The reserve as points.
     #[must_use]
     pub fn points(self) -> Points {
-        Points(self.into_inner())
+        Points::new(self.into_inner())
     }
 }
 

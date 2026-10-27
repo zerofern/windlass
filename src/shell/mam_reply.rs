@@ -168,7 +168,7 @@ pub(super) fn ip_observation(body: &[u8]) -> Parsed<IpObservation> {
     let answer: IpAnswer = json(body)?;
     Ok(IpObservation {
         ip: answer.ip,
-        asn: Asn(answer.asn.count()?),
+        asn: Asn::new(answer.asn.count()?),
         provider: answer
             .network
             .and_then(|name| NetworkName::try_new(name).ok()),
@@ -238,8 +238,8 @@ struct NoticesAnswer {
 pub(super) fn user_data(body: &[u8]) -> Parsed<UserData> {
     let answer: AccountAnswer = json(body)?;
     Ok(UserData {
-        uploaded: ByteSize(answer.uploaded_bytes.0),
-        downloaded: ByteSize(answer.downloaded_bytes.0),
+        uploaded: ByteSize::new(answer.uploaded_bytes.0),
+        downloaded: ByteSize::new(answer.downloaded_bytes.0),
         points: Points::from_balance(answer.seedbonus.0).ok_or(Malformed)?,
         wedges: WedgeCount::new(answer.wedges.count()?),
         class: UserClass::parse(&answer.classname).ok_or(Malformed)?,

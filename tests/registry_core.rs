@@ -78,7 +78,7 @@ impl Harness {
     fn sync(&mut self, torrents: Vec<(TorrentHash, TorrentUpdate)>) -> Vec<Action> {
         self.position += 1;
         self.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-            position: SyncPosition(self.position),
+            position: SyncPosition::new(self.position),
             scope: if self.position == 1 {
                 windlass::core::SyncScope::Full
             } else {
@@ -126,8 +126,8 @@ fn torrent(state: TorrentState, size: u64, total_size: u64) -> TorrentUpdate {
         name: Some(windlass::core::TorrentName::try_new("A Synthetic Audiobook").ok()),
         state: Some(state),
         progress: Progress::from_fraction(0.5),
-        size: Some(ByteSize(size)),
-        total_size: Some(ByteSize(total_size)),
+        size: Some(ByteSize::new(size)),
+        total_size: Some(ByteSize::new(total_size)),
         save_path: Some(windlass::core::SavePath::try_new("/srv/books").ok()),
         ..TorrentUpdate::default()
     }
@@ -223,7 +223,7 @@ fn significant_changes_save_at_once_and_counters_every_fifteen_minutes() {
     );
     harness.poll(&actions);
     let upload = TorrentUpdate {
-        uploaded: Some(ByteSize(100)),
+        uploaded: Some(ByteSize::new(100)),
         ..TorrentUpdate::default()
     };
     let actions = harness.sync(vec![(hash('a'), upload)]);
@@ -239,7 +239,7 @@ fn significant_changes_save_at_once_and_counters_every_fifteen_minutes() {
         rows.first()
             .and_then(|row| row.observation.as_ref())
             .map(|seen| seen.torrent.uploaded),
-        Some(ByteSize(100)),
+        Some(ByteSize::new(100)),
         "unsaved counters are saved once due"
     );
     let _ = harness.send(Event::Registry(RegistryEvent::Saved));
@@ -305,7 +305,7 @@ fn stopped_active_torrents_are_started_without_repeating_too_soon() {
     assert_eq!(
         harness.send(Event::Qbittorrent(QbittorrentEvent::CommandDone)),
         vec![Action::SyncQbittorrent {
-            position: SyncPosition(1)
+            position: SyncPosition::new(1)
         }],
         "the result is read at once"
     );
@@ -347,7 +347,7 @@ fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult 
     let untouched = TorrentUpdate {
         state: Some(TorrentState::Stopped(Completion::Incomplete)),
         progress: Some(Progress::default()),
-        downloaded: Some(ByteSize(0)),
+        downloaded: Some(ByteSize::new(0)),
         ..TorrentUpdate::default()
     };
     // A torrent found stopped that has downloaded nothing stays stopped;
@@ -528,7 +528,7 @@ fn nothing_is_managed_before_the_full_list_or_without_the_registry() {
     let actions = core.handle(
         now,
         Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-            position: SyncPosition(1),
+            position: SyncPosition::new(1),
             scope: windlass::core::SyncScope::Full,
             torrents: vec![(
                 hash('a'),

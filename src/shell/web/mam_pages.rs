@@ -8,7 +8,7 @@ use maud::{Markup, html};
 use crate::{
     core::{
         Attention, ClientRefusal, Connectability, Connectable, DownloadWatch, LastAttempt, Mam,
-        MamSession, Partials, Points, PurchaseOutcome, PurchaseRecord, RegistrationAllowance,
+        MamSession, Partials, PurchaseOutcome, PurchaseRecord, RegistrationAllowance,
         RegistrationFailure, SeedboxStatus, SettingsState, SettledBy, UPLOAD_BUFFER,
     },
     shell::describe::{client_standing, findings, gib, hold, mam_failure, purchase, rejection},
@@ -155,7 +155,7 @@ fn account_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup
                 dt { "Ratio" }
                 dd {
                     @match account.ratio() {
-                        Some(ratio) => (format!("{}.{:02}", ratio / 1000, ratio % 1000 / 10)),
+                        Some(ratio) => (ratio),
                         None => "Unlimited: nothing downloaded",
                     }
                 }
@@ -192,7 +192,7 @@ fn account_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup
                     dt { "MAM notifications" } dd { (notices.total()) ", not read by Windlass" }
                 }
                 @if let Some(cost) = account.vip_cost(data, now) {
-                    dt { "VIP renewal" } dd { "Due; about " (Points(cost)) " points" }
+                    dt { "VIP renewal" } dd { "Due; about " (cost) " points" }
                 }
                 @if let Some(record) = &account.last_purchase { (last_purchase(record)) }
             }
@@ -374,7 +374,7 @@ mod tests {
         for (state, text) in [
             (None, "waiting for MAM"),
             (
-                Some(PurchaseOutcome::Made(Points(5))),
+                Some(PurchaseOutcome::Made(Points::new(5))),
                 "made; 5 points left",
             ),
             (
@@ -461,9 +461,9 @@ mod tests {
 
     fn data() -> UserData {
         UserData {
-            uploaded: ByteSize(1 << 30),
-            downloaded: ByteSize(1 << 30),
-            points: Points(100),
+            uploaded: ByteSize::new(1 << 30),
+            downloaded: ByteSize::new(1 << 30),
+            points: Points::new(100),
             wedges: WedgeCount::new(3),
             class: UserClass::PowerUser,
             vip_until: Some(SystemTime::UNIX_EPOCH + Duration::from_hours(24)),
@@ -645,7 +645,7 @@ mod tests {
         };
         let observation = IpObservation {
             ip: IpAddr::from([192, 0, 2, 10]),
-            asn: Asn(209_103),
+            asn: Asn::new(209_103),
             provider: NetworkName::try_new("ProtonVPN Proton AG").ok(),
         };
         mam.network.observed = Some(Observed {
@@ -722,8 +722,8 @@ mod tests {
         }
 
         let mut quiet = data();
-        quiet.uploaded = ByteSize(4 << 30);
-        quiet.downloaded = ByteSize(0);
+        quiet.uploaded = ByteSize::new(4 << 30);
+        quiet.downloaded = ByteSize::new(0);
         quiet.vip_until = None;
         quiet.notices = None;
         quiet.summary = Some(SnatchSummary {

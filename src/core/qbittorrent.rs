@@ -274,13 +274,70 @@ impl Progress {
 
 /// A size in bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct ByteSize(pub u64);
+pub struct ByteSize(u64);
 
-/// An upload ratio in thousandths, such as 1500 for 1.5.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct Ratio(pub u64);
+impl ByteSize {
+    /// This many bytes.
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// This many GiB, saturating.
+    #[must_use]
+    pub const fn gib(gib: u64) -> Self {
+        Self(gib.saturating_mul(1 << 30))
+    }
+
+    /// The number of bytes.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+
+    /// Whether this is no bytes.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// This size less that one, or nothing when that one is larger.
+    #[must_use]
+    pub const fn less(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+}
+
+/// An upload ratio, kept in thousandths, such as 1500 for 1.5; shown with two
+/// decimals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Display, Serialize)]
+#[display("{}.{:02}", _0 / 1000, _0 % 1000 / 10)]
+pub struct Ratio(u64);
 
 impl Ratio {
+    /// The ratio this many thousandths make, such as 1500 for 1.5.
+    #[must_use]
+    pub const fn from_thousandths(thousandths: u64) -> Self {
+        Self(thousandths)
+    }
+
+    /// The ratio in thousandths.
+    #[must_use]
+    pub const fn thousandths(self) -> u64 {
+        self.0
+    }
+
+    /// Uploaded over downloaded, or `None` when nothing was downloaded.
+    #[must_use]
+    pub fn of(uploaded: ByteSize, downloaded: ByteSize) -> Option<Self> {
+        (!downloaded.is_zero()).then(|| {
+            Self(
+                u64::try_from(u128::from(uploaded.0) * 1000 / u128::from(downloaded.0))
+                    .unwrap_or(u64::MAX),
+            )
+        })
+    }
+
     /// A ratio from qBittorrent's floating-point value; a negative or
     /// non-finite value is not one.
     #[must_use]
@@ -375,8 +432,22 @@ pub enum TorrentCommand {
 }
 
 /// qBittorrent's position in its stream of incremental updates.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct SyncPosition(pub u64);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Display, Serialize)]
+pub struct SyncPosition(u64);
+
+impl SyncPosition {
+    /// The position qBittorrent named.
+    #[must_use]
+    pub const fn new(position: u64) -> Self {
+        Self(position)
+    }
+
+    /// The number qBittorrent is asked for changes since.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// Whether an update replaces the whole torrent list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
