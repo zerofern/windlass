@@ -242,6 +242,9 @@ impl Account {
     /// The reading to request now: routinely, or early when a decision needs a
     /// fresh one.
     pub(super) fn wanted(&self, now: Instant, early: bool) -> Option<ClientListing> {
+        if self.last_failure.is_some() && self.next_read.is_some_and(|retry_at| now < retry_at) {
+            return None;
+        }
         let routine = self.next_read.is_none_or(|next| next <= now);
         let early = early
             && self
@@ -265,6 +268,9 @@ impl Account {
 
     /// When a routine reading or an early one may next be requested.
     pub(super) fn next_due(&self, early: bool) -> Option<Instant> {
+        if self.last_failure.is_some() {
+            return self.next_read;
+        }
         let early = early
             .then(|| {
                 self.last_request

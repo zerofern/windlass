@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -300,6 +301,10 @@ pub struct Acquisition {
     pub watched: Vec<(Download, DownloadWatch)>,
     /// Running downloads the owner was told about.
     pub reported: BTreeSet<MamTorrentId>,
+    /// Newly fetched torrents may be added until qBittorrent first reports them.
+    pub(super) newly_fetched: BTreeSet<MamTorrentId>,
+    /// Held downloads MAM reapproved for the IP it currently sees.
+    pub(super) reapproved: BTreeMap<MamTorrentId, IpAddr>,
     lookup_failed: Option<Instant>,
     history_failed: Option<Instant>,
 }
@@ -323,6 +328,8 @@ impl Acquisition {
             wedge_attempts: BTreeMap::new(),
             watched: Vec::new(),
             reported: BTreeSet::new(),
+            newly_fetched: BTreeSet::new(),
+            reapproved: BTreeMap::new(),
             lookup_failed: None,
             history_failed: None,
         }

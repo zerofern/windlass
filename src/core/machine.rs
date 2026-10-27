@@ -152,21 +152,7 @@ impl Core {
         if self.mam.take_lease_renewal() == LeaseRenewal::Requested {
             actions.extend(self.port_forwarding.renew());
         }
-        let registry = &mut self.registry;
-        let wanted = super::Wanted {
-            listen_port: self.port_forwarding.forwarded_port(),
-            queue: self
-                .settings
-                .torrent_limits()
-                .map(super::QueuePreferences::for_limits),
-        };
-        actions.extend(
-            self.qbittorrent
-                .decide(occurred_at, &mut self.timers, wanted, |session| {
-                    registry.command(occurred_at.monotonic, session)
-                }),
-        );
-        actions.extend(self.qbittorrent.follow_preferences(wanted));
+        actions.extend(self.decide_qbittorrent(occurred_at));
         actions.extend(
             self.history
                 .after_step(self.step, self.settings.history_limit()),
@@ -271,6 +257,25 @@ impl Core {
             registry: &self.registry,
         };
         self.mam.decide(now, &context, &mut self.timers)
+    }
+
+    fn decide_qbittorrent(&mut self, now: ClockReading) -> Vec<Action> {
+        let wanted = super::Wanted {
+            listen_port: self.port_forwarding.forwarded_port(),
+            queue: self
+                .settings
+                .torrent_limits()
+                .map(super::QueuePreferences::for_limits),
+        };
+        let registry = &mut self.registry;
+        let mam = &self.mam;
+        let mut actions = self
+            .qbittorrent
+            .decide(now, &mut self.timers, wanted, |session| {
+                registry.command(now.monotonic, session, |id| mam.permits_download(id))
+            });
+        actions.extend(self.qbittorrent.follow_preferences(wanted));
+        actions
     }
 
     fn glance(&self) -> Glance {

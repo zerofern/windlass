@@ -315,9 +315,16 @@ impl Registry {
     }
 
     /// The change qBittorrent needs to match the registry, if any.
-    pub(super) fn command(&mut self, now: Instant, session: &Session) -> Option<TorrentCommand> {
+    pub(super) fn command(
+        &mut self,
+        now: Instant,
+        session: &Session,
+        permits_download: impl Fn(MamTorrentId) -> bool,
+    ) -> Option<TorrentCommand> {
         match self {
-            Self::Loaded(records) if session.listed() => records.command(now, session),
+            Self::Loaded(records) if session.listed() => {
+                records.command(now, session, permits_download)
+            }
             _ => None,
         }
     }
@@ -342,8 +349,16 @@ impl Records {
             .iter()
             .filter_map(|record| Some((record.identity.hash()?.clone(), record.id)))
             .collect();
+        // A fetched bookmark may leave a removed history row with the same
+        // MAM ID as its live row. The live row must win after a restart.
         let by_mam = records
             .iter()
+            .filter(|record| record.desired == Desired::Removed)
+            .chain(
+                records
+                    .iter()
+                    .filter(|record| record.desired != Desired::Removed),
+            )
             .filter_map(|record| Some((record.identity.mam_id()?, record.id)))
             .collect();
         let entries = records
@@ -545,6 +560,7 @@ impl Records {
     /// qBittorrent keeps its row, which gains the MAM ID; the queued row stays
     /// as history.
     fn link(&mut self, id: RecordId, mam: MamTorrentId, hash: TorrentHash) {
+        let origin = self.entries.get(&id).map(|entry| entry.record.origin);
         let target = match self.by_hash.get(&hash) {
             Some(&existing) if existing != id => {
                 self.set_desired(id, Desired::Removed);
@@ -557,9 +573,12 @@ impl Records {
             mam,
             hash: hash.clone(),
         };
-        self.entries
-            .entry(target)
-            .and_modify(|entry| entry.record.identity = identity);
+        self.entries.entry(target).and_modify(|entry| {
+            entry.record.identity = identity;
+            if let Some(origin) = origin {
+                entry.record.origin = origin;
+            }
+        });
         self.set_desired(target, Desired::Active);
         self.by_hash.insert(hash, target);
     }
@@ -615,8 +634,13 @@ impl Records {
         vec![Action::SaveTorrents { records }]
     }
 
-    fn command(&mut self, now: Instant, session: &Session) -> Option<TorrentCommand> {
-        let command = self.reconcile(session)?;
+    fn command(
+        &mut self,
+        now: Instant,
+        session: &Session,
+        permits_download: impl Fn(MamTorrentId) -> bool,
+    ) -> Option<TorrentCommand> {
+        let command = self.reconcile(session, permits_download)?;
         if let Some((last, at)) = &self.last_command
             && *last == command
             && now.duration_since(*at) < COMMAND_REPEAT_AFTER
@@ -627,17 +651,19 @@ impl Records {
         Some(command)
     }
 
-    /// The first change needed: removals, whole content, held torrents
-    /// stopped, fetched torrents added, starts, then force starts: a complete
+    /// The first change needed: removals, held torrents stopped, whole content,
+    /// fetched torrents added, starts, then force starts: a complete
     /// torrent short of the seeding target runs regardless of qBittorrent's
     /// queue, and goes back to the queue once it has seeded long enough.
     ///
-    /// Nothing here adds an unsatisfied torrent on MAM: a torrent that already
-    /// downloaded something is counted already, and a torrent found stopped
-    /// that has downloaded nothing is left stopped, since starting it would
-    /// pass the unsatisfied limit's check. Windlass's own downloads passed it
-    /// when they were admitted.
-    fn reconcile(&self, session: &Session) -> Option<TorrentCommand> {
+    /// A saved incomplete MAM download needs current MAM permission before
+    /// transferring content. A torrent found stopped that downloaded nothing
+    /// also stays stopped unless Windlass admitted it.
+    fn reconcile(
+        &self,
+        session: &Session,
+        permits_download: impl Fn(MamTorrentId) -> bool,
+    ) -> Option<TorrentCommand> {
         let present = |desired: Desired| {
             self.records()
                 .filter(move |record| record.desired == desired)
@@ -652,9 +678,6 @@ impl Records {
         if !removed.is_empty() {
             return Some(TorrentCommand::Remove(removed));
         }
-        if let Some((hash, _)) = present(Desired::Active).find(|(_, torrent)| partial(torrent)) {
-            return Some(TorrentCommand::SelectAllFiles(hash.clone()));
-        }
         let running: Vec<TorrentHash> = present(Desired::Held)
             .filter(|(_, torrent)| !matches!(torrent.state, TorrentState::Stopped(_)))
             .map(|(hash, _)| hash.clone())
@@ -662,10 +685,21 @@ impl Records {
         if !running.is_empty() {
             return Some(TorrentCommand::Stop(running));
         }
+        if let Some((hash, _)) = self.records().find_map(|record| {
+            let hash = record.identity.hash()?;
+            let torrent = session.torrents.get(hash)?;
+            (record.desired == Desired::Active
+                && partial(torrent)
+                && record.identity.mam_id().is_none_or(&permits_download))
+            .then_some((hash, torrent))
+        }) {
+            return Some(TorrentCommand::SelectAllFiles(hash.clone()));
+        }
         let missing = self.records().find_map(|record| match &record.identity {
             Identity::Linked { mam, hash }
                 if record.desired == Desired::Active
                     && record.origin != Origin::Adopted
+                    && permits_download(*mam)
                     && !session.torrents.contains_key(hash) =>
             {
                 Some(TorrentCommand::Add {
@@ -687,8 +721,11 @@ impl Records {
                 let untouched = torrent.progress == Progress::default()
                     && torrent.downloaded == ByteSize::new(0);
                 (matches!(torrent.state, TorrentState::Stopped(_))
-                    && !(record.origin == Origin::Adopted && untouched))
-                    .then(|| hash.clone())
+                    && !(record.origin == Origin::Adopted && untouched)
+                    && ((matches!(torrent.state, TorrentState::Stopped(Completion::Complete))
+                        && !partial(torrent))
+                        || record.identity.mam_id().is_none_or(&permits_download)))
+                .then(|| hash.clone())
             })
             .collect();
         if !stopped.is_empty() {
@@ -699,7 +736,9 @@ impl Records {
         };
         let force: Vec<TorrentHash> = present(Desired::Active)
             .filter(|(_, torrent)| {
-                unsatisfied(torrent) && torrent.force_start == ForceStart::NotForced
+                unsatisfied(torrent)
+                    && !partial(torrent)
+                    && torrent.force_start == ForceStart::NotForced
             })
             .map(|(hash, _)| hash.clone())
             .collect();

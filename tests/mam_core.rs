@@ -1717,6 +1717,89 @@ fn running_download(listing: Bookmark, wedges: u32) -> (Harness, Vec<Action>) {
 }
 
 #[test]
+fn a_saved_download_is_readded_only_after_mam_confirms_it_is_free() {
+    let now = SystemTime::UNIX_EPOCH + EPOCH;
+    let (mut harness, actions) = Harness::start(Setup {
+        rows: Some(vec![download_row(
+            1,
+            'a',
+            Duration::from_hours(3),
+            false,
+            now,
+        )]),
+        ..Setup::default()
+    });
+    let before = harness.poll(Vec::new());
+    assert!(
+        !before.iter().any(|action| matches!(
+            action,
+            Action::QbittorrentCommand {
+                command: TorrentCommand::Add { .. }
+            }
+        )),
+        "the stored intent alone cannot start a download"
+    );
+    let _ = harness.register(&actions);
+    let actions = harness.answer(read(account(harness.wall())));
+    let mut free = bookmark(1);
+    free.freeleech = Freeleech::ForEveryone;
+    let _ = harness.checked(actions, &[free]);
+    let after = harness.poll(Vec::new());
+    assert!(after.contains(&Action::QbittorrentCommand {
+        command: TorrentCommand::Add {
+            mam: torrent_id(1),
+            hash: hash('a'),
+        }
+    }));
+}
+
+#[test]
+fn a_held_download_resumes_after_a_fresh_free_check_during_registration_cooldown() {
+    let now = SystemTime::UNIX_EPOCH + EPOCH;
+    let mut row = download_row(1, 'a', Duration::from_hours(3), false, now);
+    row.desired = Desired::Held;
+    let (mut harness, actions) = Harness::start(Setup {
+        rows: Some(vec![row]),
+        last_registration: Some(Duration::from_mins(1)),
+        ..Setup::default()
+    });
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+    let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::LoadUserData { .. }]
+    ));
+    let actions = harness.answer(read(account(harness.wall())));
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::ListBookmarks { .. }]
+    ));
+    let actions = harness.answer(listed(Vec::new()));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LookUpTorrent { id: torrent_id(1) }]
+    );
+    let mut free = bookmark(1);
+    free.freeleech = Freeleech::ForEveryone;
+    let _ = harness.answer(Ok(MamReply::Torrent(Some(Box::new(free)))));
+    assert_eq!(
+        harness.record(1).map(|record| record.desired),
+        Some(Desired::Active)
+    );
+    assert!(matches!(
+        harness.mam().seedbox.status,
+        SeedboxStatus::Unconfirmed
+    ));
+    let actions = harness.poll(Vec::new());
+    assert!(actions.contains(&Action::QbittorrentCommand {
+        command: TorrentCommand::Add {
+            mam: torrent_id(1),
+            hash: hash('a'),
+        }
+    }));
+}
+
+#[test]
 fn a_download_whose_freeleech_ends_is_wedged_while_it_runs() {
     let mut free = bookmark(1);
     free.freeleech = Freeleech::ForEveryone;
@@ -2411,6 +2494,32 @@ fn a_pause_while_saving_an_attempt_keeps_it_unsent_but_counted() {
 }
 
 #[test]
+fn a_queued_bookmark_does_not_bypass_the_accounts_retry_after() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::LoadUserData { .. }]
+    ));
+    let actions = harness.answer(Err(MamFailure::TooSoon {
+        retry_after: Some(Duration::from_mins(9)),
+    }));
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::ListBookmarks { .. }]
+    ));
+    let _ = harness.answer(listed(vec![bookmark(1)]));
+    harness.advance(Duration::from_mins(1));
+    let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::LoadUserData { .. })),
+        "an early refresh must honor MAM's nine-minute wait"
+    );
+}
+
+#[test]
 fn failed_readings_listings_and_lookups_are_retried_later() {
     let (mut harness, actions) = Harness::start(Setup::default());
     assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
@@ -2638,6 +2747,20 @@ fn a_fetched_torrent_already_in_qbittorrent_keeps_its_row() {
             ),
         ]
     );
+    let restored_rows = records.records().cloned().collect();
+    let (restored, _) = Harness::start(Setup {
+        rows: Some(restored_rows),
+        ..Setup::default()
+    });
+    let live = restored
+        .record(11)
+        .unwrap_or_else(|| unreachable!("linked row"));
+    assert!(matches!(
+        live.identity,
+        windlass::core::Identity::Linked { .. }
+    ));
+    assert_eq!(live.desired, Desired::Active);
+    assert_eq!(live.origin, windlass::core::Origin::Bookmark);
 }
 
 #[test]

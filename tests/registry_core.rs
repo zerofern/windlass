@@ -335,6 +335,100 @@ fn stopped_active_torrents_are_started_without_repeating_too_soon() {
 }
 
 #[test]
+fn restart_waits_for_mam_before_starting_a_saved_download() -> TestResult {
+    let row = record(
+        1,
+        Identity::Linked {
+            mam: MamTorrentId::new(1).ok_or("zero MAM id")?,
+            hash: hash('a'),
+        },
+        Desired::Active,
+    )?;
+    let mut harness = Harness::new(vec![row]);
+    let actions = harness.sync(vec![(
+        hash('a'),
+        torrent(TorrentState::Stopped(Completion::Incomplete), 10, 10),
+    )]);
+    assert_eq!(command(&actions), None);
+    Ok(())
+}
+
+#[test]
+fn a_complete_saved_torrent_can_resume_seeding_without_mam() -> TestResult {
+    let row = record(
+        1,
+        Identity::Linked {
+            mam: MamTorrentId::new(1).ok_or("zero MAM id")?,
+            hash: hash('a'),
+        },
+        Desired::Active,
+    )?;
+    let mut harness = Harness::new(vec![row]);
+    let actions = harness.sync(vec![(
+        hash('a'),
+        torrent(TorrentState::Stopped(Completion::Complete), 10, 10),
+    )]);
+    assert_eq!(
+        command(&actions),
+        Some(&TorrentCommand::Start(vec![hash('a')]))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_partial_saved_torrent_waits_for_mam_before_selecting_more_files() -> TestResult {
+    let row = record(
+        1,
+        Identity::Linked {
+            mam: MamTorrentId::new(1).ok_or("zero MAM id")?,
+            hash: hash('a'),
+        },
+        Desired::Active,
+    )?;
+    let mut harness = Harness::new(vec![row]);
+    let mut partial = torrent(TorrentState::Stopped(Completion::Complete), 5, 10);
+    partial.completed_at = Some(Some(SystemTime::UNIX_EPOCH));
+    let actions = harness.sync(vec![(hash('a'), partial)]);
+    assert_eq!(command(&actions), None);
+    harness.poll(&actions);
+    let actions = harness.sync(vec![(
+        hash('a'),
+        TorrentUpdate {
+            state: Some(TorrentState::SeedQueued),
+            seeding_time: Some(Duration::from_hours(1)),
+            ..TorrentUpdate::default()
+        },
+    )]);
+    assert_eq!(command(&actions), None, "a partial seed is not forced");
+    Ok(())
+}
+
+#[test]
+fn a_held_download_stops_even_while_another_torrent_needs_files_selected() -> TestResult {
+    let row = record(
+        1,
+        Identity::Linked {
+            mam: MamTorrentId::new(1).ok_or("zero MAM id")?,
+            hash: hash('a'),
+        },
+        Desired::Held,
+    )?;
+    let mut harness = Harness::new(vec![row]);
+    let actions = harness.sync(vec![
+        (hash('a'), torrent(TorrentState::Downloading, 10, 10)),
+        (hash('b'), torrent(TorrentState::Downloading, 5, 10)),
+    ]);
+    assert_eq!(
+        command(&actions),
+        Some(&TorrentCommand::Stop(vec![hash('a')]))
+    );
+    let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::CommandDone));
+    let actions = harness.sync(Vec::new());
+    assert_eq!(command(&actions), None, "the same stop waits for its retry");
+    Ok(())
+}
+
+#[test]
 fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult {
     let mam = MamTorrentId::new(5).ok_or("zero id")?;
     let ours = record(
@@ -352,14 +446,12 @@ fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult 
         downloaded: Some(ByteSize::new(0)),
         ..TorrentUpdate::default()
     };
-    // A torrent found stopped that has downloaded nothing stays stopped;
-    // Windlass's own download, admitted against the limit, is started.
+    // A torrent found stopped that has downloaded nothing stays stopped.
+    // After a restart, even Windlass's earlier admission needs MAM to verify
+    // that the torrent is still free before it may start.
     let actions = harness.sync(vec![(hash('a'), untouched.clone()), (hash('b'), untouched)]);
-    assert_eq!(
-        command(&actions),
-        Some(&TorrentCommand::Start(vec![hash('b')]))
-    );
-    let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::CommandDone));
+    assert_eq!(command(&actions), None);
+    harness.poll(&actions);
     let seeded = |hours: u64, forced: ForceStart| TorrentUpdate {
         state: Some(TorrentState::SeedQueued),
         progress: Progress::from_fraction(1.0),

@@ -12,7 +12,10 @@ mod budget;
 mod connectability;
 mod network;
 
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    net::IpAddr,
+    time::{Duration, Instant, SystemTime},
+};
 
 use serde::Serialize;
 
@@ -237,6 +240,7 @@ pub struct Mam {
     lease: LeaseRenewal,
     cookie_in_use: Option<ApiCookie>,
     issued_cookie: Option<ApiCookie>,
+    confirmed_download_ip: Option<IpAddr>,
     epoch: ConnectionEpoch,
     wake: Option<(TimerId, Instant)>,
     notices: Vec<Notice>,
@@ -262,6 +266,7 @@ impl Mam {
             lease: LeaseRenewal::NotRequested,
             cookie_in_use: None,
             issued_cookie: None,
+            confirmed_download_ip: None,
             epoch: ConnectionEpoch::FIRST,
             wake: None,
             notices: Vec::new(),
@@ -282,6 +287,7 @@ impl Mam {
     /// The VPN moved to another server: the IP MAM sees may have changed.
     pub(super) const fn vpn_switched(&mut self) {
         self.network.unconfirm();
+        self.confirmed_download_ip = None;
     }
 
     pub(super) fn timer_expired(&mut self, id: TimerId) {
@@ -404,6 +410,7 @@ impl Mam {
             }
             (MamRequest::RegisterSeedbox, Ok(MamReply::Registered { ip, .. })) if current => {
                 self.seedbox.confirmed(ip, now.wall);
+                self.confirmed_download_ip = Some(ip);
                 Vec::new()
             }
             (MamRequest::RegisterSeedbox, Err(failure)) if current => {
@@ -537,10 +544,13 @@ impl Mam {
         });
         match result {
             // A queued torrent becomes a download.
-            Ok(MamReply::Fetched(fetched)) if queued => registry
-                .records_mut()
-                .map(|records| records.fetched(now.monotonic, id, fetched.hash))
-                .unwrap_or_default(),
+            Ok(MamReply::Fetched(fetched)) if queued => {
+                self.acquisition.newly_fetched.insert(id);
+                registry
+                    .records_mut()
+                    .map(|records| records.fetched(now.monotonic, id, fetched.hash))
+                    .unwrap_or_default()
+            }
             // A running download was wedged because its freeleech ended; the
             // bonus history must show the wedge before it counts.
             Ok(MamReply::Fetched(_)) => {
@@ -737,6 +747,11 @@ impl Mam {
             self.acquisition.watched = Vec::new();
             return UnsatisfiedCount::default();
         };
+        self.acquisition.newly_fetched.retain(|id| {
+            records.find_mam(*id).is_some_and(|record| {
+                record.desired == Desired::Active && record.observation.is_none()
+            })
+        });
         self.acquisition.watched = self.acquisition.watch_all(
             records.downloads(),
             self.account.data(),
@@ -748,6 +763,22 @@ impl Mam {
             .filter(|download| acquisition::recent(download, now.wall))
             .count();
         UnsatisfiedCount::new(u32::try_from(recent).unwrap_or(u32::MAX))
+    }
+
+    /// Whether MAM has cleared this incomplete download to begin transferring.
+    pub(super) fn permits_download(&self, id: MamTorrentId) -> bool {
+        let Some(observed) = self.network.current() else {
+            return false;
+        };
+        self.gate == RequestGate::Open
+            && matches!(self.session, Session::Verified { .. })
+            && (self.confirmed_download_ip == Some(observed.ip)
+                || self.acquisition.reapproved.get(&id) == Some(&observed.ip))
+            && (self.acquisition.newly_fetched.contains(&id)
+                || self.acquisition.watched.iter().any(|(download, watch)| {
+                    download.mam == id
+                        && matches!(watch, DownloadWatch::Wedged | DownloadWatch::FreeForNow)
+                }))
     }
 
     /// Apply what Windlass knows about each running download it added: a
@@ -773,6 +804,11 @@ impl Mam {
                 DownloadWatch::Wedged | DownloadWatch::FreeForNow => {
                     if download.desired == Desired::Held {
                         actions.extend(records.resume(now.monotonic, &download.hash));
+                        if let Some(observed) = self.network.current() {
+                            self.acquisition
+                                .reapproved
+                                .insert(download.mam, observed.ip);
+                        }
                     }
                     self.acquisition.reported.remove(&download.mam);
                     None
@@ -911,6 +947,9 @@ impl Mam {
         self.session = Session::Unverified;
         self.network.unconfirm();
         self.seedbox.unconfirm();
+        self.confirmed_download_ip = None;
+        self.acquisition.newly_fetched.clear();
+        self.acquisition.reapproved.clear();
     }
 
     /// A cookie the owner supplied replaces the session; one MAM issued
@@ -923,7 +962,10 @@ impl Mam {
             self.epoch = self.epoch.next();
             self.session = Session::Unverified;
             self.seedbox.unconfirm();
+            self.confirmed_download_ip = None;
             self.acquisition.refused = None;
+            self.acquisition.newly_fetched.clear();
+            self.acquisition.reapproved.clear();
         } else if context.cookie.is_some() && context.cookie == self.issued_cookie.as_ref() {
             self.cookie_in_use = self.issued_cookie.take();
         }
