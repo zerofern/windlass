@@ -170,14 +170,19 @@ fn failed_renewals_retry_and_the_lease_lapses() {
     harness.advance(Duration::from_secs(15));
     let _ = harness.expire(TimerName::PortLease, retry);
     let _ = harness.forwarding(PortForwardingEvent::MappingFailed {
-        reason: MappingFailure::Refused { result_code: 2 },
+        reason: MappingFailure::Refused {
+            reason: windlass::core::NatPmpRefusal::NotAuthorized,
+        },
     });
     assert_eq!(harness.core.port_forwarding().forwarded_port(), None);
     match harness.core.port_forwarding() {
         PortForwarding::Enabled {
             lease: None,
             failures,
-            last_failure: Some(MappingFailure::Refused { result_code: 2 }),
+            last_failure:
+                Some(MappingFailure::Refused {
+                    reason: windlass::core::NatPmpRefusal::NotAuthorized,
+                }),
             ..
         } if *failures == windlass::core::FailureCount::new(2) => {}
         other => unreachable!("unexpected state {other:?}"),
@@ -525,15 +530,17 @@ fn qbittorrents_queue_follows_the_saved_limits() {
         Some(true)
     );
     let retry = harness.qbittorrent(QbittorrentEvent::QueueSetFailed {
-        reason: QbittorrentFailure::Rejected { status: 400 },
+        reason: QbittorrentFailure::Rejected {
+            status: windlass::core::HttpStatus::new(http::StatusCode::BAD_REQUEST),
+        },
     });
     let _ = timer(&retry, TimerName::QbittorrentPoll, POLL_INTERVAL);
     assert!(matches!(
         harness.core.qbittorrent(),
         Qbittorrent::Unreachable {
-            reason: QbittorrentFailure::Rejected { status: 400 },
+            reason: QbittorrentFailure::Rejected { status },
             ..
-        }
+        } if *status == windlass::core::HttpStatus::new(http::StatusCode::BAD_REQUEST)
     ));
 }
 
@@ -567,7 +574,9 @@ fn failures_make_qbittorrent_unreachable_until_it_answers() {
     assert_eq!(session(&harness).approval, MamApproval::NotAllowed);
     for failure in [
         QbittorrentEvent::SyncFailed {
-            reason: QbittorrentFailure::Rejected { status: 403 },
+            reason: QbittorrentFailure::Rejected {
+                status: windlass::core::HttpStatus::new(http::StatusCode::FORBIDDEN),
+            },
         },
         QbittorrentEvent::PreferencesReadFailed {
             reason: QbittorrentFailure::Malformed,

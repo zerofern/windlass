@@ -322,7 +322,9 @@ fn stopped_active_torrents_are_started_without_repeating_too_soon() {
     assert!(matches!(
         harness
             .send(Event::Qbittorrent(QbittorrentEvent::CommandFailed {
-                reason: QbittorrentFailure::Rejected { status: 404 },
+                reason: QbittorrentFailure::Rejected {
+                    status: windlass::core::HttpStatus::new(http::StatusCode::NOT_FOUND)
+                },
             }))
             .as_slice(),
         [Action::StartTimer {

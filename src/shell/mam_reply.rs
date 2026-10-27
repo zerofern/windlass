@@ -194,7 +194,7 @@ pub(super) fn registration(status: StatusCode, body: &[u8]) -> Result<MamReply, 
     }
     if !status.is_success() {
         return Err(MamFailure::Rejected {
-            status: status.as_u16(),
+            status: crate::core::HttpStatus::new(status),
         });
     }
     let registration = match message.to_ascii_lowercase().as_str() {

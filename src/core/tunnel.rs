@@ -9,7 +9,7 @@ use std::{
 use nutype::nutype;
 use serde::Serialize;
 
-use crate::core::FailureCount;
+use crate::core::{FailureCount, HttpStatus};
 
 use super::{Action, ClockReading, TimerId, TimerName, timer::Timers};
 
@@ -43,7 +43,7 @@ pub enum ExitIpFailure {
     /// The service answered with an unexpected HTTP status.
     Rejected {
         /// The HTTP status code.
-        status: u16,
+        status: HttpStatus,
     },
     /// The answer was not an IP address.
     Malformed,

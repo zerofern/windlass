@@ -9,8 +9,8 @@ use nutype::nutype;
 use serde::Serialize;
 
 use super::{
-    Action, ClockReading, MamTorrentId, Port, TimerId, TimerName, TorrentCount, TorrentLimits,
-    timer::Timers,
+    Action, ClockReading, HttpStatus, MamTorrentId, Port, TimerId, TimerName, TorrentCount,
+    TorrentLimits, timer::Timers,
 };
 
 /// How often qBittorrent's state is read.
@@ -564,7 +564,7 @@ pub enum QbittorrentFailure {
     /// qBittorrent answered with an unexpected HTTP status.
     Rejected {
         /// The HTTP status code.
-        status: u16,
+        status: HttpStatus,
     },
     /// The answer could not be understood.
     Malformed,

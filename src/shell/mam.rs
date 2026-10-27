@@ -208,7 +208,7 @@ fn interpret(
         _ if status == StatusCode::TOO_MANY_REQUESTS => Err(MamFailure::TooSoon { retry_after }),
         MamRequest::RegisterSeedbox => reply::registration(status, body),
         _ if !status.is_success() => Err(MamFailure::Rejected {
-            status: status.as_u16(),
+            status: crate::core::HttpStatus::new(status),
         }),
         MamRequest::FetchTorrent { .. } => {
             return torrent_file::read(body).map_or(
@@ -728,11 +728,15 @@ mod tests {
         );
         assert_eq!(
             failure(ask(&client, load.clone(), &cookie).await),
-            Some(MamFailure::Rejected { status: 500 })
+            Some(MamFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::INTERNAL_SERVER_ERROR)
+            })
         );
         assert_eq!(
             failure(ask(&client, MamRequest::RegisterSeedbox, &cookie).await),
-            Some(MamFailure::Rejected { status: 502 })
+            Some(MamFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::BAD_GATEWAY)
+            })
         );
         for request in [
             load.clone(),

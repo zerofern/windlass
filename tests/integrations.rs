@@ -503,7 +503,9 @@ async fn unavailable_services_are_reported_and_retried() -> TestResult {
             ) && matches!(
                 observation.port_forwarding,
                 PortForwarding::Enabled {
-                    last_failure: Some(MappingFailure::Refused { result_code: 3 }),
+                    last_failure: Some(MappingFailure::Refused {
+                        reason: windlass::core::NatPmpRefusal::NetworkFailure
+                    }),
                     ..
                 }
             )
@@ -551,7 +553,9 @@ async fn rejected_and_malformed_answers_are_distinguished() -> TestResult {
         (
             "{\"listen_port\": 6881}",
             StatusCode::FORBIDDEN,
-            QbittorrentFailure::Rejected { status: 403 },
+            QbittorrentFailure::Rejected {
+                status: windlass::core::HttpStatus::new(http::StatusCode::FORBIDDEN),
+            },
         ),
         ("not json", StatusCode::OK, QbittorrentFailure::Malformed),
     ] {

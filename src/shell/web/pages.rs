@@ -1449,7 +1449,12 @@ mod tests {
         assert!(render(PortForwarding::Disabled).contains("Not configured"));
         for (reason, text) in [
             (MappingFailure::NoResponse, "did not answer"),
-            (MappingFailure::Refused { result_code: 2 }, "refused"),
+            (
+                MappingFailure::Refused {
+                    reason: crate::core::NatPmpRefusal::NotAuthorized,
+                },
+                "refused",
+            ),
             (MappingFailure::Malformed, "not valid"),
         ] {
             let html = render(PortForwarding::Enabled {
@@ -1491,7 +1496,9 @@ mod tests {
         let unreachable = drive(vec![
             Event::Qbittorrent(QbittorrentEvent::Enable),
             Event::Qbittorrent(QbittorrentEvent::ConnectFailed {
-                reason: QbittorrentFailure::Rejected { status: 403 },
+                reason: QbittorrentFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::FORBIDDEN),
+                },
             }),
         ]);
         assert!(
@@ -1683,7 +1690,9 @@ mod tests {
             use crate::core::{Check, Event, ExitIpFailure, TimerName, TunnelEvent};
 
             let _ = self.send(Event::Tunnel(TunnelEvent::ExitIpCheckFailed {
-                reason: ExitIpFailure::Rejected { status: 503 },
+                reason: ExitIpFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::SERVICE_UNAVAILABLE),
+                },
             }));
             if let Some(Check::Waiting(id)) =
                 self.core.tunnel().watch.as_ref().map(|watch| watch.check)
@@ -2068,7 +2077,9 @@ mod tests {
         assert!(render(&notifications, &configured).contains("Working"));
         notifications.last_outcome = Some(Outcome {
             at: SystemTime::UNIX_EPOCH,
-            result: Err(DeliveryFailure::Rejected { status: 429 }),
+            result: Err(DeliveryFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+            }),
         });
         notifications.failures = crate::core::FailureCount::new(2);
         notifications.dropped = crate::core::PushCount::new(3);

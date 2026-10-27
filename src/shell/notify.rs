@@ -114,7 +114,7 @@ async fn deliver(channel: &Channel, topic: &NtfyTopic, push: &Push) -> Result<()
         Ok(())
     } else {
         Err(DeliveryFailure::Rejected {
-            status: status.as_u16(),
+            status: crate::core::HttpStatus::new(status),
         })
     }
 }
@@ -1050,7 +1050,12 @@ mod tests {
         let closed = Channel::new(Some("http://127.0.0.1:9/".parse()?), None, None);
         let unconfigured = Channel::new(None, None, None);
         for (channel, reason) in [
-            (refused, DeliveryFailure::Rejected { status: 429 }),
+            (
+                refused,
+                DeliveryFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+                },
+            ),
             (closed, DeliveryFailure::Unreachable),
             (unconfigured, DeliveryFailure::Unreachable),
         ] {

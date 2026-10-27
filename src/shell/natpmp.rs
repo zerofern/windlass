@@ -8,7 +8,7 @@ use std::{
 
 use tokio::net::UdpSocket;
 
-use crate::core::{MappingFailure, Port, PortForwardingEvent};
+use crate::core::{MappingFailure, NatPmpRefusal, Port, PortForwardingEvent};
 
 const UDP: u8 = 1;
 const TCP: u8 = 2;
@@ -57,9 +57,17 @@ fn response(opcode: u8, packet: &[u8]) -> Result<(Port, Duration), MappingFailur
     if version != 0 || op != opcode + 128 {
         return Err(MappingFailure::Malformed);
     }
-    let result_code = u16::from_be_bytes([r0, r1]);
-    if result_code != 0 {
-        return Err(MappingFailure::Refused { result_code });
+    let reason = match u16::from_be_bytes([r0, r1]) {
+        0 => None,
+        1 => Some(NatPmpRefusal::UnsupportedVersion),
+        2 => Some(NatPmpRefusal::NotAuthorized),
+        3 => Some(NatPmpRefusal::NetworkFailure),
+        4 => Some(NatPmpRefusal::OutOfResources),
+        5 => Some(NatPmpRefusal::UnsupportedOpcode),
+        _ => return Err(MappingFailure::Malformed),
+    };
+    if let Some(reason) = reason {
+        return Err(MappingFailure::Refused { reason });
     }
     let port = Port::new(u16::from_be_bytes([p0, p1])).ok_or(MappingFailure::Malformed)?;
     let lifetime = Duration::from_secs(u64::from(u32::from_be_bytes([l0, l1, l2, l3])));
@@ -118,7 +126,7 @@ pub(super) async fn map_ports(
 mod tests {
     use std::time::Duration;
 
-    use crate::core::{MappingFailure, Port};
+    use crate::core::{MappingFailure, NatPmpRefusal, Port};
 
     use crate::core::PortForwardingEvent;
 
@@ -147,11 +155,22 @@ mod tests {
         let granted = [0, 129, 0, 0, 0, 0, 0, 9, 0, 0, 0xa0, 0x28, 0, 0, 0, 60];
         let port = Port::new(41000).ok_or("zero port")?;
         assert_eq!(response(UDP, &granted), Ok((port, Duration::from_mins(1))));
-        let refused = [0, 130, 0, 3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(
-            response(TCP, &refused),
-            Err(MappingFailure::Refused { result_code: 3 })
-        );
+        for (code, refusal) in [
+            (1, NatPmpRefusal::UnsupportedVersion),
+            (2, NatPmpRefusal::NotAuthorized),
+            (3, NatPmpRefusal::NetworkFailure),
+            (4, NatPmpRefusal::OutOfResources),
+            (5, NatPmpRefusal::UnsupportedOpcode),
+        ] {
+            let refused = [0, 130, 0, code, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(
+                response(TCP, &refused),
+                Err(MappingFailure::Refused { reason: refusal }),
+                "result code {code}"
+            );
+        }
+        let unknown = [0, 130, 0, 6, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(response(TCP, &unknown), Err(MappingFailure::Malformed));
         assert_eq!(
             response(TCP, &granted),
             Err(MappingFailure::Malformed),

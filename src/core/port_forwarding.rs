@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use derive_more::Display;
 use serde::Serialize;
 
 use crate::core::FailureCount;
@@ -35,6 +36,26 @@ impl Port {
     }
 }
 
+/// The NAT-PMP result codes other than success (RFC 6886, section 3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize)]
+pub enum NatPmpRefusal {
+    /// 1: the gateway does not speak this NAT-PMP version.
+    #[display("unsupported version")]
+    UnsupportedVersion,
+    /// 2: mapping is turned off or not allowed.
+    #[display("not authorized")]
+    NotAuthorized,
+    /// 3: the gateway has no working network connection.
+    #[display("network failure")]
+    NetworkFailure,
+    /// 4: the gateway cannot hold another mapping.
+    #[display("out of resources")]
+    OutOfResources,
+    /// 5: the gateway does not support this request.
+    #[display("unsupported opcode")]
+    UnsupportedOpcode,
+}
+
 /// Why the gateway did not grant a mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MappingFailure {
@@ -42,8 +63,8 @@ pub enum MappingFailure {
     NoResponse,
     /// The gateway answered with a NAT-PMP result code other than success.
     Refused {
-        /// The NAT-PMP result code.
-        result_code: u16,
+        /// Why, as the result code says.
+        reason: NatPmpRefusal,
     },
     /// The answer was not a valid NAT-PMP response.
     Malformed,

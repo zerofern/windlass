@@ -432,7 +432,9 @@ fn short_outages_stay_quiet() -> Result<(), &'static str> {
     let _ = harness.delivered();
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Enable));
     let failed = harness.send(Event::Qbittorrent(QbittorrentEvent::ConnectFailed {
-        reason: QbittorrentFailure::Rejected { status: 502 },
+        reason: QbittorrentFailure::Rejected {
+            status: windlass::core::HttpStatus::new(http::StatusCode::BAD_GATEWAY),
+        },
     }));
     harness.advance(Duration::from_mins(1));
     reconnect(&mut harness, &failed)?;
@@ -573,7 +575,9 @@ fn a_full_outbox_drops_the_oldest_notices() {
     let mut harness = Harness::new(Some(TOPIC));
     let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
     let _ = harness.send(Event::Notification(NotificationEvent::DeliveryFailed {
-        reason: DeliveryFailure::Rejected { status: 429 },
+        reason: DeliveryFailure::Rejected {
+            status: windlass::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+        },
     }));
     for _ in 0..=OUTBOX_LIMIT {
         let _ = harness.send(Event::Notification(NotificationEvent::SendTest));

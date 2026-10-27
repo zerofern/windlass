@@ -378,8 +378,8 @@ fn mam(event: &MamEvent) -> String {
 fn mapping_failure(reason: MappingFailure) -> String {
     match reason {
         MappingFailure::NoResponse => String::from("the gateway did not answer"),
-        MappingFailure::Refused { result_code } => {
-            format!("the gateway refused with NAT-PMP result {result_code}")
+        MappingFailure::Refused { reason } => {
+            format!("the gateway refused the mapping: {reason}")
         }
         MappingFailure::Malformed => String::from("the gateway's answer was not valid"),
     }
@@ -1001,7 +1001,9 @@ mod tests {
         ];
         for reason in [
             MappingFailure::NoResponse,
-            MappingFailure::Refused { result_code: 2 },
+            MappingFailure::Refused {
+                reason: crate::core::NatPmpRefusal::NotAuthorized,
+            },
             MappingFailure::Malformed,
         ] {
             entries.push((
@@ -1057,7 +1059,9 @@ mod tests {
         ];
         for reason in [
             QbittorrentFailure::Unreachable,
-            QbittorrentFailure::Rejected { status: 403 },
+            QbittorrentFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::FORBIDDEN),
+            },
             QbittorrentFailure::Malformed,
         ] {
             for failure in [
@@ -1208,7 +1212,9 @@ mod tests {
         ];
         for reason in [
             ExitIpFailure::Unreachable,
-            ExitIpFailure::Rejected { status: 503 },
+            ExitIpFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::SERVICE_UNAVAILABLE),
+            },
             ExitIpFailure::Malformed,
         ] {
             entries.push(vpn(TunnelEvent::ExitIpCheckFailed { reason }, false));
@@ -1242,7 +1248,9 @@ mod tests {
                 reason: DeliveryFailure::Unreachable,
             },
             NotificationEvent::DeliveryFailed {
-                reason: DeliveryFailure::Rejected { status: 429 },
+                reason: DeliveryFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+                },
             },
             NotificationEvent::LogRead { last: None },
             NotificationEvent::LogRead {
@@ -1511,7 +1519,9 @@ mod tests {
                     message: crate::core::MamMessage::try_new("No").ok(),
                 },
                 MamFailure::NotKept,
-                MamFailure::Rejected { status: 500 },
+                MamFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::INTERNAL_SERVER_ERROR),
+                },
                 MamFailure::Malformed,
             ]
             .into_iter()

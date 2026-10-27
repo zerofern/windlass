@@ -213,6 +213,7 @@ pub enum Action {
 
 mod failures;
 mod history;
+mod http_status;
 mod machine;
 mod mam;
 mod mam_pause;
@@ -227,6 +228,7 @@ mod tunnel;
 
 pub use failures::FailureCount;
 pub use history::{HistoryEvent, HistoryState, Step, Trim};
+pub use http_status::HttpStatus;
 pub use machine::{Core, State};
 pub use mam::{
     ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Acquisition, Asn, Attention, BOOKMARKS_EVERY,
@@ -258,7 +260,8 @@ pub use notifications::{
     SettingName, SwitchBlock,
 };
 pub use port_forwarding::{
-    LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, Port, PortForwarding, PortForwardingEvent,
+    LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, NatPmpRefusal, Port, PortForwarding,
+    PortForwardingEvent,
 };
 pub use qbittorrent::{
     Activity, ByteSize, ClientVersion, Completion, ContentPath, ContentPathError, ForceStart,

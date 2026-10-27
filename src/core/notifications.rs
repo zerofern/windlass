@@ -17,7 +17,7 @@ use std::{
 use derive_more::Display;
 use serde::Serialize;
 
-use crate::core::FailureCount;
+use crate::core::{FailureCount, HttpStatus};
 
 use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
@@ -520,7 +520,7 @@ pub enum DeliveryFailure {
     /// ntfy answered with an unexpected HTTP status.
     Rejected {
         /// The HTTP status code.
-        status: u16,
+        status: HttpStatus,
     },
 }
 

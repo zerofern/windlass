@@ -124,7 +124,7 @@ impl Client {
             Ok(response)
         } else {
             Err(QbittorrentFailure::Rejected {
-                status: status.as_u16(),
+                status: crate::core::HttpStatus::new(status),
             })
         }
     }
