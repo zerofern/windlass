@@ -344,7 +344,10 @@ fn failed_deliveries_are_retried_with_growing_waits() -> Result<(), &'static str
     let second = harness.send(failed);
     let (_, wait) = timer(&second, TimerName::NotificationRetry).ok_or("no retry")?;
     assert_eq!(wait, Duration::from_mins(1));
-    assert_eq!(harness.core.notifications().failures, 2);
+    assert_eq!(
+        harness.core.notifications().failures,
+        windlass::core::FailureCount::new(2)
+    );
     assert_eq!(
         harness
             .core
@@ -479,7 +482,9 @@ fn failover_is_announced_step_by_step() {
     enable_tunnel(&mut harness, None);
     assert_eq!(
         fail_checks(&mut harness),
-        vec![Notice::VpnProtectionLost { failures: 3 }]
+        vec![Notice::VpnProtectionLost {
+            failures: windlass::core::FailureCount::new(3)
+        }]
     );
     let _ = harness.send(Event::Tunnel(TunnelEvent::SwitchSaved));
     let switched = harness.send(Event::Tunnel(TunnelEvent::Switched));
@@ -493,7 +498,9 @@ fn failover_is_announced_step_by_step() {
         harness.notices().get(1..),
         Some(
             [
-                Notice::VpnProtectionLost { failures: 3 },
+                Notice::VpnProtectionLost {
+                    failures: windlass::core::FailureCount::new(3)
+                },
                 Notice::FailoverStarted {
                     server: server("two")
                 },
@@ -535,7 +542,9 @@ fn failed_and_blocked_switches_are_announced() {
     assert_eq!(
         fail_checks(&mut blocked),
         vec![
-            Notice::VpnProtectionLost { failures: 3 },
+            Notice::VpnProtectionLost {
+                failures: windlass::core::FailureCount::new(3)
+            },
             Notice::FailoverBlocked {
                 reason: SwitchBlock::Until(until)
             }
@@ -570,7 +579,10 @@ fn a_full_outbox_drops_the_oldest_notices() {
         let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
     }
     assert_eq!(harness.core.notifications().outbox.len(), OUTBOX_LIMIT);
-    assert_eq!(harness.core.notifications().dropped, 1);
+    assert_eq!(
+        harness.core.notifications().dropped,
+        windlass::core::PushCount::new(1)
+    );
 }
 
 #[test]
@@ -633,13 +645,23 @@ fn torrent_problems_are_reported_after_their_grace_periods() -> Result<(), &'sta
     );
     harness.advance(wait);
     let errors = harness.expire(TimerName::NotificationGrace, grace);
-    assert_eq!(sent(&errors), vec![Notice::TorrentErrors { count: 1 }]);
+    assert_eq!(
+        sent(&errors),
+        vec![Notice::TorrentErrors {
+            count: windlass::core::TorrentCount::new(1)
+        }]
+    );
     let (grace, wait) = timer(&errors, TimerName::NotificationGrace).ok_or("no grace timer")?;
     assert_eq!(wait, Duration::from_mins(5));
     let _ = harness.delivered();
     harness.advance(wait);
     let missing = harness.expire(TimerName::NotificationGrace, grace);
-    assert_eq!(sent(&missing), vec![Notice::FilesMissing { count: 1 }]);
+    assert_eq!(
+        sent(&missing),
+        vec![Notice::FilesMissing {
+            count: windlass::core::TorrentCount::new(1)
+        }]
+    );
     Ok(())
 }
 

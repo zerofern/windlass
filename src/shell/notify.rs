@@ -12,7 +12,7 @@ use reqwest::{Client as HttpClient, Url};
 
 use crate::core::{
     DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Partials, Push, SettingName,
-    StartupMode, SwitchBlock,
+    StartupMode, SwitchBlock, TorrentCount,
 };
 
 use super::describe::{hold, purchase, qbittorrent_failure, rejection, timestamp};
@@ -119,8 +119,8 @@ async fn deliver(channel: &Channel, topic: &NtfyTopic, push: &Push) -> Result<()
     }
 }
 
-fn torrents(count: usize) -> String {
-    if count == 1 {
+fn torrents(count: TorrentCount) -> String {
+    if count.get() == 1 {
         String::from("1 torrent")
     } else {
         format!("{count} torrents")
@@ -278,7 +278,7 @@ pub(super) fn message(notice: &Notice) -> Message {
             format!(
                 "{} {} missing files. Windlass does not download them again without you.",
                 torrents(*count),
-                if *count == 1 { "has" } else { "have" }
+                if count.get() == 1 { "has" } else { "have" }
             ),
             4,
             "/#torrents",
@@ -294,7 +294,7 @@ pub(super) fn message(notice: &Notice) -> Message {
             format!(
                 "{} Windlass manages {} not in qBittorrent.",
                 torrents(*count),
-                if *count == 1 { "is" } else { "are" }
+                if count.get() == 1 { "is" } else { "are" }
             ),
             4,
             "/#torrents",
@@ -526,7 +526,7 @@ pub(super) fn message(notice: &Notice) -> Message {
             format!(
                 "{} completed 20 or more days ago {} not seeded 96 hours yet. MAM requires 72 within 30 days; Windlass aims a day higher.",
                 torrents(*count),
-                if *count == 1 { "has" } else { "have" }
+                if count.get() == 1 { "has" } else { "have" }
             ),
             4,
         ),
@@ -690,7 +690,9 @@ mod tests {
                 mode: StartupMode::Resume,
             },
             Notice::StartupFailed,
-            Notice::VpnProtectionLost { failures: 3 },
+            Notice::VpnProtectionLost {
+                failures: crate::core::FailureCount::new(3),
+            },
             Notice::VpnProtectionRestored {
                 exit_ip: ip,
                 server: Some(server.clone()),
@@ -730,7 +732,7 @@ mod tests {
             },
             Notice::Test,
         ];
-        for count in [1, 2] {
+        for count in [TorrentCount::new(1), TorrentCount::new(2)] {
             notices.extend([
                 Notice::TorrentErrors { count },
                 Notice::FilesMissing { count },
@@ -771,7 +773,9 @@ mod tests {
             Notice::SeedboxRegistered {
                 ip: std::net::IpAddr::from([192, 0, 2, 10]),
             },
-            Notice::MamIpUnknown { failures: 3 },
+            Notice::MamIpUnknown {
+                failures: crate::core::FailureCount::new(3),
+            },
             Notice::MamIpKnown,
             Notice::MamStateUnreadable,
             Notice::RatioLow {
@@ -826,8 +830,12 @@ mod tests {
                 until: SystemTime::UNIX_EPOCH,
             },
             Notice::DownloadsRefused,
-            Notice::SeedingBehind { count: 1 },
-            Notice::SeedingBehind { count: 3 },
+            Notice::SeedingBehind {
+                count: TorrentCount::new(1),
+            },
+            Notice::SeedingBehind {
+                count: TorrentCount::new(3),
+            },
             Notice::SeedingOnTrack,
             Notice::PurchaseMade {
                 purchase: upload,
@@ -927,7 +935,10 @@ mod tests {
             notices.len(),
             "every notice reads differently"
         );
-        let one = message(&Notice::FilesMissing { count: 1 }).body;
+        let one = message(&Notice::FilesMissing {
+            count: TorrentCount::new(1),
+        })
+        .body;
         assert!(one.starts_with("1 torrent has"), "{one}");
         Ok(())
     }
@@ -988,7 +999,9 @@ mod tests {
         let topic = NtfyTopic::parse("windlass-alerts")?;
         let push = Push {
             entry: crate::core::NoticeId::new(42),
-            notice: Notice::FilesMissing { count: 2 },
+            notice: Notice::FilesMissing {
+                count: TorrentCount::new(2),
+            },
         };
         assert_eq!(
             send(&channel, &topic, &push).await,

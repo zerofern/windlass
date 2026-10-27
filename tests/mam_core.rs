@@ -286,7 +286,11 @@ impl Harness {
                     self.answer(Ok(MamReply::WedgeHistory(spent.to_vec())))
                 }
                 // A due listing comes before single lookups; it lists these.
-                [MamRequest::ListBookmarks { start: 0 }] => self.answer(listed(listings.to_vec())),
+                [MamRequest::ListBookmarks { start }]
+                    if *start == windlass::core::BookmarkCount::new(0) =>
+                {
+                    self.answer(listed(listings.to_vec()))
+                }
                 // The bucket ran out; the next token comes soon.
                 [] if timer(&actions, TimerName::Mam)
                     .is_some_and(|(_, after)| after <= windlass::core::REQUEST_REFILL) =>
@@ -561,7 +565,12 @@ fn a_saved_attempt_from_before_a_restart_still_spaces_the_next() {
         [MamRequest::LoadUserData { client_stats: true }]
     );
     let actions = harness.answer(read(account(harness.wall())));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(Vec::new()));
     let actions = harness.later(Duration::from_mins(40));
     assert!(
@@ -694,7 +703,10 @@ fn mam_asking_to_wait_delays_the_retry() {
         harness.mam().network.next_lookup,
         Some(start + Duration::from_mins(20))
     );
-    assert_eq!(harness.mam().network.failures, 1);
+    assert_eq!(
+        harness.mam().network.failures,
+        windlass::core::FailureCount::new(1)
+    );
     // Nothing that needs the session is sent before MAM shows which IP it sees.
     assert!(requests(&actions).is_empty(), "{actions:?}");
     harness.advance(Duration::from_mins(20));
@@ -735,7 +747,12 @@ fn a_cookie_mam_issues_is_saved_and_continues_the_session() {
         harness.mam().seedbox.status,
         SeedboxStatus::Confirmed { .. }
     ));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     assert_eq!(cookie_sent(&actions), Some(cookie("rotated-cookie")));
 
     // A rotation that cannot be saved leaves the saved cookie in use.
@@ -769,13 +786,20 @@ fn the_bucket_allows_ten_requests_then_one_every_three_seconds() {
     // The IP lookup, registration, and account read; bookmarks are the fourth.
     assert_eq!(requests(&actions).len(), 1);
     let actions = harness.answer(read(account(harness.wall())));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     // Pages two to seven use the rest of the bucket.
     for start in (0..600).step_by(100) {
         let actions = harness.answer(Ok(MamReply::Bookmarks(page(start))));
         assert_eq!(
             requests(&actions),
-            [MamRequest::ListBookmarks { start: start + 100 }]
+            [MamRequest::ListBookmarks {
+                start: windlass::core::BookmarkCount::new(start + 100)
+            }]
         );
     }
     let actions = harness.answer(Ok(MamReply::Bookmarks(page(600))));
@@ -787,7 +811,9 @@ fn the_bucket_allows_ten_requests_then_one_every_three_seconds() {
     let actions = harness.wake(&actions);
     assert_eq!(
         requests(&actions),
-        [MamRequest::ListBookmarks { start: 700 }]
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(700)
+        }]
     );
     let _ = harness.answer(Ok(MamReply::Bookmarks(page(700))));
     assert_eq!(
@@ -813,7 +839,12 @@ fn listed_with(harness: &mut Harness, account: UserData, bookmarks: Vec<Bookmark
         [MamRequest::LoadUserData { client_stats: true }]
     );
     let actions = harness.answer(read(account));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let (page, listings) = (listed(bookmarks.clone()), bookmarks);
     let actions = harness.answer(page);
     harness.checked(actions, &listings)
@@ -836,7 +867,12 @@ fn listed_then_looked_up(
         Some(MamRequest::LoadUserData { .. })
     ));
     let actions = harness.answer(read(account(harness.wall())));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let actions = harness.answer(listed(bookmarks));
     harness.checked(actions, now_listed)
 }
@@ -970,7 +1006,12 @@ fn a_snatched_bookmark_waits_until_the_owner_asks_for_it() {
     ));
     let actions = harness.answer(read(account(harness.wall())));
     snatched.snatched = Snatched::Never;
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(vec![snatched]));
     assert_eq!(
         harness.record(2).map(|record| record.desired),
@@ -1087,7 +1128,11 @@ fn read_later(harness: &mut Harness, after: Duration, connectable: Connectable) 
     }
     let mut actions = harness.answer(read(data));
     // Bookmarks fall due on the same schedule; there are none.
-    while requests(&actions) == [MamRequest::ListBookmarks { start: 0 }] {
+    while requests(&actions)
+        == [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0),
+        }]
+    {
         actions = harness.answer(listed(Vec::new()));
     }
     actions
@@ -1148,7 +1193,12 @@ fn an_unreachable_client_is_repaired_and_reported_if_that_did_not_work() {
         "registered again when allowed"
     );
     let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(Vec::new()));
     // A reading too soon after the repair does not judge it.
     let _ = read_later(&mut harness, Duration::from_mins(16), Connectable::No);
@@ -1262,7 +1312,12 @@ fn a_repair_that_worked_is_not_reported() {
     let actions = harness.wake(&actions);
     assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
     let actions = harness.answer(Ok(MamReply::Ip(observation(10, 209_103))));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(Vec::new()));
     let _ = read_later(&mut harness, Duration::from_mins(31), Connectable::Yes);
     assert_eq!(harness.mam().connectability, Connectability::Fine);
@@ -1455,7 +1510,12 @@ fn torrents_mam_no_longer_lists_or_reports_snatched_are_not_downloaded() {
     let mut still_none = account(harness.wall());
     still_none.wedges = WedgeCount::new(0);
     let actions = harness.answer(read(still_none));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let actions = harness.answer(listed(vec![
         bookmark(1),
         snatched,
@@ -1511,7 +1571,12 @@ fn a_failed_lookup_is_tried_again_after_a_wait() {
     let actions = harness.register(&actions);
     assert_eq!(requests(&actions).len(), 1);
     let actions = harness.answer(read(account(harness.wall())));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let actions = harness.answer(listed(Vec::new()));
     assert_eq!(
         requests(&actions),
@@ -1590,7 +1655,7 @@ fn no_download_starts_while_the_downloading_limit_is_reached() {
     assert_eq!(
         harness.mam().acquisition.hold,
         Some(Hold::DownloadingLimit {
-            downloading: 5,
+            downloading: windlass::core::TorrentCount::new(5),
             limit: windlass::core::DownloadingLimit::default()
         })
     );
@@ -1617,7 +1682,12 @@ fn running_download(listing: Bookmark, wedges: u32) -> (Harness, Vec<Action>) {
     // After a restart, the download is checked with MAM before anything else:
     // the bookmark listing first, then a lookup, since it is not bookmarked.
     let actions = harness.answer(read(data));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let actions = harness.answer(listed(Vec::new()));
     assert_eq!(
         requests(&actions),
@@ -1891,7 +1961,11 @@ fn vip_is_kept_within_the_reserve() {
 
 /// Answer bookmark listings with none until something else is asked.
 fn without_bookmarks(harness: &mut Harness, mut actions: Vec<Action>) -> Vec<Action> {
-    while requests(&actions) == [MamRequest::ListBookmarks { start: 0 }] {
+    while requests(&actions)
+        == [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0),
+        }]
+    {
         actions = harness.answer(listed(Vec::new()));
     }
     actions
@@ -2035,7 +2109,12 @@ fn upload_credit_keeps_the_buffer_and_uncertain_purchases_wait() {
         purchase: Purchase::Upload(amount)
     }));
     // Nothing more is bought until the next reading decides from MAM's figures.
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(Vec::new()));
     // A refusal is not retried for hours.
     let actions = harness.later(Duration::from_mins(15));
@@ -2059,7 +2138,12 @@ fn upload_credit_keeps_the_buffer_and_uncertain_purchases_wait() {
     let actions = harness.answer(Err(MamFailure::Refused {
         message: windlass::core::MamMessage::try_new("Not enough points").ok(),
     }));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(Vec::new()));
     assert!(harness.notices().contains(&Notice::PurchaseRefused {
         purchase: Purchase::Upload(amount)
@@ -2275,18 +2359,27 @@ fn failed_readings_listings_and_lookups_are_retried_later() {
         harness.mam().account.next_read,
         Some(started + Duration::from_mins(9))
     );
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(Err(MamFailure::TooSoon {
         retry_after: Some(Duration::from_mins(30)),
     }));
     let bookmarks = &harness.mam().acquisition.bookmarks;
-    assert_eq!(bookmarks.failures, 1);
+    assert_eq!(bookmarks.failures, windlass::core::FailureCount::new(1));
     assert_eq!(bookmarks.next, Some(started + Duration::from_mins(30)));
     harness.advance(Duration::from_mins(30));
     let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
     let mut actions = harness.past_lookups(actions);
     // Register and read the account, which come first, until bookmarks are listed.
-    while requests(&actions) != [MamRequest::ListBookmarks { start: 0 }] {
+    while requests(&actions)
+        != [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0),
+        }]
+    {
         actions = match requests(&actions).first() {
             Some(MamRequest::RegisterSeedbox) => harness.answer(Ok(MamReply::Registered {
                 registration: Registration::Completed,
@@ -2325,7 +2418,12 @@ fn a_failed_reading_leaves_queued_bookmarks_waiting_for_the_account() {
         [MamRequest::LoadUserData { client_stats: true }]
     );
     let actions = harness.answer(Err(MamFailure::Unreachable));
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(vec![bookmark(8)]));
     assert_eq!(harness.mam().acquisition.hold, Some(Hold::AccountUnknown));
 }
@@ -2359,7 +2457,12 @@ fn downloads_wait_for_the_seedbox_the_client_and_the_bookmark() {
         client: false,
         ..Setup::default()
     });
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(vec![bookmark(9)]));
     assert_eq!(
         harness.mam().acquisition.hold,
@@ -2371,7 +2474,12 @@ fn downloads_wait_for_the_seedbox_the_client_and_the_bookmark() {
         rows: Some(vec![queued_row(1, 50)]),
         ..Setup::default()
     });
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let _ = harness.answer(listed(Vec::new()));
     assert_eq!(harness.mam().acquisition.hold, Some(Hold::NotBookmarked));
 }
@@ -2382,7 +2490,12 @@ fn without_the_registry_nothing_is_queued() {
         rows: None,
         ..Setup::default()
     });
-    assert_eq!(requests(&actions), [MamRequest::ListBookmarks { start: 0 }]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
     let actions = harness.answer(listed(vec![bookmark(10)]));
     assert!(requests(&actions).is_empty());
     assert!(harness.mam().acquisition.bookmarks.latest.is_some());
@@ -2584,9 +2697,7 @@ fn torrents_behind_on_seeding_are_reported() {
         rows: Some(vec![row]),
         ..Setup::default()
     });
-    assert!(
-        harness
-            .notices()
-            .contains(&Notice::SeedingBehind { count: 1 })
-    );
+    assert!(harness.notices().contains(&Notice::SeedingBehind {
+        count: windlass::core::TorrentCount::new(1)
+    }));
 }

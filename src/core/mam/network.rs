@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::core::FailureCount;
+
 use super::{Asn, IpObservation, MamFailure, SessionRejection};
 
 /// How often the IP MAM sees is observed; MAM allows once a minute.
@@ -84,7 +86,7 @@ pub struct Network {
     /// When the next lookup is due; now when absent.
     pub next_lookup: Option<Instant>,
     /// Lookups that failed since the last success.
-    pub failures: u32,
+    pub failures: FailureCount,
     /// Why the latest lookup failed.
     pub last_failure: Option<MamFailure>,
     /// When the latest lookup was sent, or when Windlass started, since a
@@ -97,7 +99,7 @@ impl Network {
         Self {
             observed: None,
             next_lookup: None,
-            failures: 0,
+            failures: FailureCount::NONE,
             last_failure: None,
             last_sent: None,
         }
@@ -142,7 +144,7 @@ impl Network {
             at: wall,
             current: true,
         });
-        self.failures = 0;
+        self.failures = FailureCount::NONE;
         self.last_failure = None;
         self.next_lookup = now.checked_add(OBSERVE_EVERY);
     }
@@ -154,7 +156,7 @@ impl Network {
             } => OBSERVE_EVERY.max(*after),
             _ => OBSERVE_EVERY,
         };
-        self.failures = self.failures.saturating_add(1);
+        self.failures = self.failures.after_another();
         self.last_failure = Some(failure);
         self.next_lookup = now.checked_add(wait);
     }

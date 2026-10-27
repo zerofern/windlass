@@ -1605,7 +1605,9 @@ mod tests {
                 MamRequest::LoadUserData {
                     client_stats: false,
                 },
-                MamRequest::ListBookmarks { start: 100 },
+                MamRequest::ListBookmarks {
+                    start: crate::core::BookmarkCount::new(100),
+                },
                 MamRequest::FetchTorrent {
                     id: torrent,
                     wedge: true,
@@ -1642,7 +1644,7 @@ mod tests {
                 limit: crate::core::UnsatisfiedLimit::new(2),
             },
             Hold::DownloadingLimit {
-                downloading: 5,
+                downloading: crate::core::TorrentCount::new(5),
                 limit: crate::core::DownloadingLimit::default(),
             },
             Hold::NoWedge,

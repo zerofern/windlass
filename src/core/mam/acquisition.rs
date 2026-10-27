@@ -13,7 +13,7 @@ use super::{
     UnsatisfiedCount, UnsatisfiedLimit, WedgeSpent,
     account::{Account, ClientStanding},
 };
-use crate::core::{Download, DownloadingLimit, MamTorrentId, UserData};
+use crate::core::{Download, DownloadingLimit, FailureCount, MamTorrentId, TorrentCount, UserData};
 
 /// How often bookmarks are listed.
 pub const BOOKMARKS_EVERY: Duration = Duration::from_mins(15);
@@ -56,7 +56,7 @@ pub enum Hold {
     /// As many downloads are running as the owner allows.
     DownloadingLimit {
         /// Windlass's downloads running now.
-        downloading: u32,
+        downloading: TorrentCount,
         /// The owner's limit.
         limit: DownloadingLimit,
     },
@@ -98,7 +98,7 @@ pub struct Bookmarks {
     /// When the next listing is due; now when absent.
     pub next: Option<Instant>,
     /// Listings that failed since the last success.
-    pub failures: u32,
+    pub failures: FailureCount,
     /// Why the latest listing failed.
     pub last_failure: Option<MamFailure>,
     listing: Option<Vec<Bookmark>>,
@@ -107,10 +107,14 @@ pub struct Bookmarks {
 impl Bookmarks {
     /// The page to request now: the next of a listing in progress, or the first
     /// of a due listing.
-    pub(super) fn wanted(&self, now: Instant) -> Option<u32> {
+    pub(super) fn wanted(&self, now: Instant) -> Option<BookmarkCount> {
         self.listing.as_ref().map_or_else(
-            || self.next.is_none_or(|next| next <= now).then_some(0),
-            |listing| u32::try_from(listing.len()).ok(),
+            || {
+                self.next
+                    .is_none_or(|next| next <= now)
+                    .then_some(BookmarkCount::new(0))
+            },
+            |listing| BookmarkCount::of(listing),
         )
     }
 
@@ -144,7 +148,7 @@ impl Bookmarks {
             found: page.found,
             bookmarks: self.listing.take().unwrap_or_default(),
         });
-        self.failures = 0;
+        self.failures = FailureCount::NONE;
         self.last_failure = None;
         self.next = now.checked_add(BOOKMARKS_EVERY);
         self.latest.as_ref()
@@ -158,7 +162,7 @@ impl Bookmarks {
             _ => RETRY_AFTER,
         };
         self.listing = None;
-        self.failures = self.failures.saturating_add(1);
+        self.failures = self.failures.after_another();
         self.last_failure = Some(failure);
         self.next = now.checked_add(wait);
     }
@@ -247,7 +251,7 @@ pub(super) struct Facts<'a> {
     /// Downloads qBittorrent added in the last hour, or will add.
     pub(super) recent: UnsatisfiedCount,
     /// Windlass's downloads that are running and not finished.
-    pub(super) downloading: u32,
+    pub(super) downloading: TorrentCount,
     pub(super) downloading_limit: DownloadingLimit,
     pub(super) account: &'a Account,
 }
@@ -285,7 +289,7 @@ impl Acquisition {
             bookmarks: Bookmarks {
                 latest: None,
                 next: None,
-                failures: 0,
+                failures: FailureCount::NONE,
                 last_failure: None,
                 listing: None,
             },
@@ -406,7 +410,7 @@ impl Acquisition {
         if !facts.client_ready {
             return Next::Hold(Hold::ClientUnavailable);
         }
-        if facts.downloading >= facts.downloading_limit.into_inner() {
+        if facts.downloading_limit.is_reached_by(facts.downloading) {
             return Next::Hold(Hold::DownloadingLimit {
                 downloading: facts.downloading,
                 limit: facts.downloading_limit,

@@ -4,7 +4,7 @@ use nutype::nutype;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Serialize, Serializer};
 
-use super::{Action, Points};
+use super::{Action, Points, TorrentCount};
 
 /// The maximum number of history entries kept before the oldest are removed.
 #[nutype(
@@ -57,6 +57,14 @@ impl PointsReserve {
     )
 )]
 pub struct DownloadingLimit(u32);
+
+impl DownloadingLimit {
+    /// Whether this many running downloads reach the limit.
+    #[must_use]
+    pub fn is_reached_by(self, downloading: TorrentCount) -> bool {
+        downloading.get() >= self.into_inner()
+    }
+}
 
 /// How many torrents may be active at once: downloading, or seeding while peers
 /// download from them. Seeds nobody downloads from do not count.

@@ -36,7 +36,7 @@ pub use api::{
     Snatched, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UploadCreditError,
     UserClass, UserData, VipTorrent, WedgeCount, WedgeSpent,
 };
-pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL};
+pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL, Tokens};
 pub use connectability::{
     Connectability, Connection, Findings, IpFinding, PortFinding, REPAIR_SETTLES_AFTER,
 };
@@ -100,7 +100,7 @@ pub enum Outstanding {
         /// The cookie to send it with.
         cookie: ApiCookie,
         /// The connection it will be sent on.
-        epoch: u64,
+        epoch: ConnectionEpoch,
     },
     /// A request was sent.
     Request {
@@ -110,8 +110,24 @@ pub enum Outstanding {
         sent: Instant,
         /// The connection it was sent on; a pause, lost protection, or a new
         /// cookie starts another.
-        epoch: u64,
+        epoch: ConnectionEpoch,
     },
+}
+
+/// One connection to MAM: a pause, lost protection, or a new cookie starts
+/// another, and answers to requests sent on an earlier one are ignored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionEpoch(u64);
+
+impl ConnectionEpoch {
+    /// The connection when Windlass starts.
+    pub const FIRST: Self = Self(0);
+
+    /// The connection after this one.
+    #[must_use]
+    const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
 }
 
 /// What Windlass knows about the last visit reminder.
@@ -178,7 +194,7 @@ pub struct Mam {
     renew_lease: bool,
     cookie_in_use: Option<ApiCookie>,
     issued_cookie: Option<ApiCookie>,
-    epoch: u64,
+    epoch: ConnectionEpoch,
     wake: Option<(TimerId, Instant)>,
     notices: Vec<Notice>,
 }
@@ -203,7 +219,7 @@ impl Mam {
             renew_lease: false,
             cookie_in_use: None,
             issued_cookie: None,
-            epoch: 0,
+            epoch: ConnectionEpoch::FIRST,
             wake: None,
             notices: Vec::new(),
         }
@@ -568,12 +584,12 @@ impl Mam {
             _ => None,
         };
         let recent = self.watch_downloads(now, records);
-        let downloading = records.map_or(0, |records| {
-            let running = records
-                .downloads()
-                .filter(|download| !download.finished && !download.held)
-                .count();
-            u32::try_from(running).unwrap_or(u32::MAX)
+        let downloading = records.map_or(TorrentCount::new(0), |records| {
+            TorrentCount::counting(
+                records
+                    .downloads()
+                    .filter(|download| !download.finished && !download.held),
+            )
         });
         let facts = Facts {
             now: now.monotonic,
@@ -830,7 +846,7 @@ impl Mam {
     /// A request already sent cannot be recalled; its answer is applied only
     /// where it records a spend.
     fn disconnect(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch = self.epoch.next();
         self.session = Session::Unverified;
         self.network.unconfirm();
         self.seedbox.unconfirm();
@@ -843,7 +859,7 @@ impl Mam {
         if requested != self.cookie_in_use.as_ref() && requested != self.issued_cookie.as_ref() {
             self.cookie_in_use = requested.cloned();
             self.issued_cookie = None;
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = self.epoch.next();
             self.session = Session::Unverified;
             self.seedbox.unconfirm();
             self.acquisition.refused = None;

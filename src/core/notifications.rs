@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use derive_more::Display;
 use serde::Serialize;
+
+use crate::core::FailureCount;
 
 use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
@@ -92,6 +95,33 @@ impl NoticeId {
     }
 }
 
+/// Pushes counted, such as those dropped because the outbox was full.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Display, Serialize)]
+pub struct PushCount(u64);
+
+impl PushCount {
+    /// No pushes.
+    pub const NONE: Self = Self(0);
+
+    /// This many pushes.
+    #[must_use]
+    pub const fn new(count: u64) -> Self {
+        Self(count)
+    }
+
+    /// The count with one more push.
+    #[must_use]
+    pub const fn plus_one(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Whether any push is counted.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.0 > 0
+    }
+}
+
 /// Where a notice reaches the owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Reach {
@@ -158,7 +188,7 @@ pub enum Notice {
     /// Tunnel checks keep failing.
     VpnProtectionLost {
         /// Consecutive failed checks.
-        failures: u32,
+        failures: FailureCount,
     },
     /// A tunnel check succeeded again.
     VpnProtectionRestored {
@@ -214,21 +244,21 @@ pub enum Notice {
     /// qBittorrent reports errors for some torrents.
     TorrentErrors {
         /// How many torrents.
-        count: usize,
+        count: TorrentCount,
     },
     /// No torrent reports an error.
     TorrentErrorsCleared,
     /// Some torrents' files are missing on disk.
     FilesMissing {
         /// How many torrents.
-        count: usize,
+        count: TorrentCount,
     },
     /// No torrent's files are missing.
     FilesMissingCleared,
     /// Some torrents Windlass wants are missing from qBittorrent.
     TorrentsMissing {
         /// How many torrents.
-        count: usize,
+        count: TorrentCount,
     },
     /// Every torrent Windlass wants is in qBittorrent.
     TorrentsMissingCleared,
@@ -269,7 +299,7 @@ pub enum Notice {
     /// Windlass cannot learn which IP MAM sees.
     MamIpUnknown {
         /// Failed lookups in a row.
-        failures: u32,
+        failures: FailureCount,
     },
     /// Windlass learns which IP MAM sees again.
     MamIpKnown,
@@ -343,8 +373,8 @@ pub enum Notice {
     DownloadsRefused,
     /// Torrents completed 20 or more days ago have not seeded 96 hours.
     SeedingBehind {
-        /// How many.
-        count: usize,
+        /// How many torrents.
+        count: TorrentCount,
     },
     /// Every torrent is on track to seed 96 hours.
     SeedingOnTrack,
@@ -672,9 +702,9 @@ pub struct Notifications {
     /// The latest delivery result.
     pub last_outcome: Option<Outcome>,
     /// Notices dropped because the outbox was full.
-    pub dropped: u64,
+    pub dropped: PushCount,
     /// Deliveries that failed since the last success.
-    pub failures: u32,
+    pub failures: FailureCount,
     grace_timer: Option<(TimerId, Instant)>,
     mode: Option<StartupMode>,
 }
@@ -721,8 +751,8 @@ impl Notifications {
             outbox: VecDeque::new(),
             delivery: Delivery::Idle,
             last_outcome: None,
-            dropped: 0,
-            failures: 0,
+            dropped: PushCount::NONE,
+            failures: FailureCount::NONE,
             grace_timer: None,
             mode: None,
         }
@@ -916,7 +946,7 @@ impl Notifications {
             | NotificationEvent::SaveFailed => Vec::new(),
             NotificationEvent::Delivered => {
                 self.delivery = Delivery::Idle;
-                self.failures = 0;
+                self.failures = FailureCount::NONE;
                 self.last_outcome = Some(Outcome {
                     at: now.wall,
                     result: Ok(()),
@@ -925,14 +955,14 @@ impl Notifications {
             }
             NotificationEvent::DeliveryFailed { reason } => {
                 let push = push.clone();
-                self.failures = self.failures.saturating_add(1);
+                self.failures = self.failures.after_another();
                 self.last_outcome = Some(Outcome {
                     at: now.wall,
                     result: Err(*reason),
                 });
                 // Waits of 30 seconds, then 1, 2, 4, and 8 minutes, then 10.
                 let after = RETRY_FIRST
-                    .saturating_mul(2_u32.saturating_pow(self.failures - 1))
+                    .saturating_mul(2_u32.saturating_pow(self.failures.get().saturating_sub(1)))
                     .min(RETRY_MAX);
                 let (timer, deadline) = timers.schedule(now.monotonic, after);
                 self.delivery = Delivery::Retrying { push, timer };
@@ -961,7 +991,7 @@ impl Notifications {
     fn enqueue(&mut self, push: Push) {
         if self.outbox.len() >= OUTBOX_LIMIT {
             self.outbox.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
+            self.dropped = self.dropped.plus_one();
         }
         self.outbox.push_back(push);
     }
@@ -1061,26 +1091,30 @@ fn assess(now: SystemTime, facts: Facts<'_>) -> Vec<(Condition, Status)> {
     let listed = session.filter(|session| session.listed());
     let count = |state: TorrentState| {
         listed.map(|session| {
-            session
-                .torrents
-                .values()
-                .filter(|torrent| torrent.state == state)
-                .count()
+            TorrentCount::counting(
+                session
+                    .torrents
+                    .values()
+                    .filter(|torrent| torrent.state == state),
+            )
         })
     };
     let missing = match facts.registry {
         Registry::Loaded(records) => listed.map(|session| {
-            records
-                .records()
-                .filter(|record| record.desired == Desired::Active)
-                .filter_map(|record| record.identity.hash())
-                .filter(|hash| !session.torrents.contains_key(*hash))
-                .count()
+            TorrentCount::counting(
+                records
+                    .records()
+                    .filter(|record| record.desired == Desired::Active)
+                    .filter_map(|record| record.identity.hash())
+                    .filter(|hash| !session.torrents.contains_key(*hash)),
+            )
         }),
         _ => None,
     };
-    let counted = |count: Option<usize>, raised: fn(usize) -> Notice, cleared: Notice| match count {
-        Some(0) => Status::Clear(Some(cleared)),
+    let counted = |count: Option<TorrentCount>,
+                   raised: fn(TorrentCount) -> Notice,
+                   cleared: Notice| match count {
+        Some(count) if count.is_zero() => Status::Clear(Some(cleared)),
         Some(count) => Status::Active(raised(count)),
         None => Status::Unchanged,
     };
@@ -1163,11 +1197,11 @@ fn assess(now: SystemTime, facts: Facts<'_>) -> Vec<(Condition, Status)> {
 
 /// Active torrents completed 20 or more days ago with less than the seeding
 /// target seeded.
-fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<usize> {
+fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<TorrentCount> {
     let Registry::Loaded(records) = registry else {
         return None;
     };
-    Some(
+    Some(TorrentCount::counting(
         records
             .records()
             .filter(|record| record.desired == Desired::Active)
@@ -1178,9 +1212,8 @@ fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<usize> {
                         now.duration_since(completed)
                             .is_ok_and(|since| since >= SEEDING_DEADLINE_WARNING)
                     })
-            })
-            .count(),
-    )
+            }),
+    ))
 }
 
 /// The account's lasting conditions, as MAM reports them.
@@ -1224,7 +1257,7 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
         ),
         (
             Condition::MamIp,
-            if mam.network.failures > 0 {
+            if mam.network.failures.any() {
                 Status::Active(Notice::MamIpUnknown {
                     failures: mam.network.failures,
                 })

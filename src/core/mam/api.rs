@@ -31,7 +31,7 @@ pub enum MamRequest {
     /// List one page of the owner's bookmarks.
     ListBookmarks {
         /// How many bookmarks to skip.
-        start: u32,
+        start: BookmarkCount,
     },
     /// Download a torrent file and keep it for qBittorrent.
     FetchTorrent {
@@ -239,6 +239,11 @@ impl TorrentCount {
         Self(count)
     }
 
+    /// The number of torrents among these, saturating.
+    pub fn counting<T>(torrents: impl Iterator<Item = T>) -> Self {
+        Self(u32::try_from(torrents.count()).unwrap_or(u32::MAX))
+    }
+
     /// The count.
     #[must_use]
     pub const fn get(self) -> u32 {
@@ -309,6 +314,12 @@ impl BookmarkCount {
     #[must_use]
     pub const fn new(count: u32) -> Self {
         Self(count)
+    }
+
+    /// The number of bookmarks in this list, or `None` past what MAM counts.
+    #[must_use]
+    pub fn of(listed: &[Bookmark]) -> Option<Self> {
+        u32::try_from(listed.len()).ok().map(Self)
     }
 
     /// Whether a list this long holds them all.

@@ -176,10 +176,10 @@ fn failed_renewals_retry_and_the_lease_lapses() {
     match harness.core.port_forwarding() {
         PortForwarding::Enabled {
             lease: None,
-            failures: 2,
+            failures,
             last_failure: Some(MappingFailure::Refused { result_code: 2 }),
             ..
-        } => {}
+        } if *failures == windlass::core::FailureCount::new(2) => {}
         other => unreachable!("unexpected state {other:?}"),
     }
 }

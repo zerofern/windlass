@@ -9,6 +9,8 @@ use std::{
 use nutype::nutype;
 use serde::Serialize;
 
+use crate::core::FailureCount;
+
 use super::{Action, ClockReading, TimerId, TimerName, timer::Timers};
 
 /// How often a working tunnel is checked.
@@ -16,7 +18,7 @@ pub const CHECK_INTERVAL: Duration = Duration::from_mins(15);
 /// How soon a failed check is repeated.
 pub const RETRY_AFTER: Duration = Duration::from_mins(1);
 /// Consecutive failed checks before Windlass moves to another server.
-pub const FAILURES_BEFORE_SWITCH: u32 = 3;
+pub const FAILURES_BEFORE_SWITCH: FailureCount = FailureCount::new(3);
 /// MAM requires the VPN IP to change less than once an hour.
 pub const SWITCH_SPACING: Duration = Duration::from_hours(1);
 /// A suspected problem does not repeat a check started this recently.
@@ -171,7 +173,7 @@ pub struct Watch {
     /// The next or outstanding check.
     pub check: Check,
     /// Consecutive failed checks.
-    pub failures: u32,
+    pub failures: FailureCount,
     /// Why the latest check failed, while checks fail.
     pub last_failure: Option<ExitIpFailure>,
     /// A failover in progress.
@@ -243,7 +245,7 @@ impl Tunnel {
                     current,
                     protection: Protection::Unknown,
                     check: Check::Outstanding,
-                    failures: 0,
+                    failures: FailureCount::NONE,
                     last_failure: None,
                     failover: None,
                     last_check: now.monotonic,
@@ -269,7 +271,7 @@ impl Tunnel {
                     exit_ip: ip,
                     checked_at: now.wall,
                 };
-                watch.failures = 0;
+                watch.failures = FailureCount::NONE;
                 watch.last_failure = None;
                 watch.wait(now, timers, CHECK_INTERVAL)
             }
@@ -279,7 +281,7 @@ impl Tunnel {
                 if !matches!(watch.protection, Protection::Unavailable { .. }) {
                     watch.protection = Protection::Unavailable { since: now.wall };
                 }
-                watch.failures = watch.failures.saturating_add(1);
+                watch.failures = watch.failures.after_another();
                 watch.last_failure = Some(reason);
                 if watch.failures >= FAILURES_BEFORE_SWITCH
                     && allowance == SwitchAllowance::Now
@@ -306,7 +308,7 @@ impl Tunnel {
                 Some(Failover::Switching(server)) => {
                     watch.current = Some(server);
                     watch.protection = Protection::Unknown;
-                    watch.failures = 0;
+                    watch.failures = FailureCount::NONE;
                     watch.last_failure = None;
                     watch.check_now(now)
                 }

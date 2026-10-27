@@ -5,6 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
+use crate::core::FailureCount;
+
 use super::{
     ClientRefusal, ListedClient, MamFailure, MamMessage, Partials, Points, Purchase, RedKind,
     TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserData,
@@ -142,7 +144,7 @@ pub struct PurchaseRecord {
     pub outcome: Option<PurchaseOutcome>,
     sent: Instant,
     before: Option<Before>,
-    vip_hundredths: Option<u64>,
+    vip_weeks: Option<VipWeeks>,
 }
 
 /// The account and spending.
@@ -153,7 +155,7 @@ pub struct Account {
     /// When the next routine reading is due; now when absent.
     pub next_read: Option<Instant>,
     /// Readings that failed since the last success.
-    pub failures: u32,
+    pub failures: FailureCount,
     /// Why the latest reading failed.
     pub last_failure: Option<MamFailure>,
     /// The latest purchase.
@@ -178,7 +180,7 @@ impl Account {
         Self {
             reading: None,
             next_read: None,
-            failures: 0,
+            failures: FailureCount::NONE,
             last_failure: None,
             last_purchase: None,
             vip_price_per_week: VIP_PRICE_PER_WEEK,
@@ -280,7 +282,7 @@ impl Account {
             at: wall,
             taken: now,
         });
-        self.failures = 0;
+        self.failures = FailureCount::NONE;
         self.last_failure = None;
         self.next_read = now.checked_add(ACCOUNT_READ_EVERY);
         settled
@@ -355,7 +357,7 @@ impl Account {
             } => ACCOUNT_FRESH_FOR.max(*after),
             _ => ACCOUNT_FRESH_FOR,
         };
-        self.failures = self.failures.saturating_add(1);
+        self.failures = self.failures.after_another();
         self.last_failure = Some(failure);
         self.next_read = now.checked_add(wait);
     }
@@ -497,12 +499,7 @@ impl Account {
     /// The expected price of renewing VIP now, when it is due for renewal.
     #[must_use]
     pub fn vip_cost(&self, data: &UserData, now: SystemTime) -> Option<Points> {
-        let hundredths = vip_hundredths(data, now)?;
-        Some(Points::new(
-            hundredths
-                .saturating_mul(self.vip_price_per_week.get())
-                .div_ceil(100),
-        ))
+        Some(vip_weeks(data, now)?.cost(self.vip_price_per_week))
     }
 
     pub(super) fn buying(&mut self, purchase: Purchase, now: Instant, wall: SystemTime) {
@@ -516,7 +513,7 @@ impl Account {
                 uploaded: data.uploaded,
                 vip_until: data.vip_until,
             }),
-            vip_hundredths: self.data().and_then(|data| vip_hundredths(data, wall)),
+            vip_weeks: self.data().and_then(|data| vip_weeks(data, wall)),
         });
     }
 
@@ -535,16 +532,13 @@ impl Account {
             outcome: None,
             sent: now,
             before: None,
-            vip_hundredths: None,
+            vip_weeks: None,
         });
-        if let (PurchaseOutcome::Made(after), Purchase::Vip, Some(before), Some(hundredths)) = (
-            &outcome,
-            record.purchase,
-            record.before,
-            record.vip_hundredths,
-        ) {
-            let price = before.points.less(*after).times(100).get() / hundredths.max(1);
-            self.vip_price_per_week = Some(Points::new(price))
+        if let (PurchaseOutcome::Made(after), Purchase::Vip, Some(before), Some(weeks)) =
+            (&outcome, record.purchase, record.before, record.vip_weeks)
+        {
+            let price = weeks.price_per_week(before.points.less(*after));
+            self.vip_price_per_week = Some(price)
                 .filter(|price| *price > Points::default())
                 .unwrap_or(self.vip_price_per_week);
         }
@@ -556,7 +550,25 @@ impl Account {
 }
 
 /// Hundredths of a week a VIP purchase would buy now, when renewal is due.
-fn vip_hundredths(data: &UserData, now: SystemTime) -> Option<u64> {
+/// VIP time bought at once, in hundredths of a week.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VipWeeks(u64);
+
+impl VipWeeks {
+    /// What these weeks cost at this weekly price, rounded up.
+    const fn cost(self, per_week: Points) -> Points {
+        Points::new(self.0.saturating_mul(per_week.get()).div_ceil(100))
+    }
+
+    /// The weekly price that spending this on these weeks shows.
+    fn price_per_week(self, spent: Points) -> Points {
+        Points::new(spent.times(100).get() / self.0.max(1))
+    }
+}
+
+/// The VIP time a renewal now buys, when it is due: VIP filled to 90 days,
+/// and at least one week.
+fn vip_weeks(data: &UserData, now: SystemTime) -> Option<VipWeeks> {
     let remaining = data
         .vip_until
         .and_then(|until| until.duration_since(now).ok())
@@ -565,7 +577,9 @@ fn vip_hundredths(data: &UserData, now: SystemTime) -> Option<u64> {
         return None;
     }
     let bought = VIP_FILL.saturating_sub(remaining).as_secs();
-    Some((bought.saturating_mul(100) / WEEK.as_secs()).max(100))
+    Some(VipWeeks(
+        (bought.saturating_mul(100) / WEEK.as_secs()).max(100),
+    ))
 }
 
 fn same_kind(left: Purchase, right: Purchase) -> bool {

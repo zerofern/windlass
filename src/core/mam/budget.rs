@@ -4,14 +4,35 @@
 use std::time::{Duration, Instant};
 
 /// Tokens the bucket holds when full.
-pub const REQUEST_BURST: u32 = 10;
+pub const REQUEST_BURST: Tokens = Tokens(10);
 /// How often one token is restored.
 pub const REQUEST_REFILL: Duration = Duration::from_secs(3);
+
+/// Requests the bucket allows now, one token each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tokens(u32);
+
+impl Tokens {
+    const NONE: Self = Self(0);
+
+    /// The tokens left after taking one, if there was one.
+    const fn less_one(self) -> Option<Self> {
+        match self.0.checked_sub(1) {
+            Some(left) => Some(Self(left)),
+            None => None,
+        }
+    }
+
+    /// These tokens and this many restored, up to a full bucket.
+    fn restoring(self, restored: u32) -> Self {
+        Self(self.0.saturating_add(restored)).min(REQUEST_BURST)
+    }
+}
 
 /// The shared request budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
-    tokens: u32,
+    tokens: Tokens,
     refilled_at: Option<Instant>,
 }
 
@@ -34,10 +55,10 @@ impl Budget {
     /// Take a token, if one is available.
     pub(super) fn take(&mut self, now: Instant) -> bool {
         let (tokens, refilled_at) = self.refilled(now);
-        if tokens == 0 {
+        let Some(left) = tokens.less_one() else {
             return false;
-        }
-        self.tokens = tokens - 1;
+        };
+        self.tokens = left;
         self.refilled_at = Some(refilled_at.unwrap_or(now));
         true
     }
@@ -46,21 +67,21 @@ impl Budget {
     #[must_use]
     pub fn next_token(&self, now: Instant) -> Option<Instant> {
         match self.refilled(now) {
-            (0, Some(refilled_at)) => refilled_at.checked_add(REQUEST_REFILL),
+            (Tokens::NONE, Some(refilled_at)) => refilled_at.checked_add(REQUEST_REFILL),
             _ => None,
         }
     }
 
     /// The tokens after restoring those due by `now`, and when the last was
     /// restored; a full bucket has no restoring in progress.
-    fn refilled(&self, now: Instant) -> (u32, Option<Instant>) {
+    fn refilled(&self, now: Instant) -> (Tokens, Option<Instant>) {
         let Some(refilled_at) = self.refilled_at else {
             return (self.tokens, None);
         };
         let elapsed = now.saturating_duration_since(refilled_at);
         let restored =
             u32::try_from(elapsed.as_secs() / REQUEST_REFILL.as_secs()).unwrap_or(u32::MAX);
-        let tokens = self.tokens.saturating_add(restored).min(REQUEST_BURST);
+        let tokens = self.tokens.restoring(restored);
         if tokens == REQUEST_BURST {
             return (tokens, None);
         }

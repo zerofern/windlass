@@ -515,7 +515,8 @@ async fn unavailable_services_are_reported_and_retried() -> TestResult {
         .wait(|observation| {
             matches!(
                 observation.port_forwarding,
-                PortForwarding::Enabled { failures: 2.., .. }
+                PortForwarding::Enabled { failures, .. }
+                    if failures >= windlass::core::FailureCount::new(2)
             )
         })
         .await?;

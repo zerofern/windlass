@@ -5,6 +5,8 @@ use std::{
 
 use serde::Serialize;
 
+use crate::core::FailureCount;
+
 use super::{Action, ClockReading, TimerId, TimerName, timer::Timers};
 
 /// The lease lifetime requested from Proton VPN's NAT-PMP gateway.
@@ -102,7 +104,7 @@ pub enum PortForwarding {
         /// The next or outstanding request.
         request: LeaseRequest,
         /// Requests that failed since the last success.
-        failures: u32,
+        failures: FailureCount,
         /// Why the latest request failed, if it did.
         last_failure: Option<MappingFailure>,
     },
@@ -134,7 +136,7 @@ impl PortForwarding {
                 *self = Self::Enabled {
                     lease: None,
                     request: LeaseRequest::Outstanding,
-                    failures: 0,
+                    failures: FailureCount::NONE,
                     last_failure: None,
                 };
                 vec![request]
@@ -154,7 +156,7 @@ impl PortForwarding {
                     renewed_at: now.wall,
                     expires: now.monotonic.checked_add(lifetime).unwrap_or(now.monotonic),
                 });
-                *failures = 0;
+                *failures = FailureCount::NONE;
                 *last_failure = None;
                 // Renew with a quarter of the lifetime to spare, as Proton advises.
                 let (id, deadline) = timers.schedule(now.monotonic, lifetime * 3 / 4);
@@ -174,7 +176,7 @@ impl PortForwarding {
                 },
                 PortForwardingEvent::Mapped { .. } | PortForwardingEvent::MappingFailed { .. },
             ) => {
-                *failures += 1;
+                *failures = failures.after_another();
                 *last_failure = Some(match event {
                     PortForwardingEvent::MappingFailed { reason } => reason,
                     _ => MappingFailure::Malformed,

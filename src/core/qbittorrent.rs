@@ -16,7 +16,19 @@ use super::{
 /// How often qBittorrent's state is read.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Preferences are re-read after this many polls, to notice outside changes.
-const POLLS_PER_PREFERENCES_READ: u8 = 6;
+const POLLS_PER_PREFERENCES_READ: Polls = Polls(6);
+
+/// Polls since qBittorrent's preferences were last read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Polls(u8);
+
+impl Polls {
+    const NONE: Self = Self(0);
+
+    const fn plus_one(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
 
 /// A qBittorrent release version, such as 5.2.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -658,7 +670,7 @@ pub struct Session {
     pub activity: Activity,
     position: SyncPosition,
     listed: bool,
-    polls_since_preferences: u8,
+    polls_since_preferences: Polls,
 }
 
 /// The core's view of qBittorrent.
@@ -708,7 +720,7 @@ impl Qbittorrent {
                     activity: Activity::Syncing,
                     position: SyncPosition::default(),
                     listed: false,
-                    polls_since_preferences: 0,
+                    polls_since_preferences: Polls::NONE,
                 }));
                 vec![Action::SyncQbittorrent {
                     position: SyncPosition::default(),
@@ -718,7 +730,7 @@ impl Qbittorrent {
                 if session.activity == Activity::Syncing =>
             {
                 session.apply(update);
-                session.polls_since_preferences = session.polls_since_preferences.saturating_add(1);
+                session.polls_since_preferences = session.polls_since_preferences.plus_one();
                 session.activity = Activity::Deciding { after_sync: true };
                 Vec::new()
             }
@@ -733,7 +745,7 @@ impl Qbittorrent {
                 if session.activity == Activity::ReadingPreferences =>
             {
                 session.preferences = preferences;
-                session.polls_since_preferences = 0;
+                session.polls_since_preferences = Polls::NONE;
                 session.wait(now, timers)
             }
             (Self::Connected(session), QbittorrentEvent::ListenPortSet)

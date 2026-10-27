@@ -424,7 +424,14 @@ mod tests {
         .await;
         assert_eq!(answer.result, Ok(MamReply::UserData(Box::new(user(None)))));
 
-        let answer = ask(&client, MamRequest::ListBookmarks { start: 0 }, &cookie).await;
+        let answer = ask(
+            &client,
+            MamRequest::ListBookmarks {
+                start: crate::core::BookmarkCount::new(0),
+            },
+            &cookie,
+        )
+        .await;
         let mut vip = bookmark(VIP_ID, "A VIP Book")?;
         vip.vip = VipTorrent::Until(SystemTime::UNIX_EPOCH + VIP_UNTIL);
         vip.freeleech = Freeleech::ForEveryone;
@@ -679,7 +686,16 @@ mod tests {
             Some(MamFailure::Malformed)
         );
         assert_eq!(
-            failure(ask(&client, MamRequest::ListBookmarks { start: 0 }, &cookie).await),
+            failure(
+                ask(
+                    &client,
+                    MamRequest::ListBookmarks {
+                        start: crate::core::BookmarkCount::new(0)
+                    },
+                    &cookie
+                )
+                .await
+            ),
             Some(MamFailure::Malformed)
         );
         fake.with(|world| {
@@ -725,7 +741,9 @@ mod tests {
             MamRequest::RegisterSeedbox,
             MamRequest::RegisterSeedbox,
             MamRequest::Buy(Purchase::Vip),
-            MamRequest::ListBookmarks { start: 0 },
+            MamRequest::ListBookmarks {
+                start: crate::core::BookmarkCount::new(0),
+            },
         ] {
             assert_eq!(
                 failure(ask(&client, request.clone(), &cookie).await),

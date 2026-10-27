@@ -8,10 +8,10 @@ use maud::{DOCTYPE, Markup, html};
 use crate::{
     core::{
         Activity, Bookmarks, ByteSize, Completion, Condition, Delivery, Desired, EntryCount,
-        Failover, HistoryState, MamApproval, MamRequestsStatus, MappingFailure, Notifications,
-        NtfyTopic, Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding, Protection,
-        Qbittorrent, Records, Registry, Session, Setting, SettingStatus, Settings, SettingsState,
-        SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
+        Failover, FailureCount, HistoryState, MamApproval, MamRequestsStatus, MappingFailure,
+        Notifications, NtfyTopic, Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding,
+        Protection, Qbittorrent, Records, Registry, Session, Setting, SettingStatus, Settings,
+        SettingsState, SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
     },
     runner::Observation,
     shell::{
@@ -276,11 +276,11 @@ fn notifications_panel(notifications: &Notifications, settings: &SettingsState) 
                             None => "None yet",
                         }
                     }
-                    @if notifications.failures > 0 {
+                    @if notifications.failures.any() {
                         dt { "Failed attempts" } dd { (notifications.failures) ", retrying" }
                     }
                     dt { "Waiting to send" } dd { (notifications.outbox.len()) }
-                    @if notifications.dropped > 0 {
+                    @if notifications.dropped.any() {
                         dt { "Dropped" } dd { (notifications.dropped) " oldest, while delivery failed" }
                     }
                 }
@@ -445,7 +445,10 @@ fn port_forwarding_panel(forwarding: &PortForwarding) -> Markup {
     let (tag, tone) = match forwarding {
         PortForwarding::Disabled => ("Not configured", "neutral"),
         PortForwarding::Enabled { lease: None, .. } => ("No forwarded port", "error"),
-        PortForwarding::Enabled { failures: 0, .. } => ("Forwarded", "ok"),
+        PortForwarding::Enabled {
+            failures: FailureCount::NONE,
+            ..
+        } => ("Forwarded", "ok"),
         PortForwarding::Enabled { .. } => ("Renewal failing", "warning"),
     };
     html! {
@@ -1452,7 +1455,7 @@ mod tests {
             let html = render(PortForwarding::Enabled {
                 lease: None,
                 request: LeaseRequest::Outstanding,
-                failures: 2,
+                failures: crate::core::FailureCount::new(2),
                 last_failure: Some(reason),
             });
             assert!(
@@ -1617,7 +1620,7 @@ mod tests {
             failures, request, ..
         } = &mut forwarding
         {
-            *failures = 1;
+            *failures = crate::core::FailureCount::new(1);
             *request = crate::core::LeaseRequest::Outstanding;
         }
         assert!(
@@ -2067,8 +2070,8 @@ mod tests {
             at: SystemTime::UNIX_EPOCH,
             result: Err(DeliveryFailure::Rejected { status: 429 }),
         });
-        notifications.failures = 2;
-        notifications.dropped = 3;
+        notifications.failures = crate::core::FailureCount::new(2);
+        notifications.dropped = crate::core::PushCount::new(3);
         notifications
             .conditions
             .insert(Condition::FilesMissing, Phase::Raised);

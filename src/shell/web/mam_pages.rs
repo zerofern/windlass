@@ -653,19 +653,19 @@ mod tests {
             at: SystemTime::UNIX_EPOCH,
             current: false,
         });
-        mam.network.failures = 2;
+        mam.network.failures = crate::core::FailureCount::new(2);
         mam.network.last_failure = Some(MamFailure::Unreachable);
         mam.seedbox.last_attempt = LastAttempt::ReadFailed;
         mam.seedbox.status = SeedboxStatus::Failed {
             failure: RegistrationFailure::NotSaved,
             at: SystemTime::UNIX_EPOCH,
         };
-        mam.account.failures = 1;
+        mam.account.failures = crate::core::FailureCount::new(1);
         mam.account.last_failure = Some(MamFailure::Malformed);
         mam.acquisition.refused = Some(SystemTime::UNIX_EPOCH);
         mam.acquisition.hold = Some(Hold::DownloadsRefused);
         mam.acquisition.fetching = MamTorrentId::new(4).map(|id| (id, true));
-        mam.acquisition.bookmarks.failures = 1;
+        mam.acquisition.bookmarks.failures = crate::core::FailureCount::new(1);
         mam.acquisition.bookmarks.last_failure = Some(MamFailure::Unreachable);
         let html = render(&mam, true);
         for text in [
