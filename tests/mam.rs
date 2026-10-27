@@ -468,7 +468,7 @@ async fn a_pasted_cookie_leads_to_a_registered_seedbox_and_a_wedged_download() -
         StatusCode::SEE_OTHER
     );
     windlass
-        .wait(|observation| !observation.mam.available)
+        .wait(|observation| observation.mam.gate == windlass::core::RequestGate::Closed)
         .await?;
     let before = std::time::Instant::now();
     windlass.stop().await?;

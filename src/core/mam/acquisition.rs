@@ -9,11 +9,14 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    Bookmark, BookmarkCount, BookmarkPage, Freeleech, MamFailure, PersonalFreeleech,
-    UnsatisfiedCount, UnsatisfiedLimit, WedgeSpent,
+    Bookmark, BookmarkCount, BookmarkPage, ClientReadiness, Freeleech, MamFailure,
+    PersonalFreeleech, RequestGate, SeedboxConfirmation, UnsatisfiedCount, UnsatisfiedLimit, Wedge,
+    WedgeSpent,
     account::{Account, ClientStanding},
 };
-use crate::core::{Download, DownloadingLimit, FailureCount, MamTorrentId, TorrentCount, UserData};
+use crate::core::{
+    Completion, Download, DownloadingLimit, FailureCount, MamTorrentId, TorrentCount, UserData,
+};
 
 /// How often bookmarks are listed.
 pub const BOOKMARKS_EVERY: Duration = Duration::from_mins(15);
@@ -210,11 +213,29 @@ pub enum DownloadWatch {
     NeedHistory,
     /// It is not free for the owner.
     NotFree {
-        /// Whether Windlass spent a wedge on it that the history does not show.
-        wedge_missing: bool,
+        /// Whether the bonus history shows the wedges Windlass spent on it.
+        wedges: WedgeAccounting,
         /// Whether MAM still lists it, so a wedge could be spent.
-        listed: bool,
+        listing: MamListing,
     },
+}
+
+/// Whether the bonus history shows every wedge Windlass spent on a torrent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum WedgeAccounting {
+    /// It shows them all, or none was spent.
+    Complete,
+    /// Windlass spent a wedge on it that the history does not show.
+    Missing,
+}
+
+/// Whether MAM still lists a torrent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MamListing {
+    /// MAM lists it.
+    Listed,
+    /// MAM no longer lists it.
+    Unlisted,
 }
 
 /// The next request admission or the watch over running downloads wants.
@@ -227,7 +248,7 @@ pub(super) enum Next {
         /// The torrent.
         id: MamTorrentId,
         /// Whether to spend a wedge.
-        wedge: bool,
+        wedge: Wedge,
     },
     /// Look the torrent up on MAM.
     LookUp(MamTorrentId),
@@ -244,9 +265,9 @@ pub(super) enum Next {
 pub(super) struct Facts<'a> {
     pub(super) now: Instant,
     pub(super) wall: SystemTime,
-    pub(super) mam_available: bool,
-    pub(super) seedbox_confirmed: bool,
-    pub(super) client_ready: bool,
+    pub(super) gate: RequestGate,
+    pub(super) seedbox: SeedboxConfirmation,
+    pub(super) readiness: ClientReadiness,
     pub(super) client: ClientStanding,
     /// Downloads qBittorrent added in the last hour, or will add.
     pub(super) recent: UnsatisfiedCount,
@@ -266,7 +287,7 @@ pub struct Acquisition {
     /// Why the next queued torrent waits, if it does.
     pub hold: Option<Hold>,
     /// The download being fetched, and whether with a wedge.
-    pub fetching: Option<(MamTorrentId, bool)>,
+    pub fetching: Option<(MamTorrentId, Wedge)>,
     /// When the latest download was admitted.
     pub last_admission: Option<Instant>,
     /// Torrents looked up on MAM by ID.
@@ -398,16 +419,16 @@ impl Acquisition {
                 Next::Idle
             };
         };
-        if !facts.mam_available {
+        if facts.gate == RequestGate::Closed {
             return Next::Hold(Hold::MamUnavailable);
         }
-        if !facts.seedbox_confirmed {
+        if facts.seedbox == SeedboxConfirmation::Unconfirmed {
             return Next::Hold(Hold::SeedboxUnconfirmed);
         }
         if self.refused.is_some() {
             return Next::Hold(Hold::DownloadsRefused);
         }
-        if !facts.client_ready {
+        if facts.readiness == ClientReadiness::NotReady {
             return Next::Hold(Hold::ClientUnavailable);
         }
         if facts.downloading_limit.is_reached_by(facts.downloading) {
@@ -442,23 +463,36 @@ impl Acquisition {
             );
         };
         if free_for_owner(listing, data, facts.wall) {
-            return Next::Fetch { id, wedge: false };
+            return Next::Fetch {
+                id,
+                wedge: Wedge::Keep,
+            };
         }
         // A wedge spent before, or by an attempt whose answer was lost, is not
         // spent again.
         let Some(history) = self.history_settles(id, facts.now) else {
             return Self::ask(self.may_ask_history(id, facts.now), Next::NeedHistory);
         };
-        let wedge = !history.wedged.contains(&id);
-        if wedge && data.wedges.is_zero() {
+        let wedge = if history.wedged.contains(&id) {
+            Wedge::Keep
+        } else {
+            Wedge::Spend
+        };
+        if wedge == Wedge::Spend && data.wedges.is_zero() {
             return Next::Hold(Hold::NoWedge);
         }
         Next::Fetch { id, wedge }
     }
 
-    pub(super) fn fetching(&mut self, now: Instant, id: MamTorrentId, wedge: bool, admitted: bool) {
+    pub(super) fn fetching(
+        &mut self,
+        now: Instant,
+        id: MamTorrentId,
+        wedge: Wedge,
+        admitted: bool,
+    ) {
         self.fetching = Some((id, wedge));
-        if wedge {
+        if wedge == Wedge::Spend {
             self.wedge_attempts.insert(id, now);
         }
         if admitted {
@@ -476,7 +510,9 @@ impl Acquisition {
         wall: SystemTime,
     ) -> Vec<(Download, DownloadWatch)> {
         downloads
-            .filter(|download| !download.finished || recent(download, wall))
+            .filter(|download| {
+                download.completion == Completion::Incomplete || recent(download, wall)
+            })
             .map(|download| {
                 let watch = self.watch(&download, data, now, wall);
                 (download, watch)
@@ -500,8 +536,8 @@ impl Acquisition {
             // Only a history read once MAM recorded the wedge can show it.
             return if history.is_some_and(|history| history.at >= recorded) {
                 DownloadWatch::NotFree {
-                    wedge_missing: true,
-                    listed: true,
+                    wedges: WedgeAccounting::Missing,
+                    listing: MamListing::Listed,
                 }
             } else {
                 DownloadWatch::NeedHistory
@@ -517,8 +553,12 @@ impl Acquisition {
             DownloadWatch::FreeForNow
         } else if history.is_some_and(|history| history.at >= seen) {
             DownloadWatch::NotFree {
-                wedge_missing: false,
-                listed: listing.is_some(),
+                wedges: WedgeAccounting::Complete,
+                listing: if listing.is_some() {
+                    MamListing::Listed
+                } else {
+                    MamListing::Unlisted
+                },
             }
         } else {
             DownloadWatch::NeedHistory
@@ -537,16 +577,18 @@ impl Acquisition {
                     Next::NeedHistory
                 }
                 DownloadWatch::NotFree {
-                    wedge_missing: false,
-                    listed: true,
-                } if !download.finished => match account.fresh(now, None) {
-                    Some(data) if !data.wedges.is_zero() => Next::Fetch {
-                        id: download.mam,
-                        wedge: true,
-                    },
-                    Some(_) => Next::Idle,
-                    None => Next::NeedReading,
-                },
+                    wedges: WedgeAccounting::Complete,
+                    listing: MamListing::Listed,
+                } if download.completion == Completion::Incomplete => {
+                    match account.fresh(now, None) {
+                        Some(data) if !data.wedges.is_zero() => Next::Fetch {
+                            id: download.mam,
+                            wedge: Wedge::Spend,
+                        },
+                        Some(_) => Next::Idle,
+                        None => Next::NeedReading,
+                    }
+                }
                 _ => Next::Idle,
             };
             if next != Next::Idle {

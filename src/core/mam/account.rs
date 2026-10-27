@@ -8,10 +8,10 @@ use serde::Serialize;
 use crate::core::FailureCount;
 
 use super::{
-    ClientRefusal, ListedClient, MamFailure, MamMessage, Partials, Points, Purchase, RedKind,
-    TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserData,
+    ClientListing, ClientRefusal, ListedClient, MamFailure, MamMessage, Partials, Points, Purchase,
+    RedKind, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserData,
 };
-use crate::core::{ByteSize, ClientVersion, Ratio};
+use crate::core::{ByteSize, ClientVersion, Ratio, Urgency};
 
 /// How often the account is read.
 pub const ACCOUNT_READ_EVERY: Duration = Duration::from_mins(15);
@@ -107,7 +107,7 @@ pub enum PurchaseOutcome {
     /// An uncertain purchase, settled.
     Settled {
         /// Whether MAM sold it.
-        made: bool,
+        sale: Sale,
         /// Who settled it.
         by: SettledBy,
     },
@@ -145,6 +145,15 @@ pub struct PurchaseRecord {
     sent: Instant,
     before: Option<Before>,
     vip_weeks: Option<VipWeeks>,
+}
+
+/// Whether MAM sold what Windlass tried to buy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Sale {
+    /// MAM sold it.
+    Made,
+    /// MAM did not sell it.
+    NotMade,
 }
 
 /// The account and spending.
@@ -232,15 +241,21 @@ impl Account {
 
     /// The reading to request now: routinely, or early when a decision needs a
     /// fresh one.
-    pub(super) fn wanted(&self, now: Instant, early: bool) -> Option<bool> {
+    pub(super) fn wanted(&self, now: Instant, early: bool) -> Option<ClientListing> {
         let routine = self.next_read.is_none_or(|next| next <= now);
         let early = early
             && self
                 .last_request
                 .is_none_or(|last| now.saturating_duration_since(last) >= EARLY_READ_SPACING);
         (routine || early).then(|| {
-            self.client_stats_read
+            if self
+                .client_stats_read
                 .is_none_or(|read| now.saturating_duration_since(read) >= CLIENT_STATS_EVERY)
+            {
+                ClientListing::Include
+            } else {
+                ClientListing::Omit
+            }
         })
     }
 
@@ -297,22 +312,26 @@ impl Account {
             .as_mut()
             .filter(|record| record.outcome == Some(PurchaseOutcome::Uncertain))?;
         let made = record.before.and_then(|before| match record.purchase {
-            Purchase::Vip => Some(after.vip_until > before.vip_until),
+            Purchase::Vip => Some(if after.vip_until > before.vip_until {
+                Sale::Made
+            } else {
+                Sale::NotMade
+            }),
             Purchase::Upload(amount) => {
                 let gib = u64::from(amount.into_inner());
                 let price = UPLOAD_PRICE_PER_GIB.times(gib);
                 let spent = before.points.less(after.points);
                 let credited = after.uploaded.less(before.uploaded) >= ByteSize::gib(gib);
                 match (spent.times(2) >= price, credited) {
-                    (false, _) => Some(false),
-                    (true, true) => Some(true),
+                    (false, _) => Some(Sale::NotMade),
+                    (true, true) => Some(Sale::Made),
                     (true, false) => None,
                 }
             }
         });
-        let outcome = made.map_or(PurchaseOutcome::Unresolved, |made| {
+        let outcome = made.map_or(PurchaseOutcome::Unresolved, |sale| {
             PurchaseOutcome::Settled {
-                made,
+                sale,
                 by: SettledBy::Reading,
             }
         });
@@ -321,13 +340,13 @@ impl Account {
     }
 
     /// The owner checked an unresolved purchase on MAM.
-    pub(super) fn checked(&mut self, made: bool) -> Option<Purchase> {
+    pub(super) fn checked(&mut self, sale: Sale) -> Option<Purchase> {
         let record = self
             .last_purchase
             .as_mut()
             .filter(|record| record.outcome == Some(PurchaseOutcome::Unresolved))?;
         record.outcome = Some(PurchaseOutcome::Settled {
-            made,
+            sale,
             by: SettledBy::Owner,
         });
         Some(record.purchase)
@@ -408,10 +427,19 @@ impl Account {
 
     /// Whether the ratio is below the floor, and whether urgently.
     #[must_use]
-    pub fn ratio_low(&self) -> Option<(Ratio, bool)> {
+    pub fn ratio_low(&self) -> Option<(Ratio, Urgency)> {
         self.ratio()
             .filter(|ratio| *ratio < RATIO_FLOOR)
-            .map(|ratio| (ratio, ratio < RATIO_URGENT))
+            .map(|ratio| {
+                (
+                    ratio,
+                    if ratio < RATIO_URGENT {
+                        Urgency::Urgent
+                    } else {
+                        Urgency::Normal
+                    },
+                )
+            })
     }
 
     /// The unsatisfied count and limit, once 80% of the limit is reached.

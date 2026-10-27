@@ -9,12 +9,12 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 
 use crate::core::{
-    ActiveLimit, ApiCookie, ByteSize, Completion, ContentPath, Desired, DownloadingLimit, Event,
-    ForceStart, HistoryLimit, Identity, Logged, MamEvent, MamPauseEvent, MamRequestMode,
-    MamTorrentId, NoticeId, NotificationEvent, NtfyTopic, Observation, Origin, PointsReserve,
-    Progress, Ratio, Reach, RecordId, RegistryEvent, SavePath, SettingsEvent, StartupEvent,
-    StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentName, TorrentRecord, TorrentState,
-    TunnelEvent, VpnServer, VpnSwitch,
+    ActiveLimit, ApiCookie, ByteSize, Completion, ContentDeletion, ContentPath, Desired,
+    DownloadingLimit, Event, ForceStart, HistoryLimit, Identity, Logged, MamEvent, MamPauseEvent,
+    MamRequestMode, MamTorrentId, NoticeId, NotificationEvent, NtfyTopic, Observation, Origin,
+    PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent, SavePath, SettingsEvent,
+    StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentName, TorrentRecord,
+    TorrentState, TunnelEvent, VpnServer, VpnSwitch,
 };
 
 use super::{notify, qbittorrent::torrent_state};
@@ -703,7 +703,11 @@ fn torrent_record(row: &Row<'_>) -> StorageResult<TorrentRecord> {
         origin,
         desired,
         save_path: text(row, 5, SavePath::try_new)?,
-        deletion_allowed: row.get(6)?,
+        deletion: if row.get(6)? {
+            ContentDeletion::Allowed
+        } else {
+            ContentDeletion::NotAllowed
+        },
         observation,
     })
 }
@@ -787,7 +791,7 @@ fn save_torrents(path: &Path, records: &[TorrentRecord]) -> StorageResult<Event>
                     Desired::Removed => "removed",
                 },
                 record.save_path.as_ref().map(ToString::to_string),
-                record.deletion_allowed,
+                record.deletion == ContentDeletion::Allowed,
                 torrent.and_then(|torrent| torrent.name.as_ref().map(ToString::to_string)),
                 torrent.map(|torrent| state_name(torrent.state)),
                 torrent.map(|torrent| torrent.progress.permille()),
@@ -942,7 +946,11 @@ mod tests {
             origin,
             desired,
             save_path: crate::core::SavePath::try_new("/srv/books").ok(),
-            deletion_allowed: id == SECOND,
+            deletion: if id == SECOND {
+                crate::core::ContentDeletion::Allowed
+            } else {
+                crate::core::ContentDeletion::NotAllowed
+            },
             observation,
         };
         let adopted = TorrentHash::parse(&"a".repeat(40)).map(|hash| {

@@ -7,9 +7,10 @@ use maud::{Markup, html};
 
 use crate::{
     core::{
-        Attention, ClientRefusal, Connectability, Connectable, DownloadWatch, LastAttempt, Mam,
-        MamSession, Partials, PurchaseOutcome, PurchaseRecord, RegistrationAllowance,
-        RegistrationFailure, SeedboxStatus, SettingsState, SettledBy, UPLOAD_BUFFER,
+        Attention, ClientRefusal, Connectability, Connectable, DownloadWatch, IpStanding,
+        LastAttempt, Mam, MamHosts, MamListing, MamSession, Partials, PurchaseOutcome,
+        PurchaseRecord, RegistrationAllowance, RegistrationFailure, RequestGate, Sale,
+        SeedboxStatus, SettingsState, SettledBy, UPLOAD_BUFFER, Wedge, WedgeAccounting,
     },
     shell::describe::{client_standing, findings, gib, hold, mam_failure, purchase, rejection},
 };
@@ -29,11 +30,11 @@ fn access_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup 
     let cookie = settings
         .loaded()
         .is_some_and(|settings| settings.api_cookie.saved.is_some());
-    let (tag, tone) = match (&mam.session, mam.enabled, mam.available, cookie) {
-        (_, false, _, _) => ("Not configured", "neutral"),
+    let (tag, tone) = match (&mam.session, mam.hosts, mam.gate, cookie) {
+        (_, MamHosts::NotConfigured, _, _) => ("Not configured", "neutral"),
         (_, _, _, false) => ("No API cookie", "warning"),
         (MamSession::Rejected { .. }, ..) => ("Session refused", "error"),
-        (_, _, false, _) => ("Waiting", "neutral"),
+        (_, _, RequestGate::Closed, _) => ("Waiting", "neutral"),
         (MamSession::Verified { .. }, ..) => ("Working", "ok"),
         (MamSession::Unverified, ..) => ("Checking…", "pending"),
     };
@@ -63,7 +64,7 @@ fn access_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup 
                             @if let Some(name) = &observed.observation.provider { " (" (name) ")" }
                             ", "
                             (time(observed.at, "full"))
-                            @if !observed.current { " · unconfirmed" }
+                            @if observed.standing == IpStanding::Unconfirmed { " · unconfirmed" }
                         }
                         None => "Not observed yet",
                     }
@@ -266,8 +267,8 @@ fn outcome(outcome: Option<&PurchaseOutcome>) -> Markup {
             Some(PurchaseOutcome::Refused(Some(message))) => { "refused: " (message) }
             Some(PurchaseOutcome::Refused(None)) => "refused",
             Some(PurchaseOutcome::Uncertain) => "uncertain; nothing more is bought until the next reading",
-            Some(PurchaseOutcome::Settled { made, by }) => {
-                @if *made { "made" } @else { "not made" }
+            Some(PurchaseOutcome::Settled { sale, by }) => {
+                @if *sale == Sale::Made { "made" } @else { "not made" }
                 @match by {
                     SettledBy::Reading => ", as the next reading showed",
                     SettledBy::Owner => ", as you checked on MAM",
@@ -314,7 +315,7 @@ fn bookmarks_panel(mam: &Mam) -> Markup {
                 }
                 @if let Some((id, wedge)) = acquisition.fetching {
                     dt { "Downloading" }
-                    dd { "MAM torrent " (id.get()) @if wedge { ", spending a wedge" } }
+                    dd { "MAM torrent " (id.get()) @if wedge == Wedge::Spend { ", spending a wedge" } }
                 }
                 @if !acquisition.watched.is_empty() {
                     dt { "Running downloads" }
@@ -339,10 +340,13 @@ const fn download_watch(watch: DownloadWatch) -> &'static str {
         }
         DownloadWatch::NeedLookup | DownloadWatch::NeedHistory => "being checked with MAM",
         DownloadWatch::NotFree {
-            wedge_missing: true,
+            wedges: WedgeAccounting::Missing,
             ..
         } => "stopped: MAM's bonus history shows no wedge spent on it",
-        DownloadWatch::NotFree { listed: false, .. } => "stopped: MAM no longer lists it",
+        DownloadWatch::NotFree {
+            listing: MamListing::Unlisted,
+            ..
+        } => "stopped: MAM no longer lists it",
         DownloadWatch::NotFree { .. } => "not free for you; a wedge is spent if one is left",
     }
 }
@@ -385,14 +389,14 @@ mod tests {
             (Some(PurchaseOutcome::Uncertain), "uncertain"),
             (
                 Some(PurchaseOutcome::Settled {
-                    made: true,
+                    sale: crate::core::Sale::Made,
                     by: crate::core::SettledBy::Reading,
                 }),
                 "made, as the next reading showed",
             ),
             (
                 Some(PurchaseOutcome::Settled {
-                    made: false,
+                    sale: crate::core::Sale::NotMade,
                     by: crate::core::SettledBy::Owner,
                 }),
                 "not made, as you checked on MAM",
@@ -504,16 +508,16 @@ mod tests {
             DownloadWatch::FreeForNow,
             DownloadWatch::NeedLookup,
             DownloadWatch::NotFree {
-                wedge_missing: true,
-                listed: true,
+                wedges: crate::core::WedgeAccounting::Missing,
+                listing: crate::core::MamListing::Listed,
             },
             DownloadWatch::NotFree {
-                wedge_missing: false,
-                listed: false,
+                wedges: crate::core::WedgeAccounting::Complete,
+                listing: crate::core::MamListing::Unlisted,
             },
             DownloadWatch::NotFree {
-                wedge_missing: false,
-                listed: true,
+                wedges: crate::core::WedgeAccounting::Complete,
+                listing: crate::core::MamListing::Listed,
             },
         ];
         mam.acquisition.watched = MamTorrentId::new(5)
@@ -524,8 +528,8 @@ mod tests {
                     let download = Download {
                         mam: id,
                         hash: hash.clone(),
-                        held: false,
-                        finished: false,
+                        desired: crate::core::Desired::Active,
+                        completion: crate::core::Completion::Incomplete,
                         added_at: None,
                     };
                     (download, watch)
@@ -552,9 +556,9 @@ mod tests {
 
         let findings = Findings {
             listen_port: PortFinding::NoForwardedPort,
-            lease_renewed: false,
+            lease: crate::core::LeaseRenewal::NotRequested,
             exit_ip: IpFinding::Unknown,
-            registered: false,
+            seedbox: crate::core::SeedboxConfirmation::Unconfirmed,
             interface: None,
         };
         let mut mam = Mam::default();
@@ -629,10 +633,10 @@ mod tests {
     fn every_mam_state_has_words() {
         let mut mam = Mam::default();
         assert!(render(&mam, true).contains("Not configured"));
-        mam.enabled = true;
+        mam.hosts = crate::core::MamHosts::Configured;
         assert!(render(&mam, false).contains("No API cookie"));
         assert!(render(&mam, true).contains("Waiting"));
-        mam.available = true;
+        mam.gate = crate::core::RequestGate::Open;
         assert!(render(&mam, true).contains("Checking…"));
         mam.session = MamSession::Verified {
             at: SystemTime::UNIX_EPOCH,
@@ -651,7 +655,7 @@ mod tests {
         mam.network.observed = Some(Observed {
             observation,
             at: SystemTime::UNIX_EPOCH,
-            current: false,
+            standing: crate::core::IpStanding::Unconfirmed,
         });
         mam.network.failures = crate::core::FailureCount::new(2);
         mam.network.last_failure = Some(MamFailure::Unreachable);
@@ -664,7 +668,7 @@ mod tests {
         mam.account.last_failure = Some(MamFailure::Malformed);
         mam.acquisition.refused = Some(SystemTime::UNIX_EPOCH);
         mam.acquisition.hold = Some(Hold::DownloadsRefused);
-        mam.acquisition.fetching = MamTorrentId::new(4).map(|id| (id, true));
+        mam.acquisition.fetching = MamTorrentId::new(4).map(|id| (id, crate::core::Wedge::Spend));
         mam.acquisition.bookmarks.failures = crate::core::FailureCount::new(1);
         mam.acquisition.bookmarks.last_failure = Some(MamFailure::Unreachable);
         let html = render(&mam, true);

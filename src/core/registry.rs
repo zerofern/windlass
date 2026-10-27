@@ -10,7 +10,7 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    Action, ByteSize, ClockReading, ForceStart, Progress, SavePath, Session, Torrent,
+    Action, ByteSize, ClockReading, Completion, ForceStart, Progress, SavePath, Session, Torrent,
     TorrentCommand, TorrentHash, TorrentState,
 };
 
@@ -152,12 +152,20 @@ pub struct Download {
     pub mam: MamTorrentId,
     /// Its info hash.
     pub hash: TorrentHash,
-    /// Whether Windlass keeps it stopped.
-    pub held: bool,
+    /// Whether Windlass wants it running or keeps it held.
+    pub desired: Desired,
     /// Whether qBittorrent reports it complete.
-    pub finished: bool,
+    pub completion: Completion,
     /// When qBittorrent added it; unknown until qBittorrent lists it.
     pub added_at: Option<SystemTime>,
+}
+
+impl Download {
+    /// Whether it is still downloading: wanted running and not complete.
+    #[must_use]
+    pub fn is_downloading(&self) -> bool {
+        self.desired == Desired::Active && self.completion == Completion::Incomplete
+    }
 }
 
 /// What qBittorrent last reported about a torrent, and when.
@@ -167,6 +175,15 @@ pub struct Observation {
     pub torrent: Torrent,
     /// When it was reported.
     pub last_seen: SystemTime,
+}
+
+/// Whether the owner allows a torrent's content to be deleted for space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ContentDeletion {
+    /// It may be deleted.
+    Allowed,
+    /// It is kept.
+    NotAllowed,
 }
 
 /// One registry row: intent, then observation.
@@ -183,7 +200,7 @@ pub struct TorrentRecord {
     /// Where its content is saved.
     pub save_path: Option<SavePath>,
     /// Whether the user allows its content to be deleted for space.
-    pub deletion_allowed: bool,
+    pub deletion: ContentDeletion,
     /// What qBittorrent last reported, if it ever did.
     pub observation: Option<Observation>,
 }
@@ -226,15 +243,33 @@ pub struct Records {
     next_id: RecordId,
     unsaved: BTreeSet<RecordId>,
     saving: Option<BTreeSet<RecordId>>,
-    save_failed: bool,
+    last_save: LastSave,
     last_command: Option<(TorrentCommand, Instant)>,
+}
+
+/// Whether the last batch of rows was saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastSave {
+    /// It was, or none was tried yet.
+    Saved,
+    /// Saving it failed.
+    Failed,
+}
+
+/// Whether a row's counters changed since it was last saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Counters {
+    /// They are saved.
+    Saved,
+    /// They changed since.
+    Unsaved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     record: TorrentRecord,
     saved_at: Option<Instant>,
-    counters_unsaved: bool,
+    counters: Counters,
 }
 
 impl Registry {
@@ -255,7 +290,7 @@ impl Registry {
             }
             (Self::Loaded(records), RegistryEvent::Saved) if records.saving.is_some() => {
                 records.saving = None;
-                records.save_failed = false;
+                records.last_save = LastSave::Saved;
                 records.save(now)
             }
             (Self::Loaded(records), RegistryEvent::Redownload(id)) => records.redownload(now, id),
@@ -264,7 +299,7 @@ impl Registry {
                 records
                     .unsaved
                     .extend(records.saving.take().into_iter().flatten());
-                records.save_failed = true;
+                records.last_save = LastSave::Failed;
                 Vec::new()
             }
             _ => Vec::new(),
@@ -319,7 +354,7 @@ impl Records {
                     Entry {
                         record,
                         saved_at: None,
-                        counters_unsaved: false,
+                        counters: Counters::Saved,
                     },
                 )
             })
@@ -331,7 +366,7 @@ impl Records {
             next_id,
             unsaved: BTreeSet::new(),
             saving: None,
-            save_failed: false,
+            last_save: LastSave::Saved,
             last_command: None,
         }
     }
@@ -367,8 +402,12 @@ impl Records {
                 .then(|| Download {
                     mam: *mam,
                     hash: hash.clone(),
-                    held: record.desired == Desired::Held,
-                    finished: seen.is_some_and(|torrent| torrent.completed_at.is_some()),
+                    desired: record.desired,
+                    completion: if seen.is_some_and(|torrent| torrent.completed_at.is_some()) {
+                        Completion::Complete
+                    } else {
+                        Completion::Incomplete
+                    },
                     added_at: seen.and_then(|torrent| torrent.added_at),
                 })
         })
@@ -383,8 +422,8 @@ impl Records {
 
     /// Whether the last save failed; it is retried with the next update.
     #[must_use]
-    pub const fn save_failed(&self) -> bool {
-        self.save_failed
+    pub fn save_failed(&self) -> bool {
+        self.last_save == LastSave::Failed
     }
 
     fn observe(&mut self, now: ClockReading, session: &Session) -> Vec<Action> {
@@ -429,7 +468,7 @@ impl Records {
                     origin: Origin::Bookmark,
                     desired,
                     save_path: None,
-                    deletion_allowed: false,
+                    deletion: ContentDeletion::NotAllowed,
                     observation: None,
                 }),
             );
@@ -549,7 +588,7 @@ impl Records {
                 origin: Origin::Adopted,
                 desired: Desired::Active,
                 save_path: torrent.save_path.clone(),
-                deletion_allowed: false,
+                deletion: ContentDeletion::NotAllowed,
                 observation: None,
             }),
         );
@@ -568,7 +607,7 @@ impl Records {
             .filter(|(id, _)| ids.contains(id))
             .map(|(_, entry)| {
                 entry.saved_at = Some(now);
-                entry.counters_unsaved = false;
+                entry.counters = Counters::Saved;
                 entry.record.clone()
             })
             .collect();
@@ -682,7 +721,7 @@ impl Entry {
         Self {
             record,
             saved_at: None,
-            counters_unsaved: false,
+            counters: Counters::Saved,
         }
     }
 
@@ -691,11 +730,13 @@ impl Entry {
         let current = observation.torrent.clone();
         match self.record.observation.replace(observation) {
             Some(previous) if !significant(&previous.torrent, &current) => {
-                self.counters_unsaved |= previous.torrent != current;
+                if previous.torrent != current {
+                    self.counters = Counters::Unsaved;
+                }
                 let due = self
                     .saved_at
                     .is_none_or(|saved_at| now.duration_since(saved_at) >= COUNTER_SAVE_INTERVAL);
-                self.counters_unsaved && due
+                self.counters == Counters::Unsaved && due
             }
             _ => true,
         }

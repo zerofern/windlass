@@ -11,8 +11,8 @@ use std::{net::SocketAddr, time::Duration};
 use reqwest::{Client as HttpClient, Url};
 
 use crate::core::{
-    DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Partials, Push, SettingName,
-    StartupMode, SwitchBlock, TorrentCount,
+    ClientWarning, DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Partials, Push, Sale,
+    SettingName, StartupMode, SwitchBlock, TorrentCount, Urgency,
 };
 
 use super::describe::{hold, purchase, qbittorrent_failure, rejection, timestamp};
@@ -395,13 +395,16 @@ pub(super) fn message(notice: &Notice) -> Message {
         ),
         Notice::RatioLow {
             ratio: value,
-            urgent,
+            urgency,
         } => at_mam(
             "Ratio below 2.0",
             format!(
                 "MAM reports a ratio of {value}. Every download is held until you find out why."
             ),
-            if *urgent { 5 } else { 4 },
+            match urgency {
+                Urgency::Urgent => 5,
+                Urgency::Normal => 4,
+            },
         ),
         Notice::RatioRestored => at_mam(
             "Ratio back above 2.0",
@@ -464,20 +467,23 @@ pub(super) fn message(notice: &Notice) -> Message {
             count,
             client_warning,
         } => at_mam(
-            if *client_warning {
+            if *client_warning == ClientWarning::Given {
                 "MAM warns about a client"
             } else {
                 "MAM has notifications"
             },
             format!(
                 "MAM has {count} notifications for you{}. Windlass does not read them.",
-                if *client_warning {
+                if *client_warning == ClientWarning::Given {
                     ", including a warning that it is about to stop accepting a client"
                 } else {
                     ""
                 }
             ),
-            if *client_warning { 5 } else { 3 },
+            match client_warning {
+                ClientWarning::Given => 5,
+                ClientWarning::NotGiven => 3,
+            },
         ),
         Notice::DownloadsHeld { hold: reason } => at_mam(
             "Downloads held",
@@ -562,14 +568,18 @@ pub(super) fn message(notice: &Notice) -> Message {
             ),
             4,
         ),
-        Notice::DownloadNotFree { stopped: true } => at_mam(
+        Notice::DownloadNotFree {
+            outcome: crate::core::NotFreeOutcome::Stopped,
+        } => at_mam(
             "Download stopped",
             String::from(
                 "A download is no longer free for you, and no wedge could be spent on it, so Windlass stopped it to protect the ratio. It resumes if it becomes free or a wedge is available.",
             ),
             4,
         ),
-        Notice::DownloadNotFree { stopped: false } => at_mam(
+        Notice::DownloadNotFree {
+            outcome: crate::core::NotFreeOutcome::FinishedFirst,
+        } => at_mam(
             "Download may have cost ratio",
             String::from(
                 "A download finished before Windlass could confirm it was free for you. Check your ratio on MAM.",
@@ -585,13 +595,13 @@ pub(super) fn message(notice: &Notice) -> Message {
         ),
         Notice::PurchaseSettled {
             purchase: wanted,
-            made,
+            sale,
         } => at_mam(
             "Purchase settled",
             format!(
                 "The uncertain purchase of {} {}; Windlass buys again only as needed.",
                 purchase(*wanted),
-                if *made {
+                if *sale == Sale::Made {
                     "went through"
                 } else {
                     "did not go through"
@@ -780,11 +790,11 @@ mod tests {
             Notice::MamStateUnreadable,
             Notice::RatioLow {
                 ratio: crate::core::Ratio::from_thousandths(1500),
-                urgent: false,
+                urgency: crate::core::Urgency::Normal,
             },
             Notice::RatioLow {
                 ratio: crate::core::Ratio::from_thousandths(1050),
-                urgent: true,
+                urgency: crate::core::Urgency::Urgent,
             },
             Notice::RatioRestored,
             Notice::UnsatisfiedNearLimit {
@@ -814,11 +824,11 @@ mod tests {
             Notice::MamFlagsCleared,
             Notice::MamMessages {
                 count: NoticeCount::new(2),
-                client_warning: false,
+                client_warning: crate::core::ClientWarning::NotGiven,
             },
             Notice::MamMessages {
                 count: NoticeCount::new(1),
-                client_warning: true,
+                client_warning: crate::core::ClientWarning::Given,
             },
             Notice::DownloadsResumed,
             Notice::NoWedgesLeft,
@@ -853,24 +863,28 @@ mod tests {
             Notice::ConnectableAgain,
             Notice::PurchaseSettled {
                 purchase: Purchase::Vip,
-                made: true,
+                sale: crate::core::Sale::Made,
             },
             Notice::PurchaseSettled {
                 purchase: Purchase::Vip,
-                made: false,
+                sale: crate::core::Sale::NotMade,
             },
             Notice::PurchaseNeedsChecking {
                 purchase: Purchase::Vip,
             },
-            Notice::DownloadNotFree { stopped: true },
-            Notice::DownloadNotFree { stopped: false },
+            Notice::DownloadNotFree {
+                outcome: crate::core::NotFreeOutcome::Stopped,
+            },
+            Notice::DownloadNotFree {
+                outcome: crate::core::NotFreeOutcome::FinishedFirst,
+            },
             Notice::WedgedMidDownload,
             Notice::NotConnectable {
                 findings: crate::core::Findings {
                     listen_port: crate::core::PortFinding::NoForwardedPort,
-                    lease_renewed: false,
+                    lease: crate::core::LeaseRenewal::NotRequested,
                     exit_ip: crate::core::IpFinding::Unknown,
-                    registered: false,
+                    seedbox: crate::core::SeedboxConfirmation::Unconfirmed,
                     interface: crate::core::NetworkInterface::try_new("wg0").ok(),
                 },
             },

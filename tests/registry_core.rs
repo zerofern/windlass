@@ -140,7 +140,7 @@ fn record(id: u64, identity: Identity, desired: Desired) -> Result<TorrentRecord
         origin: windlass::core::Origin::Bookmark,
         desired,
         save_path: None,
-        deletion_allowed: true,
+        deletion: windlass::core::ContentDeletion::Allowed,
         observation: None,
     })
 }
@@ -180,7 +180,7 @@ fn unknown_torrents_are_adopted_as_active() {
             row.save_path,
             windlass::core::SavePath::try_new("/srv/books").ok()
         );
-        assert!(!row.deletion_allowed);
+        assert_eq!(row.deletion, windlass::core::ContentDeletion::NotAllowed);
         assert_eq!(row.identity.mam_id(), None);
     }
     let summary: Vec<_> = rows

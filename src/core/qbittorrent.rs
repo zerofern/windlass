@@ -651,8 +651,26 @@ pub enum Activity {
     /// Choosing the next request; never visible outside a step.
     Deciding {
         /// Whether a fresh update was just merged.
-        after_sync: bool,
+        after: DecidingAfter,
     },
+}
+
+/// What a choice of the next qBittorrent request follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DecidingAfter {
+    /// A fresh update was just merged.
+    Sync,
+    /// Any other answer.
+    Other,
+}
+
+/// Whether qBittorrent's full torrent list has arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    /// Not yet.
+    Awaited,
+    /// It has.
+    Received,
 }
 
 /// A connected qBittorrent and what Windlass knows about it.
@@ -669,7 +687,7 @@ pub struct Session {
     /// The request outstanding now.
     pub activity: Activity,
     position: SyncPosition,
-    listed: bool,
+    listing: Listing,
     polls_since_preferences: Polls,
 }
 
@@ -719,7 +737,7 @@ impl Qbittorrent {
                     torrents: BTreeMap::new(),
                     activity: Activity::Syncing,
                     position: SyncPosition::default(),
-                    listed: false,
+                    listing: Listing::Awaited,
                     polls_since_preferences: Polls::NONE,
                 }));
                 vec![Action::SyncQbittorrent {
@@ -731,14 +749,18 @@ impl Qbittorrent {
             {
                 session.apply(update);
                 session.polls_since_preferences = session.polls_since_preferences.plus_one();
-                session.activity = Activity::Deciding { after_sync: true };
+                session.activity = Activity::Deciding {
+                    after: DecidingAfter::Sync,
+                };
                 Vec::new()
             }
             (Self::Connected(session), QbittorrentEvent::CommandDone)
                 if session.activity == Activity::Commanding =>
             {
                 // Read the result of the command at once.
-                session.activity = Activity::Deciding { after_sync: false };
+                session.activity = Activity::Deciding {
+                    after: DecidingAfter::Other,
+                };
                 Vec::new()
             }
             (Self::Connected(session), QbittorrentEvent::PreferencesRead(preferences))
@@ -791,7 +813,9 @@ impl Qbittorrent {
                 vec![Action::ConnectQbittorrent]
             }
             Self::Connected(session) if session.activity == Activity::Waiting(id) => {
-                session.activity = Activity::Deciding { after_sync: false };
+                session.activity = Activity::Deciding {
+                    after: DecidingAfter::Other,
+                };
                 Vec::new()
             }
             _ => Vec::new(),
@@ -801,10 +825,10 @@ impl Qbittorrent {
     /// The session, while it is choosing its next request, and whether a fresh
     /// update was just merged.
     #[must_use]
-    pub fn deciding(&self) -> Option<(&Session, bool)> {
+    pub fn deciding(&self) -> Option<(&Session, DecidingAfter)> {
         match self {
             Self::Connected(session) => match session.activity {
-                Activity::Deciding { after_sync } => Some((session, after_sync)),
+                Activity::Deciding { after } => Some((session, after)),
                 _ => None,
             },
             _ => None,
@@ -823,13 +847,13 @@ impl Qbittorrent {
         let Self::Connected(session) = self else {
             return Vec::new();
         };
-        let Activity::Deciding { after_sync } = session.activity else {
+        let Activity::Deciding { after } = session.activity else {
             return Vec::new();
         };
         if let Some(actions) = session.set_preferences(wanted) {
             return actions;
         }
-        if !after_sync {
+        if after == DecidingAfter::Other {
             session.activity = Activity::Syncing;
             return vec![Action::SyncQbittorrent {
                 position: session.position,
@@ -861,14 +885,14 @@ impl Qbittorrent {
 impl Session {
     /// Whether the torrent list is complete: the first full update has arrived.
     #[must_use]
-    pub const fn listed(&self) -> bool {
-        self.listed
+    pub fn listed(&self) -> bool {
+        self.listing == Listing::Received
     }
 
     fn apply(&mut self, update: SyncUpdate) {
         if update.scope == SyncScope::Full {
             self.torrents.clear();
-            self.listed = true;
+            self.listing = Listing::Received;
         }
         for (hash, changes) in update.torrents {
             self.torrents.entry(hash).or_default().apply(changes);

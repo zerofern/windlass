@@ -16,6 +16,24 @@ use serde::Serialize;
 
 use super::super::{ByteSize, ClientVersion, HttpStatus, MamTorrentId, Ratio, TorrentHash};
 
+/// Whether a download spends a freeleech wedge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Wedge {
+    /// Spend a wedge, so the download costs no ratio.
+    Spend,
+    /// Spend none; the torrent is free for the owner already.
+    Keep,
+}
+
+/// Whether an account reading includes MAM's list of the owner's clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ClientListing {
+    /// Include it.
+    Include,
+    /// Leave it out.
+    Omit,
+}
+
 /// A request Windlass makes to MAM. Only one is outstanding at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum MamRequest {
@@ -26,7 +44,7 @@ pub enum MamRequest {
     /// Load the account, its snatch summary, and its notice counts.
     LoadUserData {
         /// Whether to include the client list, which MAM caches for 30 minutes.
-        client_stats: bool,
+        clients: ClientListing,
     },
     /// List one page of the owner's bookmarks.
     ListBookmarks {
@@ -38,7 +56,7 @@ pub enum MamRequest {
         /// The torrent.
         id: MamTorrentId,
         /// Whether to spend a wedge on it.
-        wedge: bool,
+        wedge: Wedge,
     },
     /// Buy from the bonus point store.
     Buy(Purchase),

@@ -7,7 +7,8 @@ use reqwest::{StatusCode, Url, header};
 use serde_json::json;
 
 use crate::core::{
-    ApiCookie, FetchedTorrent, MamFailure, MamReply, MamRequest, Purchase, SessionRejection,
+    ApiCookie, ClientListing, FetchedTorrent, MamFailure, MamReply, MamRequest, Purchase,
+    SessionRejection, Wedge,
 };
 
 use super::{mam_reply as reply, torrent_file};
@@ -126,12 +127,12 @@ fn build(client: &Client, request: &MamRequest) -> reqwest::RequestBuilder {
     match request {
         MamRequest::LookUpIp => client.http.get(client.ip.clone()),
         MamRequest::RegisterSeedbox => client.http.get(client.seedbox.clone()),
-        MamRequest::LoadUserData { client_stats } => {
+        MamRequest::LoadUserData { clients } => {
             let mut url = client.user_data.clone();
             url.query_pairs_mut()
                 .append_pair("snatch_summary", "true")
                 .append_pair("notif", "true");
-            if *client_stats {
+            if *clients == ClientListing::Include {
                 url.query_pairs_mut().append_pair("clientStats", "true");
             }
             client.http.get(url)
@@ -150,7 +151,7 @@ fn build(client: &Client, request: &MamRequest) -> reqwest::RequestBuilder {
             let mut url = client.download.clone();
             url.query_pairs_mut()
                 .append_pair("tid", &id.get().to_string());
-            if *wedge {
+            if *wedge == Wedge::Spend {
                 url.query_pairs_mut().append_pair("fl", "1");
             }
             client.http.get(url)
@@ -398,7 +399,9 @@ mod tests {
         };
         let answer = ask(
             &client,
-            MamRequest::LoadUserData { client_stats: true },
+            MamRequest::LoadUserData {
+                clients: crate::core::ClientListing::Include,
+            },
             &cookie,
         )
         .await;
@@ -417,7 +420,7 @@ mod tests {
         let answer = ask(
             &client,
             MamRequest::LoadUserData {
-                client_stats: false,
+                clients: crate::core::ClientListing::Omit,
             },
             &rotated,
         )
@@ -466,7 +469,7 @@ mod tests {
 
         let request = MamRequest::FetchTorrent {
             id: BOOK_ID,
-            wedge: true,
+            wedge: crate::core::Wedge::Spend,
         };
         let answer = ask(&client, request, &cookie).await;
         let (hash, file) = fake
@@ -596,7 +599,7 @@ mod tests {
     async fn refusals_and_faults_are_told_apart() -> TestResult {
         let (fake, client, cookie) = fake().await?;
         let load = MamRequest::LoadUserData {
-            client_stats: false,
+            clients: crate::core::ClientListing::Omit,
         };
         let failure = |answer: Answer| answer.result.err();
 
@@ -617,7 +620,7 @@ mod tests {
         }
         let unknown = MamRequest::FetchTorrent {
             id: UNKNOWN_ID,
-            wedge: false,
+            wedge: crate::core::Wedge::Keep,
         };
         assert_eq!(
             failure(ask(&client, unknown, &cookie).await),

@@ -8,7 +8,7 @@ use std::{
 
 use crate::core::FailureCount;
 
-use super::{Asn, IpObservation, MamFailure, SessionRejection};
+use super::{Asn, IpObservation, MamFailure, SeedboxConfirmation, SessionRejection};
 
 /// How often the IP MAM sees is observed; MAM allows once a minute.
 pub const OBSERVE_EVERY: Duration = Duration::from_mins(5);
@@ -66,6 +66,15 @@ impl Session {
     }
 }
 
+/// Whether what MAM saw still describes the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpStanding {
+    /// It describes the connection now.
+    Current,
+    /// The connection may have changed since.
+    Unconfirmed,
+}
+
 /// The IP and ASN MAM saw, and when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
@@ -75,7 +84,7 @@ pub struct Observed {
     pub at: SystemTime,
     /// Whether it still describes the connection; a pause, lost protection, or
     /// a server switch makes it unconfirmed.
-    pub current: bool,
+    pub standing: IpStanding,
 }
 
 /// Observing the IP MAM sees.
@@ -110,7 +119,7 @@ impl Network {
     pub fn current(&self) -> Option<&IpObservation> {
         self.observed
             .as_ref()
-            .filter(|observed| observed.current)
+            .filter(|observed| observed.standing == IpStanding::Current)
             .map(|observed| &observed.observation)
     }
 
@@ -142,7 +151,7 @@ impl Network {
         self.observed = Some(Observed {
             observation,
             at: wall,
-            current: true,
+            standing: IpStanding::Current,
         });
         self.failures = FailureCount::NONE;
         self.last_failure = None;
@@ -164,7 +173,7 @@ impl Network {
     /// The connection may have changed: observe again as soon as allowed.
     pub(super) const fn unconfirm(&mut self) {
         if let Some(observed) = &mut self.observed {
-            observed.current = false;
+            observed.standing = IpStanding::Unconfirmed;
         }
         self.next_lookup = None;
     }
@@ -262,10 +271,12 @@ impl Seedbox {
 
     /// Whether MAM confirmed this IP as the seedbox.
     #[must_use]
-    pub fn confirms(&self, observed: Option<&IpObservation>) -> bool {
+    pub fn confirms(&self, observed: Option<&IpObservation>) -> SeedboxConfirmation {
         match (&self.status, observed) {
-            (SeedboxStatus::Confirmed { ip, .. }, Some(observed)) => *ip == observed.ip,
-            _ => false,
+            (SeedboxStatus::Confirmed { ip, .. }, Some(observed)) if *ip == observed.ip => {
+                SeedboxConfirmation::Confirmed
+            }
+            _ => SeedboxConfirmation::Unconfirmed,
         }
     }
 
@@ -281,7 +292,7 @@ impl Seedbox {
             }
         );
         observed.is_some()
-            && !self.confirms(observed)
+            && self.confirms(observed) == SeedboxConfirmation::Unconfirmed
             && !refused
             && self.allowance(now) == RegistrationAllowance::Now
     }

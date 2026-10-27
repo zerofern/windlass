@@ -510,7 +510,7 @@ mod tests {
         );
         let fetch = MamRequest::FetchTorrent {
             id: KEPT,
-            wedge: false,
+            wedge: crate::core::Wedge::Keep,
         };
         for (action, expected) in [
             (

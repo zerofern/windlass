@@ -5,12 +5,13 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
-    Action, Bookmark, ByteSize, ClientStanding, DeliveryFailure, Event, ExitIpFailure, Findings,
-    Freeleech, HistoryEvent, Hold, IdleTorrents, IpFinding, MamEvent, MamFailure, MamPauseEvent,
-    MamReply, MamRequest, MamRequestMode, MappingFailure, NotificationEvent, PersonalFreeleech,
-    PortFinding, PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure, Registration,
-    RegistryEvent, SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode, SyncScope,
-    TimerName, TorrentCommand, TunnelEvent, VipTorrent,
+    Action, Bookmark, ByteSize, ClientListing, ClientStanding, DeliveryFailure, Event,
+    ExitIpFailure, Findings, Freeleech, HistoryEvent, Hold, IdleTorrents, IpFinding, LeaseRenewal,
+    MamEvent, MamFailure, MamPauseEvent, MamReply, MamRequest, MamRequestMode, MappingFailure,
+    NotificationEvent, PersonalFreeleech, PortFinding, PortForwardingEvent, Purchase,
+    QbittorrentEvent, QbittorrentFailure, Registration, RegistryEvent, Sale, SeedboxConfirmation,
+    SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode, SyncScope, TimerName,
+    TorrentCommand, TunnelEvent, VipTorrent, Wedge,
 };
 
 /// History categories, used for filtering.
@@ -151,7 +152,7 @@ pub(super) fn findings(findings: &Findings) -> String {
         ),
         PortFinding::NoForwardedPort => String::from("the VPN forwards no port"),
     };
-    let lease = if findings.lease_renewed {
+    let lease = if findings.lease == LeaseRenewal::Requested {
         "a new forwarded-port lease was asked for"
     } else {
         "no lease could be renewed"
@@ -163,7 +164,7 @@ pub(super) fn findings(findings: &Findings) -> String {
         }
         IpFinding::Unknown => String::from("the IP MAM sees, or the tunnel's, is unknown"),
     };
-    let registration = if findings.registered {
+    let registration = if findings.seedbox == SeedboxConfirmation::Confirmed {
         "the seedbox registration was confirmed and is renewed when allowed"
     } else {
         "the seedbox registration was not confirmed; Windlass registers when allowed"
@@ -257,9 +258,9 @@ fn mam_request(request: &MamRequest) -> String {
     match request {
         MamRequest::LookUpIp => String::from("Ask MAM which IP it sees"),
         MamRequest::RegisterSeedbox => String::from("Register the seedbox IP with MAM"),
-        MamRequest::LoadUserData { client_stats } => format!(
+        MamRequest::LoadUserData { clients } => format!(
             "Read the account from MAM{}",
-            if *client_stats {
+            if *clients == ClientListing::Include {
                 ", with the client list"
             } else {
                 ""
@@ -269,7 +270,7 @@ fn mam_request(request: &MamRequest) -> String {
         MamRequest::FetchTorrent { id, wedge } => format!(
             "Download the torrent file of MAM torrent {}, {}",
             id.get(),
-            if *wedge {
+            if *wedge == Wedge::Spend {
                 "spending a wedge"
             } else {
                 "without a wedge"
@@ -364,12 +365,12 @@ fn mam(event: &MamEvent) -> String {
         MamEvent::RegistrationAttemptSaveFailed => {
             String::from("Seedbox registration attempt could not be recorded, so it was not sent")
         }
-        MamEvent::PurchaseChecked { made: true } => {
+        MamEvent::PurchaseChecked { sale: Sale::Made } => {
             String::from("You checked on MAM: the uncertain purchase went through")
         }
-        MamEvent::PurchaseChecked { made: false } => {
-            String::from("You checked on MAM: the uncertain purchase did not go through")
-        }
+        MamEvent::PurchaseChecked {
+            sale: Sale::NotMade,
+        } => String::from("You checked on MAM: the uncertain purchase did not go through"),
         MamEvent::ReminderSaved => String::from("MAM visit reminder time saved"),
         MamEvent::ReminderSaveFailed => String::from("MAM visit reminder time could not be saved"),
     }
@@ -1491,8 +1492,12 @@ mod tests {
                         bookmarked_at: None,
                     },
                 ))))),
-                MamEvent::PurchaseChecked { made: true },
-                MamEvent::PurchaseChecked { made: false },
+                MamEvent::PurchaseChecked {
+                    sale: crate::core::Sale::Made,
+                },
+                MamEvent::PurchaseChecked {
+                    sale: crate::core::Sale::NotMade,
+                },
                 MamEvent::Answered {
                     result: Err(MamFailure::Unreachable),
                     rotated: ApiCookie::parse("rotated").ok(),
@@ -1611,20 +1616,22 @@ mod tests {
             [
                 MamRequest::LookUpIp,
                 MamRequest::RegisterSeedbox,
-                MamRequest::LoadUserData { client_stats: true },
                 MamRequest::LoadUserData {
-                    client_stats: false,
+                    clients: crate::core::ClientListing::Include,
+                },
+                MamRequest::LoadUserData {
+                    clients: crate::core::ClientListing::Omit,
                 },
                 MamRequest::ListBookmarks {
                     start: crate::core::BookmarkCount::new(100),
                 },
                 MamRequest::FetchTorrent {
                     id: torrent,
-                    wedge: true,
+                    wedge: crate::core::Wedge::Spend,
                 },
                 MamRequest::FetchTorrent {
                     id: torrent,
-                    wedge: false,
+                    wedge: crate::core::Wedge::Keep,
                 },
                 MamRequest::Buy(upload),
                 MamRequest::Buy(Purchase::Vip),
@@ -1705,9 +1712,9 @@ mod tests {
         ] {
             let found = crate::core::Findings {
                 listen_port,
-                lease_renewed: true,
+                lease: crate::core::LeaseRenewal::Requested,
                 exit_ip,
-                registered: true,
+                seedbox: crate::core::SeedboxConfirmation::Confirmed,
                 interface: crate::core::NetworkInterface::try_new("wg0").ok(),
             };
             let described = super::findings(&found);

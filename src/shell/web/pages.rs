@@ -1802,7 +1802,7 @@ mod tests {
                 origin: Origin::Bookmark,
                 desired,
                 save_path: None,
-                deletion_allowed: false,
+                deletion: crate::core::ContentDeletion::NotAllowed,
                 observation: None,
             })
         };
@@ -1850,7 +1850,7 @@ mod tests {
             origin: Origin::Bookmark,
             desired: Desired::Held,
             save_path: None,
-            deletion_allowed: false,
+            deletion: crate::core::ContentDeletion::NotAllowed,
             observation: None,
         };
         assert_eq!(wanted(&record), "Held: its wedge was not spent");
@@ -1877,7 +1877,7 @@ mod tests {
                 origin: Origin::Bookmark,
                 desired: Desired::Snatched,
                 save_path: None,
-                deletion_allowed: false,
+                deletion: crate::core::ContentDeletion::NotAllowed,
                 observation: None,
             })
         };

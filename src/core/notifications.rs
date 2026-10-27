@@ -22,9 +22,9 @@ use crate::core::{FailureCount, HttpStatus};
 use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
     Hold, Mam, MamSession, NoticeCount, Partials, Points, Port, PortForwarding, Protection,
-    Purchase, Qbittorrent, QbittorrentFailure, Ratio, Registry, ReportedVersion, SeedboxStatus,
-    SessionRejection, SettingsState, StartupMode, SwitchAllowance, TimerId, TimerName,
-    TorrentCount, TorrentState, Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer,
+    Purchase, Qbittorrent, QbittorrentFailure, Ratio, Registry, ReportedVersion, Sale,
+    SeedboxStatus, SessionRejection, SettingsState, StartupMode, SwitchAllowance, TimerId,
+    TimerName, TorrentCount, TorrentState, Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer,
     registry::SEEDING_TARGET, timer::Timers,
 };
 
@@ -120,6 +120,33 @@ impl PushCount {
     pub const fn any(self) -> bool {
         self.0 > 0
     }
+}
+
+/// How urgently a condition needs the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Urgency {
+    /// At once.
+    Urgent,
+    /// Soon.
+    Normal,
+}
+
+/// Whether MAM warns that it is about to stop accepting a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ClientWarning {
+    /// One of its notifications warns so.
+    Given,
+    /// None does.
+    NotGiven,
+}
+
+/// What became of a running download that is no longer free for the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum NotFreeOutcome {
+    /// Windlass stopped it: no wedge was left, or MAM no longer lists it.
+    Stopped,
+    /// It finished before Windlass could tell.
+    FinishedFirst,
 }
 
 /// Where a notice reaches the owner.
@@ -310,7 +337,7 @@ pub enum Notice {
         /// The ratio.
         ratio: Ratio,
         /// Whether it is below 1.1.
-        urgent: bool,
+        urgency: Urgency,
     },
     /// The ratio is 2.0 or more again.
     RatioRestored,
@@ -346,7 +373,7 @@ pub enum Notice {
         /// How many.
         count: NoticeCount,
         /// Whether one warns that MAM is about to stop accepting a client.
-        client_warning: bool,
+        client_warning: ClientWarning,
     },
     /// Bookmarked torrents wait.
     DownloadsHeld {
@@ -400,9 +427,8 @@ pub enum Notice {
     WedgeNotSpent,
     /// A running download is no longer free for the owner.
     DownloadNotFree {
-        /// Whether Windlass stopped it: no wedge was left, or MAM no longer
-        /// lists it. Otherwise it finished before Windlass could tell.
-        stopped: bool,
+        /// Whether Windlass stopped it, or it finished first.
+        outcome: NotFreeOutcome,
     },
     /// A running download's freeleech ended, so Windlass spent a wedge on it.
     WedgedMidDownload,
@@ -411,7 +437,7 @@ pub enum Notice {
         /// What Windlass tried to buy.
         purchase: Purchase,
         /// Whether MAM sold it.
-        made: bool,
+        sale: Sale,
     },
     /// The next reading could not tell whether an uncertain purchase went
     /// through; nothing more is bought until the owner checks on MAM.
@@ -714,20 +740,29 @@ pub struct Notifications {
 pub(super) struct Glance {
     pub(super) failover: Option<Failover>,
     pub(super) current: Option<VpnServer>,
-    pub(super) failed: bool,
-    pub(super) ready: bool,
+    pub(super) startup: Startup,
+}
+
+/// How far startup got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Startup {
+    /// Still starting.
+    Starting,
+    /// Ready.
+    Ready,
+    /// Startup failed.
+    Failed,
 }
 
 impl Glance {
-    pub(super) fn of(tunnel: &Tunnel, failed: bool, ready: bool) -> Self {
+    pub(super) fn of(tunnel: &Tunnel, startup: Startup) -> Self {
         Self {
             failover: tunnel
                 .watch
                 .as_ref()
                 .and_then(|watch| watch.failover.clone()),
             current: tunnel.current().cloned(),
-            failed,
-            ready,
+            startup,
         }
     }
 }
@@ -806,14 +841,16 @@ impl Notifications {
     /// Notices for what changed in this step.
     pub(super) fn changed(&self, before: &Glance, after: &Glance) -> Vec<Notice> {
         let mut notices = Vec::new();
-        if after.ready
-            && !before.ready
-            && let Some(mode) = self.mode
-        {
-            notices.push(Notice::Started { mode });
-        }
-        if after.failed && !before.failed {
-            notices.push(Notice::StartupFailed);
+        match (before.startup, after.startup) {
+            (Startup::Starting | Startup::Failed, Startup::Ready) => {
+                if let Some(mode) = self.mode {
+                    notices.push(Notice::Started { mode });
+                }
+            }
+            (Startup::Starting | Startup::Ready, Startup::Failed) => {
+                notices.push(Notice::StartupFailed);
+            }
+            _ => {}
         }
         if let (None, Some(Failover::Saving(switch))) = (&before.failover, &after.failover) {
             notices.push(Notice::FailoverStarted {
@@ -1272,7 +1309,7 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
             read(
                 account
                     .ratio_low()
-                    .map(|(ratio, urgent)| Notice::RatioLow { ratio, urgent }),
+                    .map(|(ratio, urgency)| Notice::RatioLow { ratio, urgency }),
                 Some(Notice::RatioRestored),
             ),
         ),
@@ -1318,7 +1355,11 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
                     .filter(|notices| !notices.total().is_zero())
                     .map(|notices| Notice::MamMessages {
                         count: notices.total(),
-                        client_warning: !notices.about_to_drop_client.is_zero(),
+                        client_warning: if notices.about_to_drop_client.is_zero() {
+                            ClientWarning::NotGiven
+                        } else {
+                            ClientWarning::Given
+                        },
                     }),
                 None,
             ),
