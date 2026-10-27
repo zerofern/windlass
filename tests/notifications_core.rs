@@ -13,6 +13,11 @@ use windlass::core::{
 
 const TOPIC: &str = "windlass-alerts";
 
+/// A notice id; ids in these tests count from 1.
+fn notice_id(id: u64) -> NoticeId {
+    NoticeId::new(id).unwrap_or_else(|| unreachable!("ids count from 1"))
+}
+
 /// How far the notifications log was read at startup.
 #[derive(Clone, Copy)]
 enum Log {
@@ -72,7 +77,7 @@ impl Harness {
         assert!(opened.contains(&Action::ReadNoticeLog));
         if let Log::Read(last) = log {
             let _ = harness.send(Event::Notification(NotificationEvent::LogRead {
-                last: last.map(NoticeId::new),
+                last: last.and_then(NoticeId::new),
             }));
         }
         harness
@@ -158,6 +163,13 @@ fn timer(actions: &[Action], expected: TimerName) -> Option<(TimerId, Duration)>
 }
 
 #[test]
+fn notice_ids_count_from_one() {
+    assert_eq!(NoticeId::new(0), None);
+    assert_eq!(NoticeId::new(1), Some(NoticeId::FIRST));
+    assert_eq!(notice_id(7).get(), 7);
+}
+
+#[test]
 fn every_notice_is_logged_and_only_urgent_ones_are_pushed_with_their_entry() {
     let mut harness = Harness::new(Some(TOPIC));
     let actions = harness.send(Event::Notification(NotificationEvent::SendTest));
@@ -171,7 +183,7 @@ fn every_notice_is_logged_and_only_urgent_ones_are_pushed_with_their_entry() {
     assert_eq!(
         pushes,
         [Push {
-            entry: Some(NoticeId::new(2)),
+            entry: Some(notice_id(2)),
             notice: Notice::Test
         }],
         "the start took the first entry"
@@ -179,7 +191,7 @@ fn every_notice_is_logged_and_only_urgent_ones_are_pushed_with_their_entry() {
     assert!(actions.iter().any(|action| matches!(
         action,
         Action::SaveNotice { entry, forget_through: None }
-            if entry.id == NoticeId::new(2) && entry.reach == Reach::Push
+            if entry.id == notice_id(2) && entry.reach == Reach::Push
     )));
     assert_eq!(
         Notice::Started {
@@ -199,7 +211,7 @@ fn ids_continue_from_the_log_and_old_notices_are_forgotten() {
     assert!(ready.iter().any(|action| matches!(
         action,
         Action::SaveNotice { entry, forget_through: Some(through) }
-            if entry.id == NoticeId::new(LOG_KEPT + 5) && *through == NoticeId::new(5)
+            if entry.id == notice_id(LOG_KEPT + 5) && *through == notice_id(5)
     )));
 }
 
@@ -212,18 +224,18 @@ fn notices_wait_for_the_log_to_be_read() {
     let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
     assert!(harness.notices().is_empty());
     let _ = harness.send(Event::Notification(NotificationEvent::LogRead {
-        last: Some(NoticeId::new(9)),
+        last: Some(notice_id(9)),
     }));
     assert_eq!(
         harness.logged,
         [
             (
-                NoticeId::new(10),
+                notice_id(10),
                 Notice::Started {
                     mode: StartupMode::Resume
                 }
             ),
-            (NoticeId::new(11), Notice::Test)
+            (notice_id(11), Notice::Test)
         ]
     );
     assert_eq!(
@@ -234,7 +246,7 @@ fn notices_wait_for_the_log_to_be_read() {
             .iter()
             .map(|push| push.entry)
             .collect::<Vec<_>>(),
-        [Some(NoticeId::new(11))]
+        [Some(notice_id(11))]
     );
     // A second read changes nothing.
     let again = harness.send(Event::Notification(NotificationEvent::LogRead {
@@ -243,7 +255,7 @@ fn notices_wait_for_the_log_to_be_read() {
     assert_eq!(
         harness.core.notifications().log,
         NoticeLog::Ready {
-            next: NoticeId::new(12)
+            next: notice_id(12)
         }
     );
     assert!(again.is_empty());
@@ -332,7 +344,10 @@ fn failed_deliveries_are_retried_with_growing_waits() -> Result<(), &'static str
     let second = harness.send(failed);
     let (_, wait) = timer(&second, TimerName::NotificationRetry).ok_or("no retry")?;
     assert_eq!(wait, Duration::from_mins(1));
-    assert_eq!(harness.core.notifications().failures, 2);
+    assert_eq!(
+        harness.core.notifications().failures,
+        windlass::core::FailureCount::new(2)
+    );
     assert_eq!(
         harness
             .core
@@ -380,13 +395,17 @@ fn qbittorrent_outages_notify_after_five_minutes_and_on_recovery() -> Result<(),
     let _ = harness.delivered();
     reconnect(&mut harness, &first)?;
     let connected = harness.send(Event::Qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.0.0"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 0, 0,
+        )),
         preferences: QbittorrentPreferences::default(),
     }));
     assert_eq!(
         harness.deliver_all(&connected),
         vec![Notice::QbittorrentVersionNotAllowed {
-            version: String::from("v5.0.0")
+            version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+                5, 0, 0
+            ))
         }],
         "a version MAM does not allow is reported at once"
     );
@@ -413,12 +432,16 @@ fn short_outages_stay_quiet() -> Result<(), &'static str> {
     let _ = harness.delivered();
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Enable));
     let failed = harness.send(Event::Qbittorrent(QbittorrentEvent::ConnectFailed {
-        reason: QbittorrentFailure::Rejected { status: 502 },
+        reason: QbittorrentFailure::Rejected {
+            status: windlass::core::HttpStatus::new(http::StatusCode::BAD_GATEWAY),
+        },
     }));
     harness.advance(Duration::from_mins(1));
     reconnect(&mut harness, &failed)?;
     let actions = harness.send(Event::Qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.2.2"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 2, 2,
+        )),
         preferences: QbittorrentPreferences::default(),
     }));
     assert!(sent(&actions).is_empty());
@@ -461,7 +484,9 @@ fn failover_is_announced_step_by_step() {
     enable_tunnel(&mut harness, None);
     assert_eq!(
         fail_checks(&mut harness),
-        vec![Notice::VpnProtectionLost { failures: 3 }]
+        vec![Notice::VpnProtectionLost {
+            failures: windlass::core::FailureCount::new(3)
+        }]
     );
     let _ = harness.send(Event::Tunnel(TunnelEvent::SwitchSaved));
     let switched = harness.send(Event::Tunnel(TunnelEvent::Switched));
@@ -475,7 +500,9 @@ fn failover_is_announced_step_by_step() {
         harness.notices().get(1..),
         Some(
             [
-                Notice::VpnProtectionLost { failures: 3 },
+                Notice::VpnProtectionLost {
+                    failures: windlass::core::FailureCount::new(3)
+                },
                 Notice::FailoverStarted {
                     server: server("two")
                 },
@@ -517,7 +544,9 @@ fn failed_and_blocked_switches_are_announced() {
     assert_eq!(
         fail_checks(&mut blocked),
         vec![
-            Notice::VpnProtectionLost { failures: 3 },
+            Notice::VpnProtectionLost {
+                failures: windlass::core::FailureCount::new(3)
+            },
             Notice::FailoverBlocked {
                 reason: SwitchBlock::Until(until)
             }
@@ -546,13 +575,18 @@ fn a_full_outbox_drops_the_oldest_notices() {
     let mut harness = Harness::new(Some(TOPIC));
     let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
     let _ = harness.send(Event::Notification(NotificationEvent::DeliveryFailed {
-        reason: DeliveryFailure::Rejected { status: 429 },
+        reason: DeliveryFailure::Rejected {
+            status: windlass::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+        },
     }));
     for _ in 0..=OUTBOX_LIMIT {
         let _ = harness.send(Event::Notification(NotificationEvent::SendTest));
     }
     assert_eq!(harness.core.notifications().outbox.len(), OUTBOX_LIMIT);
-    assert_eq!(harness.core.notifications().dropped, 1);
+    assert_eq!(
+        harness.core.notifications().dropped,
+        windlass::core::PushCount::new(1)
+    );
 }
 
 #[test]
@@ -577,7 +611,9 @@ fn torrent_problems_are_reported_after_their_grace_periods() -> Result<(), &'sta
     assert!(matches!(harness.core.registry(), Registry::Loaded(_)));
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Enable));
     let _ = harness.send(Event::Qbittorrent(QbittorrentEvent::Connected {
-        version: String::from("v5.2.2"),
+        version: windlass::core::ReportedVersion::Release(windlass::core::ClientVersion::new(
+            5, 2, 2,
+        )),
         preferences: QbittorrentPreferences::default(),
     }));
     let torrent = |fill: char, state| {
@@ -599,8 +635,8 @@ fn torrent_problems_are_reported_after_their_grace_periods() -> Result<(), &'sta
     .collect::<Option<Vec<_>>>()
     .ok_or("invalid hash")?;
     let synced = harness.send(Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-        position: SyncPosition(1),
-        full: true,
+        position: SyncPosition::new(1),
+        scope: windlass::core::SyncScope::Full,
         torrents,
         removed: Vec::new(),
     })));
@@ -613,13 +649,23 @@ fn torrent_problems_are_reported_after_their_grace_periods() -> Result<(), &'sta
     );
     harness.advance(wait);
     let errors = harness.expire(TimerName::NotificationGrace, grace);
-    assert_eq!(sent(&errors), vec![Notice::TorrentErrors { count: 1 }]);
+    assert_eq!(
+        sent(&errors),
+        vec![Notice::TorrentErrors {
+            count: windlass::core::TorrentCount::new(1)
+        }]
+    );
     let (grace, wait) = timer(&errors, TimerName::NotificationGrace).ok_or("no grace timer")?;
     assert_eq!(wait, Duration::from_mins(5));
     let _ = harness.delivered();
     harness.advance(wait);
     let missing = harness.expire(TimerName::NotificationGrace, grace);
-    assert_eq!(sent(&missing), vec![Notice::FilesMissing { count: 1 }]);
+    assert_eq!(
+        sent(&missing),
+        vec![Notice::FilesMissing {
+            count: windlass::core::TorrentCount::new(1)
+        }]
+    );
     Ok(())
 }
 

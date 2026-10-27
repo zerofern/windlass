@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use derive_more::Display;
 use serde::Serialize;
+
+use crate::core::FailureCount;
 
 use super::{Action, ClockReading, TimerId, TimerName, timer::Timers};
 
@@ -33,6 +36,26 @@ impl Port {
     }
 }
 
+/// The NAT-PMP result codes other than success (RFC 6886, section 3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize)]
+pub enum NatPmpRefusal {
+    /// 1: the gateway does not speak this NAT-PMP version.
+    #[display("unsupported version")]
+    UnsupportedVersion,
+    /// 2: mapping is turned off or not allowed.
+    #[display("not authorized")]
+    NotAuthorized,
+    /// 3: the gateway has no working network connection.
+    #[display("network failure")]
+    NetworkFailure,
+    /// 4: the gateway cannot hold another mapping.
+    #[display("out of resources")]
+    OutOfResources,
+    /// 5: the gateway does not support this request.
+    #[display("unsupported opcode")]
+    UnsupportedOpcode,
+}
+
 /// Why the gateway did not grant a mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MappingFailure {
@@ -40,8 +63,8 @@ pub enum MappingFailure {
     NoResponse,
     /// The gateway answered with a NAT-PMP result code other than success.
     Refused {
-        /// The NAT-PMP result code.
-        result_code: u16,
+        /// Why, as the result code says.
+        reason: NatPmpRefusal,
     },
     /// The answer was not a valid NAT-PMP response.
     Malformed,
@@ -102,7 +125,7 @@ pub enum PortForwarding {
         /// The next or outstanding request.
         request: LeaseRequest,
         /// Requests that failed since the last success.
-        failures: u32,
+        failures: FailureCount,
         /// Why the latest request failed, if it did.
         last_failure: Option<MappingFailure>,
     },
@@ -134,7 +157,7 @@ impl PortForwarding {
                 *self = Self::Enabled {
                     lease: None,
                     request: LeaseRequest::Outstanding,
-                    failures: 0,
+                    failures: FailureCount::NONE,
                     last_failure: None,
                 };
                 vec![request]
@@ -154,7 +177,7 @@ impl PortForwarding {
                     renewed_at: now.wall,
                     expires: now.monotonic.checked_add(lifetime).unwrap_or(now.monotonic),
                 });
-                *failures = 0;
+                *failures = FailureCount::NONE;
                 *last_failure = None;
                 // Renew with a quarter of the lifetime to spare, as Proton advises.
                 let (id, deadline) = timers.schedule(now.monotonic, lifetime * 3 / 4);
@@ -174,7 +197,7 @@ impl PortForwarding {
                 },
                 PortForwardingEvent::Mapped { .. } | PortForwardingEvent::MappingFailed { .. },
             ) => {
-                *failures += 1;
+                *failures = failures.after_another();
                 *last_failure = Some(match event {
                     PortForwardingEvent::MappingFailed { reason } => reason,
                     _ => MappingFailure::Malformed,

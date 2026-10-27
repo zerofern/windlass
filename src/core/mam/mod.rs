@@ -19,33 +19,40 @@ use serde::Serialize;
 pub use account::{
     ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Attention, CLIENT_STATS_EVERY, ClientList,
     ClientStanding, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR, RATIO_TARGET, RATIO_URGENT,
-    Reading, SettledBy, UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB, UPLOAD_STEP,
-    VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
+    Reading, Sale, SettledBy, UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB,
+    UPLOAD_STEP, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
 };
 pub use acquisition::{
     Acquisition, BOOKMARKS_EVERY, Bookmarks, DownloadWatch, HISTORY_FRESH_FOR, Hold,
-    LOOKUP_FRESH_FOR, Listed, Lookup, MAX_BOOKMARK_PAGES, RECENT_ADMISSION, WATCH_FRESH_FOR,
-    WEDGE_RECORDED_AFTER, WedgeHistory,
+    LOOKUP_FRESH_FOR, Listed, Lookup, MAX_BOOKMARK_PAGES, MamListing, RECENT_ADMISSION,
+    WATCH_FRESH_FOR, WEDGE_RECORDED_AFTER, WedgeAccounting, WedgeHistory,
 };
 pub use api::{
-    Asn, Bookmark, BookmarkPage, Connectable, FetchedTorrent, IpObservation, ListedClient,
-    MamFailure, MamNotices, MamReply, MamRequest, PersonalFreeleech, Points, Purchase, RedCategory,
-    Registration, SessionRejection, SnatchSummary, UploadCredit, UploadCreditError, UserData,
+    Asn, BookTitle, BookTitleError, Bookmark, BookmarkCount, BookmarkPage, CategoryName,
+    CategoryNameError, ClassName, ClassNameError, ClientListing, ClientRefusal, Connectable,
+    FetchedTorrent, Freeleech, IpObservation, ListedClient, MamFailure, MamMessage,
+    MamMessageError, MamNotices, MamReply, MamRequest, NetworkName, NetworkNameError, NoticeCount,
+    Partials, PersonalFreeleech, Points, Purchase, RedCategory, RedKind, Registration,
+    SessionRejection, SnatchSummary, Snatched, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit,
+    UploadCredit, UploadCreditError, UserClass, UserData, VipTorrent, Wedge, WedgeCount,
     WedgeSpent,
 };
-pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL};
+pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL, Tokens};
 pub use connectability::{
-    Connectability, Connection, Findings, IpFinding, PortFinding, REPAIR_SETTLES_AFTER,
+    Connectability, Connection, Findings, IpFinding, LeaseRenewal, PortFinding,
+    REPAIR_SETTLES_AFTER, SeedboxConfirmation,
 };
 pub use network::{
-    LOOKUP_SPACING, LastAttempt, Network, OBSERVE_EVERY, Observed, REGISTRATION_SPACING,
-    RegistrationAllowance, RegistrationFailure, Seedbox, SeedboxStatus, Session,
+    IpStanding, LOOKUP_SPACING, LastAttempt, Network, OBSERVE_EVERY, Observed,
+    REGISTRATION_SPACING, RegistrationAllowance, RegistrationFailure, Seedbox, SeedboxStatus,
+    Session,
 };
 
 use self::acquisition::{Facts, Next};
 use super::{
-    Action, ApiCookie, ClientVersion, ClockReading, Desired, DownloadingLimit, MamRequestsStatus,
-    MamTorrentId, Notice, Records, Registry, TimerId, TimerName, timer::Timers,
+    Action, ApiCookie, ClientVersion, ClockReading, Completion, Desired, Download,
+    DownloadingLimit, MamRequestsStatus, MamTorrentId, NotFreeOutcome, Notice, Records, Registry,
+    TimerId, TimerName, timer::Timers,
 };
 
 /// The owner is reminded to visit MAM this often.
@@ -79,7 +86,7 @@ pub enum MamEvent {
     /// The owner checked on MAM whether an unresolved purchase went through.
     PurchaseChecked {
         /// Whether it did.
-        made: bool,
+        sale: Sale,
     },
     /// The reminder time was saved.
     ReminderSaved,
@@ -97,7 +104,7 @@ pub enum Outstanding {
         /// The cookie to send it with.
         cookie: ApiCookie,
         /// The connection it will be sent on.
-        epoch: u64,
+        epoch: ConnectionEpoch,
     },
     /// A request was sent.
     Request {
@@ -107,8 +114,24 @@ pub enum Outstanding {
         sent: Instant,
         /// The connection it was sent on; a pause, lost protection, or a new
         /// cookie starts another.
-        epoch: u64,
+        epoch: ConnectionEpoch,
     },
+}
+
+/// One connection to MAM: a pause, lost protection, or a new cookie starts
+/// another, and answers to requests sent on an earlier one are ignored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionEpoch(u64);
+
+impl ConnectionEpoch {
+    /// The connection when Windlass starts.
+    pub const FIRST: Self = Self(0);
+
+    /// The connection after this one.
+    #[must_use]
+    const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
 }
 
 /// What Windlass knows about the last visit reminder.
@@ -125,17 +148,56 @@ pub enum LastReminder {
     ReadFailed,
 }
 
+/// Whether MAM's hosts are configured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum MamHosts {
+    /// They are configured; Windlass works with MAM.
+    Configured,
+    /// They are not; Windlass leaves MAM alone.
+    #[default]
+    NotConfigured,
+}
+
+/// Whether requests to MAM may be sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum RequestGate {
+    /// They may: not paused, and VPN protection available.
+    Open,
+    /// They may not.
+    #[default]
+    Closed,
+}
+
+/// Whether the VPN tunnel protects traffic now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TunnelProtection {
+    /// It does.
+    Protected,
+    /// It does not.
+    Unprotected,
+}
+
+/// Whether qBittorrent is ready for a download: connected, listed, and a
+/// version MAM allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClientReadiness {
+    /// It is ready.
+    Ready,
+    /// It is not.
+    NotReady,
+}
+
 /// The core state that MAM work depends on.
 #[derive(Debug)]
 pub(super) struct Context<'a> {
     pub(super) requests: MamRequestsStatus,
-    pub(super) protected: bool,
+    pub(super) protection: TunnelProtection,
     /// The saved cookie, when no change to it is being saved.
     pub(super) cookie: Option<&'a ApiCookie>,
     /// The cookie the owner last asked for, or one MAM issued being saved.
     pub(super) requested_cookie: Option<&'a ApiCookie>,
     pub(super) reserve: Option<Points>,
-    pub(super) client_ready: bool,
+    pub(super) readiness: ClientReadiness,
     /// The running qBittorrent's version, once connected.
     pub(super) client_version: Option<ClientVersion>,
     /// What the rest of Windlass knows about the connection.
@@ -149,9 +211,9 @@ pub(super) struct Context<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Mam {
     /// Whether MAM's hosts are configured.
-    pub enabled: bool,
+    pub hosts: MamHosts,
     /// Whether requests may be sent: not paused, and VPN protection available.
-    pub available: bool,
+    pub gate: RequestGate,
     /// The API session.
     pub session: Session,
     /// The IP MAM sees.
@@ -172,10 +234,10 @@ pub struct Mam {
     pub client: ClientStanding,
     /// Whether MAM can reach qBittorrent, and what Windlass did about it.
     pub connectability: Connectability,
-    renew_lease: bool,
+    lease: LeaseRenewal,
     cookie_in_use: Option<ApiCookie>,
     issued_cookie: Option<ApiCookie>,
-    epoch: u64,
+    epoch: ConnectionEpoch,
     wake: Option<(TimerId, Instant)>,
     notices: Vec<Notice>,
 }
@@ -185,8 +247,8 @@ impl Mam {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            enabled: false,
-            available: false,
+            hosts: MamHosts::NotConfigured,
+            gate: RequestGate::Closed,
             session: Session::Unverified,
             network: Network::new(),
             seedbox: Seedbox::new(),
@@ -197,10 +259,10 @@ impl Mam {
             last_reminder: LastReminder::Unread,
             client: ClientStanding::Unknown,
             connectability: Connectability::Fine,
-            renew_lease: false,
+            lease: LeaseRenewal::NotRequested,
             cookie_in_use: None,
             issued_cookie: None,
-            epoch: 0,
+            epoch: ConnectionEpoch::FIRST,
             wake: None,
             notices: Vec::new(),
         }
@@ -238,7 +300,7 @@ impl Mam {
     ) -> (Vec<Action>, Option<ApiCookie>) {
         match event {
             MamEvent::Enable => {
-                self.enabled = true;
+                self.hosts = MamHosts::Configured;
                 // A previous run may have looked the IP up moments ago.
                 self.network.sent(now.monotonic);
                 (Vec::new(), None)
@@ -295,10 +357,10 @@ impl Mam {
                 (Vec::new(), None)
             }
             MamEvent::ReminderSaved | MamEvent::ReminderSaveFailed => (Vec::new(), None),
-            MamEvent::PurchaseChecked { made } => {
-                if let Some(purchase) = self.account.checked(made) {
+            MamEvent::PurchaseChecked { sale } => {
+                if let Some(purchase) = self.account.checked(sale) {
                     self.notices
-                        .push(Notice::PurchaseSettled { purchase, made });
+                        .push(Notice::PurchaseSettled { purchase, sale });
                 }
                 (Vec::new(), None)
             }
@@ -349,11 +411,11 @@ impl Mam {
                 Vec::new()
             }
             (MamRequest::LoadUserData { .. }, Ok(MamReply::UserData(data))) if current => {
-                if let Some((purchase, PurchaseOutcome::Settled { made, .. })) =
+                if let Some((purchase, PurchaseOutcome::Settled { sale, .. })) =
                     self.account.read(now.monotonic, now.wall, *data)
                 {
                     self.notices
-                        .push(Notice::PurchaseSettled { purchase, made });
+                        .push(Notice::PurchaseSettled { purchase, sale });
                 }
                 self.follow_downloads(now, registry)
             }
@@ -366,7 +428,9 @@ impl Mam {
                 Vec::new()
             }
             (MamRequest::LookUpTorrent { id }, Ok(MamReply::Torrent(listing))) if current => {
-                let snatched = listing.as_ref().is_some_and(|listing| listing.snatched);
+                let snatched = listing
+                    .as_ref()
+                    .is_some_and(|listing| listing.snatched == Snatched::Before);
                 self.acquisition
                     .looked_up(now.monotonic, *id, listing.map(|listing| *listing));
                 let mut actions = match registry.records_mut() {
@@ -460,7 +524,7 @@ impl Mam {
         &mut self,
         now: ClockReading,
         id: MamTorrentId,
-        wedge: bool,
+        wedge: Wedge,
         result: Result<MamReply, MamFailure>,
         registry: &mut Registry,
     ) -> Vec<Action> {
@@ -480,7 +544,7 @@ impl Mam {
             // A running download was wedged because its freeleech ended; the
             // bonus history must show the wedge before it counts.
             Ok(MamReply::Fetched(_)) => {
-                if wedge {
+                if wedge == Wedge::Spend {
                     self.notices.push(Notice::WedgedMidDownload);
                 }
                 self.follow_downloads(now, registry)
@@ -513,7 +577,11 @@ impl Mam {
         };
         // A queued bookmark MAM now reports snatched waits for the owner.
         let mut actions = Vec::new();
-        for bookmark in listed.bookmarks.iter().filter(|bookmark| bookmark.snatched) {
+        for bookmark in listed
+            .bookmarks
+            .iter()
+            .filter(|bookmark| bookmark.snatched == Snatched::Before)
+        {
             actions.extend(records.snatched(now.monotonic, bookmark.id));
         }
         let new: Vec<(MamTorrentId, Desired)> = listed
@@ -521,16 +589,32 @@ impl Mam {
             .iter()
             .filter(|bookmark| !records.knows(bookmark.id))
             .map(|bookmark| {
-                let desired = if bookmark.snatched {
-                    Desired::Snatched
-                } else {
-                    Desired::Queued
+                let desired = match bookmark.snatched {
+                    Snatched::Before => Desired::Snatched,
+                    Snatched::Never => Desired::Queued,
                 };
                 (bookmark.id, desired)
             })
             .collect();
         actions.extend(records.bookmarked(now.monotonic, new));
         actions
+    }
+
+    /// Open or close the request gate; closing it disconnects.
+    fn follow_gate(&mut self, context: &Context<'_>) -> RequestGate {
+        let gate = if self.hosts == MamHosts::Configured
+            && context.requests == MamRequestsStatus::Running
+            && context.protection == TunnelProtection::Protected
+        {
+            RequestGate::Open
+        } else {
+            RequestGate::Closed
+        };
+        if self.gate == RequestGate::Open && gate == RequestGate::Closed {
+            self.disconnect();
+        }
+        self.gate = gate;
+        gate
     }
 
     /// Choose and send the next request, if one is wanted and allowed.
@@ -541,12 +625,7 @@ impl Mam {
         timers: &mut Timers,
     ) -> Vec<Action> {
         let mut actions = self.remind(now);
-        let available =
-            self.enabled && context.requests == MamRequestsStatus::Running && context.protected;
-        if self.available && !available {
-            self.disconnect();
-        }
-        self.available = available;
+        let gate = self.follow_gate(context);
         self.follow_cookie(context);
         let observed = self.network.current().cloned();
         let cookie = context
@@ -560,19 +639,19 @@ impl Mam {
             _ => None,
         };
         let recent = self.watch_downloads(now, records);
-        let downloading = records.map_or(0, |records| {
-            let running = records
-                .downloads()
-                .filter(|download| !download.finished && !download.held)
-                .count();
-            u32::try_from(running).unwrap_or(u32::MAX)
+        let downloading = records.map_or(TorrentCount::new(0), |records| {
+            TorrentCount::counting(records.downloads().filter(Download::is_downloading))
         });
         let facts = Facts {
             now: now.monotonic,
             wall: now.wall,
-            mam_available: available && cookie.is_some(),
-            seedbox_confirmed: self.seedbox.confirms(observed.as_ref()),
-            client_ready: context.client_ready,
+            gate: if cookie.is_some() {
+                gate
+            } else {
+                RequestGate::Closed
+            },
+            seedbox: self.seedbox.confirms(observed.as_ref()),
+            readiness: context.readiness,
             client: self.client,
             recent,
             downloading,
@@ -592,7 +671,7 @@ impl Mam {
         let early = next == Next::NeedReading
             || watching == Next::NeedReading
             || self.account.purchase_uncertain();
-        if available && self.outstanding.is_none() {
+        if gate == RequestGate::Open && self.outstanding.is_none() {
             let wanted = self.wanted(
                 now,
                 cookie.is_some(),
@@ -643,16 +722,20 @@ impl Mam {
     }
 
     /// Whether a new forwarded-port lease is wanted, once.
-    pub(super) const fn take_lease_renewal(&mut self) -> bool {
-        std::mem::replace(&mut self.renew_lease, false)
+    pub(super) fn take_lease_renewal(&mut self) -> LeaseRenewal {
+        std::mem::take(&mut self.lease)
     }
 
     /// Note what Windlass knows about each running download it added; how many
     /// downloads qBittorrent added in the last hour, or will add.
-    fn watch_downloads(&mut self, now: ClockReading, records: Option<&Records>) -> u32 {
+    fn watch_downloads(
+        &mut self,
+        now: ClockReading,
+        records: Option<&Records>,
+    ) -> UnsatisfiedCount {
         let Some(records) = records else {
             self.acquisition.watched = Vec::new();
-            return 0;
+            return UnsatisfiedCount::default();
         };
         self.acquisition.watched = self.acquisition.watch_all(
             records.downloads(),
@@ -664,7 +747,7 @@ impl Mam {
             .downloads()
             .filter(|download| acquisition::recent(download, now.wall))
             .count();
-        u32::try_from(recent).unwrap_or(u32::MAX)
+        UnsatisfiedCount::new(u32::try_from(recent).unwrap_or(u32::MAX))
     }
 
     /// Apply what Windlass knows about each running download it added: a
@@ -680,26 +763,35 @@ impl Mam {
             now.monotonic,
             now.wall,
         );
-        let no_wedges = self.account.data().is_some_and(|data| data.wedges == 0);
+        let no_wedges = self
+            .account
+            .data()
+            .is_some_and(|data| data.wedges.is_zero());
         let mut actions = Vec::new();
         for (download, watch) in &watched {
             let notice = match *watch {
                 DownloadWatch::Wedged | DownloadWatch::FreeForNow => {
-                    if download.held {
+                    if download.desired == Desired::Held {
                         actions.extend(records.resume(now.monotonic, &download.hash));
                     }
                     self.acquisition.reported.remove(&download.mam);
                     None
                 }
                 DownloadWatch::NotFree {
-                    wedge_missing: true,
+                    wedges: WedgeAccounting::Missing,
                     ..
                 } => Some(Notice::WedgeNotSpent),
-                DownloadWatch::NotFree { .. } if download.finished => {
-                    Some(Notice::DownloadNotFree { stopped: false })
+                DownloadWatch::NotFree { .. } if download.completion == Completion::Complete => {
+                    Some(Notice::DownloadNotFree {
+                        outcome: NotFreeOutcome::FinishedFirst,
+                    })
                 }
-                DownloadWatch::NotFree { listed, .. } if !listed || no_wedges => {
-                    Some(Notice::DownloadNotFree { stopped: true })
+                DownloadWatch::NotFree { listing, .. }
+                    if listing == MamListing::Unlisted || no_wedges =>
+                {
+                    Some(Notice::DownloadNotFree {
+                        outcome: NotFreeOutcome::Stopped,
+                    })
                 }
                 // Waiting for MAM, or a wedge is spent on it next.
                 DownloadWatch::NeedLookup
@@ -709,7 +801,7 @@ impl Mam {
             let Some(notice) = notice else {
                 continue;
             };
-            if !download.finished && !download.held {
+            if download.is_downloading() {
                 actions.extend(records.hold(now.monotonic, &download.hash));
             }
             if self.acquisition.reported.insert(download.mam) {
@@ -737,7 +829,7 @@ impl Mam {
             observed.as_ref().map(|observed| observed.ip),
             self.seedbox.confirms(observed.as_ref()),
         );
-        self.renew_lease = findings.lease_renewed;
+        self.lease = findings.lease;
         self.connectability
             .repaired(now.monotonic, now.wall, findings);
         self.network.unconfirm();
@@ -782,8 +874,8 @@ impl Mam {
         if self.seedbox.wanted(now.wall, self.network.current()) {
             return Some(Wanted::Register);
         }
-        if let Some(client_stats) = self.account.wanted(now.monotonic, early) {
-            return Some(Wanted::Request(MamRequest::LoadUserData { client_stats }));
+        if let Some(clients) = self.account.wanted(now.monotonic, early) {
+            return Some(Wanted::Request(MamRequest::LoadUserData { clients }));
         }
         // A due listing refreshes every bookmark's flags in one request, so it
         // comes before looking a single torrent up.
@@ -815,7 +907,7 @@ impl Mam {
     /// A request already sent cannot be recalled; its answer is applied only
     /// where it records a spend.
     fn disconnect(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch = self.epoch.next();
         self.session = Session::Unverified;
         self.network.unconfirm();
         self.seedbox.unconfirm();
@@ -828,7 +920,7 @@ impl Mam {
         if requested != self.cookie_in_use.as_ref() && requested != self.issued_cookie.as_ref() {
             self.cookie_in_use = requested.cloned();
             self.issued_cookie = None;
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = self.epoch.next();
             self.session = Session::Unverified;
             self.seedbox.unconfirm();
             self.acquisition.refused = None;
@@ -880,7 +972,7 @@ impl Mam {
             RegistrationAllowance::After(at) => monotonic(at),
             RegistrationAllowance::Now | RegistrationAllowance::Unknown => None,
         };
-        let waiting = self.available && self.outstanding.is_none();
+        let waiting = self.gate == RequestGate::Open && self.outstanding.is_none();
         let work = [
             self.network.next_due(),
             registration,

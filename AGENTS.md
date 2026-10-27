@@ -22,8 +22,19 @@ The core never calls `Instant::now()`, never performs I/O, never uses `async`, a
 Prefer deep, domain-specific types.
 
 - Wrap domain values in newtypes; avoid raw primitives across boundaries.
+- No bare `f64`, `u64`, `u32`, `usize`, `String`, or `bool` in domain types.
+  Library types that already say what they are, such as `SystemTime`,
+  `Duration`, and `IpAddr`, are fine. A `bool` is usually clearer as a
+  two-variant enum.
+- Give each kind of id and count its own type, so values of different things
+  cannot be mixed.
+- Parse, don't validate: the shell parses everything entering Windlass (MAM,
+  qBittorrent, storage, forms, the command line) once, into types known to be
+  valid. A value Windlass relies on that is missing or out of range fails the
+  whole input; it is never replaced by a default.
 - Use existing Rust/library types before creating custom ones.
-- Use `nutype` for validated newtypes.
+- Use `nutype` for validated newtypes, and `derive_more` for `Display` and
+  similar derives on other newtypes and enums.
 - Use `secrecy::SecretString` for secrets.
 - Make invalid states unrepresentable with enums.
 - Do not use sentinel values like `0`, `-1`, or empty strings to mean “none”.

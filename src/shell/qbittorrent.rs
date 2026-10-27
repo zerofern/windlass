@@ -16,9 +16,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::core::{
-    ByteSize, MamTorrentId, Port, Progress, QbittorrentEvent, QbittorrentFailure,
-    QbittorrentPreferences, QueuePreferences, Ratio, SyncPosition, SyncUpdate, TorrentCommand,
-    TorrentHash, TorrentState, TorrentUpdate,
+    ByteSize, Completion, ContentPath, ForceStart, IdleTorrents, MamTorrentId, NetworkInterface,
+    Port, Progress, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, QueueLimit,
+    QueuePreferences, Queueing, Ratio, ReportedVersion, SavePath, SyncPosition, SyncScope,
+    SyncUpdate, TorrentCommand, TorrentCount, TorrentHash, TorrentName, TorrentState,
+    TorrentUpdate,
 };
 
 use super::storage;
@@ -122,7 +124,7 @@ impl Client {
             Ok(response)
         } else {
             Err(QbittorrentFailure::Rejected {
-                status: status.as_u16(),
+                status: crate::core::HttpStatus::new(status),
             })
         }
     }
@@ -146,28 +148,22 @@ impl Client {
             .text()
             .await
             .map_err(|_| QbittorrentFailure::Malformed)?;
+        let version = ReportedVersion::parse(&version).ok_or(QbittorrentFailure::Malformed)?;
         let preferences = self.preferences().await?;
         Ok(QbittorrentEvent::Connected {
-            version: version.trim().to_owned(),
+            version,
             preferences,
         })
     }
 
     async fn preferences(&self) -> Outcome<QbittorrentPreferences> {
         let raw: RawPreferences = self.json("api/v2/app/preferences").await?;
-        let queue = raw.queue();
-        Ok(QbittorrentPreferences {
-            listen_port: raw.listen_port.and_then(Port::new),
-            interface: raw
-                .current_network_interface
-                .filter(|interface| !interface.is_empty()),
-            queue,
-        })
+        raw.into_preferences()
     }
 
     async fn sync(&self, position: SyncPosition) -> Outcome<SyncUpdate> {
         let raw: RawSync = self
-            .json(&format!("api/v2/sync/maindata?rid={}", position.0))
+            .json(&format!("api/v2/sync/maindata?rid={}", position.get()))
             .await?;
         raw.into_update()
     }
@@ -184,14 +180,12 @@ impl Client {
     }
 
     async fn set_queue(&self, queue: QueuePreferences) -> Outcome<()> {
-        // qBittorrent takes -1 for no limit.
-        let limit = |limit: Option<u32>| limit.map_or(-1, i64::from);
         let preferences = serde_json::json!({
-            "queueing_enabled": queue.queueing,
-            "max_active_downloads": limit(queue.max_downloading),
-            "max_active_torrents": limit(queue.max_active),
-            "max_active_uploads": limit(queue.max_seeding),
-            "dont_count_slow_torrents": queue.idle_not_counted,
+            "queueing_enabled": queue.queueing == Queueing::On,
+            "max_active_downloads": queue_limit(queue.max_downloading),
+            "max_active_torrents": queue_limit(queue.max_active),
+            "max_active_uploads": queue_limit(queue.max_seeding),
+            "dont_count_slow_torrents": queue.idle == IdleTorrents::NotCounted,
         })
         .to_string();
         self.post("api/v2/app/setPreferences", &[("json", preferences)])
@@ -279,7 +273,9 @@ impl Client {
 
 #[derive(Debug, Deserialize)]
 struct RawPreferences {
+    /// 0 when qBittorrent picks a port itself.
     listen_port: Option<u16>,
+    /// Empty when qBittorrent uses any interface.
     current_network_interface: Option<String>,
     queueing_enabled: Option<bool>,
     max_active_downloads: Option<i64>,
@@ -289,19 +285,70 @@ struct RawPreferences {
 }
 
 impl RawPreferences {
-    /// The queue, when qBittorrent reports all of it; a negative limit is none.
-    fn queue(&self) -> Option<QueuePreferences> {
-        let limit = |limit: Option<i64>| limit.map(|limit| u32::try_from(limit).ok());
-        Some(QueuePreferences {
-            queueing: self.queueing_enabled?,
-            max_downloading: limit(self.max_active_downloads)?,
-            max_active: limit(self.max_active_torrents)?,
-            max_seeding: limit(self.max_active_uploads)?,
-            idle_not_counted: self.dont_count_slow_torrents?,
+    fn into_preferences(self) -> Outcome<QbittorrentPreferences> {
+        let queue = self.queue()?;
+        Ok(QbittorrentPreferences {
+            listen_port: self.listen_port.and_then(Port::new),
+            interface: self
+                .current_network_interface
+                .filter(|interface| !interface.is_empty())
+                .map(|interface| NetworkInterface::try_new(interface).map_err(malformed))
+                .transpose()?,
+            queue,
         })
+    }
+
+    /// The queue, when qBittorrent reports it: all of it, or none of it.
+    fn queue(&self) -> Outcome<Option<QueuePreferences>> {
+        let fields = (
+            self.queueing_enabled,
+            self.max_active_downloads,
+            self.max_active_torrents,
+            self.max_active_uploads,
+            self.dont_count_slow_torrents,
+        );
+        let (queueing, downloading, active, seeding, slow) = match fields {
+            (None, None, None, None, None) => return Ok(None),
+            (Some(queueing), Some(downloading), Some(active), Some(seeding), Some(slow)) => {
+                (queueing, downloading, active, seeding, slow)
+            }
+            _ => return Err(QbittorrentFailure::Malformed),
+        };
+        // qBittorrent reports -1 for no limit.
+        let limit = |limit: i64| match limit {
+            -1 => Ok(QueueLimit::Unlimited),
+            limit => u32::try_from(limit)
+                .map(|limit| QueueLimit::At(TorrentCount::new(limit)))
+                .map_err(|_| QbittorrentFailure::Malformed),
+        };
+        Ok(Some(QueuePreferences {
+            queueing: if queueing {
+                Queueing::On
+            } else {
+                Queueing::Off
+            },
+            max_downloading: limit(downloading)?,
+            max_active: limit(active)?,
+            max_seeding: limit(seeding)?,
+            idle: if slow {
+                IdleTorrents::NotCounted
+            } else {
+                IdleTorrents::Counted
+            },
+        }))
     }
 }
 
+/// A queue limit as qBittorrent takes it: -1 for no limit.
+fn queue_limit(limit: QueueLimit) -> i64 {
+    match limit {
+        QueueLimit::Unlimited => -1,
+        QueueLimit::At(count) => i64::from(count.get()),
+    }
+}
+
+/// An update; qBittorrent leaves out what did not change, so an absent
+/// `full_update` means a partial update, and absent lists mean none.
 #[derive(Debug, Deserialize)]
 struct RawSync {
     rid: u64,
@@ -317,12 +364,16 @@ impl RawSync {
     fn into_update(self) -> Outcome<SyncUpdate> {
         let hash = |hash: &str| TorrentHash::parse(hash).ok_or(QbittorrentFailure::Malformed);
         Ok(SyncUpdate {
-            position: SyncPosition(self.rid),
-            full: self.full_update,
+            position: SyncPosition::new(self.rid),
+            scope: if self.full_update {
+                SyncScope::Full
+            } else {
+                SyncScope::Changes
+            },
             torrents: self
                 .torrents
-                .iter()
-                .map(|(key, fields)| Ok((hash(key)?, torrent_update(fields))))
+                .into_iter()
+                .map(|(key, fields)| Ok((hash(&key)?, torrent_update(fields)?)))
                 .collect::<Outcome<_>>()?,
             removed: self
                 .torrents_removed
@@ -333,44 +384,75 @@ impl RawSync {
     }
 }
 
-fn torrent_update(fields: &Value) -> TorrentUpdate {
-    let text = |name| fields.get(name).and_then(Value::as_str);
-    let bytes = |name| fields.get(name).and_then(Value::as_u64).map(ByteSize);
-    // Paths are empty, and times are zero, negative, or 2^32 - 1, when not known.
-    let path = |name| text(name).map(|path| Some(path.to_owned()).filter(|path| !path.is_empty()));
-    let time = |name| {
-        fields.get(name).and_then(Value::as_i64).map(|seconds| {
-            u64::try_from(seconds)
-                .ok()
-                .filter(|seconds| *seconds > 0 && *seconds != u64::from(u32::MAX))
-                .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
-        })
+/// A torrent's changed fields. A field qBittorrent leaves out is unchanged;
+/// one it sends must hold a value of its type.
+#[derive(Debug, Deserialize)]
+struct RawTorrent {
+    name: Option<String>,
+    state: Option<String>,
+    progress: Option<f64>,
+    size: Option<u64>,
+    total_size: Option<u64>,
+    completed: Option<u64>,
+    uploaded: Option<u64>,
+    ratio: Option<f64>,
+    seeding_time: Option<u64>,
+    added_on: Option<i64>,
+    completion_on: Option<i64>,
+    content_path: Option<String>,
+    save_path: Option<String>,
+    force_start: Option<bool>,
+}
+
+/// Any parse error means the answer is not understood.
+fn malformed<E>(_: E) -> QbittorrentFailure {
+    QbittorrentFailure::Malformed
+}
+
+fn torrent_update(fields: Value) -> Outcome<TorrentUpdate> {
+    let raw: RawTorrent = serde_json::from_value(fields).map_err(malformed)?;
+    // Paths are empty, which no path type holds, and times are 0, -1, or
+    // 2^32 - 1, when not known.
+    let time = |seconds: i64| match seconds {
+        -1 | 0 => Ok(None),
+        seconds if seconds == i64::from(u32::MAX) => Ok(None),
+        seconds => u64::try_from(seconds)
+            .ok()
+            .and_then(|seconds| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+            .map(Some)
+            .ok_or(QbittorrentFailure::Malformed),
     };
-    TorrentUpdate {
-        name: text("name").map(str::to_owned),
-        state: text("state").map(torrent_state),
-        progress: fields
-            .get("progress")
-            .and_then(Value::as_f64)
-            .map(Progress::from_fraction),
-        size: bytes("size"),
-        total_size: bytes("total_size"),
-        downloaded: bytes("completed"),
-        uploaded: bytes("uploaded"),
-        ratio: fields
-            .get("ratio")
-            .and_then(Value::as_f64)
-            .map(Ratio::from_float),
-        seeding_time: fields
-            .get("seeding_time")
-            .and_then(Value::as_u64)
-            .map(Duration::from_secs),
-        added_at: time("added_on"),
-        completed_at: time("completion_on"),
-        content_path: path("content_path"),
-        save_path: path("save_path"),
-        force_start: fields.get("force_start").and_then(Value::as_bool),
-    }
+    Ok(TorrentUpdate {
+        name: raw
+            .name
+            .map(|name| TorrentName::try_new(name).map(Some).map_err(malformed))
+            .transpose()?,
+        state: raw.state.as_deref().map(torrent_state),
+        progress: raw
+            .progress
+            .map(|progress| Progress::from_fraction(progress).ok_or(QbittorrentFailure::Malformed))
+            .transpose()?,
+        size: raw.size.map(ByteSize::new),
+        total_size: raw.total_size.map(ByteSize::new),
+        downloaded: raw.completed.map(ByteSize::new),
+        uploaded: raw.uploaded.map(ByteSize::new),
+        ratio: raw
+            .ratio
+            .map(|ratio| Ratio::from_float(ratio).ok_or(QbittorrentFailure::Malformed))
+            .transpose()?,
+        seeding_time: raw.seeding_time.map(Duration::from_secs),
+        added_at: raw.added_on.map(time).transpose()?,
+        completed_at: raw.completion_on.map(time).transpose()?,
+        content_path: raw.content_path.map(|path| ContentPath::try_new(path).ok()),
+        save_path: raw.save_path.map(|path| SavePath::try_new(path).ok()),
+        force_start: raw.force_start.map(|forced| {
+            if forced {
+                ForceStart::Forced
+            } else {
+                ForceStart::NotForced
+            }
+        }),
+    })
 }
 
 /// qBittorrent's state names, from 4.x `paused*` to 5.x `stopped*`.
@@ -383,8 +465,8 @@ pub(super) fn torrent_state(state: &str) -> TorrentState {
         "uploading" | "forcedUP" => TorrentState::Seeding,
         "stalledUP" => TorrentState::SeedStalled,
         "queuedUP" => TorrentState::SeedQueued,
-        "pausedUP" | "stoppedUP" => TorrentState::Stopped { complete: true },
-        "pausedDL" | "stoppedDL" => TorrentState::Stopped { complete: false },
+        "pausedUP" | "stoppedUP" => TorrentState::Stopped(Completion::Complete),
+        "pausedDL" | "stoppedDL" => TorrentState::Stopped(Completion::Incomplete),
         "checkingUP" | "checkingDL" | "checkingResumeData" => TorrentState::Checking,
         "moving" => TorrentState::Moving,
         "missingFiles" => TorrentState::MissingFiles,
@@ -397,7 +479,7 @@ pub(super) fn torrent_state(state: &str) -> TorrentState {
 mod tests {
     use serde_json::json;
 
-    use crate::core::{ByteSize, Progress, QbittorrentFailure, TorrentState};
+    use crate::core::{ByteSize, Progress, QbittorrentFailure, QueueLimit, TorrentState};
 
     use crate::core::{Port, QbittorrentEvent, SyncPosition};
 
@@ -414,7 +496,7 @@ mod tests {
         for (request, expected) in [
             (Request::Connect, QbittorrentEvent::ConnectFailed { reason }),
             (
-                Request::Sync(SyncPosition(0)),
+                Request::Sync(SyncPosition::new(0)),
                 QbittorrentEvent::SyncFailed { reason },
             ),
             (
@@ -453,13 +535,13 @@ mod tests {
         let raw: super::RawPreferences = serde_json::from_value(full.clone())?;
         assert_eq!(
             raw.queue(),
-            Some(crate::core::QueuePreferences {
-                queueing: true,
-                max_downloading: Some(2),
-                max_active: None,
-                max_seeding: Some(4),
-                idle_not_counted: true,
-            })
+            Ok(Some(crate::core::QueuePreferences {
+                queueing: crate::core::Queueing::On,
+                max_downloading: crate::core::QueueLimit::At(crate::core::TorrentCount::new(2)),
+                max_active: crate::core::QueueLimit::Unlimited,
+                max_seeding: crate::core::QueueLimit::At(crate::core::TorrentCount::new(4)),
+                idle: crate::core::IdleTorrents::NotCounted,
+            }))
         );
         for missing in [
             "queueing_enabled",
@@ -477,7 +559,7 @@ mod tests {
                 .collect();
             let raw: super::RawPreferences =
                 serde_json::from_value(serde_json::Value::Object(partial))?;
-            assert_eq!(raw.queue(), None, "{missing}");
+            assert_eq!(raw.queue(), Err(QbittorrentFailure::Malformed), "{missing}");
         }
         Ok(())
     }
@@ -521,28 +603,33 @@ mod tests {
     }
 
     #[test]
-    fn unknown_times_and_paths_are_absent() {
-        let update = torrent_update(&json!({
+    fn unknown_times_and_paths_are_absent() -> Result<(), QbittorrentFailure> {
+        let fields = json!({
             "added_on": 0,
             "completion_on": 4_294_967_295_u64,
             "content_path": "",
             "save_path": "/srv/books"
-        }));
+        });
+        let update = torrent_update(fields)?;
         assert_eq!(update.added_at, Some(None));
         assert_eq!(update.completed_at, Some(None));
         assert_eq!(update.content_path, Some(None));
-        assert_eq!(update.save_path, Some(Some(String::from("/srv/books"))));
+        assert_eq!(
+            update.save_path,
+            Some(crate::core::SavePath::try_new(String::from("/srv/books")).ok())
+        );
+        Ok(())
     }
 
     #[test]
     fn states_cover_old_and_new_names() {
         assert_eq!(
             torrent_state("pausedUP"),
-            TorrentState::Stopped { complete: true }
+            TorrentState::Stopped(crate::core::Completion::Complete)
         );
         assert_eq!(
             torrent_state("stoppedDL"),
-            TorrentState::Stopped { complete: false }
+            TorrentState::Stopped(crate::core::Completion::Incomplete)
         );
         for (name, state) in [
             ("forcedMetaDL", TorrentState::FetchingMetadata),
@@ -563,12 +650,13 @@ mod tests {
     }
 
     #[test]
-    fn partial_updates_keep_only_the_fields_present() {
-        let update = torrent_update(&json!({ "progress": 0.5, "size": 10 }));
+    fn partial_updates_keep_only_the_fields_present() -> Result<(), QbittorrentFailure> {
+        let update = torrent_update(json!({ "progress": 0.5, "size": 10 }))?;
         assert_eq!(update.name, None);
         assert_eq!(update.state, None);
-        assert_eq!(update.progress, Some(Progress::from_fraction(0.5)));
-        assert_eq!(update.size, Some(ByteSize(10)));
+        assert_eq!(update.progress, Progress::from_fraction(0.5));
+        assert_eq!(update.size, Some(ByteSize::new(10)));
+        Ok(())
     }
 
     #[test]
@@ -576,9 +664,83 @@ mod tests {
         let value = json!({ "rid": 3, "torrents": { "not-a-hash": { "name": "x" } } });
         let raw: RawSync = serde_json::from_value(value)?;
         assert_eq!(raw.into_update(), Err(QbittorrentFailure::Malformed));
+        let value = json!({ "rid": 3, "torrents": { "a".repeat(40): { "name": "" } } });
+        let raw: RawSync = serde_json::from_value(value)?;
+        assert_eq!(raw.into_update(), Err(QbittorrentFailure::Malformed));
         let value = json!({ "rid": 3, "torrents_removed": ["also-not-a-hash"] });
         let raw: RawSync = serde_json::from_value(value)?;
         assert_eq!(raw.into_update(), Err(QbittorrentFailure::Malformed));
+        Ok(())
+    }
+    #[test]
+    fn fields_qbittorrent_sends_must_hold_valid_values() {
+        for fields in [
+            json!({ "name": 7 }),
+            json!({ "name": "" }),
+            json!({ "progress": 1.5 }),
+            json!({ "progress": -0.1 }),
+            json!({ "ratio": -2.0 }),
+            json!({ "size": -1 }),
+            json!({ "added_on": -5 }),
+            json!({ "completion_on": "soon" }),
+            json!({ "completion_on": -7 }),
+            json!({ "force_start": "yes" }),
+        ] {
+            assert_eq!(
+                torrent_update(fields.clone()),
+                Err(QbittorrentFailure::Malformed),
+                "{fields}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_limits_and_interfaces_must_be_valid() -> Result<(), serde_json::Error> {
+        let queue = |downloading: i64| {
+            json!({
+                "queueing_enabled": false,
+                "max_active_downloads": downloading,
+                "max_active_torrents": 5,
+                "max_active_uploads": 5,
+                "dont_count_slow_torrents": false
+            })
+        };
+        assert_eq!(super::queue_limit(QueueLimit::Unlimited), -1);
+        assert_eq!(
+            super::queue_limit(QueueLimit::At(crate::core::TorrentCount::new(3))),
+            3
+        );
+        for limits in [
+            queue(-2),
+            json!({ "max_active_torrents": -3 }),
+            json!({ "max_active_uploads": -3 }),
+        ] {
+            let mut fields = queue(3);
+            if let (Some(fields), Some(limits)) = (fields.as_object_mut(), limits.as_object()) {
+                fields.extend(limits.clone());
+            }
+            let raw: super::RawPreferences = serde_json::from_value(fields)?;
+            assert_eq!(raw.into_preferences(), Err(QbittorrentFailure::Malformed));
+        }
+        let raw: super::RawPreferences = serde_json::from_value(queue(3))?;
+        assert_eq!(
+            raw.queue()
+                .map(|queue| queue.map(|queue| (queue.queueing, queue.idle))),
+            Ok(Some((
+                crate::core::Queueing::Off,
+                crate::core::IdleTorrents::Counted
+            )))
+        );
+        let raw: super::RawPreferences =
+            serde_json::from_value(json!({ "current_network_interface": "  " }))?;
+        assert_eq!(raw.into_preferences(), Err(QbittorrentFailure::Malformed));
+        let raw: super::RawPreferences =
+            serde_json::from_value(json!({ "current_network_interface": "" }))?;
+        assert_eq!(
+            raw.into_preferences()
+                .map(|preferences| preferences.interface),
+            Ok(None)
+        );
         Ok(())
     }
 }

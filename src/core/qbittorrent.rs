@@ -4,16 +4,31 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use derive_more::Display;
+use nutype::nutype;
 use serde::Serialize;
 
 use super::{
-    Action, ClockReading, MamTorrentId, Port, TimerId, TimerName, TorrentLimits, timer::Timers,
+    Action, ClockReading, HttpStatus, MamTorrentId, Port, TimerId, TimerName, TorrentCount,
+    TorrentLimits, timer::Timers,
 };
 
 /// How often qBittorrent's state is read.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Preferences are re-read after this many polls, to notice outside changes.
-const POLLS_PER_PREFERENCES_READ: u8 = 6;
+const POLLS_PER_PREFERENCES_READ: Polls = Polls(6);
+
+/// Polls since qBittorrent's preferences were last read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Polls(u8);
+
+impl Polls {
+    const NONE: Self = Self(0);
+
+    const fn plus_one(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
 
 /// A qBittorrent release version, such as 5.2.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -44,7 +59,9 @@ impl ClientVersion {
         }
     }
 
-    const fn new(major: u32, minor: u32, patch: u32) -> Self {
+    /// A release version from its parts.
+    #[must_use]
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
             minor,
@@ -74,6 +91,98 @@ impl fmt::Display for ClientVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
     }
+}
+
+/// The version qBittorrent reports, read once when Windlass connects.
+#[derive(Debug, Clone, PartialEq, Eq, Display, Serialize)]
+pub enum ReportedVersion {
+    /// A release version, such as 5.2.2.
+    Release(ClientVersion),
+    /// Anything else, such as an alpha or a development build.
+    Unrecognised(VersionText),
+}
+
+impl ReportedVersion {
+    /// Read the version text; blank text is no version.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        ClientVersion::parse(text).map_or_else(
+            || VersionText::try_new(text).ok().map(Self::Unrecognised),
+            |version| Some(Self::Release(version)),
+        )
+    }
+
+    /// The release version, if it is one.
+    #[must_use]
+    pub const fn release(&self) -> Option<ClientVersion> {
+        match self {
+            Self::Release(version) => Some(*version),
+            Self::Unrecognised(_) => None,
+        }
+    }
+
+    /// MAM's position on this version; only releases can be allowed.
+    #[must_use]
+    pub fn mam_approval(&self) -> MamApproval {
+        self.release()
+            .map_or(MamApproval::NotAllowed, ClientVersion::mam_approval)
+    }
+}
+
+/// Version text qBittorrent reports that is not a release version.
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct VersionText(String);
+
+/// A torrent's name in qBittorrent.
+#[nutype(
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct TorrentName(String);
+
+/// The directory a torrent's content is saved under.
+#[nutype(
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct SavePath(String);
+
+/// Where a torrent's content is stored: its file, or its top directory.
+#[nutype(
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct ContentPath(String);
+
+/// The network interface qBittorrent is bound to, such as `wg0`.
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(Debug, Clone, PartialEq, Eq, Display, Serialize)
+)]
+pub struct NetworkInterface(String);
+
+/// Whether a stopped torrent had downloaded all its selected content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Completion {
+    /// All selected content is downloaded.
+    Complete,
+    /// Some is still missing.
+    Incomplete,
+}
+
+/// Whether a torrent runs regardless of qBittorrent's queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum ForceStart {
+    /// The queue manages it.
+    #[default]
+    NotForced,
+    /// It runs regardless of the queue.
+    Forced,
 }
 
 /// MAM's position on a qBittorrent version, from its allowed client list.
@@ -126,10 +235,7 @@ pub enum TorrentState {
     /// Complete and waiting for an upload slot.
     SeedQueued,
     /// Stopped by the user or an application.
-    Stopped {
-        /// Whether all selected content was downloaded.
-        complete: bool,
-    },
+    Stopped(Completion),
     /// Verifying content on disk.
     Checking,
     /// Moving content to another location.
@@ -148,15 +254,17 @@ pub enum TorrentState {
 pub struct Progress(u16);
 
 impl Progress {
-    /// Progress from a fraction between 0 and 1; out-of-range values are clamped.
+    /// Progress from a fraction between 0 and 1; anything else is not one.
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "the value is clamped to 0..=1000 before conversion"
+        reason = "the fraction is checked to be within 0..=1, so the value is within 0..=1000"
     )]
-    pub fn from_fraction(fraction: f64) -> Self {
-        Self((fraction.clamp(0.0, 1.0) * 1000.0).round() as u16)
+    pub fn from_fraction(fraction: f64) -> Option<Self> {
+        (0.0..=1.0)
+            .contains(&fraction)
+            .then(|| Self((fraction * 1000.0).round() as u16))
     }
 
     /// Progress from tenths of a percent; values above 1000 are refused.
@@ -178,22 +286,80 @@ impl Progress {
 
 /// A size in bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct ByteSize(pub u64);
+pub struct ByteSize(u64);
 
-/// An upload ratio in thousandths, such as 1500 for 1.5.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct Ratio(pub u64);
+impl ByteSize {
+    /// This many bytes.
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// This many GiB, saturating.
+    #[must_use]
+    pub const fn gib(gib: u64) -> Self {
+        Self(gib.saturating_mul(1 << 30))
+    }
+
+    /// The number of bytes.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+
+    /// Whether this is no bytes.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// This size less that one, or nothing when that one is larger.
+    #[must_use]
+    pub const fn less(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+}
+
+/// An upload ratio, kept in thousandths, such as 1500 for 1.5; shown with two
+/// decimals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Display, Serialize)]
+#[display("{}.{:02}", _0 / 1000, _0 % 1000 / 10)]
+pub struct Ratio(u64);
 
 impl Ratio {
-    /// A ratio from qBittorrent's floating-point value; negative values are zero.
+    /// The ratio this many thousandths make, such as 1500 for 1.5.
+    #[must_use]
+    pub const fn from_thousandths(thousandths: u64) -> Self {
+        Self(thousandths)
+    }
+
+    /// The ratio in thousandths.
+    #[must_use]
+    pub const fn thousandths(self) -> u64 {
+        self.0
+    }
+
+    /// Uploaded over downloaded, or `None` when nothing was downloaded.
+    #[must_use]
+    pub fn of(uploaded: ByteSize, downloaded: ByteSize) -> Option<Self> {
+        (!downloaded.is_zero()).then(|| {
+            Self(
+                u64::try_from(u128::from(uploaded.0) * 1000 / u128::from(downloaded.0))
+                    .unwrap_or(u64::MAX),
+            )
+        })
+    }
+
+    /// A ratio from qBittorrent's floating-point value; a negative or
+    /// non-finite value is not one.
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "the value is clamped to be non-negative, and ratios far beyond u64 are not real"
+        reason = "the value is checked to be finite and non-negative; the cast saturates"
     )]
-    pub fn from_float(ratio: f64) -> Self {
-        Self((ratio.max(0.0) * 1000.0).round() as u64)
+    pub fn from_float(ratio: f64) -> Option<Self> {
+        (ratio.is_finite() && ratio >= 0.0).then(|| Self((ratio * 1000.0).round() as u64))
     }
 }
 
@@ -223,8 +389,8 @@ macro_rules! torrent_fields {
 }
 
 torrent_fields! {
-    /// The torrent's display name.
-    name: String,
+    /// The torrent's display name, once qBittorrent reports it.
+    name: Option<TorrentName>,
     /// What qBittorrent is doing with it.
     state: TorrentState,
     /// How much of the selected content is downloaded.
@@ -246,11 +412,11 @@ torrent_fields! {
     /// When the download completed.
     completed_at: Option<SystemTime>,
     /// Where the torrent's content is stored.
-    content_path: Option<String>,
+    content_path: Option<ContentPath>,
     /// The directory the content is saved under.
-    save_path: Option<String>,
+    save_path: Option<SavePath>,
     /// Whether it runs regardless of qBittorrent's queue.
-    force_start: bool,
+    force_start: ForceStart,
 }
 
 /// A change qBittorrent must make so that it matches the torrent registry.
@@ -278,8 +444,32 @@ pub enum TorrentCommand {
 }
 
 /// qBittorrent's position in its stream of incremental updates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Display, Serialize)]
+pub struct SyncPosition(u64);
+
+impl SyncPosition {
+    /// The position qBittorrent named.
+    #[must_use]
+    pub const fn new(position: u64) -> Self {
+        Self(position)
+    }
+
+    /// The number qBittorrent is asked for changes since.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Whether an update replaces the whole torrent list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct SyncPosition(pub u64);
+pub enum SyncScope {
+    /// Only what changed since the last update.
+    #[default]
+    Changes,
+    /// The whole list, replacing what Windlass knew.
+    Full,
+}
 
 /// One incremental update of qBittorrent's torrent list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -287,7 +477,7 @@ pub struct SyncUpdate {
     /// The position to request next.
     pub position: SyncPosition,
     /// Whether this update replaces the whole list.
-    pub full: bool,
+    pub scope: SyncScope,
     /// New or changed torrents.
     pub torrents: Vec<(TorrentHash, TorrentUpdate)>,
     /// Torrents no longer in qBittorrent.
@@ -300,24 +490,54 @@ pub struct QbittorrentPreferences {
     /// The port qBittorrent listens on for peers.
     pub listen_port: Option<Port>,
     /// The network interface qBittorrent is bound to, if any.
-    pub interface: Option<String>,
+    pub interface: Option<NetworkInterface>,
     /// How qBittorrent queues torrents, when it reports it.
     pub queue: Option<QueuePreferences>,
 }
 
-/// How qBittorrent queues torrents. A limit that is absent is unlimited.
+/// Whether qBittorrent holds torrents beyond its limits in a queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Queueing {
+    /// Torrents beyond the limits wait.
+    On,
+    /// Every torrent runs.
+    Off,
+}
+
+/// One of qBittorrent's queue limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize)]
+pub enum QueueLimit {
+    /// No limit.
+    #[display("no limit")]
+    Unlimited,
+    /// At most this many torrents.
+    #[display("{_0}")]
+    At(TorrentCount),
+}
+
+/// Whether qBittorrent counts torrents moving almost no data against its
+/// limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum IdleTorrents {
+    /// They count.
+    Counted,
+    /// They are left out, so idle seeds keep seeding.
+    NotCounted,
+}
+
+/// How qBittorrent queues torrents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct QueuePreferences {
     /// Whether torrents beyond the limits wait in a queue.
-    pub queueing: bool,
+    pub queueing: Queueing,
     /// How many torrents may download at once.
-    pub max_downloading: Option<u32>,
+    pub max_downloading: QueueLimit,
     /// How many torrents may be active at once.
-    pub max_active: Option<u32>,
+    pub max_active: QueueLimit,
     /// How many torrents may seed at once.
-    pub max_seeding: Option<u32>,
-    /// Whether torrents moving almost no data are left out of the counts.
-    pub idle_not_counted: bool,
+    pub max_seeding: QueueLimit,
+    /// Whether torrents moving almost no data count against the limits.
+    pub idle: IdleTorrents,
 }
 
 impl QueuePreferences {
@@ -325,13 +545,13 @@ impl QueuePreferences {
     /// only while peers download from them, so idle seeds keep seeding.
     #[must_use]
     pub fn for_limits(limits: TorrentLimits) -> Self {
-        let active = limits.active().into_inner();
+        let active = QueueLimit::At(TorrentCount::new(limits.active().into_inner()));
         Self {
-            queueing: true,
-            max_downloading: Some(limits.downloading().into_inner()),
-            max_active: Some(active),
-            max_seeding: Some(active),
-            idle_not_counted: true,
+            queueing: Queueing::On,
+            max_downloading: QueueLimit::At(TorrentCount::new(limits.downloading().into_inner())),
+            max_active: active,
+            max_seeding: active,
+            idle: IdleTorrents::NotCounted,
         }
     }
 }
@@ -344,7 +564,7 @@ pub enum QbittorrentFailure {
     /// qBittorrent answered with an unexpected HTTP status.
     Rejected {
         /// The HTTP status code.
-        status: u16,
+        status: HttpStatus,
     },
     /// The answer could not be understood.
     Malformed,
@@ -357,8 +577,8 @@ pub enum QbittorrentEvent {
     Enable,
     /// The web UI answered with its version and preferences.
     Connected {
-        /// The application version, such as `v5.2.2`.
-        version: String,
+        /// The application version.
+        version: ReportedVersion,
         /// The current preferences.
         preferences: QbittorrentPreferences,
     },
@@ -431,15 +651,33 @@ pub enum Activity {
     /// Choosing the next request; never visible outside a step.
     Deciding {
         /// Whether a fresh update was just merged.
-        after_sync: bool,
+        after: DecidingAfter,
     },
+}
+
+/// What a choice of the next qBittorrent request follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DecidingAfter {
+    /// A fresh update was just merged.
+    Sync,
+    /// Any other answer.
+    Other,
+}
+
+/// Whether qBittorrent's full torrent list has arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    /// Not yet.
+    Awaited,
+    /// It has.
+    Received,
 }
 
 /// A connected qBittorrent and what Windlass knows about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     /// The version qBittorrent reported.
-    pub version: String,
+    pub version: ReportedVersion,
     /// MAM's position on that version.
     pub approval: MamApproval,
     /// The latest preferences read.
@@ -449,8 +687,8 @@ pub struct Session {
     /// The request outstanding now.
     pub activity: Activity,
     position: SyncPosition,
-    listed: bool,
-    polls_since_preferences: u8,
+    listing: Listing,
+    polls_since_preferences: Polls,
 }
 
 /// The core's view of qBittorrent.
@@ -491,8 +729,7 @@ impl Qbittorrent {
                     preferences,
                 },
             ) => {
-                let approval = ClientVersion::parse(&version)
-                    .map_or(MamApproval::NotAllowed, ClientVersion::mam_approval);
+                let approval = version.mam_approval();
                 *self = Self::Connected(Box::new(Session {
                     version,
                     approval,
@@ -500,8 +737,8 @@ impl Qbittorrent {
                     torrents: BTreeMap::new(),
                     activity: Activity::Syncing,
                     position: SyncPosition::default(),
-                    listed: false,
-                    polls_since_preferences: 0,
+                    listing: Listing::Awaited,
+                    polls_since_preferences: Polls::NONE,
                 }));
                 vec![Action::SyncQbittorrent {
                     position: SyncPosition::default(),
@@ -511,22 +748,26 @@ impl Qbittorrent {
                 if session.activity == Activity::Syncing =>
             {
                 session.apply(update);
-                session.polls_since_preferences = session.polls_since_preferences.saturating_add(1);
-                session.activity = Activity::Deciding { after_sync: true };
+                session.polls_since_preferences = session.polls_since_preferences.plus_one();
+                session.activity = Activity::Deciding {
+                    after: DecidingAfter::Sync,
+                };
                 Vec::new()
             }
             (Self::Connected(session), QbittorrentEvent::CommandDone)
                 if session.activity == Activity::Commanding =>
             {
                 // Read the result of the command at once.
-                session.activity = Activity::Deciding { after_sync: false };
+                session.activity = Activity::Deciding {
+                    after: DecidingAfter::Other,
+                };
                 Vec::new()
             }
             (Self::Connected(session), QbittorrentEvent::PreferencesRead(preferences))
                 if session.activity == Activity::ReadingPreferences =>
             {
                 session.preferences = preferences;
-                session.polls_since_preferences = 0;
+                session.polls_since_preferences = Polls::NONE;
                 session.wait(now, timers)
             }
             (Self::Connected(session), QbittorrentEvent::ListenPortSet)
@@ -572,7 +813,9 @@ impl Qbittorrent {
                 vec![Action::ConnectQbittorrent]
             }
             Self::Connected(session) if session.activity == Activity::Waiting(id) => {
-                session.activity = Activity::Deciding { after_sync: false };
+                session.activity = Activity::Deciding {
+                    after: DecidingAfter::Other,
+                };
                 Vec::new()
             }
             _ => Vec::new(),
@@ -582,10 +825,10 @@ impl Qbittorrent {
     /// The session, while it is choosing its next request, and whether a fresh
     /// update was just merged.
     #[must_use]
-    pub fn deciding(&self) -> Option<(&Session, bool)> {
+    pub fn deciding(&self) -> Option<(&Session, DecidingAfter)> {
         match self {
             Self::Connected(session) => match session.activity {
-                Activity::Deciding { after_sync } => Some((session, after_sync)),
+                Activity::Deciding { after } => Some((session, after)),
                 _ => None,
             },
             _ => None,
@@ -604,13 +847,13 @@ impl Qbittorrent {
         let Self::Connected(session) = self else {
             return Vec::new();
         };
-        let Activity::Deciding { after_sync } = session.activity else {
+        let Activity::Deciding { after } = session.activity else {
             return Vec::new();
         };
         if let Some(actions) = session.set_preferences(wanted) {
             return actions;
         }
-        if !after_sync {
+        if after == DecidingAfter::Other {
             session.activity = Activity::Syncing;
             return vec![Action::SyncQbittorrent {
                 position: session.position,
@@ -642,14 +885,14 @@ impl Qbittorrent {
 impl Session {
     /// Whether the torrent list is complete: the first full update has arrived.
     #[must_use]
-    pub const fn listed(&self) -> bool {
-        self.listed
+    pub fn listed(&self) -> bool {
+        self.listing == Listing::Received
     }
 
     fn apply(&mut self, update: SyncUpdate) {
-        if update.full {
+        if update.scope == SyncScope::Full {
             self.torrents.clear();
-            self.listed = true;
+            self.listing = Listing::Received;
         }
         for (hash, changes) in update.torrents {
             self.torrents.entry(hash).or_default().apply(changes);

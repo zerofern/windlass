@@ -248,8 +248,11 @@ core scenarios with simulated time, and end to end only for their wiring.
 - **Does:** reports a ratio below 2.0 (urgent below 1.1), unsatisfied torrents at
   80% of MAM's limit, unsatisfied torrents not seeding, partial downloads, tracker
   errors and other red categories, MAM notification counts, points below the
-  reserve, VIP ending, and torrents at day 20 without 96 hours seeded.
-- **Where:** `core/mam/account.rs`, `core/notifications.rs` (`mam`).
+  reserve, VIP ending, and torrents at day 20 without 96 hours seeded. A
+  reading missing any value these rely on is not understood, and counts as no
+  reading.
+- **Where:** `core/mam/account.rs`, `core/notifications.rs` (`mam`),
+  `shell/mam_reply.rs` (parsing).
 - **Tested:** `tests/mam_core.rs`, `tests/notifications_core.rs`.
 - **Missing end to end:** one fake-MAM account with red flags producing the
   notices (part of E8).

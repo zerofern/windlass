@@ -72,7 +72,7 @@ async fn exit_ip(client: &Client) -> Result<IpAddr, ExitIpFailure> {
     let status = response.status();
     if !status.is_success() {
         return Err(ExitIpFailure::Rejected {
-            status: status.as_u16(),
+            status: crate::core::HttpStatus::new(status),
         });
     }
     // A body that cannot be read is no address either.
@@ -137,7 +137,9 @@ mod tests {
             (
                 "down",
                 "/nonexistent/systemctl",
-                failed(ExitIpFailure::Rejected { status: 503 }),
+                failed(ExitIpFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::SERVICE_UNAVAILABLE),
+                }),
                 TunnelEvent::SwitchFailed,
             ),
             // Nothing listens on the discard port.

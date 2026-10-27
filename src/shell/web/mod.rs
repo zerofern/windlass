@@ -32,7 +32,7 @@ use crate::{
     core::{
         ActiveLimit, ApiCookie, DownloadingLimit, Event, HistoryLimit, HistoryState, MamEvent,
         MamPauseEvent, MamRequestMode, NotificationEvent, NtfyTopic, PointsReserve, RecordId,
-        RegistryEvent, SettingsEvent, StartupEvent, StartupMode, State, TorrentLimits,
+        RegistryEvent, Sale, SettingsEvent, StartupEvent, StartupMode, State, TorrentLimits,
     },
     runner::{Observation, Runner},
     shell::{
@@ -416,13 +416,13 @@ struct CheckedForm {
 }
 
 async fn purchase_checked(AppState(app): AppState<App>, Form(form): Form<CheckedForm>) -> Response {
-    let made = match form.made.as_str() {
-        "yes" => true,
-        "no" => false,
+    let sale = match form.made.as_str() {
+        "yes" => Sale::Made,
+        "no" => Sale::NotMade,
         _ => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     };
     match app
-        .send(Event::Mam(MamEvent::PurchaseChecked { made }))
+        .send(Event::Mam(MamEvent::PurchaseChecked { sale }))
         .await
     {
         Ok(()) => back(Some(Location::Status.path())).into_response(),

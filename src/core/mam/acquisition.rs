@@ -9,10 +9,14 @@ use std::{
 use serde::Serialize;
 
 use super::{
-    Bookmark, BookmarkPage, MamFailure, PersonalFreeleech, WedgeSpent,
+    Bookmark, BookmarkCount, BookmarkPage, ClientReadiness, Freeleech, MamFailure,
+    PersonalFreeleech, RequestGate, SeedboxConfirmation, UnsatisfiedCount, UnsatisfiedLimit, Wedge,
+    WedgeSpent,
     account::{Account, ClientStanding},
 };
-use crate::core::{Download, DownloadingLimit, MamTorrentId, UserData};
+use crate::core::{
+    Completion, Download, DownloadingLimit, FailureCount, MamTorrentId, TorrentCount, UserData,
+};
 
 /// How often bookmarks are listed.
 pub const BOOKMARKS_EVERY: Duration = Duration::from_mins(15);
@@ -55,7 +59,7 @@ pub enum Hold {
     /// As many downloads are running as the owner allows.
     DownloadingLimit {
         /// Windlass's downloads running now.
-        downloading: u32,
+        downloading: TorrentCount,
         /// The owner's limit.
         limit: DownloadingLimit,
     },
@@ -66,9 +70,9 @@ pub enum Hold {
     /// Another download would leave fewer than the reserved unsatisfied slots.
     UnsatisfiedLimit {
         /// MAM's count plus recent admissions.
-        count: u32,
+        count: UnsatisfiedCount,
         /// MAM's limit.
-        limit: u32,
+        limit: UnsatisfiedLimit,
     },
     /// The torrent needs a wedge and none is left.
     NoWedge,
@@ -84,7 +88,7 @@ pub struct Listed {
     /// When, by the process clock.
     pub taken: Instant,
     /// Bookmarks in total, as MAM counts them.
-    pub found: u32,
+    pub found: BookmarkCount,
     /// The bookmarks.
     pub bookmarks: Vec<Bookmark>,
 }
@@ -97,7 +101,7 @@ pub struct Bookmarks {
     /// When the next listing is due; now when absent.
     pub next: Option<Instant>,
     /// Listings that failed since the last success.
-    pub failures: u32,
+    pub failures: FailureCount,
     /// Why the latest listing failed.
     pub last_failure: Option<MamFailure>,
     listing: Option<Vec<Bookmark>>,
@@ -106,10 +110,14 @@ pub struct Bookmarks {
 impl Bookmarks {
     /// The page to request now: the next of a listing in progress, or the first
     /// of a due listing.
-    pub(super) fn wanted(&self, now: Instant) -> Option<u32> {
+    pub(super) fn wanted(&self, now: Instant) -> Option<BookmarkCount> {
         self.listing.as_ref().map_or_else(
-            || self.next.is_none_or(|next| next <= now).then_some(0),
-            |listing| u32::try_from(listing.len()).ok(),
+            || {
+                self.next
+                    .is_none_or(|next| next <= now)
+                    .then_some(BookmarkCount::new(0))
+            },
+            |listing| BookmarkCount::of(listing),
         )
     }
 
@@ -132,7 +140,7 @@ impl Bookmarks {
         let listing = self.listing.get_or_insert_with(Vec::new);
         listing.extend(page.bookmarks);
         let done = empty
-            || listing.len() >= usize::try_from(page.found).unwrap_or(usize::MAX)
+            || page.found.is_reached_by(listing.len())
             || listing.len() >= MAX_BOOKMARK_PAGES * PAGE_SIZE;
         if !done {
             return None;
@@ -143,7 +151,7 @@ impl Bookmarks {
             found: page.found,
             bookmarks: self.listing.take().unwrap_or_default(),
         });
-        self.failures = 0;
+        self.failures = FailureCount::NONE;
         self.last_failure = None;
         self.next = now.checked_add(BOOKMARKS_EVERY);
         self.latest.as_ref()
@@ -157,7 +165,7 @@ impl Bookmarks {
             _ => RETRY_AFTER,
         };
         self.listing = None;
-        self.failures = self.failures.saturating_add(1);
+        self.failures = self.failures.after_another();
         self.last_failure = Some(failure);
         self.next = now.checked_add(wait);
     }
@@ -205,11 +213,29 @@ pub enum DownloadWatch {
     NeedHistory,
     /// It is not free for the owner.
     NotFree {
-        /// Whether Windlass spent a wedge on it that the history does not show.
-        wedge_missing: bool,
+        /// Whether the bonus history shows the wedges Windlass spent on it.
+        wedges: WedgeAccounting,
         /// Whether MAM still lists it, so a wedge could be spent.
-        listed: bool,
+        listing: MamListing,
     },
+}
+
+/// Whether the bonus history shows every wedge Windlass spent on a torrent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum WedgeAccounting {
+    /// It shows them all, or none was spent.
+    Complete,
+    /// Windlass spent a wedge on it that the history does not show.
+    Missing,
+}
+
+/// Whether MAM still lists a torrent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MamListing {
+    /// MAM lists it.
+    Listed,
+    /// MAM no longer lists it.
+    Unlisted,
 }
 
 /// The next request admission or the watch over running downloads wants.
@@ -222,7 +248,7 @@ pub(super) enum Next {
         /// The torrent.
         id: MamTorrentId,
         /// Whether to spend a wedge.
-        wedge: bool,
+        wedge: Wedge,
     },
     /// Look the torrent up on MAM.
     LookUp(MamTorrentId),
@@ -239,14 +265,14 @@ pub(super) enum Next {
 pub(super) struct Facts<'a> {
     pub(super) now: Instant,
     pub(super) wall: SystemTime,
-    pub(super) mam_available: bool,
-    pub(super) seedbox_confirmed: bool,
-    pub(super) client_ready: bool,
+    pub(super) gate: RequestGate,
+    pub(super) seedbox: SeedboxConfirmation,
+    pub(super) readiness: ClientReadiness,
     pub(super) client: ClientStanding,
     /// Downloads qBittorrent added in the last hour, or will add.
-    pub(super) recent: u32,
+    pub(super) recent: UnsatisfiedCount,
     /// Windlass's downloads that are running and not finished.
-    pub(super) downloading: u32,
+    pub(super) downloading: TorrentCount,
     pub(super) downloading_limit: DownloadingLimit,
     pub(super) account: &'a Account,
 }
@@ -261,7 +287,7 @@ pub struct Acquisition {
     /// Why the next queued torrent waits, if it does.
     pub hold: Option<Hold>,
     /// The download being fetched, and whether with a wedge.
-    pub fetching: Option<(MamTorrentId, bool)>,
+    pub fetching: Option<(MamTorrentId, Wedge)>,
     /// When the latest download was admitted.
     pub last_admission: Option<Instant>,
     /// Torrents looked up on MAM by ID.
@@ -284,7 +310,7 @@ impl Acquisition {
             bookmarks: Bookmarks {
                 latest: None,
                 next: None,
-                failures: 0,
+                failures: FailureCount::NONE,
                 last_failure: None,
                 listing: None,
             },
@@ -393,19 +419,19 @@ impl Acquisition {
                 Next::Idle
             };
         };
-        if !facts.mam_available {
+        if facts.gate == RequestGate::Closed {
             return Next::Hold(Hold::MamUnavailable);
         }
-        if !facts.seedbox_confirmed {
+        if facts.seedbox == SeedboxConfirmation::Unconfirmed {
             return Next::Hold(Hold::SeedboxUnconfirmed);
         }
         if self.refused.is_some() {
             return Next::Hold(Hold::DownloadsRefused);
         }
-        if !facts.client_ready {
+        if facts.readiness == ClientReadiness::NotReady {
             return Next::Hold(Hold::ClientUnavailable);
         }
-        if facts.downloading >= facts.downloading_limit.into_inner() {
+        if facts.downloading_limit.is_reached_by(facts.downloading) {
             return Next::Hold(Hold::DownloadingLimit {
                 downloading: facts.downloading,
                 limit: facts.downloading_limit,
@@ -423,13 +449,9 @@ impl Acquisition {
         let Some(summary) = &data.summary else {
             return Next::Hold(Hold::AccountUnknown);
         };
-        let count = summary.unsatisfied.saturating_add(facts.recent);
+        let count = summary.unsatisfied.plus(facts.recent);
         let limit = summary.unsatisfied_limit;
-        if count
-            .saturating_add(1)
-            .saturating_add(super::account::UNSATISFIED_RESERVE)
-            > limit
-        {
+        if !limit.admits_one_more(count, super::account::UNSATISFIED_RESERVE) {
             return Next::Hold(Hold::UnsatisfiedLimit { count, limit });
         }
         let id = bookmark.id;
@@ -441,23 +463,36 @@ impl Acquisition {
             );
         };
         if free_for_owner(listing, data, facts.wall) {
-            return Next::Fetch { id, wedge: false };
+            return Next::Fetch {
+                id,
+                wedge: Wedge::Keep,
+            };
         }
         // A wedge spent before, or by an attempt whose answer was lost, is not
         // spent again.
         let Some(history) = self.history_settles(id, facts.now) else {
             return Self::ask(self.may_ask_history(id, facts.now), Next::NeedHistory);
         };
-        let wedge = !history.wedged.contains(&id);
-        if wedge && data.wedges == 0 {
+        let wedge = if history.wedged.contains(&id) {
+            Wedge::Keep
+        } else {
+            Wedge::Spend
+        };
+        if wedge == Wedge::Spend && data.wedges.is_zero() {
             return Next::Hold(Hold::NoWedge);
         }
         Next::Fetch { id, wedge }
     }
 
-    pub(super) fn fetching(&mut self, now: Instant, id: MamTorrentId, wedge: bool, admitted: bool) {
+    pub(super) fn fetching(
+        &mut self,
+        now: Instant,
+        id: MamTorrentId,
+        wedge: Wedge,
+        admitted: bool,
+    ) {
         self.fetching = Some((id, wedge));
-        if wedge {
+        if wedge == Wedge::Spend {
             self.wedge_attempts.insert(id, now);
         }
         if admitted {
@@ -475,7 +510,9 @@ impl Acquisition {
         wall: SystemTime,
     ) -> Vec<(Download, DownloadWatch)> {
         downloads
-            .filter(|download| !download.finished || recent(download, wall))
+            .filter(|download| {
+                download.completion == Completion::Incomplete || recent(download, wall)
+            })
             .map(|download| {
                 let watch = self.watch(&download, data, now, wall);
                 (download, watch)
@@ -499,8 +536,8 @@ impl Acquisition {
             // Only a history read once MAM recorded the wedge can show it.
             return if history.is_some_and(|history| history.at >= recorded) {
                 DownloadWatch::NotFree {
-                    wedge_missing: true,
-                    listed: true,
+                    wedges: WedgeAccounting::Missing,
+                    listing: MamListing::Listed,
                 }
             } else {
                 DownloadWatch::NeedHistory
@@ -516,8 +553,12 @@ impl Acquisition {
             DownloadWatch::FreeForNow
         } else if history.is_some_and(|history| history.at >= seen) {
             DownloadWatch::NotFree {
-                wedge_missing: false,
-                listed: listing.is_some(),
+                wedges: WedgeAccounting::Complete,
+                listing: if listing.is_some() {
+                    MamListing::Listed
+                } else {
+                    MamListing::Unlisted
+                },
             }
         } else {
             DownloadWatch::NeedHistory
@@ -536,16 +577,18 @@ impl Acquisition {
                     Next::NeedHistory
                 }
                 DownloadWatch::NotFree {
-                    wedge_missing: false,
-                    listed: true,
-                } if !download.finished => match account.fresh(now, None) {
-                    Some(data) if data.wedges > 0 => Next::Fetch {
-                        id: download.mam,
-                        wedge: true,
-                    },
-                    Some(_) => Next::Idle,
-                    None => Next::NeedReading,
-                },
+                    wedges: WedgeAccounting::Complete,
+                    listing: MamListing::Listed,
+                } if download.completion == Completion::Incomplete => {
+                    match account.fresh(now, None) {
+                        Some(data) if !data.wedges.is_zero() => Next::Fetch {
+                            id: download.mam,
+                            wedge: Wedge::Spend,
+                        },
+                        Some(_) => Next::Idle,
+                        None => Next::NeedReading,
+                    }
+                }
                 _ => Next::Idle,
             };
             if next != Next::Idle {
@@ -625,8 +668,8 @@ pub(super) fn recent(download: &Download, wall: SystemTime) -> bool {
 fn free_for_owner(listing: &Bookmark, data: &UserData, now: SystemTime) -> bool {
     let until = now.checked_add(WATCH_FRESH_FOR).unwrap_or(now);
     let account_vip = data.is_vip(until);
-    let torrent_vip = listing.vip && listing.vip_expires.is_none_or(|expires| expires > until);
-    listing.free
+    let torrent_vip = listing.vip.at(until);
+    listing.freeleech == Freeleech::ForEveryone
         || listing.personal == PersonalFreeleech::ThroughWedge
         || (listing.personal == PersonalFreeleech::ThroughVip && account_vip)
         || (torrent_vip && account_vip)

@@ -11,8 +11,8 @@ use std::{net::SocketAddr, time::Duration};
 use reqwest::{Client as HttpClient, Url};
 
 use crate::core::{
-    DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Push, SettingName, StartupMode,
-    SwitchBlock,
+    ClientWarning, DeliveryFailure, Notice, NotificationEvent, NtfyTopic, Partials, Push, Sale,
+    SettingName, StartupMode, SwitchBlock, TorrentCount, Urgency,
 };
 
 use super::describe::{hold, purchase, qbittorrent_failure, rejection, timestamp};
@@ -114,13 +114,13 @@ async fn deliver(channel: &Channel, topic: &NtfyTopic, push: &Push) -> Result<()
         Ok(())
     } else {
         Err(DeliveryFailure::Rejected {
-            status: status.as_u16(),
+            status: crate::core::HttpStatus::new(status),
         })
     }
 }
 
-fn torrents(count: usize) -> String {
-    if count == 1 {
+fn torrents(count: TorrentCount) -> String {
+    if count.get() == 1 {
         String::from("1 torrent")
     } else {
         format!("{count} torrents")
@@ -278,7 +278,7 @@ pub(super) fn message(notice: &Notice) -> Message {
             format!(
                 "{} {} missing files. Windlass does not download them again without you.",
                 torrents(*count),
-                if *count == 1 { "has" } else { "have" }
+                if count.get() == 1 { "has" } else { "have" }
             ),
             4,
             "/#torrents",
@@ -294,7 +294,7 @@ pub(super) fn message(notice: &Notice) -> Message {
             format!(
                 "{} Windlass manages {} not in qBittorrent.",
                 torrents(*count),
-                if *count == 1 { "is" } else { "are" }
+                if count.get() == 1 { "is" } else { "are" }
             ),
             4,
             "/#torrents",
@@ -395,14 +395,16 @@ pub(super) fn message(notice: &Notice) -> Message {
         ),
         Notice::RatioLow {
             ratio: value,
-            urgent,
+            urgency,
         } => at_mam(
             "Ratio below 2.0",
             format!(
-                "MAM reports a ratio of {}. Every download is held until you find out why.",
-                ratio(*value)
+                "MAM reports a ratio of {value}. Every download is held until you find out why."
             ),
-            if *urgent { 5 } else { 4 },
+            match urgency {
+                Urgency::Urgent => 5,
+                Urgency::Normal => 4,
+            },
         ),
         Notice::RatioRestored => at_mam(
             "Ratio back above 2.0",
@@ -439,16 +441,19 @@ pub(super) fn message(notice: &Notice) -> Message {
             "MAM flags the account's torrents",
             format!(
                 "MAM reports{}{}{}.",
-                if *partial { " a partial download;" } else { "" },
-                if *tracker_errors > 0 {
-                    format!(" {tracker_errors} tracker errors;")
-                } else {
-                    String::new()
+                match partial {
+                    Partials::Seen => " a partial download;",
+                    Partials::NotSeen => "",
                 },
-                if *flagged > 0 {
-                    format!(" {flagged} torrents in categories it marks red")
-                } else {
+                if tracker_errors.is_zero() {
                     String::new()
+                } else {
+                    format!(" {tracker_errors} tracker errors;")
+                },
+                if flagged.is_zero() {
+                    String::new()
+                } else {
+                    format!(" {flagged} torrents in categories it marks red")
                 }
             ),
             4,
@@ -462,20 +467,23 @@ pub(super) fn message(notice: &Notice) -> Message {
             count,
             client_warning,
         } => at_mam(
-            if *client_warning {
+            if *client_warning == ClientWarning::Given {
                 "MAM warns about a client"
             } else {
                 "MAM has notifications"
             },
             format!(
                 "MAM has {count} notifications for you{}. Windlass does not read them.",
-                if *client_warning {
+                if *client_warning == ClientWarning::Given {
                     ", including a warning that it is about to stop accepting a client"
                 } else {
                     ""
                 }
             ),
-            if *client_warning { 5 } else { 3 },
+            match client_warning {
+                ClientWarning::Given => 5,
+                ClientWarning::NotGiven => 3,
+            },
         ),
         Notice::DownloadsHeld { hold: reason } => at_mam(
             "Downloads held",
@@ -524,7 +532,7 @@ pub(super) fn message(notice: &Notice) -> Message {
             format!(
                 "{} completed 20 or more days ago {} not seeded 96 hours yet. MAM requires 72 within 30 days; Windlass aims a day higher.",
                 torrents(*count),
-                if *count == 1 { "has" } else { "have" }
+                if count.get() == 1 { "has" } else { "have" }
             ),
             4,
         ),
@@ -560,14 +568,18 @@ pub(super) fn message(notice: &Notice) -> Message {
             ),
             4,
         ),
-        Notice::DownloadNotFree { stopped: true } => at_mam(
+        Notice::DownloadNotFree {
+            outcome: crate::core::NotFreeOutcome::Stopped,
+        } => at_mam(
             "Download stopped",
             String::from(
                 "A download is no longer free for you, and no wedge could be spent on it, so Windlass stopped it to protect the ratio. It resumes if it becomes free or a wedge is available.",
             ),
             4,
         ),
-        Notice::DownloadNotFree { stopped: false } => at_mam(
+        Notice::DownloadNotFree {
+            outcome: crate::core::NotFreeOutcome::FinishedFirst,
+        } => at_mam(
             "Download may have cost ratio",
             String::from(
                 "A download finished before Windlass could confirm it was free for you. Check your ratio on MAM.",
@@ -583,13 +595,13 @@ pub(super) fn message(notice: &Notice) -> Message {
         ),
         Notice::PurchaseSettled {
             purchase: wanted,
-            made,
+            sale,
         } => at_mam(
             "Purchase settled",
             format!(
                 "The uncertain purchase of {} {}; Windlass buys again only as needed.",
                 purchase(*wanted),
-                if *made {
+                if *sale == Sale::Made {
                     "went through"
                 } else {
                     "did not go through"
@@ -649,11 +661,6 @@ pub(super) fn message(notice: &Notice) -> Message {
     }
 }
 
-/// A ratio in thousandths, with two decimals.
-fn ratio(thousandths: u64) -> String {
-    format!("{}.{:02}", thousandths / 1000, thousandths % 1000 / 10)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -674,6 +681,7 @@ mod tests {
         Points, Port, Purchase, Push, QbittorrentFailure, SessionRejection, SettingName,
         StartupMode, SwitchBlock, UploadCredit, VpnServer,
     };
+    use crate::core::{NoticeCount, Partials, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit};
 
     use super::{Channel, message, send};
 
@@ -682,7 +690,8 @@ mod tests {
     fn notices() -> Result<Vec<Notice>, Box<dyn Error + Send + Sync>> {
         let server = VpnServer::try_new("two")?;
         let ip = std::net::IpAddr::from([192, 0, 2, 7]);
-        let version = String::from("v5.0.0");
+        let version =
+            crate::core::ReportedVersion::Release(crate::core::ClientVersion::new(5, 0, 0));
         let mut notices = vec![
             Notice::Started {
                 mode: StartupMode::Initialise,
@@ -691,7 +700,9 @@ mod tests {
                 mode: StartupMode::Resume,
             },
             Notice::StartupFailed,
-            Notice::VpnProtectionLost { failures: 3 },
+            Notice::VpnProtectionLost {
+                failures: crate::core::FailureCount::new(3),
+            },
             Notice::VpnProtectionRestored {
                 exit_ip: ip,
                 server: Some(server.clone()),
@@ -731,7 +742,7 @@ mod tests {
             },
             Notice::Test,
         ];
-        for count in [1, 2] {
+        for count in [TorrentCount::new(1), TorrentCount::new(2)] {
             notices.extend([
                 Notice::TorrentErrors { count },
                 Notice::FilesMissing { count },
@@ -772,69 +783,77 @@ mod tests {
             Notice::SeedboxRegistered {
                 ip: std::net::IpAddr::from([192, 0, 2, 10]),
             },
-            Notice::MamIpUnknown { failures: 3 },
+            Notice::MamIpUnknown {
+                failures: crate::core::FailureCount::new(3),
+            },
             Notice::MamIpKnown,
             Notice::MamStateUnreadable,
             Notice::RatioLow {
-                ratio: 1500,
-                urgent: false,
+                ratio: crate::core::Ratio::from_thousandths(1500),
+                urgency: crate::core::Urgency::Normal,
             },
             Notice::RatioLow {
-                ratio: 1050,
-                urgent: true,
+                ratio: crate::core::Ratio::from_thousandths(1050),
+                urgency: crate::core::Urgency::Urgent,
             },
             Notice::RatioRestored,
             Notice::UnsatisfiedNearLimit {
-                count: 121,
-                limit: 150,
+                count: UnsatisfiedCount::new(121),
+                limit: UnsatisfiedLimit::new(150),
             },
             Notice::UnsatisfiedBelowLimit,
-            Notice::UnsatisfiedNotSeeding { count: 2 },
+            Notice::UnsatisfiedNotSeeding {
+                count: TorrentCount::new(2),
+            },
             Notice::UnsatisfiedSeeding,
             Notice::MamFlagged {
-                partial: true,
-                tracker_errors: 1,
-                flagged: 2,
+                partial: Partials::Seen,
+                tracker_errors: TorrentCount::new(1),
+                flagged: TorrentCount::new(2),
             },
             Notice::MamFlagged {
-                partial: false,
-                tracker_errors: 0,
-                flagged: 1,
+                partial: Partials::NotSeen,
+                tracker_errors: TorrentCount::new(0),
+                flagged: TorrentCount::new(1),
             },
             Notice::MamFlagged {
-                partial: false,
-                tracker_errors: 2,
-                flagged: 0,
+                partial: Partials::NotSeen,
+                tracker_errors: TorrentCount::new(2),
+                flagged: TorrentCount::new(0),
             },
             Notice::MamFlagsCleared,
             Notice::MamMessages {
-                count: 2,
-                client_warning: false,
+                count: NoticeCount::new(2),
+                client_warning: crate::core::ClientWarning::NotGiven,
             },
             Notice::MamMessages {
-                count: 1,
-                client_warning: true,
+                count: NoticeCount::new(1),
+                client_warning: crate::core::ClientWarning::Given,
             },
             Notice::DownloadsResumed,
             Notice::NoWedgesLeft,
             Notice::PointsBelowReserve {
-                points: Points(10_000),
-                reserve: Points(20_000),
+                points: Points::new(10_000),
+                reserve: Points::new(20_000),
             },
             Notice::VipEnding {
                 until: SystemTime::UNIX_EPOCH,
             },
             Notice::DownloadsRefused,
-            Notice::SeedingBehind { count: 1 },
-            Notice::SeedingBehind { count: 3 },
+            Notice::SeedingBehind {
+                count: TorrentCount::new(1),
+            },
+            Notice::SeedingBehind {
+                count: TorrentCount::new(3),
+            },
             Notice::SeedingOnTrack,
             Notice::PurchaseMade {
                 purchase: upload,
-                points: Points(35_000),
+                points: Points::new(35_000),
             },
             Notice::PurchaseMade {
                 purchase: Purchase::Vip,
-                points: Points(35_000),
+                points: Points::new(35_000),
             },
             Notice::PurchaseRefused { purchase: upload },
             Notice::PurchaseUncertain { purchase: upload },
@@ -844,25 +863,29 @@ mod tests {
             Notice::ConnectableAgain,
             Notice::PurchaseSettled {
                 purchase: Purchase::Vip,
-                made: true,
+                sale: crate::core::Sale::Made,
             },
             Notice::PurchaseSettled {
                 purchase: Purchase::Vip,
-                made: false,
+                sale: crate::core::Sale::NotMade,
             },
             Notice::PurchaseNeedsChecking {
                 purchase: Purchase::Vip,
             },
-            Notice::DownloadNotFree { stopped: true },
-            Notice::DownloadNotFree { stopped: false },
+            Notice::DownloadNotFree {
+                outcome: crate::core::NotFreeOutcome::Stopped,
+            },
+            Notice::DownloadNotFree {
+                outcome: crate::core::NotFreeOutcome::FinishedFirst,
+            },
             Notice::WedgedMidDownload,
             Notice::NotConnectable {
                 findings: crate::core::Findings {
                     listen_port: crate::core::PortFinding::NoForwardedPort,
-                    lease_renewed: false,
+                    lease: crate::core::LeaseRenewal::NotRequested,
                     exit_ip: crate::core::IpFinding::Unknown,
-                    registered: false,
-                    interface: Some(String::from("wg0")),
+                    seedbox: crate::core::SeedboxConfirmation::Unconfirmed,
+                    interface: crate::core::NetworkInterface::try_new("wg0").ok(),
                 },
             },
         ];
@@ -892,8 +915,8 @@ mod tests {
                 Hold::AccountUnknown,
                 Hold::RatioLow,
                 Hold::UnsatisfiedLimit {
-                    count: 148,
-                    limit: 150,
+                    count: UnsatisfiedCount::new(148),
+                    limit: UnsatisfiedLimit::new(150),
                 },
                 Hold::NoWedge,
                 Hold::NotBookmarked,
@@ -926,7 +949,10 @@ mod tests {
             notices.len(),
             "every notice reads differently"
         );
-        let one = message(&Notice::FilesMissing { count: 1 }).body;
+        let one = message(&Notice::FilesMissing {
+            count: TorrentCount::new(1),
+        })
+        .body;
         assert!(one.starts_with("1 torrent has"), "{one}");
         Ok(())
     }
@@ -986,8 +1012,10 @@ mod tests {
         );
         let topic = NtfyTopic::parse("windlass-alerts")?;
         let push = Push {
-            entry: Some(crate::core::NoticeId::new(42)),
-            notice: Notice::FilesMissing { count: 2 },
+            entry: crate::core::NoticeId::new(42),
+            notice: Notice::FilesMissing {
+                count: TorrentCount::new(2),
+            },
         };
         assert_eq!(
             send(&channel, &topic, &push).await,
@@ -1036,7 +1064,12 @@ mod tests {
         let closed = Channel::new(Some("http://127.0.0.1:9/".parse()?), None, None);
         let unconfigured = Channel::new(None, None, None);
         for (channel, reason) in [
-            (refused, DeliveryFailure::Rejected { status: 429 }),
+            (
+                refused,
+                DeliveryFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+                },
+            ),
             (closed, DeliveryFailure::Unreachable),
             (unconfigured, DeliveryFailure::Unreachable),
         ] {

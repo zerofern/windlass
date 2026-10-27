@@ -21,7 +21,7 @@ pub enum TimerName {
 
 /// One scheduled instance of a timer. Replacing a timer gives it a new
 /// identity, so an obsolete expiry is recognised and ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
 pub struct TimerId(u64);
 
 /// When a timer expires: a monotonic deadline, recorded in history as the
@@ -43,18 +43,19 @@ impl Serialize for Deadline {
 /// Allocates timer identities and turns delays into deadlines.
 #[derive(Debug, Default)]
 pub(super) struct Timers {
-    issued: u64,
+    next: TimerId,
 }
 
 impl Timers {
     pub(super) const fn new() -> Self {
-        Self { issued: 0 }
+        Self { next: TimerId(0) }
     }
 
     pub(super) fn schedule(&mut self, now: Instant, after: Duration) -> (TimerId, Deadline) {
-        self.issued += 1;
+        let id = self.next;
+        self.next = TimerId(id.0.saturating_add(1));
         (
-            TimerId(self.issued),
+            id,
             Deadline {
                 at: now.checked_add(after).unwrap_or(now),
                 after,

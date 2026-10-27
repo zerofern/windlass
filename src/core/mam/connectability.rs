@@ -9,7 +9,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::core::Port;
+use crate::core::{NetworkInterface, Port};
 
 /// A reading taken this long after a repair shows whether it worked; MAM caches
 /// what it reports about clients for 30 minutes.
@@ -25,7 +25,7 @@ pub struct Connection {
     /// The tunnel's exit IP, from the latest successful check.
     pub tunnel_ip: Option<IpAddr>,
     /// The network interface qBittorrent is bound to.
-    pub interface: Option<String>,
+    pub interface: Option<NetworkInterface>,
 }
 
 /// qBittorrent's listen port against the forwarded port.
@@ -60,25 +60,48 @@ pub enum IpFinding {
     Unknown,
 }
 
+/// Whether a new forwarded-port lease is asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum LeaseRenewal {
+    /// A new lease is asked for.
+    Requested,
+    /// None is asked for.
+    #[default]
+    NotRequested,
+}
+
+/// Whether MAM confirmed the seedbox registration for the IP it sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SeedboxConfirmation {
+    /// MAM confirmed it.
+    Confirmed,
+    /// MAM has not confirmed it.
+    Unconfirmed,
+}
+
 /// What Windlass found when it checked the connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Findings {
     /// qBittorrent's listen port against the forwarded port.
     pub listen_port: PortFinding,
     /// Whether a new forwarded-port lease was asked for.
-    pub lease_renewed: bool,
+    pub lease: LeaseRenewal,
     /// The IP MAM sees against the tunnel's.
     pub exit_ip: IpFinding,
     /// Whether MAM had confirmed the seedbox registration for the IP it sees;
     /// Windlass registers again when allowed either way.
-    pub registered: bool,
+    pub seedbox: SeedboxConfirmation,
     /// The network interface qBittorrent is bound to, if any.
-    pub interface: Option<String>,
+    pub interface: Option<NetworkInterface>,
 }
 
 impl Findings {
     /// Check the connection as the rest of Windlass knows it.
-    pub(super) fn check(connection: &Connection, mam_ip: Option<IpAddr>, registered: bool) -> Self {
+    pub(super) fn check(
+        connection: &Connection,
+        mam_ip: Option<IpAddr>,
+        seedbox: SeedboxConfirmation,
+    ) -> Self {
         let listen_port = match (connection.listen_port, connection.forwarded_port) {
             (_, None) => PortFinding::NoForwardedPort,
             (Some(listening), Some(forwarded)) if listening == forwarded => {
@@ -96,9 +119,13 @@ impl Findings {
         };
         Self {
             listen_port,
-            lease_renewed: connection.forwarded_port.is_some(),
+            lease: if connection.forwarded_port.is_some() {
+                LeaseRenewal::Requested
+            } else {
+                LeaseRenewal::NotRequested
+            },
             exit_ip,
-            registered,
+            seedbox,
             interface: connection.interface.clone(),
         }
     }

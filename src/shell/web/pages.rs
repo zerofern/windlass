@@ -7,11 +7,11 @@ use maud::{DOCTYPE, Markup, html};
 
 use crate::{
     core::{
-        Activity, Bookmarks, ByteSize, Condition, Delivery, Desired, EntryCount, Failover,
-        HistoryState, MamApproval, MamRequestsStatus, MappingFailure, Notifications, NtfyTopic,
-        Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding, Protection, Qbittorrent,
-        Ratio, Records, Registry, Session, Setting, SettingStatus, Settings, SettingsState,
-        SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
+        Activity, Bookmarks, ByteSize, Completion, Condition, Delivery, Desired, EntryCount,
+        Failover, FailureCount, HistoryState, MamApproval, MamRequestsStatus, MappingFailure,
+        Notifications, NtfyTopic, Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding,
+        Protection, Qbittorrent, Records, Registry, Session, Setting, SettingStatus, Settings,
+        SettingsState, SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
     },
     runner::Observation,
     shell::{
@@ -276,11 +276,11 @@ fn notifications_panel(notifications: &Notifications, settings: &SettingsState) 
                             None => "None yet",
                         }
                     }
-                    @if notifications.failures > 0 {
+                    @if notifications.failures.any() {
                         dt { "Failed attempts" } dd { (notifications.failures) ", retrying" }
                     }
                     dt { "Waiting to send" } dd { (notifications.outbox.len()) }
-                    @if notifications.dropped > 0 {
+                    @if notifications.dropped.any() {
                         dt { "Dropped" } dd { (notifications.dropped) " oldest, while delivery failed" }
                     }
                 }
@@ -445,7 +445,10 @@ fn port_forwarding_panel(forwarding: &PortForwarding) -> Markup {
     let (tag, tone) = match forwarding {
         PortForwarding::Disabled => ("Not configured", "neutral"),
         PortForwarding::Enabled { lease: None, .. } => ("No forwarded port", "error"),
-        PortForwarding::Enabled { failures: 0, .. } => ("Forwarded", "ok"),
+        PortForwarding::Enabled {
+            failures: FailureCount::NONE,
+            ..
+        } => ("Forwarded", "ok"),
         PortForwarding::Enabled { .. } => ("Renewal failing", "warning"),
     };
     html! {
@@ -547,7 +550,7 @@ fn qbittorrent_panel(qbittorrent: &Qbittorrent, forwarded: Option<Port>) -> Mark
 
 fn size(bytes: ByteSize) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes.0;
+    let mut value = bytes.bytes();
     let mut unit = 0;
     let mut tenths = 0;
     while value >= 1024 && unit + 1 < UNITS.len() {
@@ -572,8 +575,8 @@ const fn torrent_state(state: TorrentState) -> &'static str {
         TorrentState::Seeding => "Seeding",
         TorrentState::SeedStalled => "Seeding, no peers",
         TorrentState::SeedQueued => "Queued to seed",
-        TorrentState::Stopped { complete: true } => "Stopped, complete",
-        TorrentState::Stopped { complete: false } => "Stopped, incomplete",
+        TorrentState::Stopped(Completion::Complete) => "Stopped, complete",
+        TorrentState::Stopped(Completion::Incomplete) => "Stopped, incomplete",
         TorrentState::Checking => "Checking",
         TorrentState::Moving => "Moving",
         TorrentState::MissingFiles => "Files missing",
@@ -585,10 +588,6 @@ const fn torrent_state(state: TorrentState) -> &'static str {
 fn progress(torrent: &Torrent) -> String {
     let permille = torrent.progress.permille();
     format!("{}.{}%", permille / 10, permille % 10)
-}
-
-fn ratio(ratio: Ratio) -> String {
-    format!("{}.{:02}", ratio.0 / 1000, ratio.0 % 1000 / 10)
 }
 
 /// The torrent registry, with what qBittorrent reports now; while the
@@ -616,7 +615,13 @@ fn session_table(session: Option<&Session>) -> Markup {
         return html! {};
     };
     let mut torrents: Vec<_> = session.torrents.values().collect();
-    torrents.sort_by_key(|torrent| torrent.name.to_lowercase());
+    let name = |torrent: &Torrent| {
+        torrent
+            .name
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string)
+    };
+    torrents.sort_by_key(|torrent| name(torrent).to_lowercase());
     html! {
         section.panel.table-box aria-labelledby="torrents" {
             h2 #torrents .table-title { "Torrents" }
@@ -630,7 +635,7 @@ fn session_table(session: Option<&Session>) -> Markup {
                 tbody {
                     @for torrent in torrents {
                         tr {
-                            td { (torrent.name) }
+                            td { (name(torrent)) }
                             td { (torrent_state(torrent.state)) }
                             td.mono { (progress(torrent)) }
                             td.mono { (size(torrent.size)) }
@@ -689,17 +694,17 @@ fn registry_table(records: &Records, session: Option<&Session>, bookmarks: &Book
                 .and_then(|hash| session?.torrents.get(hash));
             // What qBittorrent reports now, or else what it reported last.
             let seen = live.or_else(|| record.observation.as_ref().map(|seen| &seen.torrent));
-            // Before qBittorrent has it, the bookmark names it.
-            let name = seen.map_or_else(
+            // Before qBittorrent names it, the bookmark does.
+            let name = seen.and_then(|torrent| torrent.name.as_ref()).map_or_else(
                 || {
                     record.identity.mam_id().map_or_else(String::new, |id| {
                         bookmarks.find(id).map_or_else(
                             || format!("MAM torrent {}", id.get()),
-                            |bookmark| bookmark.title.clone(),
+                            |bookmark| bookmark.title.to_string(),
                         )
                     })
                 },
-                |torrent| torrent.name.clone(),
+                ToString::to_string,
             );
             (name, record, live, seen)
         })
@@ -744,7 +749,7 @@ fn registry_table(records: &Records, session: Option<&Session>, bookmarks: &Book
                                 Some(torrent) => {
                                     td.mono { (progress(torrent)) }
                                     td.mono { (size(torrent.size)) }
-                                    td.mono { (size(torrent.uploaded)) " · ratio " (ratio(torrent.ratio)) }
+                                    td.mono { (size(torrent.uploaded)) " · ratio " (torrent.ratio) }
                                     td {
                                         @match torrent.completed_at {
                                             Some(at) => (time(at, "full")),
@@ -1444,13 +1449,18 @@ mod tests {
         assert!(render(PortForwarding::Disabled).contains("Not configured"));
         for (reason, text) in [
             (MappingFailure::NoResponse, "did not answer"),
-            (MappingFailure::Refused { result_code: 2 }, "refused"),
+            (
+                MappingFailure::Refused {
+                    reason: crate::core::NatPmpRefusal::NotAuthorized,
+                },
+                "refused",
+            ),
             (MappingFailure::Malformed, "not valid"),
         ] {
             let html = render(PortForwarding::Enabled {
                 lease: None,
                 request: LeaseRequest::Outstanding,
-                failures: 2,
+                failures: crate::core::FailureCount::new(2),
                 last_failure: Some(reason),
             });
             assert!(
@@ -1486,7 +1496,9 @@ mod tests {
         let unreachable = drive(vec![
             Event::Qbittorrent(QbittorrentEvent::Enable),
             Event::Qbittorrent(QbittorrentEvent::ConnectFailed {
-                reason: QbittorrentFailure::Rejected { status: 403 },
+                reason: QbittorrentFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::FORBIDDEN),
+                },
             }),
         ]);
         assert!(
@@ -1495,22 +1507,24 @@ mod tests {
         let hash = TorrentHash::parse(&"a".repeat(40)).ok_or("invalid hash")?;
         let second = TorrentHash::parse(&"b".repeat(40)).ok_or("invalid hash")?;
         let torrents = SyncUpdate {
-            full: true,
+            scope: crate::core::SyncScope::Full,
             torrents: vec![
                 (
                     hash,
                     TorrentUpdate {
-                        name: Some(String::from("A Synthetic Audiobook")),
-                        state: Some(TorrentState::Stopped { complete: false }),
-                        progress: Some(Progress::from_fraction(0.5)),
-                        size: Some(ByteSize(1536)),
+                        name: Some(crate::core::TorrentName::try_new("A Synthetic Audiobook").ok()),
+                        state: Some(TorrentState::Stopped(crate::core::Completion::Incomplete)),
+                        progress: Progress::from_fraction(0.5),
+                        size: Some(ByteSize::new(1536)),
                         ..TorrentUpdate::default()
                     },
                 ),
                 (
                     second,
                     TorrentUpdate {
-                        name: Some(String::from("Another Synthetic Book")),
+                        name: Some(
+                            crate::core::TorrentName::try_new("Another Synthetic Book").ok(),
+                        ),
                         ..TorrentUpdate::default()
                     },
                 ),
@@ -1540,10 +1554,11 @@ mod tests {
             let core = drive(vec![
                 Event::Qbittorrent(QbittorrentEvent::Enable),
                 Event::Qbittorrent(QbittorrentEvent::Connected {
-                    version: String::from(version),
+                    version: crate::core::ReportedVersion::parse(version).ok_or("a version")?,
                     preferences: QbittorrentPreferences {
                         listen_port: Port::new(listen),
-                        interface: interface.map(str::to_owned),
+                        interface: interface
+                            .and_then(|name| crate::core::NetworkInterface::try_new(name).ok()),
                         queue: None,
                     },
                 }),
@@ -1564,9 +1579,9 @@ mod tests {
         }
         let reading = crate::core::Registry::Reading;
         assert!(render(torrent_list(&Qbittorrent::Disabled, &reading, &none)).is_empty());
-        assert_eq!(size(ByteSize(512)), "512 B");
-        assert_eq!(size(ByteSize(1536)), "1.5 KiB");
-        assert_eq!(size(ByteSize(5 * 1024 * 1024 * 1024)), "5.0 GiB");
+        assert_eq!(size(ByteSize::new(512)), "512 B");
+        assert_eq!(size(ByteSize::new(1536)), "1.5 KiB");
+        assert_eq!(size(ByteSize::new(5 * 1024 * 1024 * 1024)), "5.0 GiB");
         Ok(())
     }
 
@@ -1584,8 +1599,8 @@ mod tests {
             TorrentState::Seeding,
             TorrentState::SeedStalled,
             TorrentState::SeedQueued,
-            TorrentState::Stopped { complete: true },
-            TorrentState::Stopped { complete: false },
+            TorrentState::Stopped(crate::core::Completion::Complete),
+            TorrentState::Stopped(crate::core::Completion::Incomplete),
             TorrentState::Checking,
             TorrentState::Moving,
             TorrentState::MissingFiles,
@@ -1612,7 +1627,7 @@ mod tests {
             failures, request, ..
         } = &mut forwarding
         {
-            *failures = 1;
+            *failures = crate::core::FailureCount::new(1);
             *request = crate::core::LeaseRequest::Outstanding;
         }
         assert!(
@@ -1623,7 +1638,9 @@ mod tests {
         let core = drive(vec![
             Event::Qbittorrent(QbittorrentEvent::Enable),
             Event::Qbittorrent(QbittorrentEvent::Connected {
-                version: String::from("v5.2.2"),
+                version: crate::core::ReportedVersion::Release(crate::core::ClientVersion::new(
+                    5, 2, 2,
+                )),
                 preferences: QbittorrentPreferences::default(),
             }),
         ]);
@@ -1673,7 +1690,9 @@ mod tests {
             use crate::core::{Check, Event, ExitIpFailure, TimerName, TunnelEvent};
 
             let _ = self.send(Event::Tunnel(TunnelEvent::ExitIpCheckFailed {
-                reason: ExitIpFailure::Rejected { status: 503 },
+                reason: ExitIpFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::SERVICE_UNAVAILABLE),
+                },
             }));
             if let Some(Check::Waiting(id)) =
                 self.core.tunnel().watch.as_ref().map(|watch| watch.check)
@@ -1783,7 +1802,7 @@ mod tests {
                 origin: Origin::Bookmark,
                 desired,
                 save_path: None,
-                deletion_allowed: false,
+                deletion: crate::core::ContentDeletion::NotAllowed,
                 observation: None,
             })
         };
@@ -1831,7 +1850,7 @@ mod tests {
             origin: Origin::Bookmark,
             desired: Desired::Held,
             save_path: None,
-            deletion_allowed: false,
+            deletion: crate::core::ContentDeletion::NotAllowed,
             observation: None,
         };
         assert_eq!(wanted(&record), "Held: its wedge was not spent");
@@ -1858,7 +1877,7 @@ mod tests {
                 origin: Origin::Bookmark,
                 desired: Desired::Snatched,
                 save_path: None,
-                deletion_allowed: false,
+                deletion: crate::core::ContentDeletion::NotAllowed,
                 observation: None,
             })
         };
@@ -1868,15 +1887,15 @@ mod tests {
         bookmarks.latest = Some(Listed {
             at: SystemTime::UNIX_EPOCH,
             taken: std::time::Instant::now(),
-            found: 1,
+            found: crate::core::BookmarkCount::new(1),
             bookmarks: vec![Bookmark {
                 id: mam,
-                title: String::from("A Book Snatched Before"),
-                vip: false,
-                free: false,
+                title: crate::core::BookTitle::try_new("A Book Snatched Before")
+                    .map_err(|_| "title")?,
+                vip: crate::core::VipTorrent::No,
+                freeleech: crate::core::Freeleech::No,
                 personal: PersonalFreeleech::No,
-                snatched: true,
-                vip_expires: None,
+                snatched: crate::core::Snatched::Before,
                 bookmarked_at: None,
             }],
         });
@@ -1910,13 +1929,13 @@ mod tests {
             return Err("invalid hash");
         };
         let update = |name: &str, state| TorrentUpdate {
-            name: Some(name.to_owned()),
+            name: Some(crate::core::TorrentName::try_new(name).ok()),
             state: Some(state),
-            progress: Some(Progress::from_fraction(1.0)),
-            size: Some(ByteSize(2048)),
-            total_size: Some(ByteSize(2048)),
-            uploaded: Some(ByteSize(4096)),
-            ratio: Some(Ratio(1500)),
+            progress: Progress::from_fraction(1.0),
+            size: Some(ByteSize::new(2048)),
+            total_size: Some(ByteSize::new(2048)),
+            uploaded: Some(ByteSize::new(4096)),
+            ratio: Some(Ratio::from_thousandths(1500)),
             completed_at: Some(Some(SystemTime::UNIX_EPOCH)),
             ..TorrentUpdate::default()
         };
@@ -1924,12 +1943,14 @@ mod tests {
         for event in [
             Event::Qbittorrent(QbittorrentEvent::Enable),
             Event::Qbittorrent(QbittorrentEvent::Connected {
-                version: String::from("v5.2.2"),
+                version: crate::core::ReportedVersion::Release(crate::core::ClientVersion::new(
+                    5, 2, 2,
+                )),
                 preferences: QbittorrentPreferences::default(),
             }),
             Event::Qbittorrent(QbittorrentEvent::Synced(SyncUpdate {
-                position: SyncPosition(1),
-                full: true,
+                position: SyncPosition::new(1),
+                scope: crate::core::SyncScope::Full,
                 torrents: vec![
                     (present, update("An Adopted Book", TorrentState::Seeding)),
                     (
@@ -1986,7 +2007,7 @@ mod tests {
         if let Some(first) = rows.first_mut() {
             first.observation = Some(Observation {
                 torrent: Torrent {
-                    name: String::from("A Remembered Book"),
+                    name: crate::core::TorrentName::try_new("A Remembered Book").ok(),
                     ..Torrent::default()
                 },
                 last_seen: SystemTime::UNIX_EPOCH,
@@ -2056,10 +2077,12 @@ mod tests {
         assert!(render(&notifications, &configured).contains("Working"));
         notifications.last_outcome = Some(Outcome {
             at: SystemTime::UNIX_EPOCH,
-            result: Err(DeliveryFailure::Rejected { status: 429 }),
+            result: Err(DeliveryFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+            }),
         });
-        notifications.failures = 2;
-        notifications.dropped = 3;
+        notifications.failures = crate::core::FailureCount::new(2);
+        notifications.dropped = crate::core::PushCount::new(3);
         notifications
             .conditions
             .insert(Condition::FilesMissing, Phase::Raised);

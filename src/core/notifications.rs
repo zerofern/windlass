@@ -10,17 +10,22 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     net::IpAddr,
+    num::NonZeroU64,
     time::{Duration, Instant, SystemTime},
 };
 
+use derive_more::Display;
 use serde::Serialize;
+
+use crate::core::{FailureCount, HttpStatus};
 
 use super::{
     Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
-    Hold, Mam, MamSession, Points, Port, PortForwarding, Protection, Purchase, Qbittorrent,
-    QbittorrentFailure, Registry, SeedboxStatus, SessionRejection, SettingsState, StartupMode,
-    SwitchAllowance, TimerId, TimerName, TorrentState, Tunnel, VpnServer, registry::SEEDING_TARGET,
-    timer::Timers,
+    Hold, Mam, MamSession, NoticeCount, Partials, Points, Port, PortForwarding, Protection,
+    Purchase, Qbittorrent, QbittorrentFailure, Ratio, Registry, ReportedVersion, Sale,
+    SeedboxStatus, SessionRejection, SettingsState, StartupMode, SwitchAllowance, TimerId,
+    TimerName, TorrentCount, TorrentState, Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer,
+    registry::SEEDING_TARGET, timer::Timers,
 };
 
 /// A torrent completed this long ago must have reached the seeding target by
@@ -64,26 +69,84 @@ pub enum SwitchBlock {
 
 /// A notice's place in the notifications log, counting from 1 across restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct NoticeId(u64);
+pub struct NoticeId(NonZeroU64);
 
 impl NoticeId {
-    const FIRST: Self = Self(1);
+    /// The first notice ever logged.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
 
-    /// The id stored for a logged notice.
+    /// The id stored for a logged notice; ids count from 1.
     #[must_use]
-    pub const fn new(id: u64) -> Self {
-        Self(id)
+    pub const fn new(id: u64) -> Option<Self> {
+        match NonZeroU64::new(id) {
+            Some(id) => Some(Self(id)),
+            None => None,
+        }
     }
 
     /// The number the log stores and links name.
     #[must_use]
     pub const fn get(self) -> u64 {
-        self.0
+        self.0.get()
     }
 
     const fn following(self) -> Self {
         Self(self.0.saturating_add(1))
     }
+}
+
+/// Pushes counted, such as those dropped because the outbox was full.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Display, Serialize)]
+pub struct PushCount(u64);
+
+impl PushCount {
+    /// No pushes.
+    pub const NONE: Self = Self(0);
+
+    /// This many pushes.
+    #[must_use]
+    pub const fn new(count: u64) -> Self {
+        Self(count)
+    }
+
+    /// The count with one more push.
+    #[must_use]
+    pub const fn plus_one(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Whether any push is counted.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.0 > 0
+    }
+}
+
+/// How urgently a condition needs the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Urgency {
+    /// At once.
+    Urgent,
+    /// Soon.
+    Normal,
+}
+
+/// Whether MAM warns that it is about to stop accepting a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ClientWarning {
+    /// One of its notifications warns so.
+    Given,
+    /// None does.
+    NotGiven,
+}
+
+/// What became of a running download that is no longer free for the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum NotFreeOutcome {
+    /// Windlass stopped it: no wedge was left, or MAM no longer lists it.
+    Stopped,
+    /// It finished before Windlass could tell.
+    FinishedFirst,
 }
 
 /// Where a notice reaches the owner.
@@ -152,7 +215,7 @@ pub enum Notice {
     /// Tunnel checks keep failing.
     VpnProtectionLost {
         /// Consecutive failed checks.
-        failures: u32,
+        failures: FailureCount,
     },
     /// A tunnel check succeeded again.
     VpnProtectionRestored {
@@ -198,31 +261,31 @@ pub enum Notice {
     /// MAM does not allow the running qBittorrent version.
     QbittorrentVersionNotAllowed {
         /// The version.
-        version: String,
+        version: ReportedVersion,
     },
     /// The running qBittorrent version is allowed again.
     QbittorrentVersionAllowed {
         /// The version.
-        version: String,
+        version: ReportedVersion,
     },
     /// qBittorrent reports errors for some torrents.
     TorrentErrors {
         /// How many torrents.
-        count: usize,
+        count: TorrentCount,
     },
     /// No torrent reports an error.
     TorrentErrorsCleared,
     /// Some torrents' files are missing on disk.
     FilesMissing {
         /// How many torrents.
-        count: usize,
+        count: TorrentCount,
     },
     /// No torrent's files are missing.
     FilesMissingCleared,
     /// Some torrents Windlass wants are missing from qBittorrent.
     TorrentsMissing {
         /// How many torrents.
-        count: usize,
+        count: TorrentCount,
     },
     /// Every torrent Windlass wants is in qBittorrent.
     TorrentsMissingCleared,
@@ -263,7 +326,7 @@ pub enum Notice {
     /// Windlass cannot learn which IP MAM sees.
     MamIpUnknown {
         /// Failed lookups in a row.
-        failures: u32,
+        failures: FailureCount,
     },
     /// Windlass learns which IP MAM sees again.
     MamIpKnown,
@@ -271,46 +334,46 @@ pub enum Notice {
     MamStateUnreadable,
     /// The ratio is below 2.0, so downloads are held.
     RatioLow {
-        /// The ratio in thousandths.
-        ratio: u64,
+        /// The ratio.
+        ratio: Ratio,
         /// Whether it is below 1.1.
-        urgent: bool,
+        urgency: Urgency,
     },
     /// The ratio is 2.0 or more again.
     RatioRestored,
     /// Unsatisfied torrents reached 80% of MAM's limit.
     UnsatisfiedNearLimit {
         /// MAM's count.
-        count: u32,
+        count: UnsatisfiedCount,
         /// MAM's limit.
-        limit: u32,
+        limit: UnsatisfiedLimit,
     },
     /// Unsatisfied torrents are below 80% of the limit again.
     UnsatisfiedBelowLimit,
     /// MAM counts unsatisfied torrents that are not seeding.
     UnsatisfiedNotSeeding {
         /// How many.
-        count: u32,
+        count: TorrentCount,
     },
     /// Every unsatisfied torrent seeds again.
     UnsatisfiedSeeding,
     /// MAM flags a partial download, tracker errors, or other red categories.
     MamFlagged {
         /// Whether MAM sees a partial download.
-        partial: bool,
+        partial: Partials,
         /// Important tracker errors.
-        tracker_errors: u32,
+        tracker_errors: TorrentCount,
         /// Torrents in other red categories, such as duplicate peers.
-        flagged: u32,
+        flagged: TorrentCount,
     },
     /// MAM flags nothing any more.
     MamFlagsCleared,
     /// MAM has notifications for the owner; their text is not read.
     MamMessages {
         /// How many.
-        count: u32,
+        count: NoticeCount,
         /// Whether one warns that MAM is about to stop accepting a client.
-        client_warning: bool,
+        client_warning: ClientWarning,
     },
     /// Bookmarked torrents wait.
     DownloadsHeld {
@@ -337,8 +400,8 @@ pub enum Notice {
     DownloadsRefused,
     /// Torrents completed 20 or more days ago have not seeded 96 hours.
     SeedingBehind {
-        /// How many.
-        count: usize,
+        /// How many torrents.
+        count: TorrentCount,
     },
     /// Every torrent is on track to seed 96 hours.
     SeedingOnTrack,
@@ -364,9 +427,8 @@ pub enum Notice {
     WedgeNotSpent,
     /// A running download is no longer free for the owner.
     DownloadNotFree {
-        /// Whether Windlass stopped it: no wedge was left, or MAM no longer
-        /// lists it. Otherwise it finished before Windlass could tell.
-        stopped: bool,
+        /// Whether Windlass stopped it, or it finished first.
+        outcome: NotFreeOutcome,
     },
     /// A running download's freeleech ended, so Windlass spent a wedge on it.
     WedgedMidDownload,
@@ -375,7 +437,7 @@ pub enum Notice {
         /// What Windlass tried to buy.
         purchase: Purchase,
         /// Whether MAM sold it.
-        made: bool,
+        sale: Sale,
     },
     /// The next reading could not tell whether an uncertain purchase went
     /// through; nothing more is bought until the owner checks on MAM.
@@ -484,7 +546,7 @@ pub enum DeliveryFailure {
     /// ntfy answered with an unexpected HTTP status.
     Rejected {
         /// The HTTP status code.
-        status: u16,
+        status: HttpStatus,
     },
 }
 
@@ -666,9 +728,9 @@ pub struct Notifications {
     /// The latest delivery result.
     pub last_outcome: Option<Outcome>,
     /// Notices dropped because the outbox was full.
-    pub dropped: u64,
+    pub dropped: PushCount,
     /// Deliveries that failed since the last success.
-    pub failures: u32,
+    pub failures: FailureCount,
     grace_timer: Option<(TimerId, Instant)>,
     mode: Option<StartupMode>,
 }
@@ -678,20 +740,29 @@ pub struct Notifications {
 pub(super) struct Glance {
     pub(super) failover: Option<Failover>,
     pub(super) current: Option<VpnServer>,
-    pub(super) failed: bool,
-    pub(super) ready: bool,
+    pub(super) startup: Startup,
+}
+
+/// How far startup got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Startup {
+    /// Still starting.
+    Starting,
+    /// Ready.
+    Ready,
+    /// Startup failed.
+    Failed,
 }
 
 impl Glance {
-    pub(super) fn of(tunnel: &Tunnel, failed: bool, ready: bool) -> Self {
+    pub(super) fn of(tunnel: &Tunnel, startup: Startup) -> Self {
         Self {
             failover: tunnel
                 .watch
                 .as_ref()
                 .and_then(|watch| watch.failover.clone()),
             current: tunnel.current().cloned(),
-            failed,
-            ready,
+            startup,
         }
     }
 }
@@ -715,8 +786,8 @@ impl Notifications {
             outbox: VecDeque::new(),
             delivery: Delivery::Idle,
             last_outcome: None,
-            dropped: 0,
-            failures: 0,
+            dropped: PushCount::NONE,
+            failures: FailureCount::NONE,
             grace_timer: None,
             mode: None,
         }
@@ -770,14 +841,16 @@ impl Notifications {
     /// Notices for what changed in this step.
     pub(super) fn changed(&self, before: &Glance, after: &Glance) -> Vec<Notice> {
         let mut notices = Vec::new();
-        if after.ready
-            && !before.ready
-            && let Some(mode) = self.mode
-        {
-            notices.push(Notice::Started { mode });
-        }
-        if after.failed && !before.failed {
-            notices.push(Notice::StartupFailed);
+        match (before.startup, after.startup) {
+            (Startup::Starting | Startup::Failed, Startup::Ready) => {
+                if let Some(mode) = self.mode {
+                    notices.push(Notice::Started { mode });
+                }
+            }
+            (Startup::Starting | Startup::Ready, Startup::Failed) => {
+                notices.push(Notice::StartupFailed);
+            }
+            _ => {}
         }
         if let (None, Some(Failover::Saving(switch))) = (&before.failover, &after.failover) {
             notices.push(Notice::FailoverStarted {
@@ -867,11 +940,7 @@ impl Notifications {
                 notice,
                 reach,
             },
-            forget_through: id
-                .get()
-                .checked_sub(LOG_KEPT)
-                .filter(|through| *through > 0)
-                .map(NoticeId::new),
+            forget_through: id.get().checked_sub(LOG_KEPT).and_then(NoticeId::new),
         })
     }
 
@@ -914,7 +983,7 @@ impl Notifications {
             | NotificationEvent::SaveFailed => Vec::new(),
             NotificationEvent::Delivered => {
                 self.delivery = Delivery::Idle;
-                self.failures = 0;
+                self.failures = FailureCount::NONE;
                 self.last_outcome = Some(Outcome {
                     at: now.wall,
                     result: Ok(()),
@@ -923,14 +992,14 @@ impl Notifications {
             }
             NotificationEvent::DeliveryFailed { reason } => {
                 let push = push.clone();
-                self.failures = self.failures.saturating_add(1);
+                self.failures = self.failures.after_another();
                 self.last_outcome = Some(Outcome {
                     at: now.wall,
                     result: Err(*reason),
                 });
                 // Waits of 30 seconds, then 1, 2, 4, and 8 minutes, then 10.
                 let after = RETRY_FIRST
-                    .saturating_mul(2_u32.saturating_pow(self.failures - 1))
+                    .saturating_mul(2_u32.saturating_pow(self.failures.get().saturating_sub(1)))
                     .min(RETRY_MAX);
                 let (timer, deadline) = timers.schedule(now.monotonic, after);
                 self.delivery = Delivery::Retrying { push, timer };
@@ -959,7 +1028,7 @@ impl Notifications {
     fn enqueue(&mut self, push: Push) {
         if self.outbox.len() >= OUTBOX_LIMIT {
             self.outbox.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
+            self.dropped = self.dropped.plus_one();
         }
         self.outbox.push_back(push);
     }
@@ -1059,26 +1128,30 @@ fn assess(now: SystemTime, facts: Facts<'_>) -> Vec<(Condition, Status)> {
     let listed = session.filter(|session| session.listed());
     let count = |state: TorrentState| {
         listed.map(|session| {
-            session
-                .torrents
-                .values()
-                .filter(|torrent| torrent.state == state)
-                .count()
+            TorrentCount::counting(
+                session
+                    .torrents
+                    .values()
+                    .filter(|torrent| torrent.state == state),
+            )
         })
     };
     let missing = match facts.registry {
         Registry::Loaded(records) => listed.map(|session| {
-            records
-                .records()
-                .filter(|record| record.desired == Desired::Active)
-                .filter_map(|record| record.identity.hash())
-                .filter(|hash| !session.torrents.contains_key(*hash))
-                .count()
+            TorrentCount::counting(
+                records
+                    .records()
+                    .filter(|record| record.desired == Desired::Active)
+                    .filter_map(|record| record.identity.hash())
+                    .filter(|hash| !session.torrents.contains_key(*hash)),
+            )
         }),
         _ => None,
     };
-    let counted = |count: Option<usize>, raised: fn(usize) -> Notice, cleared: Notice| match count {
-        Some(0) => Status::Clear(Some(cleared)),
+    let counted = |count: Option<TorrentCount>,
+                   raised: fn(TorrentCount) -> Notice,
+                   cleared: Notice| match count {
+        Some(count) if count.is_zero() => Status::Clear(Some(cleared)),
         Some(count) => Status::Active(raised(count)),
         None => Status::Unchanged,
     };
@@ -1161,11 +1234,11 @@ fn assess(now: SystemTime, facts: Facts<'_>) -> Vec<(Condition, Status)> {
 
 /// Active torrents completed 20 or more days ago with less than the seeding
 /// target seeded.
-fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<usize> {
+fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<TorrentCount> {
     let Registry::Loaded(records) = registry else {
         return None;
     };
-    Some(
+    Some(TorrentCount::counting(
         records
             .records()
             .filter(|record| record.desired == Desired::Active)
@@ -1176,9 +1249,8 @@ fn seeding_behind(now: SystemTime, registry: &Registry) -> Option<usize> {
                         now.duration_since(completed)
                             .is_ok_and(|since| since >= SEEDING_DEADLINE_WARNING)
                     })
-            })
-            .count(),
-    )
+            }),
+    ))
 }
 
 /// The account's lasting conditions, as MAM reports them.
@@ -1222,7 +1294,7 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
         ),
         (
             Condition::MamIp,
-            if mam.network.failures > 0 {
+            if mam.network.failures.any() {
                 Status::Active(Notice::MamIpUnknown {
                     failures: mam.network.failures,
                 })
@@ -1237,7 +1309,7 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
             read(
                 account
                     .ratio_low()
-                    .map(|(ratio, urgent)| Notice::RatioLow { ratio, urgent }),
+                    .map(|(ratio, urgency)| Notice::RatioLow { ratio, urgency }),
                 Some(Notice::RatioRestored),
             ),
         ),
@@ -1255,7 +1327,7 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
             read(
                 account
                     .not_seeding_unsatisfied()
-                    .filter(|count| *count > 0)
+                    .filter(|count| !count.is_zero())
                     .map(|count| Notice::UnsatisfiedNotSeeding { count }),
                 Some(Notice::UnsatisfiedSeeding),
             ),
@@ -1280,10 +1352,14 @@ fn mam(now: SystemTime, mam: &Mam, reserve: Option<Points>) -> Vec<(Condition, S
                 account
                     .data()
                     .and_then(|data| data.notices)
-                    .filter(|notices| notices.total() > 0)
+                    .filter(|notices| !notices.total().is_zero())
                     .map(|notices| Notice::MamMessages {
                         count: notices.total(),
-                        client_warning: notices.about_to_drop_client > 0,
+                        client_warning: if notices.about_to_drop_client.is_zero() {
+                            ClientWarning::NotGiven
+                        } else {
+                            ClientWarning::Given
+                        },
                     }),
                 None,
             ),

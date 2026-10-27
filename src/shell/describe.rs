@@ -5,12 +5,13 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::core::{
-    Action, ByteSize, ClientStanding, DeliveryFailure, Event, ExitIpFailure, Findings,
-    HistoryEvent, Hold, IpFinding, MamEvent, MamFailure, MamPauseEvent, MamReply, MamRequest,
-    MamRequestMode, MappingFailure, NotificationEvent, PersonalFreeleech, PortFinding,
-    PortForwardingEvent, Purchase, QbittorrentEvent, QbittorrentFailure, Registration,
-    RegistryEvent, SessionRejection, SettingsEvent, StartupEvent, StartupMode, TimerName,
-    TorrentCommand, TunnelEvent,
+    Action, Bookmark, ByteSize, ClientListing, ClientStanding, DeliveryFailure, Event,
+    ExitIpFailure, Findings, Freeleech, HistoryEvent, Hold, IdleTorrents, IpFinding, LeaseRenewal,
+    MamEvent, MamFailure, MamPauseEvent, MamReply, MamRequest, MamRequestMode, MappingFailure,
+    NotificationEvent, PersonalFreeleech, PortFinding, PortForwardingEvent, Purchase,
+    QbittorrentEvent, QbittorrentFailure, Registration, RegistryEvent, Sale, SeedboxConfirmation,
+    SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode, SyncScope, TimerName,
+    TorrentCommand, TunnelEvent, VipTorrent, Wedge,
 };
 
 /// History categories, used for filtering.
@@ -73,7 +74,9 @@ pub(super) const fn is_routine(event: &Event) -> bool {
             },
         ) => true,
         Event::Qbittorrent(QbittorrentEvent::Synced(update)) => {
-            !update.full && update.torrents.is_empty() && update.removed.is_empty()
+            matches!(update.scope, SyncScope::Changes)
+                && update.torrents.is_empty()
+                && update.removed.is_empty()
         }
         _ => false,
     }
@@ -92,7 +95,7 @@ const fn timer(name: TimerName) -> &'static str {
 
 /// A size in GiB with one decimal.
 pub(super) fn gib(size: ByteSize) -> String {
-    let tenths = u128::from(size.0) * 10 / (1 << 30);
+    let tenths = u128::from(size.bytes()) * 10 / (1 << 30);
     format!("{}.{} GiB", tenths / 10, tenths % 10)
 }
 
@@ -149,7 +152,7 @@ pub(super) fn findings(findings: &Findings) -> String {
         ),
         PortFinding::NoForwardedPort => String::from("the VPN forwards no port"),
     };
-    let lease = if findings.lease_renewed {
+    let lease = if findings.lease == LeaseRenewal::Requested {
         "a new forwarded-port lease was asked for"
     } else {
         "no lease could be renewed"
@@ -161,7 +164,7 @@ pub(super) fn findings(findings: &Findings) -> String {
         }
         IpFinding::Unknown => String::from("the IP MAM sees, or the tunnel's, is unknown"),
     };
-    let registration = if findings.registered {
+    let registration = if findings.seedbox == SeedboxConfirmation::Confirmed {
         "the seedbox registration was confirmed and is renewed when allowed"
     } else {
         "the seedbox registration was not confirmed; Windlass registers when allowed"
@@ -219,6 +222,31 @@ pub(super) fn hold(hold: Hold) -> String {
     }
 }
 
+/// A torrent as MAM lists it now.
+fn looked_up(listing: &Bookmark) -> String {
+    format!(
+        "MAM torrent {} looked up: {}{}{}{}",
+        listing.id.get(),
+        match listing.freeleech {
+            Freeleech::ForEveryone => "freeleech, ",
+            Freeleech::No => "",
+        },
+        match listing.vip {
+            VipTorrent::No => "",
+            VipTorrent::Indefinitely | VipTorrent::Until(_) => "VIP, ",
+        },
+        match listing.personal {
+            PersonalFreeleech::No => "not free for you",
+            PersonalFreeleech::ThroughVip => "free for you through VIP",
+            PersonalFreeleech::ThroughWedge => "free for you through a wedge",
+        },
+        match listing.snatched {
+            Snatched::Before => ", snatched before",
+            Snatched::Never => "",
+        }
+    )
+}
+
 pub(super) fn purchase(purchase: Purchase) -> String {
     match purchase {
         Purchase::Upload(amount) => format!("{amount} GiB of upload credit"),
@@ -230,9 +258,9 @@ fn mam_request(request: &MamRequest) -> String {
     match request {
         MamRequest::LookUpIp => String::from("Ask MAM which IP it sees"),
         MamRequest::RegisterSeedbox => String::from("Register the seedbox IP with MAM"),
-        MamRequest::LoadUserData { client_stats } => format!(
+        MamRequest::LoadUserData { clients } => format!(
             "Read the account from MAM{}",
-            if *client_stats {
+            if *clients == ClientListing::Include {
                 ", with the client list"
             } else {
                 ""
@@ -242,7 +270,7 @@ fn mam_request(request: &MamRequest) -> String {
         MamRequest::FetchTorrent { id, wedge } => format!(
             "Download the torrent file of MAM torrent {}, {}",
             id.get(),
-            if *wedge {
+            if *wedge == Wedge::Spend {
                 "spending a wedge"
             } else {
                 "without a wedge"
@@ -266,8 +294,14 @@ fn mam(event: &MamEvent) -> String {
         MamEvent::Answered { result, rotated } => {
             let answer = match result {
                 Ok(MamReply::Ip(observed)) => format!(
-                    "MAM sees IP {} in {} ({})",
-                    observed.ip, observed.asn, observed.provider
+                    "MAM sees IP {} in {}{}",
+                    observed.ip,
+                    observed.asn,
+                    observed
+                        .provider
+                        .as_ref()
+                        .map(|name| format!(" ({name})"))
+                        .unwrap_or_default()
                 ),
                 Ok(MamReply::Registered {
                     registration: Registration::Completed,
@@ -303,22 +337,7 @@ fn mam(event: &MamEvent) -> String {
                 Ok(MamReply::Purchased { points }) => {
                     format!("Purchase made; {points} points left")
                 }
-                Ok(MamReply::Torrent(Some(listing))) => format!(
-                    "MAM torrent {} looked up: {}{}{}{}",
-                    listing.id.get(),
-                    if listing.free { "freeleech, " } else { "" },
-                    if listing.vip { "VIP, " } else { "" },
-                    match listing.personal {
-                        PersonalFreeleech::No => "not free for you",
-                        PersonalFreeleech::ThroughVip => "free for you through VIP",
-                        PersonalFreeleech::ThroughWedge => "free for you through a wedge",
-                    },
-                    if listing.snatched {
-                        ", snatched before"
-                    } else {
-                        ""
-                    }
-                ),
+                Ok(MamReply::Torrent(Some(listing))) => looked_up(listing),
                 Ok(MamReply::Torrent(None)) => String::from("MAM no longer lists the torrent"),
                 Ok(MamReply::WedgeHistory(spent)) => {
                     format!("Bonus history read: {} wedges spent", spent.len())
@@ -346,12 +365,12 @@ fn mam(event: &MamEvent) -> String {
         MamEvent::RegistrationAttemptSaveFailed => {
             String::from("Seedbox registration attempt could not be recorded, so it was not sent")
         }
-        MamEvent::PurchaseChecked { made: true } => {
+        MamEvent::PurchaseChecked { sale: Sale::Made } => {
             String::from("You checked on MAM: the uncertain purchase went through")
         }
-        MamEvent::PurchaseChecked { made: false } => {
-            String::from("You checked on MAM: the uncertain purchase did not go through")
-        }
+        MamEvent::PurchaseChecked {
+            sale: Sale::NotMade,
+        } => String::from("You checked on MAM: the uncertain purchase did not go through"),
         MamEvent::ReminderSaved => String::from("MAM visit reminder time saved"),
         MamEvent::ReminderSaveFailed => String::from("MAM visit reminder time could not be saved"),
     }
@@ -360,8 +379,8 @@ fn mam(event: &MamEvent) -> String {
 fn mapping_failure(reason: MappingFailure) -> String {
     match reason {
         MappingFailure::NoResponse => String::from("the gateway did not answer"),
-        MappingFailure::Refused { result_code } => {
-            format!("the gateway refused with NAT-PMP result {result_code}")
+        MappingFailure::Refused { reason } => {
+            format!("the gateway refused the mapping: {reason}")
         }
         MappingFailure::Malformed => String::from("the gateway's answer was not valid"),
     }
@@ -561,7 +580,10 @@ fn qbittorrent(event: &QbittorrentEvent) -> String {
             "qBittorrent update: {} torrents changed, {} removed{}",
             update.torrents.len(),
             update.removed.len(),
-            if update.full { " (full list)" } else { "" }
+            match update.scope {
+                SyncScope::Full => " (full list)",
+                SyncScope::Changes => "",
+            }
         ),
         QbittorrentEvent::SyncFailed { reason } => {
             format!(
@@ -574,7 +596,10 @@ fn qbittorrent(event: &QbittorrentEvent) -> String {
             preferences
                 .listen_port
                 .map_or_else(|| String::from("none"), |port| port.get().to_string()),
-            preferences.interface.as_deref().unwrap_or("any")
+            preferences
+                .interface
+                .as_ref()
+                .map_or_else(|| String::from("any"), ToString::to_string)
         ),
         QbittorrentEvent::PreferencesReadFailed { reason } => format!(
             "Reading qBittorrent preferences failed: {}",
@@ -738,7 +763,7 @@ pub(super) fn action(action: &Action) -> String {
         }
         Action::ConnectQbittorrent => String::from("Connect to qBittorrent"),
         Action::SyncQbittorrent { position } => {
-            format!("Read qBittorrent changes since update {}", position.0)
+            format!("Read qBittorrent changes since update {position}")
         }
         Action::ReadQbittorrentPreferences => String::from("Read qBittorrent preferences"),
         Action::SetQbittorrentListenPort { port } => {
@@ -775,18 +800,14 @@ pub(super) fn action(action: &Action) -> String {
             limits.active()
         ),
         Action::SetQbittorrentQueue { queue } => {
-            let limit = |limit: Option<u32>| {
-                limit.map_or_else(|| String::from("no limit"), |limit| limit.to_string())
-            };
             format!(
                 "Set qBittorrent's queue: {} downloading, {} active, {} seeding, idle torrents {}",
-                limit(queue.max_downloading),
-                limit(queue.max_active),
-                limit(queue.max_seeding),
-                if queue.idle_not_counted {
-                    "not counted"
-                } else {
-                    "counted"
+                queue.max_downloading,
+                queue.max_active,
+                queue.max_seeding,
+                match queue.idle {
+                    IdleTorrents::NotCounted => "not counted",
+                    IdleTorrents::Counted => "counted",
                 }
             )
         }
@@ -981,7 +1002,9 @@ mod tests {
         ];
         for reason in [
             MappingFailure::NoResponse,
-            MappingFailure::Refused { result_code: 2 },
+            MappingFailure::Refused {
+                reason: crate::core::NatPmpRefusal::NotAuthorized,
+            },
             MappingFailure::Malformed,
         ] {
             entries.push((
@@ -1005,7 +1028,9 @@ mod tests {
             qbittorrent(QbittorrentEvent::Enable, false),
             qbittorrent(
                 QbittorrentEvent::Connected {
-                    version: String::from("v5.2.2"),
+                    version: crate::core::ReportedVersion::Release(
+                        crate::core::ClientVersion::new(5, 2, 2),
+                    ),
                     preferences: QbittorrentPreferences::default(),
                 },
                 false,
@@ -1013,7 +1038,7 @@ mod tests {
             qbittorrent(QbittorrentEvent::Synced(SyncUpdate::default()), true),
             qbittorrent(
                 QbittorrentEvent::Synced(SyncUpdate {
-                    full: true,
+                    scope: crate::core::SyncScope::Full,
                     ..SyncUpdate::default()
                 }),
                 false,
@@ -1021,7 +1046,7 @@ mod tests {
             qbittorrent(
                 QbittorrentEvent::PreferencesRead(QbittorrentPreferences {
                     listen_port: Some(PORT),
-                    interface: Some(String::from("wg0")),
+                    interface: crate::core::NetworkInterface::try_new("wg0").ok(),
                     queue: None,
                 }),
                 true,
@@ -1035,7 +1060,9 @@ mod tests {
         ];
         for reason in [
             QbittorrentFailure::Unreachable,
-            QbittorrentFailure::Rejected { status: 403 },
+            QbittorrentFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::FORBIDDEN),
+            },
             QbittorrentFailure::Malformed,
         ] {
             for failure in [
@@ -1085,7 +1112,7 @@ mod tests {
             },
             Action::ConnectQbittorrent,
             Action::SyncQbittorrent {
-                position: SyncPosition(1),
+                position: SyncPosition::new(1),
             },
             Action::ReadQbittorrentPreferences,
             Action::SetQbittorrentListenPort { port: PORT },
@@ -1123,7 +1150,7 @@ mod tests {
             Action::ReadNoticeLog,
             Action::SaveNotice {
                 entry: crate::core::Logged {
-                    id: crate::core::NoticeId::new(7),
+                    id: crate::core::NoticeId::new(7).unwrap_or(crate::core::NoticeId::FIRST),
                     at: SystemTime::UNIX_EPOCH,
                     notice: crate::core::Notice::Test,
                     reach: crate::core::Reach::Push,
@@ -1186,7 +1213,9 @@ mod tests {
         ];
         for reason in [
             ExitIpFailure::Unreachable,
-            ExitIpFailure::Rejected { status: 503 },
+            ExitIpFailure::Rejected {
+                status: crate::core::HttpStatus::new(http::StatusCode::SERVICE_UNAVAILABLE),
+            },
             ExitIpFailure::Malformed,
         ] {
             entries.push(vpn(TunnelEvent::ExitIpCheckFailed { reason }, false));
@@ -1220,11 +1249,13 @@ mod tests {
                 reason: DeliveryFailure::Unreachable,
             },
             NotificationEvent::DeliveryFailed {
-                reason: DeliveryFailure::Rejected { status: 429 },
+                reason: DeliveryFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::TOO_MANY_REQUESTS),
+                },
             },
             NotificationEvent::LogRead { last: None },
             NotificationEvent::LogRead {
-                last: Some(crate::core::NoticeId::new(3)),
+                last: crate::core::NoticeId::new(3),
             },
             NotificationEvent::LogReadFailed,
             NotificationEvent::SaveFailed,
@@ -1320,7 +1351,7 @@ mod tests {
             },
             Action::ConnectQbittorrent,
             Action::SyncQbittorrent {
-                position: SyncPosition(3),
+                position: SyncPosition::new(3),
             },
             Action::ReadQbittorrentPreferences,
             Action::SetQbittorrentListenPort { port: PORT },
@@ -1359,13 +1390,23 @@ mod tests {
         let hash = TorrentHash::parse(&"c".repeat(40)).ok_or("hash")?;
         let torrent = MamTorrentId::new(9).ok_or("id")?;
         let data = UserData {
-            uploaded: ByteSize(3 << 30),
-            downloaded: ByteSize(1 << 30),
-            points: Points(1),
-            wedges: 2,
-            class: String::from("VIP"),
+            uploaded: ByteSize::new(3 << 30),
+            downloaded: ByteSize::new(1 << 30),
+            points: Points::new(1),
+            wedges: crate::core::WedgeCount::new(2),
+            class: crate::core::UserClass::Vip,
             vip_until: None,
-            summary: Some(crate::core::SnatchSummary::default()),
+            summary: Some(crate::core::SnatchSummary {
+                unsatisfied: crate::core::UnsatisfiedCount::default(),
+                unsatisfied_limit: crate::core::UnsatisfiedLimit::new(150),
+                unsatisfied_not_seeding: crate::core::TorrentCount::default(),
+                hit_and_run_not_seeding: crate::core::TorrentCount::default(),
+                partial: crate::core::Partials::NotSeen,
+                duplicates: crate::core::TorrentCount::default(),
+                tracker_errors: crate::core::TorrentCount::default(),
+                connectable: crate::core::Connectable::Offline,
+                red: Vec::new(),
+            }),
             notices: None,
             clients: None,
         };
@@ -1388,13 +1429,13 @@ mod tests {
             (Event::Mam(MamEvent::Enable), "mam", false),
             routine(MamReply::Ip(IpObservation {
                 ip,
-                asn: Asn(1),
-                provider: String::from("Provider"),
+                asn: Asn::new(1),
+                provider: crate::core::NetworkName::try_new("Provider").ok(),
             })),
             routine(MamReply::UserData(Box::new(data))),
             routine(MamReply::UserData(Box::new(without_summary))),
             routine(MamReply::Bookmarks(BookmarkPage {
-                found: 0,
+                found: crate::core::BookmarkCount::new(0),
                 bookmarks: Vec::new(),
             })),
             (Event::Mam(MamEvent::ReminderSaved), "mam", true),
@@ -1411,49 +1452,52 @@ mod tests {
                 })),
                 answered(Ok(MamReply::Fetched(FetchedTorrent {
                     hash: hash.clone(),
-                    size: ByteSize(1 << 20),
+                    size: ByteSize::new(1 << 20),
                 }))),
-                answered(Ok(MamReply::Purchased { points: Points(2) })),
+                answered(Ok(MamReply::Purchased {
+                    points: Points::new(2),
+                })),
                 answered(Ok(MamReply::WedgeHistory(Vec::new()))),
                 answered(Ok(MamReply::Torrent(None))),
                 answered(Ok(MamReply::Torrent(Some(Box::new(
                     crate::core::Bookmark {
                         id: torrent,
-                        title: String::from("Synthetic"),
-                        vip: true,
-                        free: true,
+                        title: crate::core::BookTitle::try_new("Synthetic")?,
+                        vip: crate::core::VipTorrent::Indefinitely,
+                        freeleech: crate::core::Freeleech::ForEveryone,
                         personal: crate::core::PersonalFreeleech::ThroughWedge,
-                        snatched: true,
-                        vip_expires: None,
+                        snatched: crate::core::Snatched::Before,
                         bookmarked_at: None,
                     },
                 ))))),
                 answered(Ok(MamReply::Torrent(Some(Box::new(
                     crate::core::Bookmark {
                         id: torrent,
-                        title: String::from("Synthetic"),
-                        vip: false,
-                        free: false,
+                        title: crate::core::BookTitle::try_new("Synthetic")?,
+                        vip: crate::core::VipTorrent::No,
+                        freeleech: crate::core::Freeleech::No,
                         personal: crate::core::PersonalFreeleech::ThroughVip,
-                        snatched: false,
-                        vip_expires: None,
+                        snatched: crate::core::Snatched::Never,
                         bookmarked_at: None,
                     },
                 ))))),
                 answered(Ok(MamReply::Torrent(Some(Box::new(
                     crate::core::Bookmark {
                         id: torrent,
-                        title: String::from("Synthetic"),
-                        vip: false,
-                        free: false,
+                        title: crate::core::BookTitle::try_new("Synthetic")?,
+                        vip: crate::core::VipTorrent::No,
+                        freeleech: crate::core::Freeleech::No,
                         personal: crate::core::PersonalFreeleech::No,
-                        snatched: false,
-                        vip_expires: None,
+                        snatched: crate::core::Snatched::Never,
                         bookmarked_at: None,
                     },
                 ))))),
-                MamEvent::PurchaseChecked { made: true },
-                MamEvent::PurchaseChecked { made: false },
+                MamEvent::PurchaseChecked {
+                    sale: crate::core::Sale::Made,
+                },
+                MamEvent::PurchaseChecked {
+                    sale: crate::core::Sale::NotMade,
+                },
                 MamEvent::Answered {
                     result: Err(MamFailure::Unreachable),
                     rotated: ApiCookie::parse("rotated").ok(),
@@ -1477,10 +1521,12 @@ mod tests {
                 },
                 MamFailure::Refused { message: None },
                 MamFailure::Refused {
-                    message: Some(String::from("No")),
+                    message: crate::core::MamMessage::try_new("No").ok(),
                 },
                 MamFailure::NotKept,
-                MamFailure::Rejected { status: 500 },
+                MamFailure::Rejected {
+                    status: crate::core::HttpStatus::new(http::StatusCode::INTERNAL_SERVER_ERROR),
+                },
                 MamFailure::Malformed,
             ]
             .into_iter()
@@ -1554,11 +1600,11 @@ mod tests {
             },
             Action::SetQbittorrentQueue {
                 queue: crate::core::QueuePreferences {
-                    queueing: false,
-                    max_downloading: None,
-                    max_active: None,
-                    max_seeding: None,
-                    idle_not_counted: false,
+                    queueing: crate::core::Queueing::Off,
+                    max_downloading: crate::core::QueueLimit::Unlimited,
+                    max_active: crate::core::QueueLimit::Unlimited,
+                    max_seeding: crate::core::QueueLimit::Unlimited,
+                    idle: crate::core::IdleTorrents::Counted,
                 },
             },
             Action::QbittorrentCommand {
@@ -1570,18 +1616,22 @@ mod tests {
             [
                 MamRequest::LookUpIp,
                 MamRequest::RegisterSeedbox,
-                MamRequest::LoadUserData { client_stats: true },
                 MamRequest::LoadUserData {
-                    client_stats: false,
+                    clients: crate::core::ClientListing::Include,
                 },
-                MamRequest::ListBookmarks { start: 100 },
+                MamRequest::LoadUserData {
+                    clients: crate::core::ClientListing::Omit,
+                },
+                MamRequest::ListBookmarks {
+                    start: crate::core::BookmarkCount::new(100),
+                },
                 MamRequest::FetchTorrent {
                     id: torrent,
-                    wedge: true,
+                    wedge: crate::core::Wedge::Spend,
                 },
                 MamRequest::FetchTorrent {
                     id: torrent,
-                    wedge: false,
+                    wedge: crate::core::Wedge::Keep,
                 },
                 MamRequest::Buy(upload),
                 MamRequest::Buy(Purchase::Vip),
@@ -1606,9 +1656,12 @@ mod tests {
             Hold::ClientUnavailable,
             Hold::AccountUnknown,
             Hold::RatioLow,
-            Hold::UnsatisfiedLimit { count: 1, limit: 2 },
+            Hold::UnsatisfiedLimit {
+                count: crate::core::UnsatisfiedCount::new(1),
+                limit: crate::core::UnsatisfiedLimit::new(2),
+            },
             Hold::DownloadingLimit {
-                downloading: 5,
+                downloading: crate::core::TorrentCount::new(5),
                 limit: crate::core::DownloadingLimit::default(),
             },
             Hold::NoWedge,
@@ -1628,7 +1681,7 @@ mod tests {
         ) {
             assert!(!super::hold(hold).is_empty());
         }
-        assert_eq!(super::gib(ByteSize(3 << 29)), "1.5 GiB");
+        assert_eq!(super::gib(ByteSize::new(3 << 29)), "1.5 GiB");
 
         let port = crate::core::Port::new(41000).ok_or("zero port")?;
         let other = crate::core::Port::new(6881).ok_or("zero port")?;
@@ -1659,10 +1712,10 @@ mod tests {
         ] {
             let found = crate::core::Findings {
                 listen_port,
-                lease_renewed: true,
+                lease: crate::core::LeaseRenewal::Requested,
                 exit_ip,
-                registered: true,
-                interface: Some(String::from("wg0")),
+                seedbox: crate::core::SeedboxConfirmation::Confirmed,
+                interface: crate::core::NetworkInterface::try_new("wg0").ok(),
             };
             let described = super::findings(&found);
             assert!(described.contains(text), "{described}");

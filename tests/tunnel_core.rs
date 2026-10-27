@@ -103,7 +103,7 @@ impl Harness {
     /// Fail checks until a switch would be considered, waiting out each retry.
     fn fail_repeatedly(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
-        for _ in 0..FAILURES_BEFORE_SWITCH {
+        for _ in 0..FAILURES_BEFORE_SWITCH.get() {
             if let Some(id) = timer(&actions, RETRY_AFTER) {
                 self.advance(RETRY_AFTER);
                 assert_eq!(self.expire(id), vec![Action::CheckExitIp]);
@@ -238,7 +238,10 @@ fn repeated_failures_switch_to_the_next_server() -> TestResult {
     assert!(switched.contains(&Action::CheckExitIp));
     assert_eq!(harness.watch().current, Some(server("three")));
     assert_eq!(harness.watch().protection, Protection::Unknown);
-    assert_eq!(harness.watch().failures, 0);
+    assert_eq!(
+        harness.watch().failures,
+        windlass::core::FailureCount::new(0)
+    );
     assert_eq!(harness.core.port_forwarding().forwarded_port(), None);
     assert!(
         switched.contains(&Action::RequestPortMapping {
@@ -394,7 +397,7 @@ fn switches_need_a_known_last_switch_and_another_server() {
     let _ = core.handle(now, Event::Startup(StartupEvent::StorageOpened));
     let _ = core.handle(now, Event::Tunnel(TunnelEvent::LastSwitchReadFailed));
     assert_eq!(core.tunnel().last_switch, LastSwitch::ReadFailed);
-    for _ in 0..FAILURES_BEFORE_SWITCH {
+    for _ in 0..FAILURES_BEFORE_SWITCH.get() {
         let actions = core.handle(
             now,
             Event::Tunnel(TunnelEvent::ExitIpCheckFailed {

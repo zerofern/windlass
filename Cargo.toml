@@ -7,6 +7,8 @@ description = "A cohesive MAM acquisition and library service"
 
 [dependencies]
 axum = "0.8"
+derive_more = { version = "2", features = ["display"] }
+http = "1"
 maud = { version = "0.27", features = ["axum"] }
 nutype = { version = "0.6", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }

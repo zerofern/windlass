@@ -1,10 +1,11 @@
 use super::{
-    Action, ClockReading, Event, HistoryState, Mam, MamApproval, MamPreferencePersistence,
-    MamPreferenceState, MamPreferenceUpdate, Notifications, PortForwarding, PortForwardingEvent,
-    Protection, Qbittorrent, Registry, SettingsState, Step, TimerName, Tunnel, TunnelEvent,
-    mam::Context,
+    Action, ClockReading, DecidingAfter, Event, HistoryState, Mam, MamApproval,
+    MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate, Notifications,
+    PortForwarding, PortForwardingEvent, Protection, Qbittorrent, Registry, SettingsState, Step,
+    TimerName, Tunnel, TunnelEvent,
+    mam::{ClientReadiness, Context, LeaseRenewal, TunnelProtection},
     mam_pause,
-    notifications::{Facts, Glance},
+    notifications::{Facts, Glance, Startup},
     settings, startup,
     timer::Timers,
 };
@@ -144,11 +145,11 @@ impl Core {
             Event::Mam(event) => self.handle_mam(occurred_at, event),
         };
         self.port_forwarding.expire(occurred_at.monotonic);
-        if let Some((session, true)) = self.qbittorrent.deciding() {
+        if let Some((session, DecidingAfter::Sync)) = self.qbittorrent.deciding() {
             actions.extend(self.registry.observe(occurred_at, session));
         }
         actions.extend(self.decide_mam(occurred_at));
-        if self.mam.take_lease_renewal() {
+        if self.mam.take_lease_renewal() == LeaseRenewal::Requested {
             actions.extend(self.port_forwarding.renew());
         }
         let registry = &mut self.registry;
@@ -226,22 +227,28 @@ impl Core {
         };
         let context = Context {
             requests: self.state.mam_requests(),
-            protected: self
+            protection: if self
                 .tunnel
                 .watch
                 .as_ref()
-                .is_some_and(|watch| matches!(watch.protection, Protection::Available { .. })),
+                .is_some_and(|watch| matches!(watch.protection, Protection::Available { .. }))
+            {
+                TunnelProtection::Protected
+            } else {
+                TunnelProtection::Unprotected
+            },
             cookie: loaded.and_then(super::Settings::usable_api_cookie),
             requested_cookie: loaded.and_then(|settings| settings.api_cookie.requested.as_ref()),
             reserve: self.settings.points_reserve(),
-            client_ready: match &self.qbittorrent {
-                Qbittorrent::Connected(session) => {
-                    session.listed() && session.approval != MamApproval::NotAllowed
+            readiness: match &self.qbittorrent {
+                Qbittorrent::Connected(session)
+                    if session.listed() && session.approval != MamApproval::NotAllowed =>
+                {
+                    ClientReadiness::Ready
                 }
-                _ => false,
+                _ => ClientReadiness::NotReady,
             },
-            client_version: session
-                .and_then(|session| super::ClientVersion::parse(&session.version)),
+            client_version: session.and_then(|session| session.version.release()),
             connection: super::Connection {
                 listen_port: session.and_then(|session| session.preferences.listen_port),
                 forwarded_port: self.port_forwarding.forwarded_port(),
@@ -269,8 +276,11 @@ impl Core {
     fn glance(&self) -> Glance {
         Glance::of(
             &self.tunnel,
-            matches!(self.state, State::Failed),
-            matches!(self.state, State::Ready(_)),
+            match self.state {
+                State::Failed => Startup::Failed,
+                State::Ready(_) => Startup::Ready,
+                _ => Startup::Starting,
+            },
         )
     }
 

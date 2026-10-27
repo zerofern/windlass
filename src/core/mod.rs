@@ -211,7 +211,9 @@ pub enum Action {
     },
 }
 
+mod failures;
 mod history;
+mod http_status;
 mod machine;
 mod mam;
 mod mam_pause;
@@ -224,45 +226,57 @@ mod startup;
 mod timer;
 mod tunnel;
 
+pub use failures::FailureCount;
 pub use history::{HistoryEvent, HistoryState, Step, Trim};
+pub use http_status::HttpStatus;
 pub use machine::{Core, State};
 pub use mam::{
     ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Acquisition, Asn, Attention, BOOKMARKS_EVERY,
-    Bookmark, BookmarkPage, Bookmarks, Budget, CLIENT_STATS_EVERY, ClientList, ClientStanding,
-    Connectability, Connectable, Connection, DownloadWatch, FetchedTorrent, Findings,
-    HISTORY_FRESH_FOR, Hold, IpFinding, IpObservation, LOOKUP_FRESH_FOR, LOOKUP_SPACING,
-    LastAttempt, LastReminder, Listed, ListedClient, Lookup, MAX_BOOKMARK_PAGES, Mam, MamEvent,
-    MamFailure, MamNotices, MamReply, MamRequest, Network, OBSERVE_EVERY, Observed, Outstanding,
-    PersonalFreeleech, Points, PortFinding, Purchase, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR,
-    RATIO_TARGET, RATIO_URGENT, RECENT_ADMISSION, REGISTRATION_SPACING, REMINDER_EVERY,
-    REPAIR_SETTLES_AFTER, REQUEST_BURST, REQUEST_REFILL, Reading, RedCategory, Registration,
-    RegistrationAllowance, RegistrationFailure, Seedbox, SeedboxStatus, Session as MamSession,
-    SessionRejection, SettledBy, SnatchSummary, UNSATISFIED_RESERVE, UPLOAD_BUFFER,
-    UPLOAD_PRICE_PER_GIB, UPLOAD_STEP, UploadCredit, UploadCreditError, UserData, VIP_FILL,
-    VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN, WATCH_FRESH_FOR, WEDGE_RECORDED_AFTER,
-    WedgeHistory, WedgeSpent,
+    BookTitle, BookTitleError, Bookmark, BookmarkCount, BookmarkPage, Bookmarks, Budget,
+    CLIENT_STATS_EVERY, CategoryName, CategoryNameError, ClassName, ClassNameError, ClientList,
+    ClientListing, ClientRefusal, ClientStanding, Connectability, Connectable, Connection,
+    ConnectionEpoch, DownloadWatch, FetchedTorrent, Findings, Freeleech, HISTORY_FRESH_FOR, Hold,
+    IpFinding, IpObservation, IpStanding, LOOKUP_FRESH_FOR, LOOKUP_SPACING, LastAttempt,
+    LastReminder, LeaseRenewal, Listed, ListedClient, Lookup, MAX_BOOKMARK_PAGES, Mam, MamEvent,
+    MamFailure, MamHosts, MamListing, MamMessage, MamMessageError, MamNotices, MamReply,
+    MamRequest, Network, NetworkName, NetworkNameError, NoticeCount, OBSERVE_EVERY, Observed,
+    Outstanding, Partials, PersonalFreeleech, Points, PortFinding, Purchase, PurchaseOutcome,
+    PurchaseRecord, RATIO_FLOOR, RATIO_TARGET, RATIO_URGENT, RECENT_ADMISSION,
+    REGISTRATION_SPACING, REMINDER_EVERY, REPAIR_SETTLES_AFTER, REQUEST_BURST, REQUEST_REFILL,
+    Reading, RedCategory, RedKind, Registration, RegistrationAllowance, RegistrationFailure,
+    RequestGate, Sale, Seedbox, SeedboxConfirmation, SeedboxStatus, Session as MamSession,
+    SessionRejection, SettledBy, SnatchSummary, Snatched, Tokens, TorrentCount,
+    UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB, UPLOAD_STEP, UnsatisfiedCount,
+    UnsatisfiedLimit, UploadCredit, UploadCreditError, UserClass, UserData, VIP_FILL,
+    VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN, VipTorrent, WATCH_FRESH_FOR,
+    WEDGE_RECORDED_AFTER, Wedge, WedgeAccounting, WedgeCount, WedgeHistory, WedgeSpent,
 };
 pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,
     MamRequestMode, MamRequestsStatus,
 };
 pub use notifications::{
-    Condition, Delivery, DeliveryFailure, LOG_KEPT, Logged, Notice, NoticeId, NoticeLog,
-    NotificationEvent, Notifications, OUTBOX_LIMIT, Outcome, Phase, Push, Reach, SettingName,
-    SwitchBlock,
+    ClientWarning, Condition, Delivery, DeliveryFailure, LOG_KEPT, Logged, NotFreeOutcome, Notice,
+    NoticeId, NoticeLog, NotificationEvent, Notifications, OUTBOX_LIMIT, Outcome, Phase, Push,
+    PushCount, Reach, SettingName, SwitchBlock, Urgency,
 };
 pub use port_forwarding::{
-    LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, Port, PortForwarding, PortForwardingEvent,
+    LEASE_LIFETIME, Lease, LeaseRequest, MappingFailure, NatPmpRefusal, Port, PortForwarding,
+    PortForwardingEvent,
 };
 pub use qbittorrent::{
-    Activity, ByteSize, ClientVersion, MamApproval, POLL_INTERVAL, Progress, Qbittorrent,
-    QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences, QueuePreferences, Ratio, Session,
-    SyncPosition, SyncUpdate, Torrent, TorrentCommand, TorrentHash, TorrentState, TorrentUpdate,
+    Activity, ByteSize, ClientVersion, Completion, ContentPath, ContentPathError, DecidingAfter,
+    ForceStart, IdleTorrents, MamApproval, NetworkInterface, NetworkInterfaceError, POLL_INTERVAL,
+    Progress, Qbittorrent, QbittorrentEvent, QbittorrentFailure, QbittorrentPreferences,
+    QueueLimit, QueuePreferences, Queueing, Ratio, ReportedVersion, SavePath, SavePathError,
+    Session, SyncPosition, SyncScope, SyncUpdate, Torrent, TorrentCommand, TorrentHash,
+    TorrentName, TorrentNameError, TorrentState, TorrentUpdate, VersionText, VersionTextError,
     Wanted,
 };
 pub use registry::{
-    COUNTER_SAVE_INTERVAL, Desired, Download, Identity, MamTorrentId, Observation, Origin,
-    RecordId, Records, Registry, RegistryEvent, SEEDING_REQUIRED, SEEDING_TARGET, TorrentRecord,
+    COUNTER_SAVE_INTERVAL, ContentDeletion, Desired, Download, Identity, MamTorrentId, Observation,
+    Origin, RecordId, Records, Registry, RegistryEvent, SEEDING_REQUIRED, SEEDING_TARGET,
+    TorrentRecord,
 };
 pub use settings::{
     ActiveLimit, ActiveLimitError, ApiCookie, DownloadingLimit, DownloadingLimitError, EntryCount,

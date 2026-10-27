@@ -9,10 +9,11 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, types::Type};
 
 use crate::core::{
-    ActiveLimit, ApiCookie, ByteSize, Desired, DownloadingLimit, Event, HistoryLimit, Identity,
-    Logged, MamEvent, MamPauseEvent, MamRequestMode, MamTorrentId, NoticeId, NotificationEvent,
-    NtfyTopic, Observation, Origin, PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent,
-    SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentRecord,
+    ActiveLimit, ApiCookie, ByteSize, Completion, ContentDeletion, ContentPath, Desired,
+    DownloadingLimit, Event, ForceStart, HistoryLimit, Identity, Logged, MamEvent, MamPauseEvent,
+    MamRequestMode, MamTorrentId, NoticeId, NotificationEvent, NtfyTopic, Observation, Origin,
+    PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent, SavePath, SettingsEvent,
+    StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentName, TorrentRecord,
     TorrentState, TunnelEvent, VpnServer, VpnSwitch,
 };
 
@@ -508,10 +509,13 @@ fn save_mam_time(path: &Path, column: &'static str, at: SystemTime) -> StorageRe
 fn read_notice_log(path: &Path) -> StorageResult<Event> {
     let last: Option<i64> =
         connection(path)?.query_row("SELECT MAX(id) FROM notices", [], |row| row.get(0))?;
-    let last = last
-        .map(|id| u64::try_from(id).map(NoticeId::new))
-        .transpose()?;
+    let last = last.map(notice_id).transpose()?;
     Ok(Event::Notification(NotificationEvent::LogRead { last }))
+}
+
+/// A stored notice id; ids count from 1.
+fn notice_id(id: i64) -> StorageResult<NoticeId> {
+    Ok(NoticeId::new(u64::try_from(id)?).ok_or("a notice id of 0")?)
 }
 
 /// Save a notice's words, and forget the oldest ones.
@@ -571,7 +575,7 @@ pub(super) fn read_notices(path: &Path, limit: u32) -> StorageResult<Vec<StoredN
     rows.map(|row| {
         let (id, at, urgent, title, body, page) = row?;
         Ok(StoredNotice {
-            id: NoticeId::new(u64::try_from(id)?),
+            id: notice_id(id)?,
             at: time_from_seconds(at)?,
             urgent,
             title,
@@ -698,10 +702,24 @@ fn torrent_record(row: &Row<'_>) -> StorageResult<TorrentRecord> {
         identity,
         origin,
         desired,
-        save_path: row.get(5)?,
-        deletion_allowed: row.get(6)?,
+        save_path: text(row, 5, SavePath::try_new)?,
+        deletion: if row.get(6)? {
+            ContentDeletion::Allowed
+        } else {
+            ContentDeletion::NotAllowed
+        },
         observation,
     })
+}
+
+/// An optional text column, parsed into its type.
+fn text<T, E: Error + Send + Sync + 'static>(
+    row: &Row<'_>,
+    column: usize,
+    parse: impl FnOnce(String) -> Result<T, E>,
+) -> StorageResult<Option<T>> {
+    let value: Option<String> = row.get(column)?;
+    Ok(value.map(parse).transpose()?)
 }
 
 fn observation(row: &Row<'_>, last_seen: i64) -> StorageResult<Observation> {
@@ -720,21 +738,21 @@ fn observation(row: &Row<'_>, last_seen: i64) -> StorageResult<Observation> {
         .ok_or_else(|| invalid_data("invalid progress"))?;
     Ok(Observation {
         torrent: Torrent {
-            name: row.get(7)?,
+            name: text(row, 7, TorrentName::try_new)?,
             state: torrent_state(&state),
             progress,
-            size: ByteSize(count(10)?),
-            total_size: ByteSize(count(11)?),
-            downloaded: ByteSize(count(12)?),
-            uploaded: ByteSize(count(13)?),
-            ratio: Ratio(count(14)?),
+            size: ByteSize::new(count(10)?),
+            total_size: ByteSize::new(count(11)?),
+            downloaded: ByteSize::new(count(12)?),
+            uploaded: ByteSize::new(count(13)?),
+            ratio: Ratio::from_thousandths(count(14)?),
             seeding_time: Duration::from_secs(count(15)?),
             added_at: time(16)?,
             completed_at: time(17)?,
-            content_path: row.get(18)?,
-            save_path: row.get(19)?,
+            content_path: text(row, 18, ContentPath::try_new)?,
+            save_path: text(row, 19, SavePath::try_new)?,
             // Not saved; qBittorrent's next full update says.
-            force_start: false,
+            force_start: ForceStart::NotForced,
         },
         last_seen: time_from_seconds(last_seen)?,
     })
@@ -772,21 +790,21 @@ fn save_torrents(path: &Path, records: &[TorrentRecord]) -> StorageResult<Event>
                     Desired::Held => "held",
                     Desired::Removed => "removed",
                 },
-                record.save_path,
-                record.deletion_allowed,
-                torrent.map(|torrent| torrent.name.as_str()),
+                record.save_path.as_ref().map(ToString::to_string),
+                record.deletion == ContentDeletion::Allowed,
+                torrent.and_then(|torrent| torrent.name.as_ref().map(ToString::to_string)),
                 torrent.map(|torrent| state_name(torrent.state)),
                 torrent.map(|torrent| torrent.progress.permille()),
-                count(|torrent| torrent.size.0),
-                count(|torrent| torrent.total_size.0),
-                count(|torrent| torrent.downloaded.0),
-                count(|torrent| torrent.uploaded.0),
-                count(|torrent| torrent.ratio.0),
+                count(|torrent| torrent.size.bytes()),
+                count(|torrent| torrent.total_size.bytes()),
+                count(|torrent| torrent.downloaded.bytes()),
+                count(|torrent| torrent.uploaded.bytes()),
+                count(|torrent| torrent.ratio.thousandths()),
                 count(|torrent| torrent.seeding_time.as_secs()),
                 time(|torrent| torrent.added_at),
                 time(|torrent| torrent.completed_at),
-                torrent.and_then(|torrent| torrent.content_path.as_deref()),
-                torrent.and_then(|torrent| torrent.save_path.as_deref()),
+                torrent.and_then(|torrent| torrent.content_path.as_ref().map(ToString::to_string)),
+                torrent.and_then(|torrent| torrent.save_path.as_ref().map(ToString::to_string)),
                 observed.map(|observation| seconds(observation.last_seen)),
             ])?;
         }
@@ -805,8 +823,8 @@ const fn state_name(state: TorrentState) -> &'static str {
         TorrentState::Seeding => "uploading",
         TorrentState::SeedStalled => "stalledUP",
         TorrentState::SeedQueued => "queuedUP",
-        TorrentState::Stopped { complete: true } => "stoppedUP",
-        TorrentState::Stopped { complete: false } => "stoppedDL",
+        TorrentState::Stopped(Completion::Complete) => "stoppedUP",
+        TorrentState::Stopped(Completion::Incomplete) => "stoppedDL",
         TorrentState::Checking => "checkingDL",
         TorrentState::Moving => "moving",
         TorrentState::MissingFiles => "missingFiles",
@@ -904,20 +922,21 @@ mod tests {
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let observed = Observation {
             torrent: Torrent {
-                name: String::from("A Synthetic Audiobook"),
-                state: TorrentState::Stopped { complete: true },
+                name: crate::core::TorrentName::try_new("A Synthetic Audiobook").ok(),
+                state: TorrentState::Stopped(crate::core::Completion::Complete),
                 progress: DONE,
-                size: ByteSize(10),
-                total_size: ByteSize(12),
-                downloaded: ByteSize(10),
-                uploaded: ByteSize(30),
-                ratio: Ratio(3000),
+                size: ByteSize::new(10),
+                total_size: ByteSize::new(12),
+                downloaded: ByteSize::new(10),
+                uploaded: ByteSize::new(30),
+                ratio: Ratio::from_thousandths(3000),
                 seeding_time: Duration::from_hours(1),
                 added_at: Some(at(1_700_000_000)),
                 completed_at: Some(at(1_700_000_600)),
-                content_path: Some(String::from("/srv/books/A Synthetic Audiobook")),
-                save_path: Some(String::from("/srv/books")),
-                force_start: false,
+                content_path: crate::core::ContentPath::try_new("/srv/books/A Synthetic Audiobook")
+                    .ok(),
+                save_path: crate::core::SavePath::try_new("/srv/books").ok(),
+                force_start: crate::core::ForceStart::NotForced,
             },
             last_seen: at(1_700_001_000),
         };
@@ -926,8 +945,12 @@ mod tests {
             identity,
             origin,
             desired,
-            save_path: Some(String::from("/srv/books")),
-            deletion_allowed: id == SECOND,
+            save_path: crate::core::SavePath::try_new("/srv/books").ok(),
+            deletion: if id == SECOND {
+                crate::core::ContentDeletion::Allowed
+            } else {
+                crate::core::ContentDeletion::NotAllowed
+            },
             observation,
         };
         let adopted = TorrentHash::parse(&"a".repeat(40)).map(|hash| {
@@ -1065,8 +1088,8 @@ mod tests {
             TorrentState::Seeding,
             TorrentState::SeedStalled,
             TorrentState::SeedQueued,
-            TorrentState::Stopped { complete: true },
-            TorrentState::Stopped { complete: false },
+            TorrentState::Stopped(crate::core::Completion::Complete),
+            TorrentState::Stopped(crate::core::Completion::Incomplete),
             TorrentState::Checking,
             TorrentState::Moving,
             TorrentState::MissingFiles,
@@ -1209,7 +1232,7 @@ mod tests {
         let storage = storage()?;
         let path = &storage.path;
         let entry = |id, notice: Notice| Logged {
-            id: NoticeId::new(id),
+            id: NoticeId::new(id).unwrap_or(NoticeId::FIRST),
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(id),
             reach: notice.reach(),
             notice,
@@ -1224,7 +1247,7 @@ mod tests {
         for (logged, forget) in [
             (entry(1, Notice::Test), None),
             (entry(2, started), None),
-            (entry(3, Notice::MamVisitReminder), Some(NoticeId::new(1))),
+            (entry(3, Notice::MamVisitReminder), NoticeId::new(1)),
         ] {
             assert_eq!(
                 outcome(path, Operation::SaveNotice(logged, forget)),
@@ -1234,7 +1257,7 @@ mod tests {
         assert_eq!(
             outcome(path, Operation::ReadNoticeLog),
             Event::Notification(NotificationEvent::LogRead {
-                last: Some(NoticeId::new(3))
+                last: NoticeId::new(3)
             })
         );
         let notices = read_notices(path, 10).unwrap_or_default();
@@ -1272,10 +1295,13 @@ mod tests {
         assert!(read_notices(path, 10).is_err(), "a time before 1970");
         assert!(sql("UPDATE notices SET at = 3, id = -3 WHERE id = 3;"));
         assert!(read_notices(path, 10).is_err(), "a negative id");
+        assert!(sql("UPDATE notices SET id = 0 WHERE id = -3;"));
+        assert!(read_notices(path, 10).is_err(), "an id of 0");
+        assert!(sql("UPDATE notices SET id = -3 WHERE id = 0;"));
         assert_eq!(
             outcome(path, Operation::ReadNoticeLog),
             Event::Notification(NotificationEvent::LogRead {
-                last: Some(NoticeId::new(2))
+                last: NoticeId::new(2)
             })
         );
         // Each column holding the wrong kind of value fails the read.
@@ -1304,7 +1330,7 @@ mod tests {
         assert_eq!(
             outcome(
                 path,
-                Operation::SaveNotice(entry(8, Notice::Test), Some(NoticeId::new(7)))
+                Operation::SaveNotice(entry(8, Notice::Test), NoticeId::new(7))
             ),
             Event::Notification(NotificationEvent::SaveFailed)
         );

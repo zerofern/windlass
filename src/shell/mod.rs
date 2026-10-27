@@ -26,6 +26,7 @@ mod fake_mam;
 mod history;
 mod ingress;
 mod mam;
+mod mam_reply;
 mod natpmp;
 mod notify;
 mod qbittorrent;
@@ -509,7 +510,7 @@ mod tests {
         );
         let fetch = MamRequest::FetchTorrent {
             id: KEPT,
-            wedge: false,
+            wedge: crate::core::Wedge::Keep,
         };
         for (action, expected) in [
             (
