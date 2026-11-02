@@ -12,9 +12,9 @@ use crate::core::{
     ActiveLimit, ApiCookie, ByteSize, Completion, ContentDeletion, ContentPath, Desired,
     DownloadingLimit, Event, ForceStart, HistoryLimit, Identity, Logged, MamEvent, MamPauseEvent,
     MamRequestMode, MamTorrentId, NoticeId, NotificationEvent, NtfyTopic, Observation, Origin,
-    PointsReserve, Progress, Ratio, Reach, RecordId, RegistryEvent, SavePath, SettingsEvent,
-    StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits, TorrentName, TorrentRecord,
-    TorrentState, TunnelEvent, VpnServer, VpnSwitch,
+    PointsReserve, Progress, Ratio, RatioUse, Reach, RecordId, RegistryEvent, SavePath,
+    SavedRatioGuard, SettingsEvent, StartupEvent, StartupMode, Torrent, TorrentHash, TorrentLimits,
+    TorrentName, TorrentRecord, TorrentState, TunnelEvent, VpnServer, VpnSwitch,
 };
 
 use super::{notify, qbittorrent::torrent_state};
@@ -24,8 +24,9 @@ use super::{notify, qbittorrent::torrent_state};
 /// history entries; version 4 adds the torrent registry and VPN state; version 5
 /// adds the ntfy topic; version 6 adds held torrents, kept torrent files, MAM
 /// state, and the points reserve; version 7 adds snatched bookmarks; version 8
-/// adds the notifications log; version 9 adds the torrent limits.
-const SCHEMA_VERSION: i64 = 9;
+/// adds the notifications log; version 9 adds the torrent limits; version 10
+/// adds the ratio guard.
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_V1: &str = "CREATE TABLE mam_configuration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -171,9 +172,16 @@ const SCHEMA_V8: &str = "CREATE TABLE notices (
 const SCHEMA_V9: &str = "ALTER TABLE settings ADD COLUMN max_downloading INTEGER;
 ALTER TABLE settings ADD COLUMN max_active INTEGER;";
 
+/// The ratio guard: the downloaded figure watched, and when ratio use was
+/// seen, with the figure then. Sizes are bytes; times are Unix seconds.
+const SCHEMA_V10: &str = "ALTER TABLE mam_state ADD COLUMN downloaded_watched INTEGER;
+ALTER TABLE mam_state ADD COLUMN ratio_used_at INTEGER;
+ALTER TABLE mam_state ADD COLUMN ratio_used_downloaded INTEGER;";
+
 /// The changes from each version to the next, starting from version 1.
-const UPGRADES: [&str; 8] = [
+const UPGRADES: [&str; 9] = [
     SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V10,
 ];
 
 type StorageResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -205,6 +213,7 @@ pub(super) enum Operation {
     ReadMamState,
     SaveRegistrationAttempt(SystemTime),
     SaveReminder(SystemTime),
+    SaveRatioGuard(SavedRatioGuard),
     ReadNoticeLog,
     SaveNotice(Logged, Option<NoticeId>),
 }
@@ -278,6 +287,10 @@ pub(super) fn execute(path: &Path, operation: Operation) -> Result<Event, Failed
             save_mam_time(path, "last_reminder_at", at)
                 .map(|()| Event::Mam(MamEvent::ReminderSaved)),
             Event::Mam(MamEvent::ReminderSaveFailed),
+        ),
+        Operation::SaveRatioGuard(guard) => (
+            save_ratio_guard(path, guard).map(|()| Event::Mam(MamEvent::RatioGuardSaved)),
+            Event::Mam(MamEvent::RatioGuardSaveFailed),
         ),
         Operation::ReadNoticeLog => (
             read_notice_log(path),
@@ -479,19 +492,71 @@ fn write_points_reserve(path: &Path, reserve: PointsReserve) -> StorageResult<Ev
     Ok(Event::Settings(SettingsEvent::PointsReserveWritten))
 }
 
+/// The MAM state row's columns, each optional.
+type MamStateRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
 fn read_mam_state(path: &Path) -> StorageResult<Event> {
-    let stored: Option<(Option<i64>, Option<i64>)> = connection(path)?
+    let stored: Option<MamStateRow> = connection(path)?
         .query_row(
-            "SELECT last_registration_at, last_reminder_at FROM mam_state WHERE singleton = 1",
+            "SELECT last_registration_at, last_reminder_at, downloaded_watched, ratio_used_at, \
+             ratio_used_downloaded FROM mam_state WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let (registration, reminder) = stored.unwrap_or_default();
+    let (registration, reminder, watched, used_at, used_downloaded) = stored.unwrap_or_default();
+    let bytes =
+        |bytes: i64| -> StorageResult<ByteSize> { Ok(ByteSize::new(u64::try_from(bytes)?)) };
+    let ratio_guard = match (watched, used_at, used_downloaded) {
+        (None, None, None) => SavedRatioGuard::Unset,
+        (Some(watched), None, None) => SavedRatioGuard::Watching(bytes(watched)?),
+        (Some(before), Some(at), Some(after)) => SavedRatioGuard::Tripped(RatioUse {
+            before: bytes(before)?,
+            after: bytes(after)?,
+            at: time_from_seconds(at)?,
+        }),
+        _ => return Err(invalid_data("an incomplete ratio guard").into()),
+    };
     Ok(Event::Mam(MamEvent::StateRead {
         last_registration: registration.map(time_from_seconds).transpose()?,
         last_reminder: reminder.map(time_from_seconds).transpose()?,
+        ratio_guard,
     }))
+}
+
+fn save_ratio_guard(path: &Path, guard: SavedRatioGuard) -> StorageResult<()> {
+    let (watched, used_at, used_downloaded) = match guard {
+        SavedRatioGuard::Unset => (None, None, None),
+        SavedRatioGuard::Watching(watched) => (Some(integer(watched.bytes())), None, None),
+        SavedRatioGuard::Tripped(used) => (
+            Some(integer(used.before.bytes())),
+            Some(seconds(used.at)),
+            Some(integer(used.after.bytes())),
+        ),
+    };
+    connection(path)?.execute(
+        "INSERT INTO mam_state(singleton, downloaded_watched, ratio_used_at, ratio_used_downloaded)
+         VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(singleton) DO UPDATE SET downloaded_watched = excluded.downloaded_watched,
+             ratio_used_at = excluded.ratio_used_at,
+             ratio_used_downloaded = excluded.ratio_used_downloaded",
+        params![watched, used_at, used_downloaded],
+    )?;
+    Ok(())
 }
 
 /// Save one of the MAM state times; `column` is one of this module's names.
@@ -1411,6 +1476,64 @@ mod tests {
     }
 
     #[test]
+    fn the_ratio_guard_round_trips_and_partial_rows_fail() -> TestResult {
+        use crate::core::{MamEvent, RatioUse, SavedRatioGuard};
+
+        let storage = storage()?;
+        let path = &storage.path;
+        let read = |guard| {
+            Event::Mam(MamEvent::StateRead {
+                last_registration: None,
+                last_reminder: None,
+                ratio_guard: guard,
+            })
+        };
+        let tripped = SavedRatioGuard::Tripped(RatioUse {
+            before: ByteSize::new(10),
+            after: ByteSize::new(30),
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+        });
+        for guard in [
+            SavedRatioGuard::Watching(ByteSize::new(10)),
+            tripped,
+            SavedRatioGuard::Unset,
+        ] {
+            assert_eq!(
+                outcome(path, Operation::SaveRatioGuard(guard)),
+                Event::Mam(MamEvent::RatioGuardSaved)
+            );
+            assert_eq!(outcome(path, Operation::ReadMamState), read(guard));
+        }
+        for corrupt in [
+            "UPDATE mam_state SET ratio_used_at = 5;",
+            "UPDATE mam_state SET downloaded_watched = -1, ratio_used_at = NULL;",
+        ] {
+            assert!(storage.connection.execute_batch(corrupt).is_ok());
+            assert_eq!(
+                outcome(path, Operation::ReadMamState),
+                Event::Mam(MamEvent::StateReadFailed),
+                "{corrupt}"
+            );
+        }
+        let missing = path.with_file_name("missing.sqlite");
+        assert_eq!(
+            outcome(&missing, Operation::SaveRatioGuard(tripped)),
+            Event::Mam(MamEvent::RatioGuardSaveFailed)
+        );
+        assert!(
+            storage
+                .connection
+                .execute_batch("ALTER TABLE mam_state DROP COLUMN ratio_used_at;")
+                .is_ok()
+        );
+        assert_eq!(
+            outcome(path, Operation::SaveRatioGuard(tripped)),
+            Event::Mam(MamEvent::RatioGuardSaveFailed)
+        );
+        Ok(())
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "one table of every MAM storage operation and its failure"
@@ -1430,6 +1553,7 @@ mod tests {
                 Event::Mam(MamEvent::StateRead {
                     last_registration: None,
                     last_reminder: None,
+                    ratio_guard: crate::core::SavedRatioGuard::Unset,
                 }),
             ),
             (
@@ -1445,6 +1569,7 @@ mod tests {
                 Event::Mam(MamEvent::StateRead {
                     last_registration: Some(at(1_000)),
                     last_reminder: Some(at(2_000)),
+                    ratio_guard: crate::core::SavedRatioGuard::Unset,
                 }),
             ),
             (

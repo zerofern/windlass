@@ -15,6 +15,9 @@ use crate::core::{ClientVersion, Ratio, Urgency};
 
 /// How often the account is read.
 pub const ACCOUNT_READ_EVERY: Duration = Duration::from_mins(15);
+/// While Windlass has a download running, the account is read this often, so
+/// ratio use is caught soon.
+pub const ACCOUNT_READ_WHILE_DOWNLOADING: Duration = Duration::from_mins(5);
 /// How often the client list is included; MAM caches it for 30 minutes.
 pub const CLIENT_STATS_EVERY: Duration = Duration::from_mins(30);
 /// A reading this recent may admit a download or allow a purchase.
@@ -138,6 +141,15 @@ pub struct PurchaseRecord {
     vip_weeks: Option<VipWeeks>,
 }
 
+/// How often the account is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadPace {
+    /// Every 15 minutes.
+    Routine,
+    /// Every 5 minutes, while Windlass has a download running.
+    Downloading,
+}
+
 /// Whether MAM sold what Windlass tried to buy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Sale {
@@ -166,6 +178,7 @@ pub struct Account {
     pub client_list: Option<ClientList>,
     client_stats_read: Option<Instant>,
     last_request: Option<Instant>,
+    pace: ReadPace,
     refused: Option<Instant>,
 }
 
@@ -187,6 +200,7 @@ impl Account {
             client_list: None,
             client_stats_read: None,
             last_request: None,
+            pace: ReadPace::Routine,
             refused: None,
         }
     }
@@ -236,7 +250,7 @@ impl Account {
         if self.last_failure.is_some() && self.next_read.is_some_and(|retry_at| now < retry_at) {
             return None;
         }
-        let routine = self.next_read.is_none_or(|next| next <= now);
+        let routine = self.routine_due().is_none_or(|next| next <= now);
         let early = early
             && self
                 .last_request
@@ -268,10 +282,29 @@ impl Account {
                     .and_then(|last| last.checked_add(EARLY_READ_SPACING))
             })
             .flatten();
-        match (self.next_read, early) {
+        match (self.routine_due(), early) {
             (Some(next), Some(early)) => Some(next.min(early)),
             (next, early) => next.or(early),
         }
+    }
+
+    /// Read at this pace from now on.
+    pub(super) const fn pace(&mut self, pace: ReadPace) {
+        self.pace = pace;
+    }
+
+    /// When the next routine reading is due; now when absent. While a download
+    /// runs, a reading is due five minutes after the last.
+    fn routine_due(&self) -> Option<Instant> {
+        let downloading = match self.pace {
+            ReadPace::Downloading => self
+                .reading
+                .as_ref()
+                .and_then(|reading| reading.taken.checked_add(ACCOUNT_READ_WHILE_DOWNLOADING)),
+            ReadPace::Routine => None,
+        };
+        self.next_read
+            .map(|next| downloading.map_or(next, |downloading| next.min(downloading)))
     }
 
     /// Store a reading; whether it settled an uncertain purchase, and how.

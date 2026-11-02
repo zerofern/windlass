@@ -197,6 +197,11 @@ pub enum Action {
         /// When it is made.
         at: SystemTime,
     },
+    /// Save the ratio guard, so it holds across restarts.
+    SaveRatioGuard {
+        /// The guard.
+        guard: SavedRatioGuard,
+    },
     /// Save when the owner was last reminded to visit MAM.
     SaveReminder {
         /// When.
@@ -231,24 +236,25 @@ pub use history::{HistoryEvent, HistoryState, Step, Trim};
 pub use http_status::HttpStatus;
 pub use machine::{Core, State};
 pub use mam::{
-    ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Acquisition, Asn, Attention, BOOKMARKS_EVERY,
-    BookTitle, BookTitleError, Bookmark, BookmarkCount, BookmarkPage, Bookmarks, Budget,
-    CLIENT_STATS_EVERY, CategoryName, CategoryNameError, ClassName, ClassNameError, ClientList,
-    ClientListing, ClientRefusal, ClientStanding, Connectability, Connectable, Connection,
-    ConnectionEpoch, DownloadWatch, FetchedTorrent, Findings, Freeleech, HISTORY_FRESH_FOR, Hold,
-    IpFinding, IpObservation, IpStanding, LOOKUP_FRESH_FOR, LOOKUP_SPACING, LastAttempt,
-    LastReminder, LeaseRenewal, Listed, ListedClient, Lookup, MAX_BOOKMARK_PAGES, Mam, MamEvent,
-    MamFailure, MamHosts, MamListing, MamMessage, MamMessageError, MamNotices, MamReply,
-    MamRequest, Network, NetworkName, NetworkNameError, NoticeCount, OBSERVE_EVERY, Observed,
-    Outstanding, Partials, PersonalFreeleech, Points, PortFinding, Purchase, PurchaseOutcome,
-    PurchaseRecord, RATIO_FLOOR, RATIO_URGENT, RECENT_ADMISSION, REGISTRATION_SPACING,
-    REMINDER_EVERY, REPAIR_SETTLES_AFTER, REQUEST_BURST, REQUEST_REFILL, Reading, RedCategory,
-    RedKind, Registration, RegistrationAllowance, RegistrationFailure, RequestGate, Sale, Seedbox,
-    SeedboxConfirmation, SeedboxStatus, Session as MamSession, SessionRejection, SettledBy,
-    SnatchSummary, Snatched, Tokens, TorrentCount, UNSATISFIED_RESERVE, UnsatisfiedCount,
-    UnsatisfiedLimit, UserClass, UserData, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN,
-    VIP_WARN_WITHIN, VipTorrent, WATCH_FRESH_FOR, WEDGE_RECORDED_AFTER, Wedge, WedgeAccounting,
-    WedgeCount, WedgeHistory, WedgeSpent,
+    ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, ACCOUNT_READ_WHILE_DOWNLOADING, Account, Acquisition,
+    Asn, Attention, BOOKMARKS_EVERY, BookTitle, BookTitleError, Bookmark, BookmarkCount,
+    BookmarkPage, Bookmarks, Budget, CLIENT_STATS_EVERY, CategoryName, CategoryNameError,
+    ClassName, ClassNameError, ClientList, ClientListing, ClientRefusal, ClientStanding,
+    Connectability, Connectable, Connection, ConnectionEpoch, DownloadWatch, FetchedTorrent,
+    Findings, Freeleech, HISTORY_FRESH_FOR, Hold, IpFinding, IpObservation, IpStanding,
+    LOOKUP_FRESH_FOR, LOOKUP_SPACING, LastAttempt, LastReminder, LeaseRenewal, Listed,
+    ListedClient, Lookup, MAX_BOOKMARK_PAGES, Mam, MamEvent, MamFailure, MamHosts, MamListing,
+    MamMessage, MamMessageError, MamNotices, MamReply, MamRequest, Network, NetworkName,
+    NetworkNameError, NoticeCount, OBSERVE_EVERY, Observed, Outstanding, Partials,
+    PersonalFreeleech, Points, PortFinding, Purchase, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR,
+    RATIO_URGENT, RECENT_ADMISSION, REGISTRATION_SPACING, REMINDER_EVERY, REPAIR_SETTLES_AFTER,
+    REQUEST_BURST, REQUEST_REFILL, RatioGuard, RatioUse, Reading, RedCategory, RedKind,
+    Registration, RegistrationAllowance, RegistrationFailure, RequestGate, Sale, SavedRatioGuard,
+    Seedbox, SeedboxConfirmation, SeedboxStatus, Session as MamSession, SessionRejection,
+    SettledBy, SnatchSummary, Snatched, Tokens, TorrentCount, UNSATISFIED_RESERVE,
+    UnsatisfiedCount, UnsatisfiedLimit, UserClass, UserData, VIP_FILL, VIP_PRICE_PER_WEEK,
+    VIP_RENEW_WITHIN, VIP_WARN_WITHIN, VipTorrent, WATCH_FRESH_FOR, WEDGE_RECORDED_AFTER, Wedge,
+    WedgeAccounting, WedgeCount, WedgeHistory, WedgeSpent,
 };
 pub use mam_pause::{
     MamPauseEvent, MamPreferencePersistence, MamPreferenceState, MamPreferenceUpdate,

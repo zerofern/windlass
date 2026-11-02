@@ -300,6 +300,7 @@ impl Shell {
             Action::ReadMamState => Operation::ReadMamState,
             Action::SaveRegistrationAttempt { at } => Operation::SaveRegistrationAttempt(at),
             Action::SaveReminder { at } => Operation::SaveReminder(at),
+            Action::SaveRatioGuard { guard } => Operation::SaveRatioGuard(guard),
             Action::WriteNtfyTopic { topic } => Operation::WriteNtfyTopic(topic),
             Action::ReadLastVpnSwitch => Operation::ReadLastVpnSwitch,
             Action::SaveVpnSwitch { switch } => Operation::SaveVpnSwitch(switch),

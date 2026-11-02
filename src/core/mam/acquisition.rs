@@ -11,8 +11,8 @@ use serde::Serialize;
 
 use super::{
     Bookmark, BookmarkCount, BookmarkPage, ClientReadiness, Freeleech, MamFailure,
-    PersonalFreeleech, RequestGate, SeedboxConfirmation, UnsatisfiedCount, UnsatisfiedLimit, Wedge,
-    WedgeSpent,
+    PersonalFreeleech, RatioGuard, RequestGate, SeedboxConfirmation, UnsatisfiedCount,
+    UnsatisfiedLimit, Wedge, WedgeSpent,
     account::{Account, ClientStanding},
 };
 use crate::core::{
@@ -77,6 +77,11 @@ pub enum Hold {
     },
     /// The torrent needs a wedge and none is left.
     NoWedge,
+    /// MAM counted downloaded bytes against the ratio; downloads stay stopped
+    /// until the owner checks.
+    RatioUsed,
+    /// The ratio guard's saved state is not read yet, or could not be.
+    RatioGuardUnknown,
     /// The queued torrents are no longer bookmarked, or MAM no longer lists them.
     NotBookmarked,
 }
@@ -275,6 +280,7 @@ pub(super) struct Facts<'a> {
     /// Windlass's downloads that are running and not finished.
     pub(super) downloading: TorrentCount,
     pub(super) downloading_limit: DownloadingLimit,
+    pub(super) ratio_guard: RatioGuard,
     pub(super) account: &'a Account,
 }
 
@@ -434,6 +440,13 @@ impl Acquisition {
         }
         if self.refused.is_some() {
             return Next::Hold(Hold::DownloadsRefused);
+        }
+        match facts.ratio_guard {
+            RatioGuard::Watching(_) => {}
+            RatioGuard::Tripped(_) => return Next::Hold(Hold::RatioUsed),
+            RatioGuard::Reading | RatioGuard::ReadFailed => {
+                return Next::Hold(Hold::RatioGuardUnknown);
+            }
         }
         if facts.readiness == ClientReadiness::NotReady {
             return Next::Hold(Hold::ClientUnavailable);

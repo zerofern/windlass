@@ -38,6 +38,7 @@ core scenarios with simulated time, and end to end only for their wiring.
 | 12 | Admit a download: gates and the wedge decision | Yes | Yes | – |
 | 13 | Fetch and add a download | Yes | Yes | – |
 | 14 | Keep running downloads free | Yes | Yes | – |
+| 14a | Never use ratio: stop everything if MAM counts a download | Yes | Yes | – |
 | 15 | Watch the account | Yes | **No** | – |
 | 16 | Check MAM's client list (A5) | Yes | **No** | – |
 | 17 | Keep qBittorrent connectable (A6) | Yes | **No** | – |
@@ -238,13 +239,34 @@ core scenarios with simulated time, and end to end only for their wiring.
   `core/mam/mod.rs` (`follow_downloads`).
 - **Tested:** `tests/mam_core.rs`; E5 and E5b end to end.
 - **Known limit:** MAM gives no end time for site-wide freeleech, so up to about
-  15 minutes of a download can fall after it ends.
+  15 minutes of a download can fall after it ends. Flow 14a catches it if that
+  happens.
+
+### 14a. Never use ratio
+
+- **Trigger:** every account reading: every 5 minutes while a download Windlass
+  added is running, every 15 otherwise; the owner's check on the dashboard.
+- **Does:** Windlass only downloads what MAM does not count against the ratio,
+  so MAM's downloaded figure must never rise. The figure is saved and compared
+  across restarts, so bytes counted while Windlass was stopped are caught too.
+  When it rises, even by one byte, Windlass stops every unfinished download it
+  added, starts none, pushes an urgent notice, and stays stopped across
+  restarts until the owner says on the dashboard that they checked. Then it
+  watches from the latest figure. A lower figure, such as a correction by
+  staff, is watched from then on. If the saved figure cannot be read, no
+  download starts.
+- **Where:** `core/mam/ratio_guard.rs`, `core/mam/mod.rs` (`follow_downloads`),
+  `shell/storage.rs` (`mam_state`), `shell/web/mam_pages.rs`.
+- **Tested:** `tests/mam_core.rs` (`ratio_use_*`, `the_first_reading_sets_*`,
+  `without_the_saved_guard_*`), storage and dashboard unit tests, and E9 end to
+  end.
 
 ## Account safety and spending
 
 ### 15. Watch the account
 
-- **Trigger:** every account reading (15 minutes; client list every 30).
+- **Trigger:** every account reading (15 minutes, or 5 while a download runs;
+  client list every 30).
 - **Does:** reports a ratio below 2.0 (urgent below 1.1), unsatisfied torrents at
   80% of MAM's limit, unsatisfied torrents not seeding, partial downloads, tracker
   errors and other red categories, MAM notification counts, points below the
@@ -352,6 +374,7 @@ and a fake qBittorrent, driven over HTTP.
 | E5b. A download no longer free and no longer bookmarked is looked up by itself, stopped with no wedge left, and resumed once free | 14, 22 | `a_download_that_cannot_be_wedged_stops_and_resumes_when_free` |
 | E6, E7. Restarts and request counts are checked inside E5 and E5b: no lookup for a bookmarked download, one for an un-bookmarked one, no second registration, no broken rule | 10, 14, 22 | (in E5, E5b) |
 | E8. Account flags and the client list produce notices and holds | 15, 16 | Planned, after the client list capture |
+| E9. Ratio counted while Windlass was stopped stops the download after a restart, across another restart, until the owner checks on the dashboard | 14a, 22 | `ratio_use_stops_downloads_until_the_owner_checks` |
 
 Each test starts Windlass, which waits a minute before its first IP lookup, so
 the end-to-end tests take about three minutes in all.

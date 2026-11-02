@@ -635,13 +635,26 @@ async fn older_storage_is_upgraded_and_newer_storage_is_refused() -> TestResult 
         "ALTER TABLE settings DROP COLUMN max_downloading; \
          ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; DROP TABLE torrent_files; DROP TABLE mam_state; \
          ALTER TABLE settings DROP COLUMN points_reserve; PRAGMA user_version = 5;",
-        "ALTER TABLE settings DROP COLUMN max_downloading; \
+        "ALTER TABLE mam_state DROP COLUMN downloaded_watched; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_at; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_downloaded; \
+         ALTER TABLE settings DROP COLUMN max_downloading; \
          ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; INSERT INTO torrents (id, mam_id, origin, desired, deletion_allowed) \
          VALUES (1, 5, 'bookmark', 'held', 0); PRAGMA user_version = 6;",
-        "ALTER TABLE settings DROP COLUMN max_downloading; \
+        "ALTER TABLE mam_state DROP COLUMN downloaded_watched; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_at; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_downloaded; \
+         ALTER TABLE settings DROP COLUMN max_downloading; \
          ALTER TABLE settings DROP COLUMN max_active; DROP TABLE notices; PRAGMA user_version = 7;",
-        "ALTER TABLE settings DROP COLUMN max_downloading; \
+        "ALTER TABLE mam_state DROP COLUMN downloaded_watched; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_at; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_downloaded; \
+         ALTER TABLE settings DROP COLUMN max_downloading; \
          ALTER TABLE settings DROP COLUMN max_active; PRAGMA user_version = 8;",
+        "ALTER TABLE mam_state DROP COLUMN downloaded_watched; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_at; \
+         ALTER TABLE mam_state DROP COLUMN ratio_used_downloaded; \
+         PRAGMA user_version = 9;",
     ] {
         let older = tempfile::tempdir()?;
         let older_path = older.path().join("windlass.sqlite");
@@ -737,6 +750,9 @@ async fn redownload_requests_name_a_registry_row() -> TestResult {
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(location, "/");
     }
+    let (status, location, _) = dashboard.post("/mam/ratio/checked", "").await?;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location, "/");
     let (status, location, _) = dashboard.post("/torrents/redownload", "record=5").await?;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location, "/");
@@ -823,6 +839,7 @@ async fn commands_after_shutdown_are_refused() -> TestResult {
         ("/settings/api-cookie/clear", ""),
         ("/notifications/test", ""),
         ("/mam/purchase/checked", "made=yes"),
+        ("/mam/ratio/checked", ""),
         ("/torrents/redownload", "record=1"),
     ] {
         let (status, _, _) = dashboard.post(uri, form).await?;

@@ -14,9 +14,9 @@ use windlass::core::{
     MamNotices, MamPauseEvent, MamReply, MamRequest, MamRequestMode, MamSession, MamTorrentId,
     Notice, NotificationEvent, PersonalFreeleech, Points, Port, PortFinding, PortForwardingEvent,
     Purchase, QbittorrentEvent, QbittorrentPreferences, Registration, Registry, RegistryEvent,
-    SeedboxStatus, SessionRejection, SettingsEvent, SnatchSummary, StartupEvent, StartupMode,
-    SyncPosition, SyncUpdate, TimerId, TimerName, TorrentCommand, TorrentHash, TorrentRecord,
-    TunnelEvent, UserData, WedgeSpent,
+    SavedRatioGuard, SeedboxStatus, SessionRejection, SettingsEvent, SnatchSummary, StartupEvent,
+    StartupMode, SyncPosition, SyncUpdate, TimerId, TimerName, TorrentCommand, TorrentHash,
+    TorrentRecord, TunnelEvent, UserData, WedgeSpent,
 };
 use windlass::core::{
     BookTitle, BookmarkCount, ClientRefusal, Freeleech, Partials, Snatched, TorrentCount,
@@ -61,6 +61,8 @@ struct Setup {
     /// The registry's rows; `None` when it cannot be read.
     rows: Option<Vec<TorrentRecord>>,
     client: bool,
+    /// The saved ratio guard.
+    ratio_guard: SavedRatioGuard,
 }
 
 impl Default for Setup {
@@ -70,14 +72,16 @@ impl Default for Setup {
             last_registration: None,
             rows: Some(Vec::new()),
             client: true,
+            ratio_guard: SavedRatioGuard::Unset,
         }
     }
 }
 
 impl Harness {
     /// A started core with MAM requests running, VPN protection, a connected
-    /// qBittorrent, and MAM enabled. Returns the actions of the last step.
-    fn start(setup: Setup) -> (Self, Vec<Action>) {
+    /// qBittorrent, and MAM enabled, at the moment MAM was enabled. Returns the
+    /// actions of the last step.
+    fn begin(setup: Setup) -> (Self, Vec<Action>) {
         let mut harness = Self {
             core: Core::new(),
             start: Instant::now(),
@@ -111,6 +115,7 @@ impl Harness {
             Event::Mam(MamEvent::StateRead {
                 last_registration: setup.last_registration.and_then(|ago| now.checked_sub(ago)),
                 last_reminder: Some(now),
+                ratio_guard: setup.ratio_guard,
             }),
             Event::Tunnel(TunnelEvent::Enable {
                 servers: Vec::new(),
@@ -135,6 +140,12 @@ impl Harness {
             let _ = harness.sync(Vec::new());
         }
         let actions = harness.send(Event::Mam(MamEvent::Enable));
+        (harness, actions)
+    }
+
+    /// A started core, as `begin` leaves it, once the first minute passed.
+    fn start(setup: Setup) -> (Self, Vec<Action>) {
+        let (mut harness, actions) = Self::begin(setup);
         // The first IP lookup waits a minute after a start, since a previous
         // run may have just made one; let that minute pass.
         let actions = if timer(&actions, TimerName::Mam)
@@ -1604,7 +1615,14 @@ fn a_failed_lookup_is_tried_again_after_a_wait() {
     let actions = harness.answer(Err(MamFailure::Unreachable));
     let actions = without_bookmarks(&mut harness, actions);
     assert!(requests(&actions).is_empty(), "{actions:?}");
+    // A download is running, so the account is read every five minutes; the
+    // lookup is tried again after it.
     let actions = harness.later(Duration::from_mins(5));
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::LoadUserData { .. }]
+    ));
+    let actions = harness.answer(read(account(harness.wall())));
     assert_eq!(
         requests(&actions),
         [MamRequest::LookUpTorrent { id: torrent_id(1) }]
@@ -1650,7 +1668,8 @@ fn no_download_starts_while_the_downloading_limit_is_reached() {
         .zip(fills)
         .map(|(id, fill)| download_row(id, fill, Duration::from_hours(3), false, now))
         .collect::<Vec<_>>();
-    // Five running downloads, the default limit; the sixth is held.
+    // Five running downloads, the default limit; the sixth is held, and MAM
+    // no longer lists it, so it stays held.
     let mut rows = rows;
     if let Some(held) = rows.last_mut() {
         held.desired = Desired::Held;
@@ -1668,9 +1687,13 @@ fn no_download_starts_while_the_downloading_limit_is_reached() {
         listing
     };
     let listings: Vec<Bookmark> = std::iter::once(bookmark(1))
-        .chain((2..=7).map(free))
+        .chain((2..=6).map(free))
         .collect();
     let _ = harness.checked(actions, &listings);
+    assert_eq!(
+        harness.record(7).map(|record| record.desired),
+        Some(Desired::Held)
+    );
     assert_eq!(
         harness.mam().acquisition.hold,
         Some(Hold::DownloadingLimit {
@@ -1714,6 +1737,230 @@ fn running_download(listing: Bookmark, wedges: u32) -> (Harness, Vec<Action>) {
     );
     let actions = harness.answer(Ok(MamReply::Torrent(Some(Box::new(listing)))));
     (harness, actions)
+}
+
+/// A free listing for this torrent.
+fn free_listing(id: u64) -> Bookmark {
+    let mut listing = bookmark(id);
+    listing.freeleech = Freeleech::ForEveryone;
+    listing
+}
+
+/// The saves of the ratio guard among these actions.
+fn guard_saves(actions: &[Action]) -> Vec<SavedRatioGuard> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::SaveRatioGuard { guard } => Some(*guard),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn ratio_use_stops_every_download_until_the_owner_checks() {
+    let (mut harness, actions) = running_download(free_listing(1), 200);
+    let _ = harness.checked(actions, &[free_listing(1)]);
+    assert_eq!(
+        harness.mam().ratio_guard,
+        windlass::core::RatioGuard::Watching(Some(ByteSize::new(0)))
+    );
+    // A download is running, so the next reading comes five minutes later; MAM
+    // now counts a gigabyte downloaded.
+    let actions = harness.later(Duration::from_mins(5));
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::LoadUserData { .. }]
+    ));
+    let mut used = account(harness.wall());
+    used.downloaded = ByteSize::new(GIB);
+    let actions = harness.answer(read(used));
+    let tripped = windlass::core::RatioUse {
+        before: ByteSize::new(0),
+        after: ByteSize::new(GIB),
+        at: harness.wall(),
+    };
+    assert_eq!(guard_saves(&actions), [SavedRatioGuard::Tripped(tripped)]);
+    assert!(harness.notices().contains(&Notice::RatioUsed {
+        counted: ByteSize::new(GIB)
+    }));
+    assert_eq!(
+        harness.record(1).map(|record| record.desired),
+        Some(Desired::Held)
+    );
+    // Even a free download stays stopped, and nothing new starts.
+    let actions = harness.checked(actions, &[free_listing(1)]);
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::FetchTorrent { .. })),
+        "{actions:?}"
+    );
+    assert_eq!(
+        harness.record(1).map(|record| record.desired),
+        Some(Desired::Held)
+    );
+    // The owner checked; the download is free, so it runs again, and the
+    // figure watched is the latest MAM reported.
+    let actions = harness.send(Event::Mam(MamEvent::RatioUseChecked));
+    assert_eq!(
+        guard_saves(&actions),
+        [SavedRatioGuard::Watching(ByteSize::new(GIB))]
+    );
+    assert!(harness.notices().contains(&Notice::RatioUseChecked));
+    assert_eq!(
+        harness.record(1).map(|record| record.desired),
+        Some(Desired::Active)
+    );
+    // A second check changes nothing.
+    let actions = harness.send(Event::Mam(MamEvent::RatioUseChecked));
+    assert!(guard_saves(&actions).is_empty());
+}
+
+#[test]
+fn ratio_use_holds_every_queued_download() {
+    let (mut harness, actions) = Harness::start(Setup {
+        ratio_guard: SavedRatioGuard::Watching(ByteSize::new(0)),
+        ..Setup::default()
+    });
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    // Even one byte trips the guard.
+    let mut used = account(harness.wall());
+    used.downloaded = ByteSize::new(1);
+    let actions = harness.answer(read(used));
+    assert!(harness.notices().contains(&Notice::RatioUsed {
+        counted: ByteSize::new(1)
+    }));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::ListBookmarks {
+            start: windlass::core::BookmarkCount::new(0)
+        }]
+    );
+    let actions = harness.answer(listed(vec![free_listing(5)]));
+    let actions = harness.checked(actions, &[free_listing(5)]);
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::FetchTorrent { .. })),
+        "{actions:?}"
+    );
+    assert_eq!(harness.mam().acquisition.hold, Some(Hold::RatioUsed));
+}
+
+#[test]
+fn the_first_reading_sets_the_figure_watched_and_a_fall_replaces_it() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let mut first = account(harness.wall());
+    first.downloaded = ByteSize::new(5 * GIB);
+    let actions = harness.answer(read(first.clone()));
+    assert_eq!(
+        guard_saves(&actions),
+        [SavedRatioGuard::Watching(ByteSize::new(5 * GIB))]
+    );
+    let _ = without_bookmarks(&mut harness, actions);
+    // The same figure saves nothing.
+    let _ = harness.later(Duration::from_mins(15));
+    let actions = harness.answer(read(first.clone()));
+    assert!(guard_saves(&actions).is_empty());
+    let _ = without_bookmarks(&mut harness, actions);
+    // A lower figure, such as a correction by staff, is watched from now on.
+    let _ = harness.later(Duration::from_mins(15));
+    let mut corrected = first;
+    corrected.downloaded = ByteSize::new(4 * GIB);
+    let actions = harness.answer(read(corrected));
+    assert_eq!(
+        guard_saves(&actions),
+        [SavedRatioGuard::Watching(ByteSize::new(4 * GIB))]
+    );
+    assert!(
+        !harness
+            .notices()
+            .iter()
+            .any(|notice| matches!(notice, Notice::RatioUsed { .. }))
+    );
+}
+
+#[test]
+fn ratio_used_before_a_restart_or_while_windlass_was_stopped_is_caught() {
+    // A trip saved before the restart still holds.
+    let used = windlass::core::RatioUse {
+        before: ByteSize::new(0),
+        after: ByteSize::new(GIB),
+        at: SystemTime::UNIX_EPOCH + EPOCH,
+    };
+    let (mut harness, actions) = Harness::start(Setup {
+        ratio_guard: SavedRatioGuard::Tripped(used),
+        ..Setup::default()
+    });
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    // A reading with the figure unchanged does not lift it.
+    let actions = harness.answer(read(account(harness.wall())));
+    assert!(guard_saves(&actions).is_empty());
+    assert_eq!(
+        harness.mam().ratio_guard,
+        windlass::core::RatioGuard::Tripped(used)
+    );
+    // Bytes MAM counted while Windlass was stopped trip it after the restart.
+    let (mut harness, actions) = Harness::start(Setup {
+        ratio_guard: SavedRatioGuard::Watching(ByteSize::new(GIB)),
+        ..Setup::default()
+    });
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let mut later = account(harness.wall());
+    later.downloaded = ByteSize::new(2 * GIB);
+    let _ = harness.answer(read(later));
+    assert!(harness.notices().contains(&Notice::RatioUsed {
+        counted: ByteSize::new(GIB)
+    }));
+}
+
+#[test]
+fn without_the_saved_guard_no_download_starts() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let _ = harness.send(Event::Mam(MamEvent::StateReadFailed));
+    assert_eq!(
+        harness.mam().ratio_guard,
+        windlass::core::RatioGuard::ReadFailed
+    );
+    // A reading cannot set a figure to watch: what was saved is unknown.
+    let actions = harness.answer(read(account(harness.wall())));
+    assert!(guard_saves(&actions).is_empty());
+    let actions = harness.answer(listed(vec![free_listing(5)]));
+    let actions = harness.checked(actions, &[free_listing(5)]);
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::FetchTorrent { .. })),
+        "{actions:?}"
+    );
+    assert_eq!(
+        harness.mam().acquisition.hold,
+        Some(Hold::RatioGuardUnknown)
+    );
+}
+
+#[test]
+fn the_account_is_read_every_fifteen_minutes_without_a_running_download() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let actions = harness.answer(read(account(harness.wall())));
+    let _ = without_bookmarks(&mut harness, actions);
+    let actions = harness.later(Duration::from_mins(5));
+    assert!(requests(&actions).is_empty(), "{actions:?}");
+    let actions = harness.later(Duration::from_mins(10));
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::LoadUserData { .. }]
+    ));
 }
 
 #[test]
@@ -1810,8 +2057,14 @@ fn a_download_whose_freeleech_ends_is_wedged_while_it_runs() {
     ));
     let actions = harness.checked(actions, &[]);
     let _ = without_bookmarks(&mut harness, actions);
-    // Not bookmarked, so it is looked up by itself, and not again soon.
+    // Not bookmarked, so it is looked up by itself, and not again soon. A
+    // download is running, so the account is read every five minutes.
     let actions = harness.later(Duration::from_mins(10));
+    assert!(matches!(
+        requests(&actions).as_slice(),
+        [MamRequest::LoadUserData { .. }]
+    ));
+    let actions = harness.answer(read(account(harness.wall())));
     let actions = without_bookmarks(&mut harness, actions);
     assert!(
         !requests(&actions)
@@ -1823,15 +2076,15 @@ fn a_download_whose_freeleech_ends_is_wedged_while_it_runs() {
     let actions = harness.later(Duration::from_mins(6));
     let actions = harness.respond(actions, &bookmark(1));
     assert!(requests(&actions).is_empty(), "{actions:?}");
-    // Freeleech ends; the next check finds it, and spending a wedge needs a
-    // fresh count of wedges.
+    // Freeleech ends. The routine reading comes first, then the next check
+    // finds it, and the wedge is spent with that fresh count of wedges.
     let actions = harness.later(Duration::from_mins(6));
-    let actions = harness.checked(actions, &[bookmark(1)]);
     assert!(matches!(
         requests(&actions).as_slice(),
         [MamRequest::LoadUserData { .. }]
     ));
     let actions = harness.answer(read(account(harness.wall())));
+    let actions = harness.checked(actions, &[bookmark(1)]);
     assert_eq!(
         requests(&actions),
         [MamRequest::FetchTorrent {
@@ -1857,6 +2110,50 @@ fn a_download_whose_freeleech_ends_is_wedged_while_it_runs() {
     assert_eq!(
         harness.record(1).map(|record| record.desired),
         Some(Desired::Active)
+    );
+}
+
+#[test]
+fn a_wedge_waits_for_a_fresh_count_of_wedges() {
+    let now = SystemTime::UNIX_EPOCH + EPOCH;
+    let (mut harness, actions) = Harness::start(Setup {
+        rows: Some(vec![download_row(
+            1,
+            'a',
+            Duration::from_hours(3),
+            false,
+            now,
+        )]),
+        ..Setup::default()
+    });
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    let actions = harness.answer(read(account(harness.wall())));
+    let actions = without_bookmarks(&mut harness, actions);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LookUpTorrent { id: torrent_id(1) }]
+    );
+    // The lookup answers after the reading went stale: not free, so a wedge is
+    // wanted, but only with a fresh count of wedges.
+    harness.advance(Duration::from_mins(6));
+    let actions = harness.answer(Ok(MamReply::Torrent(Some(Box::new(bookmark(1))))));
+    let actions = harness.past_lookups(actions);
+    assert!(
+        matches!(
+            requests(&actions).as_slice(),
+            [MamRequest::LoadUserData { .. }]
+        ),
+        "{actions:?}"
+    );
+    let actions = harness.answer(read(account(harness.wall())));
+    let actions = harness.checked(actions, &[bookmark(1)]);
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::FetchTorrent {
+            id: torrent_id(1),
+            wedge: windlass::core::Wedge::Spend
+        }]
     );
 }
 
@@ -2269,6 +2566,7 @@ fn the_owner_is_reminded_weekly_to_visit_mam() {
     let actions = harness.send(Event::Mam(MamEvent::StateRead {
         last_registration: None,
         last_reminder: None,
+        ratio_guard: SavedRatioGuard::Unset,
     }));
     let started = harness.wall();
     assert!(actions.contains(&Action::SaveReminder { at: started }));

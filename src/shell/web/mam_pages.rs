@@ -9,10 +9,12 @@ use crate::{
     core::{
         Attention, ClientRefusal, Connectability, Connectable, DownloadWatch, IpStanding,
         LastAttempt, Mam, MamHosts, MamListing, MamSession, Partials, PurchaseOutcome,
-        PurchaseRecord, RegistrationAllowance, RegistrationFailure, RequestGate, Sale,
+        PurchaseRecord, RatioGuard, RegistrationAllowance, RegistrationFailure, RequestGate, Sale,
         SeedboxStatus, SettingsState, SettledBy, Wedge, WedgeAccounting,
     },
-    shell::describe::{client_standing, findings, gib, hold, mam_failure, purchase, rejection},
+    shell::describe::{
+        client_standing, findings, gib, hold, mam_failure, purchase, rejection, size,
+    },
 };
 
 use super::pages::time;
@@ -21,6 +23,7 @@ use super::pages::time;
 pub(super) fn panels(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup {
     html! {
         (access_panel(mam, settings, now))
+        (ratio_guard_panel(mam))
         (account_panel(mam, settings, now))
         (bookmarks_panel(mam))
     }
@@ -97,6 +100,47 @@ fn access_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup 
                         (_, RegistrationAllowance::After(at)) => {
                             "Not before " (time(at, "full")) ", as MAM allows one an hour"
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether anything used ratio, which Windlass never does on purpose.
+fn ratio_guard_panel(mam: &Mam) -> Markup {
+    let (tag, tone) = match mam.ratio_guard {
+        RatioGuard::Reading => ("Reading", "pending"),
+        RatioGuard::ReadFailed => ("Unknown", "error"),
+        RatioGuard::Watching(_) => ("No ratio used", "ok"),
+        RatioGuard::Tripped(_) => ("Ratio used", "error"),
+    };
+    html! {
+        section.panel aria-labelledby="mam-ratio" {
+            div.panel-head {
+                h2 #mam-ratio { "Ratio use" }
+                span class={ "tag " (tone) } { (tag) }
+            }
+            @match &mam.ratio_guard {
+                RatioGuard::Reading => p { "Reading the downloaded figure Windlass last saw." }
+                RatioGuard::ReadFailed => p {
+                    "Windlass could not read the downloaded figure it last saw, so it starts no download."
+                }
+                RatioGuard::Watching(None) => p {
+                    "Windlass only downloads what MAM does not count against your ratio. The next account reading sets the downloaded figure it watches."
+                }
+                RatioGuard::Watching(Some(downloaded)) => p {
+                    "Windlass only downloads what MAM does not count against your ratio, and watches MAM's downloaded figure of "
+                    (size(*downloaded)) ". If it rises, every download stops."
+                }
+                RatioGuard::Tripped(used) => {
+                    p {
+                        "MAM counted " (size(used.counted())) " against your ratio, seen "
+                        (time(used.at, "full"))
+                        ". Every download Windlass added is stopped. Find out on MAM what used it, then say:"
+                    }
+                    form.inline method="post" action="/mam/ratio/checked" {
+                        button.secondary type="submit" { "I checked; let downloads run" }
                     }
                 }
             }
@@ -622,6 +666,46 @@ mod tests {
             "An entry Windlass cannot read · not connectable",
         ] {
             assert!(html.contains(text), "{text}: {html}");
+        }
+    }
+
+    #[test]
+    fn every_ratio_guard_state_has_words() {
+        use crate::core::{ByteSize, RatioGuard, RatioUse};
+
+        let mut mam = Mam::default();
+        for (guard, texts) in [
+            (RatioGuard::Reading, vec!["Reading the downloaded figure"]),
+            (
+                RatioGuard::ReadFailed,
+                vec!["Unknown", "starts no download"],
+            ),
+            (
+                RatioGuard::Watching(None),
+                vec!["No ratio used", "The next account reading sets"],
+            ),
+            (
+                RatioGuard::Watching(Some(ByteSize::new(1536))),
+                vec!["downloaded figure of 1.5 KiB"],
+            ),
+            (
+                RatioGuard::Tripped(RatioUse {
+                    before: ByteSize::new(0),
+                    after: ByteSize::new(50 << 20),
+                    at: SystemTime::UNIX_EPOCH,
+                }),
+                vec![
+                    "Ratio used",
+                    "MAM counted 50.0 MiB against your ratio",
+                    "action=\"/mam/ratio/checked\"",
+                ],
+            ),
+        ] {
+            mam.ratio_guard = guard;
+            let html = render(&mam, true);
+            for text in texts {
+                assert!(html.contains(text), "{text}: {html}");
+            }
         }
     }
 

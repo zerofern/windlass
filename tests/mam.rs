@@ -33,8 +33,8 @@ use tokio::{sync::watch, task::JoinHandle};
 use tower::ServiceExt;
 use windlass::{
     core::{
-        Desired, Event, MamSession, PurchaseOutcome, Registry, SeedboxStatus, StartupEvent,
-        StartupMode, State as CoreState,
+        Desired, Event, MamSession, PurchaseOutcome, RatioGuard, Registry, SeedboxStatus,
+        StartupEvent, StartupMode, State as CoreState,
     },
     runner::{Observation, Runner},
     shell::{
@@ -798,6 +798,66 @@ async fn a_download_that_cannot_be_wedged_stops_and_resumes_when_free() -> TestR
         })
         .await?;
     assert_eq!(sent(&mam, "/tor/download.php"), [format!("tid={BOOK}")]);
+    assert_eq!(mam.violations(), Vec::<String>::new());
+    windlass.stop().await
+}
+
+/// The ratio guard: MAM counts bytes downloaded against the ratio while
+/// Windlass was stopped. After the restart the download stops, and it stays
+/// stopped across another restart until the owner checks on the dashboard.
+#[tokio::test]
+async fn ratio_use_stops_downloads_until_the_owner_checks() -> TestResult {
+    let mam = FakeMam::start().await?;
+    let mut book = Torrent::bookmarked("A Free Book", GIB);
+    book.free = true;
+    let hash = book.hash();
+    mam.with(|world| {
+        world.torrents.insert(BOOK, book);
+    });
+    let qbittorrent = qbittorrent_adding(vec![hash.clone()]);
+    let webui = fake_qbittorrent(Arc::clone(&qbittorrent)).await?;
+    let windlass = Windlass::start(&mam, webui).await?;
+    windlass.connect().await?;
+    windlass.in_qbittorrent(&hash).await?;
+
+    mam.with(|world| world.account.downloaded += GIB);
+    let windlass = windlass.restart(&mam, webui).await?;
+    let _ = windlass
+        .wait(|observation| {
+            record(observation, BOOK).is_some_and(|row| row.desired == Desired::Held)
+        })
+        .await?;
+    assert!(windlass.noticed("Ratio used: downloads stopped").await?);
+    windlass
+        .wait(|_| {
+            qbittorrent
+                .lock()
+                .is_ok_and(|fake| fake.stopped.contains(&hash))
+        })
+        .await?;
+
+    let windlass = windlass.restart(&mam, webui).await?;
+    let _ = windlass
+        .wait(|observation| matches!(observation.mam.ratio_guard, RatioGuard::Tripped(_)))
+        .await?;
+    let status = windlass.get("/").await?;
+    assert!(status.contains("I checked; let downloads run"), "{status}");
+    assert_eq!(
+        windlass.post("/mam/ratio/checked", "").await?,
+        StatusCode::SEE_OTHER
+    );
+    windlass
+        .wait(|observation| {
+            record(observation, BOOK).is_some_and(|row| row.desired == Desired::Active)
+        })
+        .await?;
+    windlass
+        .wait(|_| {
+            qbittorrent
+                .lock()
+                .is_ok_and(|fake| fake.started.contains(&hash))
+        })
+        .await?;
     assert_eq!(mam.violations(), Vec::<String>::new());
     windlass.stop().await
 }
