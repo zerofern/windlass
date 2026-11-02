@@ -77,18 +77,10 @@ impl MamRequest {
     }
 }
 
-/// An amount of upload credit in whole GiB, as the store sells it: 50 or more.
-#[nutype(
-    validate(greater_or_equal = 50),
-    derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Display, Serialize)
-)]
-pub struct UploadCredit(u32);
-
-/// A bonus store purchase Windlass can make. Gifts are not expressible.
+/// A bonus store purchase Windlass can make. Gifts are not expressible, and
+/// neither is upload credit: Windlass never uses ratio, so it never buys it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Purchase {
-    /// Upload credit.
-    Upload(UploadCredit),
     /// VIP, filled to 90 days from the purchase.
     Vip,
 }

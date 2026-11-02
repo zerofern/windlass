@@ -249,7 +249,6 @@ fn looked_up(listing: &Bookmark) -> String {
 
 pub(super) fn purchase(purchase: Purchase) -> String {
     match purchase {
-        Purchase::Upload(amount) => format!("{amount} GiB of upload credit"),
         Purchase::Vip => String::from("VIP, filled to 90 days"),
     }
 }
@@ -1376,7 +1375,7 @@ mod tests {
             Asn, BookmarkPage, ByteSize, ClientStanding, FetchedTorrent, Hold, IpObservation,
             MamEvent, MamFailure, MamReply, MamRequest, MamTorrentId, Points, PointsReserve,
             Purchase, Registration, SessionRejection, TimerName, TorrentCommand, TorrentHash,
-            UploadCredit, UserData,
+            UserData,
         };
 
         let id = timer_actions()
@@ -1566,7 +1565,7 @@ mod tests {
         }));
         assert!(rotated.contains("new cookie") && !rotated.contains("rotated"));
 
-        let upload = Purchase::Upload(UploadCredit::try_new(50)?);
+        let upload = Purchase::Vip;
         for entry in [
             Action::WritePointsReserve {
                 reserve: PointsReserve::default(),

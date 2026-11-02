@@ -21,9 +21,9 @@ use serde::Serialize;
 
 pub use account::{
     ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Attention, CLIENT_STATS_EVERY, ClientList,
-    ClientStanding, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR, RATIO_TARGET, RATIO_URGENT,
-    Reading, Sale, SettledBy, UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB,
-    UPLOAD_STEP, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
+    ClientStanding, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR, RATIO_URGENT, Reading, Sale,
+    SettledBy, UNSATISFIED_RESERVE, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN,
+    VIP_WARN_WITHIN,
 };
 pub use acquisition::{
     Acquisition, BOOKMARKS_EVERY, Bookmarks, DownloadWatch, HISTORY_FRESH_FOR, Hold,
@@ -37,8 +37,7 @@ pub use api::{
     MamMessageError, MamNotices, MamReply, MamRequest, NetworkName, NetworkNameError, NoticeCount,
     Partials, PersonalFreeleech, Points, Purchase, RedCategory, RedKind, Registration,
     SessionRejection, SnatchSummary, Snatched, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit,
-    UploadCredit, UploadCreditError, UserClass, UserData, VipTorrent, Wedge, WedgeCount,
-    WedgeSpent,
+    UserClass, UserData, VipTorrent, Wedge, WedgeCount, WedgeSpent,
 };
 pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL, Tokens};
 pub use connectability::{

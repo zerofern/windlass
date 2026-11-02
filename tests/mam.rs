@@ -618,9 +618,10 @@ async fn a_snatched_bookmark_waits_until_the_owner_downloads_it_again() -> TestR
 #[tokio::test]
 async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
     let mam = FakeMam::start().await?;
+    let day = Duration::from_hours(24);
     mam.with(|world| {
-        // Little upload beyond downloads, so upload credit is wanted.
-        world.account.uploaded = 20 * GIB;
+        // VIP ends tomorrow, so a renewal is wanted.
+        world.account.vip_until = SystemTime::now().checked_add(day);
         world.account.points = 100_000.5;
         world.fail("/json/bonusBuy.php", fake_mam::Fault::Status(500), 1);
     });
@@ -639,7 +640,7 @@ async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
     windlass
         .wait(|observation| outcome(observation) == Some(PurchaseOutcome::Uncertain))
         .await?;
-    // MAM took points but shows no credit, so the next reading cannot tell.
+    // MAM took points but VIP ends no later, so the next reading cannot tell.
     mam.with(|world| world.account.points -= 25_000.0);
     let _ = windlass
         .wait(|observation| outcome(observation) == Some(PurchaseOutcome::Unresolved))
@@ -657,7 +658,11 @@ async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
     windlass
         .wait(|observation| matches!(outcome(observation), Some(PurchaseOutcome::Made(_))))
         .await?;
-    assert_eq!(mam.with(|world| world.account.uploaded), Some(70 * GIB));
+    let renewed = mam.with(|world| world.account.vip_until).flatten();
+    assert!(
+        renewed.is_some_and(|until| until > SystemTime::now() + 80 * day),
+        "{renewed:?}"
+    );
     assert_eq!(sent(&mam, "/json/bonusBuy.php").len(), 2);
     windlass.stop().await
 }

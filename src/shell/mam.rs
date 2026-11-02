@@ -159,10 +159,6 @@ fn build(client: &Client, request: &MamRequest) -> reqwest::RequestBuilder {
         MamRequest::Buy(purchase) => {
             let mut url = client.store.clone();
             match purchase {
-                Purchase::Upload(amount) => url
-                    .query_pairs_mut()
-                    .append_pair("spendtype", "upload")
-                    .append_pair("amount", &amount.to_string()),
                 Purchase::Vip => url
                     .query_pairs_mut()
                     .append_pair("spendtype", "VIP")
@@ -263,8 +259,8 @@ mod tests {
         Connectable, FetchedTorrent, Freeleech, IpObservation, MamFailure, MamMessage, MamNotices,
         MamReply, MamRequest, MamTorrentId, NetworkName, Partials, PersonalFreeleech, Points,
         Purchase, RedCategory, RedKind, Registration, SessionRejection, SnatchSummary, Snatched,
-        TorrentCount, TorrentHash, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserClass,
-        UserData, VipTorrent, WedgeCount,
+        TorrentCount, TorrentHash, UnsatisfiedCount, UnsatisfiedLimit, UserClass, UserData,
+        VipTorrent, WedgeCount,
     };
 
     use super::super::fake_mam::{FakeMam, Fault, Host, Torrent};
@@ -501,14 +497,6 @@ mod tests {
             answer.result
         );
 
-        let upload = MamRequest::Buy(Purchase::Upload(UploadCredit::try_new(50)?));
-        let answer = ask(&client, upload, &cookie).await;
-        assert_eq!(
-            answer.result,
-            Ok(MamReply::Purchased {
-                points: Points::new(35_000)
-            })
-        );
         let answer = ask(&client, MamRequest::Buy(Purchase::Vip), &cookie).await;
         assert!(matches!(answer.result, Ok(MamReply::Purchased { .. })));
 
@@ -573,12 +561,6 @@ mod tests {
                     Host::Site,
                     "GET",
                     "/json/bonusBuy.php",
-                    "spendtype=upload&amount=50"
-                ),
-                (
-                    Host::Site,
-                    "GET",
-                    "/json/bonusBuy.php",
                     "spendtype=VIP&duration=max"
                 ),
             ]
@@ -627,9 +609,8 @@ mod tests {
             Some(MamFailure::Refused { message: None })
         );
         fake.with(|world| world.account.points = 10.0);
-        let upload = MamRequest::Buy(Purchase::Upload(UploadCredit::try_new(50)?));
         assert_eq!(
-            failure(ask(&client, upload, &cookie).await),
+            failure(ask(&client, MamRequest::Buy(Purchase::Vip), &cookie).await),
             Some(MamFailure::Refused {
                 message: MamMessage::try_new("Not enough points").ok()
             })

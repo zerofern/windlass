@@ -2136,22 +2136,22 @@ fn a_purchase_the_reading_cannot_settle_waits_for_the_owner() {
     let (mut harness, actions) = Harness::start(Setup::default());
     let actions = harness.register(&actions);
     assert_eq!(requests(&actions).len(), 1);
-    let mut thin = account(harness.wall());
-    thin.uploaded = ByteSize::new(20 * GIB);
-    let actions = harness.answer(read(thin.clone()));
+    let mut ending = account(harness.wall());
+    ending.vip_until = harness.wall().checked_add(DAY);
+    let actions = harness.answer(read(ending.clone()));
     let Some(MamRequest::Buy(purchase)) = requests(&actions).first().cloned() else {
         unreachable!("no purchase in {actions:?}");
     };
     let actions = harness.answer(Err(MamFailure::Unreachable));
     let _ = without_bookmarks(&mut harness, actions);
-    // Points were spent, but no upload credit arrived: Windlass cannot tell.
-    // The next reading comes early, to settle it.
+    // Points were spent, but VIP ends no later: Windlass cannot tell. The next
+    // reading comes early, to settle it.
     let actions = harness.later(Duration::from_mins(1));
     assert!(matches!(
         requests(&actions).first(),
         Some(MamRequest::LoadUserData { .. })
     ));
-    let mut spent = thin.clone();
+    let mut spent = ending;
     spent.points = Points::new(35_000);
     let actions = harness.answer(read(spent.clone()));
     let actions = without_bookmarks(&mut harness, actions);
@@ -2198,91 +2198,52 @@ fn a_purchase_the_reading_cannot_settle_waits_for_the_owner() {
     let mut earned = spent;
     earned.points = Points::new(60_000);
     let actions = harness.answer(read(earned));
-    assert!(matches!(
+    assert_eq!(
         requests(&actions).first(),
-        Some(MamRequest::Buy(Purchase::Upload(_)))
-    ));
-    // This one's answer is lost too, but the credit arrives with the points
-    // spent: MAM sold it.
-    let actions = harness.answer(Err(MamFailure::Unreachable));
-    let _ = without_bookmarks(&mut harness, actions);
-    let actions = harness.later(Duration::from_mins(15));
-    assert!(matches!(
-        requests(&actions).first(),
-        Some(MamRequest::LoadUserData { .. })
-    ));
-    let mut credited = thin;
-    credited.points = Points::new(35_000);
-    credited.uploaded = ByteSize::new(70 * GIB);
-    let _ = harness.answer(read(credited));
-    assert!(harness.notices().contains(&Notice::PurchaseSettled {
-        purchase,
-        sale: windlass::core::Sale::Made
-    }));
+        Some(&MamRequest::Buy(Purchase::Vip))
+    );
 }
 
 #[test]
-fn upload_credit_keeps_the_buffer_and_uncertain_purchases_wait() {
+fn a_refused_purchase_waits_hours_before_it_is_tried_again() {
     let (mut harness, actions) = Harness::start(Setup::default());
     let actions = harness.register(&actions);
     assert_eq!(requests(&actions).len(), 1);
-    let mut thin = account(harness.wall());
-    thin.uploaded = ByteSize::new(20 * GIB);
-    let actions = harness.answer(read(thin.clone()));
-    let Some(MamRequest::Buy(Purchase::Upload(amount))) = requests(&actions).first().cloned()
-    else {
-        unreachable!("no upload purchase in {actions:?}");
-    };
-    assert_eq!(amount.into_inner(), 50);
-    let actions = harness.answer(Err(MamFailure::Unreachable));
-    assert!(harness.notices().contains(&Notice::PurchaseUncertain {
-        purchase: Purchase::Upload(amount)
-    }));
-    // Nothing more is bought until the next reading decides from MAM's figures.
-    assert_eq!(
-        requests(&actions),
-        [MamRequest::ListBookmarks {
-            start: windlass::core::BookmarkCount::new(0)
-        }]
-    );
-    let _ = harness.answer(listed(Vec::new()));
-    // A refusal is not retried for hours.
-    let actions = harness.later(Duration::from_mins(15));
-    assert!(
-        matches!(
-            requests(&actions).first(),
-            Some(MamRequest::LoadUserData { .. })
-        ),
-        "{actions:?}"
-    );
-    // The points were not spent, so MAM did not sell it, and it is bought again.
-    let actions = harness.answer(read(thin.clone()));
-    assert!(harness.notices().contains(&Notice::PurchaseSettled {
-        purchase: Purchase::Upload(amount),
-        sale: windlass::core::Sale::NotMade
-    }));
-    assert!(matches!(
-        requests(&actions).first(),
-        Some(MamRequest::Buy(Purchase::Upload(_)))
-    ));
+    let mut ending = account(harness.wall());
+    ending.vip_until = harness.wall().checked_add(DAY);
+    let actions = harness.answer(read(ending.clone()));
+    assert_eq!(requests(&actions), [MamRequest::Buy(Purchase::Vip)]);
     let actions = harness.answer(Err(MamFailure::Refused {
         message: windlass::core::MamMessage::try_new("Not enough points").ok(),
     }));
-    assert_eq!(
-        requests(&actions),
-        [MamRequest::ListBookmarks {
-            start: windlass::core::BookmarkCount::new(0)
-        }]
-    );
-    let _ = harness.answer(listed(Vec::new()));
+    let _ = without_bookmarks(&mut harness, actions);
     assert!(harness.notices().contains(&Notice::PurchaseRefused {
-        purchase: Purchase::Upload(amount)
+        purchase: Purchase::Vip
     }));
     let actions = harness.later(Duration::from_mins(15));
     assert!(matches!(
         requests(&actions).first(),
         Some(MamRequest::LoadUserData { .. })
     ));
+    let actions = harness.answer(read(ending));
+    assert!(
+        !requests(&actions)
+            .iter()
+            .any(|request| matches!(request, MamRequest::Buy(_))),
+        "{actions:?}"
+    );
+}
+
+#[test]
+fn upload_credit_is_never_bought() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    // A thin buffer, a ratio near MAM's minimum, and points to spare.
+    let mut thin = account(harness.wall());
+    thin.uploaded = ByteSize::new(11 * GIB);
+    thin.downloaded = ByteSize::new(10 * GIB);
+    thin.points = Points::new(1_000_000);
     let actions = harness.answer(read(thin));
     assert!(
         !requests(&actions)
@@ -2581,21 +2542,6 @@ fn failed_readings_listings_and_lookups_are_retried_later() {
     let _ = harness.answer(Err(MamFailure::Unreachable));
     let later = harness.start + harness.elapsed + Duration::from_mins(5);
     assert_eq!(harness.mam().acquisition.bookmarks.next, Some(later));
-}
-
-#[test]
-fn upload_credit_restores_a_ratio_below_three() {
-    let (mut harness, actions) = Harness::start(Setup::default());
-    let actions = harness.register(&actions);
-    assert_eq!(requests(&actions).len(), 1);
-    let mut middling = account(harness.wall());
-    middling.uploaded = ByteSize::new(60 * GIB);
-    middling.downloaded = ByteSize::new(30 * GIB);
-    let actions = harness.answer(read(middling));
-    assert!(matches!(
-        requests(&actions).first(),
-        Some(MamRequest::Buy(Purchase::Upload(_)))
-    ));
 }
 
 #[test]

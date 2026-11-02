@@ -41,7 +41,7 @@ core scenarios with simulated time, and end to end only for their wiring.
 | 15 | Watch the account | Yes | **No** | – |
 | 16 | Check MAM's client list (A5) | Yes | **No** | – |
 | 17 | Keep qBittorrent connectable (A6) | Yes | **No** | – |
-| 18 | Spend points: VIP and upload credit | Yes | Yes | – |
+| 18 | Spend points: VIP | Yes | Yes | – |
 | 19 | Settle an uncertain purchase | Yes | Yes | – |
 | 20 | Remind the owner weekly | Yes | – | – |
 | 21 | Deliver notifications | Yes | Yes (web) | Yes |
@@ -278,19 +278,19 @@ core scenarios with simulated time, and end to end only for their wiring.
 - **End to end:** wiring only (the lease renewal reaches the gateway); the
   30-minute judgement stays in the core tests.
 
-### 18. Spend points: VIP and upload credit
+### 18. Spend points: VIP
 
 - **Does:** renews VIP within 14 days of its end, priced from the last purchase;
-  buys 50 GiB of upload credit when the buffer is under 25 GiB or the ratio under
-  3.0; never below the points reserve; backs off 6 hours after a refusal.
+  never below the points reserve; backs off 6 hours after a refusal. Upload
+  credit is never bought: Windlass never uses ratio.
 - **Where:** `core/mam/account.rs` (`wanted_purchase`).
-- **Tested:** `tests/mam_core.rs`; E1 covers a VIP renewal and E4 upload credit.
+- **Tested:** `tests/mam_core.rs`; E1 and E4 cover VIP renewals.
 
 ### 19. Settle an uncertain purchase
 
 - **Does:** a purchase whose answer was lost is settled from the next reading,
-  which comes early, about a minute later (points not spent, a later VIP end, or
-  credit arrived); otherwise the dashboard asks the owner, and nothing is bought
+  which comes early, about a minute later (a later VIP end means MAM sold it;
+  points not spent mean it did not); otherwise the dashboard asks the owner, and nothing is bought
   until they answer.
 - **Where:** `core/mam/account.rs` (`settle`, `checked`), `shell/web/mam_pages.rs`.
 - **Tested:** `tests/mam_core.rs`; the route in `tests/web.rs`; E4.
@@ -347,7 +347,7 @@ and a fake qBittorrent, driven over HTTP.
 | E1. A pasted cookie leads to a registered seedbox and a wedged download | 9, 10, 12, 13, 18 | `a_pasted_cookie_leads_to_a_registered_seedbox_and_a_wedged_download` |
 | E2. A refused session is reported and stops requests | 9 | `a_refused_session_is_reported_and_stops_requests` |
 | E3. A snatched bookmark waits; "Download again" downloads it | 11, 12, 13 | `a_snatched_bookmark_waits_until_the_owner_downloads_it_again` |
-| E4. An uncertain purchase is settled from the dashboard; upload credit is bought | 18, 19 | `an_uncertain_purchase_is_settled_on_the_dashboard` |
+| E4. An uncertain VIP renewal is settled from the dashboard and bought again | 18, 19 | `an_uncertain_purchase_is_settled_on_the_dashboard` |
 | E5. A freeleech download needs no wedge; after its freeleech ends and Windlass restarts, the bookmark listing shows it and it is wedged, without registering again within the hour | 10, 12, 14, 22 | `a_download_whose_freeleech_ends_is_wedged_after_a_restart` |
 | E5b. A download no longer free and no longer bookmarked is looked up by itself, stopped with no wedge left, and resumed once free | 14, 22 | `a_download_that_cannot_be_wedged_stops_and_resumes_when_free` |
 | E6, E7. Restarts and request counts are checked inside E5 and E5b: no lookup for a bookmarked download, one for an un-bookmarked one, no second registration, no broken rule | 10, 14, 22 | (in E5, E5b) |

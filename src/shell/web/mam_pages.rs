@@ -10,7 +10,7 @@ use crate::{
         Attention, ClientRefusal, Connectability, Connectable, DownloadWatch, IpStanding,
         LastAttempt, Mam, MamHosts, MamListing, MamSession, Partials, PurchaseOutcome,
         PurchaseRecord, RegistrationAllowance, RegistrationFailure, RequestGate, Sale,
-        SeedboxStatus, SettingsState, SettledBy, UPLOAD_BUFFER, Wedge, WedgeAccounting,
+        SeedboxStatus, SettingsState, SettledBy, Wedge, WedgeAccounting,
     },
     shell::describe::{client_standing, findings, gib, hold, mam_failure, purchase, rejection},
 };
@@ -152,7 +152,7 @@ fn account_panel(mam: &Mam, settings: &SettingsState, now: SystemTime) -> Markup
                 }
                 dt { "Wedges" } dd { (data.wedges) }
                 dt { "Upload beyond downloads" }
-                dd { (gib(data.buffer())) " · kept above " (gib(UPLOAD_BUFFER)) }
+                dd { (gib(data.buffer())) }
                 dt { "Ratio" }
                 dd {
                     @match account.ratio() {

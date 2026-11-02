@@ -120,9 +120,8 @@ Windlass saves it and uses it from then on.
   seedbox when it changes, at most once an hour, counting every attempt across
   restarts.
 - It reads the account every 15 minutes, and its client list every 30.
-- It keeps VIP, renewing it within 14 days of expiry, and buys upload credit in
-  50 GiB steps when the upload buffer falls below 25 GiB or the ratio below 3.0.
-  Purchases never take points below the reserve set on the settings page, 20,000
+- It keeps VIP, renewing it within 14 days of expiry. It never buys upload
+  credit: Windlass never uses ratio, so it has no use for it. Purchases never take points below the reserve set on the settings page, 20,000
   by default, and an uncertain purchase stops further buying until MAM is read again.
 - It lists your bookmarks every 15 minutes and queues them. Bookmarks MAM reports
   as snatched before are listed under Torrents but wait for you to press

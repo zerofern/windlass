@@ -679,7 +679,7 @@ mod tests {
     use crate::core::{
         ClientStanding, DeliveryFailure, EntryCount, Hold, Notice, NotificationEvent, NtfyTopic,
         Points, Port, Purchase, Push, QbittorrentFailure, SessionRejection, SettingName,
-        StartupMode, SwitchBlock, UploadCredit, VpnServer,
+        StartupMode, SwitchBlock, VpnServer,
     };
     use crate::core::{NoticeCount, Partials, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit};
 
@@ -767,7 +767,7 @@ mod tests {
             ]
             .map(|setting| Notice::SettingNotSaved { setting }),
         );
-        notices.extend(mam_notices()?);
+        notices.extend(mam_notices());
         Ok(notices)
     }
 
@@ -775,8 +775,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one list of every MAM notice reads best together"
     )]
-    fn mam_notices() -> Result<Vec<Notice>, Box<dyn Error + Send + Sync>> {
-        let upload = Purchase::Upload(UploadCredit::try_new(50)?);
+    fn mam_notices() -> Vec<Notice> {
         let mut notices = vec![
             Notice::MamSessionAccepted,
             Notice::SeedboxNotRegistered,
@@ -848,15 +847,15 @@ mod tests {
             },
             Notice::SeedingOnTrack,
             Notice::PurchaseMade {
-                purchase: upload,
-                points: Points::new(35_000),
-            },
-            Notice::PurchaseMade {
                 purchase: Purchase::Vip,
                 points: Points::new(35_000),
             },
-            Notice::PurchaseRefused { purchase: upload },
-            Notice::PurchaseUncertain { purchase: upload },
+            Notice::PurchaseRefused {
+                purchase: Purchase::Vip,
+            },
+            Notice::PurchaseUncertain {
+                purchase: Purchase::Vip,
+            },
             Notice::WedgeNotSpent,
             Notice::MamVisitReminder,
             Notice::MamClientListed,
@@ -924,7 +923,7 @@ mod tests {
             ]
             .map(|hold| Notice::DownloadsHeld { hold }),
         );
-        Ok(notices)
+        notices
     }
 
     #[test]
