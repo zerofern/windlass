@@ -10,6 +10,8 @@ SQLite persistence, and native systemd services on NixOS.
 - [Feature Briefs](.workflow/features/) contain the agreed and proposed flows.
 - [Flows](docs/flows.md) maps what Windlass does, flow by flow, with how each is
   tested and the end-to-end tests still planned.
+- [MAM rules](docs/mam-rules.md) lists what Windlass must never do on MAM, and
+  the tests that prove it.
 - [Project instructions](AGENTS.md) define coding and testing conventions.
 
 ## Proof of concept

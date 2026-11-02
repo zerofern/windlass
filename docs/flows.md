@@ -4,6 +4,8 @@ What Windlass does, one flow at a time. For each flow: what triggers it, what
 Windlass does and promises, where the decisions live, how it is tested today, and
 the end-to-end test it still needs. The feature briefs under
 `.workflow/features/` hold the rules and their reasons; this page is the map.
+[MAM rules](mam-rules.md) lists what must never happen on MAM, and the tests
+that prove it.
 
 ## How Windlass is tested
 

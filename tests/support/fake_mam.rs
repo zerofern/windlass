@@ -790,6 +790,12 @@ fn buy(world: &mut World, query: &Query) -> Value {
             json!({ "success": true, "type": "VIP", "amount": (weeks * 100.0).round() / 100.0,
                     "seedbonus": world.account.points })
         }
+        Some("upload") => {
+            world
+                .violations
+                .push(String::from("upload credit, which Windlass never buys"));
+            refuse("Not allowed")
+        }
         Some(kind @ ("gift" | "sendWedge")) => {
             world
                 .violations

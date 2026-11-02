@@ -510,6 +510,74 @@ fn nothing_is_sent_to_mam_in_the_first_minute_after_a_start() {
 }
 
 #[test]
+fn the_client_list_is_read_at_most_every_thirty_minutes() {
+    let (mut harness, actions) = Harness::start(Setup::default());
+    let actions = harness.register(&actions);
+    // MAM caches the client list for 30 minutes, so it is asked for no more
+    // often.
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData {
+            clients: windlass::core::ClientListing::Include
+        }]
+    );
+    let actions = harness.answer(read(account(harness.wall())));
+    let _ = without_bookmarks(&mut harness, actions);
+    let actions = harness.later(Duration::from_mins(15));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData {
+            clients: windlass::core::ClientListing::Omit
+        }]
+    );
+    // A reading without the list leaves its 30 minutes running.
+    let mut without_list = account(harness.wall());
+    without_list.clients = None;
+    let actions = harness.answer(read(without_list));
+    let _ = without_bookmarks(&mut harness, actions);
+    let actions = harness.later(Duration::from_mins(15));
+    assert_eq!(
+        requests(&actions),
+        [MamRequest::LoadUserData {
+            clients: windlass::core::ClientListing::Include
+        }]
+    );
+}
+
+#[test]
+fn torrents_the_owner_added_are_never_stopped() {
+    let adopted = TorrentRecord {
+        id: windlass::core::RecordId::new(1).unwrap_or_else(|| unreachable!("non-zero")),
+        identity: windlass::core::Identity::Client(hash('e')),
+        origin: windlass::core::Origin::Adopted,
+        desired: Desired::Active,
+        save_path: None,
+        deletion: windlass::core::ContentDeletion::NotAllowed,
+        observation: None,
+    };
+    let (mut harness, actions) = Harness::start(Setup {
+        rows: Some(vec![adopted]),
+        ratio_guard: SavedRatioGuard::Watching(ByteSize::new(0)),
+        ..Setup::default()
+    });
+    let actions = harness.register(&actions);
+    assert_eq!(requests(&actions).len(), 1);
+    // Even after ratio use stops Windlass's own downloads, the owner's
+    // torrent keeps running.
+    let mut used = account(harness.wall());
+    used.downloaded = ByteSize::new(GIB);
+    let _ = harness.answer(read(used));
+    assert!(harness.notices().contains(&Notice::RatioUsed {
+        counted: ByteSize::new(GIB)
+    }));
+    let row = match harness.core.registry() {
+        Registry::Loaded(records) => records.find(&hash('e')).cloned(),
+        _ => None,
+    };
+    assert_eq!(row.map(|row| row.desired), Some(Desired::Active));
+}
+
+#[test]
 fn without_a_cookie_only_the_ip_is_observed() {
     let (mut harness, actions) = Harness::start(Setup {
         cookie: None,
