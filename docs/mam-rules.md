@@ -83,8 +83,9 @@ person and per IP (1.2, 1.3), and turning off qBittorrent's automatic updates
   `tests/mam_core.rs::a_saved_download_is_readded_only_after_mam_confirms_it_is_free`,
   `tests/mam.rs::a_download_that_cannot_be_wedged_stops_and_resumes_when_free`
 - **Never go on if ratio was used anyway.** A rise in MAM's downloaded figure,
-  even while Windlass was stopped, stops every download until the owner
-  checks; it is read every 5 minutes while a download runs.
+  even while Windlass was stopped, stops every download and pushes an urgent
+  notification to the owner's phone; downloads stay stopped until the owner
+  checks. The figure is read every 5 minutes while a download runs.
   Tests: `tests/mam_core.rs::ratio_use_stops_every_download_until_the_owner_checks`,
   `tests/mam_core.rs::ratio_use_holds_every_queued_download`,
   `tests/mam_core.rs::ratio_used_before_a_restart_or_while_windlass_was_stopped_is_caught`,
@@ -94,7 +95,8 @@ person and per IP (1.2, 1.3), and turning off qBittorrent's automatic updates
   `src/shell/storage.rs::the_ratio_guard_round_trips_and_partial_rows_fail`,
   `src/shell/web/mam_pages.rs::every_ratio_guard_state_has_words`,
   `tests/mam.rs::ratio_use_stops_downloads_until_the_owner_checks`
-- **Never download while the ratio is below 2.0**, twice MAM's minimum.
+- **Never download while the ratio is below 2.0**, twice MAM's minimum; the
+  hold is pushed to the owner's phone.
   Tests: `tests/mam_core.rs::every_admission_rule_can_hold_a_download`,
   `tests/mam_core.rs::the_account_watches_raise_notices`
 - **Never buy upload credit.**

@@ -33,8 +33,8 @@ use tokio::{sync::watch, task::JoinHandle};
 use tower::ServiceExt;
 use windlass::{
     core::{
-        Desired, Event, MamSession, PurchaseOutcome, RatioGuard, Registry, SeedboxStatus,
-        StartupEvent, StartupMode, State as CoreState,
+        Delivery, Desired, Event, MamSession, Notice, PurchaseOutcome, RatioGuard, Registry,
+        SeedboxStatus, StartupEvent, StartupMode, State as CoreState,
     },
     runner::{Observation, Runner},
     shell::{
@@ -828,6 +828,20 @@ async fn ratio_use_stops_downloads_until_the_owner_checks() -> TestResult {
         })
         .await?;
     assert!(windlass.noticed("Ratio used: downloads stopped").await?);
+    // The stop is pushed to the owner's phone; ntfy does not answer here, so
+    // the push waits to be sent again.
+    let pushed = |observation: &Observation| {
+        let notifications = &observation.notifications;
+        let sending = match &notifications.delivery {
+            Delivery::Sending(push) | Delivery::Retrying { push, .. } => Some(push),
+            Delivery::Idle => None,
+        };
+        sending
+            .into_iter()
+            .chain(notifications.outbox.iter())
+            .any(|push| matches!(push.notice, Notice::RatioUsed { .. }))
+    };
+    let _ = windlass.wait(pushed).await?;
     windlass
         .wait(|_| {
             qbittorrent

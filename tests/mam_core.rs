@@ -1838,6 +1838,26 @@ fn free_listing(id: u64) -> Bookmark {
     listing
 }
 
+/// Whether a notice matching this is pushed to the phone: sent now, being
+/// sent, or waiting in the outbox.
+fn pushed(harness: &Harness, actions: &[Action], wanted: impl Fn(&Notice) -> bool) -> bool {
+    let notifications = harness.core.notifications();
+    let sending = match &notifications.delivery {
+        windlass::core::Delivery::Sending(push)
+        | windlass::core::Delivery::Retrying { push, .. } => Some(push),
+        windlass::core::Delivery::Idle => None,
+    };
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::SendNotification { push, .. } => Some(push),
+            _ => None,
+        })
+        .chain(sending)
+        .chain(notifications.outbox.iter())
+        .any(|push| wanted(&push.notice))
+}
+
 /// The saves of the ratio guard among these actions.
 fn guard_saves(actions: &[Action]) -> Vec<SavedRatioGuard> {
     actions
@@ -1876,6 +1896,11 @@ fn ratio_use_stops_every_download_until_the_owner_checks() {
     assert!(harness.notices().contains(&Notice::RatioUsed {
         counted: ByteSize::new(GIB)
     }));
+    // Stopping downloads for ratio reaches the owner's phone.
+    assert!(pushed(&harness, &actions, |notice| matches!(
+        notice,
+        Notice::RatioUsed { .. }
+    )));
     assert_eq!(
         harness.record(1).map(|record| record.desired),
         Some(Desired::Held)
@@ -2706,7 +2731,12 @@ fn the_account_watches_raise_notices() {
     }
     troubled.uploaded = ByteSize::new(GIB);
     troubled.downloaded = ByteSize::new(GIB);
-    let _ = listed_with(&mut harness, troubled, Vec::new());
+    let actions = listed_with(&mut harness, troubled, Vec::new());
+    // Holding downloads for a low ratio reaches the owner's phone.
+    assert!(pushed(&harness, &actions, |notice| matches!(
+        notice,
+        Notice::RatioLow { .. }
+    )));
     let notices = harness.notices();
     for expected in [
         Notice::RatioLow {
