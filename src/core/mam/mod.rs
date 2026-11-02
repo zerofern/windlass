@@ -11,6 +11,7 @@ mod api;
 mod budget;
 mod connectability;
 mod network;
+mod ratio_guard;
 
 use std::{
     net::IpAddr,
@@ -20,10 +21,10 @@ use std::{
 use serde::Serialize;
 
 pub use account::{
-    ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, Account, Attention, CLIENT_STATS_EVERY, ClientList,
-    ClientStanding, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR, RATIO_TARGET, RATIO_URGENT,
-    Reading, Sale, SettledBy, UNSATISFIED_RESERVE, UPLOAD_BUFFER, UPLOAD_PRICE_PER_GIB,
-    UPLOAD_STEP, VIP_FILL, VIP_PRICE_PER_WEEK, VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
+    ACCOUNT_FRESH_FOR, ACCOUNT_READ_EVERY, ACCOUNT_READ_WHILE_DOWNLOADING, Account, Attention,
+    CLIENT_STATS_EVERY, ClientList, ClientStanding, PurchaseOutcome, PurchaseRecord, RATIO_FLOOR,
+    RATIO_URGENT, Reading, Sale, SettledBy, UNSATISFIED_RESERVE, VIP_FILL, VIP_PRICE_PER_WEEK,
+    VIP_RENEW_WITHIN, VIP_WARN_WITHIN,
 };
 pub use acquisition::{
     Acquisition, BOOKMARKS_EVERY, Bookmarks, DownloadWatch, HISTORY_FRESH_FOR, Hold,
@@ -37,8 +38,7 @@ pub use api::{
     MamMessageError, MamNotices, MamReply, MamRequest, NetworkName, NetworkNameError, NoticeCount,
     Partials, PersonalFreeleech, Points, Purchase, RedCategory, RedKind, Registration,
     SessionRejection, SnatchSummary, Snatched, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit,
-    UploadCredit, UploadCreditError, UserClass, UserData, VipTorrent, Wedge, WedgeCount,
-    WedgeSpent,
+    UserClass, UserData, VipTorrent, Wedge, WedgeCount, WedgeSpent,
 };
 pub use budget::{Budget, REQUEST_BURST, REQUEST_REFILL, Tokens};
 pub use connectability::{
@@ -50,8 +50,13 @@ pub use network::{
     REGISTRATION_SPACING, RegistrationAllowance, RegistrationFailure, Seedbox, SeedboxStatus,
     Session,
 };
+pub use ratio_guard::{RatioGuard, RatioUse, SavedRatioGuard};
 
-use self::acquisition::{Facts, Next};
+use self::{
+    account::ReadPace,
+    acquisition::{Facts, Next},
+    ratio_guard::Seen,
+};
 use super::{
     Action, ApiCookie, ClientVersion, ClockReading, Completion, Desired, Download,
     DownloadingLimit, MamRequestsStatus, MamTorrentId, NotFreeOutcome, Notice, Records, Registry,
@@ -79,6 +84,8 @@ pub enum MamEvent {
         last_registration: Option<SystemTime>,
         /// The last visit reminder.
         last_reminder: Option<SystemTime>,
+        /// The ratio guard.
+        ratio_guard: SavedRatioGuard,
     },
     /// Saved MAM state could not be read.
     StateReadFailed,
@@ -91,6 +98,12 @@ pub enum MamEvent {
         /// Whether it did.
         sale: Sale,
     },
+    /// The owner checked on MAM what used ratio; downloads may run again.
+    RatioUseChecked,
+    /// The ratio guard was saved.
+    RatioGuardSaved,
+    /// Saving the ratio guard failed; it is saved again when it next changes.
+    RatioGuardSaveFailed,
     /// The reminder time was saved.
     ReminderSaved,
     /// Saving the reminder time failed.
@@ -235,6 +248,8 @@ pub struct Mam {
     pub last_reminder: LastReminder,
     /// What MAM's client list says about the running qBittorrent.
     pub client: ClientStanding,
+    /// The watch over ratio use.
+    pub ratio_guard: RatioGuard,
     /// Whether MAM can reach qBittorrent, and what Windlass did about it.
     pub connectability: Connectability,
     lease: LeaseRenewal,
@@ -262,6 +277,7 @@ impl Mam {
             outstanding: None,
             last_reminder: LastReminder::Unread,
             client: ClientStanding::Unknown,
+            ratio_guard: RatioGuard::Reading,
             connectability: Connectability::Fine,
             lease: LeaseRenewal::NotRequested,
             cookie_in_use: None,
@@ -276,6 +292,7 @@ impl Mam {
     pub(super) fn start_reading(&mut self) -> Vec<Action> {
         self.seedbox.last_attempt = LastAttempt::Reading;
         self.last_reminder = LastReminder::Reading;
+        self.ratio_guard = RatioGuard::Reading;
         vec![Action::ReadMamState]
     }
 
@@ -315,15 +332,28 @@ impl Mam {
             MamEvent::StateRead {
                 last_registration,
                 last_reminder,
+                ratio_guard,
             } => {
                 self.seedbox.last_attempt = LastAttempt::Known(last_registration);
                 self.last_reminder = LastReminder::Known(last_reminder);
+                self.ratio_guard = RatioGuard::restored(ratio_guard);
                 (Vec::new(), None)
             }
             MamEvent::StateReadFailed => {
                 self.seedbox.last_attempt = LastAttempt::ReadFailed;
                 self.last_reminder = LastReminder::ReadFailed;
+                self.ratio_guard = RatioGuard::ReadFailed;
                 (Vec::new(), None)
+            }
+            MamEvent::RatioUseChecked => {
+                let latest = self.account.data().map(|data| data.downloaded);
+                let Some(guard) = self.ratio_guard.checked(latest) else {
+                    return (Vec::new(), None);
+                };
+                self.notices.push(Notice::RatioUseChecked);
+                let mut actions = vec![Action::SaveRatioGuard { guard }];
+                actions.extend(self.follow_downloads(now, registry));
+                (actions, None)
             }
             MamEvent::RegistrationAttemptSaved => {
                 let Some(Outstanding::SavingRegistration { at, cookie, epoch }) =
@@ -362,7 +392,10 @@ impl Mam {
                 }
                 (Vec::new(), None)
             }
-            MamEvent::ReminderSaved | MamEvent::ReminderSaveFailed => (Vec::new(), None),
+            MamEvent::ReminderSaved
+            | MamEvent::ReminderSaveFailed
+            | MamEvent::RatioGuardSaved
+            | MamEvent::RatioGuardSaveFailed => (Vec::new(), None),
             MamEvent::PurchaseChecked { sale } => {
                 if let Some(purchase) = self.account.checked(sale) {
                     self.notices
@@ -418,13 +451,27 @@ impl Mam {
                 Vec::new()
             }
             (MamRequest::LoadUserData { .. }, Ok(MamReply::UserData(data))) if current => {
+                let downloaded = data.downloaded;
                 if let Some((purchase, PurchaseOutcome::Settled { sale, .. })) =
                     self.account.read(now.monotonic, now.wall, *data)
                 {
                     self.notices
                         .push(Notice::PurchaseSettled { purchase, sale });
                 }
-                self.follow_downloads(now, registry)
+                let mut actions = match self.ratio_guard.observe(downloaded, now.wall) {
+                    Seen::Unchanged => Vec::new(),
+                    Seen::Rebased(guard) => vec![Action::SaveRatioGuard { guard }],
+                    Seen::Tripped(used) => {
+                        self.notices.push(Notice::RatioUsed {
+                            counted: used.counted(),
+                        });
+                        vec![Action::SaveRatioGuard {
+                            guard: SavedRatioGuard::Tripped(used),
+                        }]
+                    }
+                };
+                actions.extend(self.follow_downloads(now, registry));
+                actions
             }
             (MamRequest::WedgeHistory, Ok(MamReply::WedgeHistory(spent))) if current => {
                 self.acquisition.history_read(now.monotonic, &spent);
@@ -569,8 +616,9 @@ impl Mam {
         }
     }
 
-    /// Record new bookmarks once the listing is complete; bookmarks MAM reports
-    /// snatched before wait for the owner.
+    /// Record new bookmarks once the listing is complete, and act on what it
+    /// shows about running downloads; bookmarks MAM reports snatched before
+    /// wait for the owner.
     fn listed(
         &mut self,
         now: ClockReading,
@@ -607,6 +655,8 @@ impl Mam {
             })
             .collect();
         actions.extend(records.bookmarked(now.monotonic, new));
+        // The listing shows whether each running download is still free.
+        actions.extend(self.follow_downloads(now, registry));
         actions
     }
 
@@ -652,6 +702,11 @@ impl Mam {
         let downloading = records.map_or(TorrentCount::new(0), |records| {
             TorrentCount::counting(records.downloads().filter(Download::is_downloading))
         });
+        self.account.pace(if downloading.is_zero() {
+            ReadPace::Routine
+        } else {
+            ReadPace::Downloading
+        });
         let facts = Facts {
             now: now.monotonic,
             wall: now.wall,
@@ -666,6 +721,7 @@ impl Mam {
             recent,
             downloading,
             downloading_limit: context.downloading_limit,
+            ratio_guard: self.ratio_guard,
             account: &self.account,
         };
         let next = records.map_or(Next::Idle, |records| {
@@ -771,6 +827,7 @@ impl Mam {
             return false;
         };
         self.gate == RequestGate::Open
+            && self.ratio_guard.permits_downloads()
             && matches!(self.session, Session::Verified { .. })
             && (self.confirmed_download_ip == Some(observed.ip)
                 || self.acquisition.reapproved.get(&id) == Some(&observed.ip))
@@ -798,11 +855,13 @@ impl Mam {
             .account
             .data()
             .is_some_and(|data| data.wedges.is_zero());
+        // Once ratio was used, every download stops until the owner checks.
+        let tripped = matches!(self.ratio_guard, RatioGuard::Tripped(_));
         let mut actions = Vec::new();
         for (download, watch) in &watched {
             let notice = match *watch {
                 DownloadWatch::Wedged | DownloadWatch::FreeForNow => {
-                    if download.desired == Desired::Held {
+                    if download.desired == Desired::Held && self.ratio_guard.permits_downloads() {
                         actions.extend(records.resume(now.monotonic, &download.hash));
                         if let Some(observed) = self.network.current() {
                             self.acquisition
@@ -834,13 +893,12 @@ impl Mam {
                 | DownloadWatch::NeedHistory
                 | DownloadWatch::NotFree { .. } => None,
             };
-            let Some(notice) = notice else {
-                continue;
-            };
-            if download.is_downloading() {
+            if (tripped || notice.is_some()) && download.is_downloading() {
                 actions.extend(records.hold(now.monotonic, &download.hash));
             }
-            if self.acquisition.reported.insert(download.mam) {
+            if let Some(notice) = notice
+                && self.acquisition.reported.insert(download.mam)
+            {
                 self.notices.push(notice);
             }
         }

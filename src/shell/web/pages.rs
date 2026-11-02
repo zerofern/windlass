@@ -7,15 +7,17 @@ use maud::{DOCTYPE, Markup, html};
 
 use crate::{
     core::{
-        Activity, Bookmarks, ByteSize, Completion, Condition, Delivery, Desired, EntryCount,
-        Failover, FailureCount, HistoryState, MamApproval, MamRequestsStatus, MappingFailure,
-        Notifications, NtfyTopic, Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding,
-        Protection, Qbittorrent, Records, Registry, Session, Setting, SettingStatus, Settings,
-        SettingsState, SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
+        Activity, Bookmarks, Completion, Condition, Delivery, Desired, EntryCount, Failover,
+        FailureCount, HistoryState, MamApproval, MamRequestsStatus, MappingFailure, Notifications,
+        NtfyTopic, Origin, Outcome, POLL_INTERVAL, Phase, Port, PortForwarding, Protection,
+        Qbittorrent, Records, Registry, Session, Setting, SettingStatus, Settings, SettingsState,
+        SwitchAllowance, Torrent, TorrentRecord, TorrentState, Trim, Tunnel,
     },
     runner::Observation,
     shell::{
-        describe::{CATEGORIES, delivery_failure, exit_ip_failure, qbittorrent_failure, timestamp},
+        describe::{
+            CATEGORIES, delivery_failure, exit_ip_failure, qbittorrent_failure, size, timestamp,
+        },
         history::{HistoryPage, HistoryQuery, Page},
         storage::StoredNotice,
     },
@@ -545,24 +547,6 @@ fn qbittorrent_panel(qbittorrent: &Qbittorrent, forwarded: Option<Port>) -> Mark
                 }
             }
         }
-    }
-}
-
-fn size(bytes: ByteSize) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes.bytes();
-    let mut unit = 0;
-    let mut tenths = 0;
-    while value >= 1024 && unit + 1 < UNITS.len() {
-        tenths = (value % 1024) * 10 / 1024;
-        value /= 1024;
-        unit += 1;
-    }
-    let unit = UNITS.get(unit).copied().unwrap_or("B");
-    if unit == "B" {
-        format!("{value} {unit}")
-    } else {
-        format!("{value}.{tenths} {unit}")
     }
 }
 

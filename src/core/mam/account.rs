@@ -9,22 +9,21 @@ use crate::core::FailureCount;
 
 use super::{
     ClientListing, ClientRefusal, ListedClient, MamFailure, MamMessage, Partials, Points, Purchase,
-    RedKind, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UploadCredit, UserData,
+    RedKind, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit, UserData,
 };
-use crate::core::{ByteSize, ClientVersion, Ratio, Urgency};
+use crate::core::{ClientVersion, Ratio, Urgency};
 
 /// How often the account is read.
 pub const ACCOUNT_READ_EVERY: Duration = Duration::from_mins(15);
+/// While Windlass has a download running, the account is read this often, so
+/// ratio use is caught soon.
+pub const ACCOUNT_READ_WHILE_DOWNLOADING: Duration = Duration::from_mins(5);
 /// How often the client list is included; MAM caches it for 30 minutes.
 pub const CLIENT_STATS_EVERY: Duration = Duration::from_mins(30);
 /// A reading this recent may admit a download or allow a purchase.
 pub const ACCOUNT_FRESH_FOR: Duration = Duration::from_mins(5);
 /// Unsatisfied slots kept free below MAM's limit.
 pub const UNSATISFIED_RESERVE: UnsatisfiedCount = UnsatisfiedCount::new(2);
-/// Uploaded minus downloaded is kept at least this high.
-pub const UPLOAD_BUFFER: ByteSize = ByteSize::gib(25);
-/// Upload credit is bought to keep the ratio at this.
-pub const RATIO_TARGET: Ratio = Ratio::from_thousandths(3000);
 /// Below this ratio every download is held.
 pub const RATIO_FLOOR: Ratio = Ratio::from_thousandths(2000);
 /// Below this ratio the notice is urgent.
@@ -35,10 +34,6 @@ pub const VIP_RENEW_WITHIN: Duration = Duration::from_hours(14 * 24);
 pub const VIP_WARN_WITHIN: Duration = Duration::from_hours(7 * 24);
 /// A VIP purchase fills the account to this long from the purchase.
 pub const VIP_FILL: Duration = Duration::from_hours(90 * 24);
-/// Upload credit is bought in steps of this many GiB.
-pub const UPLOAD_STEP: u32 = 50;
-/// Points per GiB of upload credit, as observed on 2026-10-24.
-pub const UPLOAD_PRICE_PER_GIB: Points = Points::new(500);
 /// Points per week of VIP, as observed on 2026-10-24, until a purchase shows
 /// another price.
 pub const VIP_PRICE_PER_WEEK: Points = Points::new(1250);
@@ -129,7 +124,6 @@ pub enum SettledBy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Before {
     points: Points,
-    uploaded: ByteSize,
     vip_until: Option<SystemTime>,
 }
 
@@ -145,6 +139,15 @@ pub struct PurchaseRecord {
     sent: Instant,
     before: Option<Before>,
     vip_weeks: Option<VipWeeks>,
+}
+
+/// How often the account is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadPace {
+    /// Every 15 minutes.
+    Routine,
+    /// Every 5 minutes, while Windlass has a download running.
+    Downloading,
 }
 
 /// Whether MAM sold what Windlass tried to buy.
@@ -175,7 +178,8 @@ pub struct Account {
     pub client_list: Option<ClientList>,
     client_stats_read: Option<Instant>,
     last_request: Option<Instant>,
-    refused: Option<(Purchase, Instant)>,
+    pace: ReadPace,
+    refused: Option<Instant>,
 }
 
 impl Default for Account {
@@ -196,6 +200,7 @@ impl Account {
             client_list: None,
             client_stats_read: None,
             last_request: None,
+            pace: ReadPace::Routine,
             refused: None,
         }
     }
@@ -245,7 +250,7 @@ impl Account {
         if self.last_failure.is_some() && self.next_read.is_some_and(|retry_at| now < retry_at) {
             return None;
         }
-        let routine = self.next_read.is_none_or(|next| next <= now);
+        let routine = self.routine_due().is_none_or(|next| next <= now);
         let early = early
             && self
                 .last_request
@@ -277,10 +282,29 @@ impl Account {
                     .and_then(|last| last.checked_add(EARLY_READ_SPACING))
             })
             .flatten();
-        match (self.next_read, early) {
+        match (self.routine_due(), early) {
             (Some(next), Some(early)) => Some(next.min(early)),
             (next, early) => next.or(early),
         }
+    }
+
+    /// Read at this pace from now on.
+    pub(super) const fn pace(&mut self, pace: ReadPace) {
+        self.pace = pace;
+    }
+
+    /// When the next routine reading is due; now when absent. While a download
+    /// runs, a reading is due five minutes after the last.
+    fn routine_due(&self) -> Option<Instant> {
+        let downloading = match self.pace {
+            ReadPace::Downloading => self
+                .reading
+                .as_ref()
+                .and_then(|reading| reading.taken.checked_add(ACCOUNT_READ_WHILE_DOWNLOADING)),
+            ReadPace::Routine => None,
+        };
+        self.next_read
+            .map(|next| downloading.map_or(next, |downloading| next.min(downloading)))
     }
 
     /// Store a reading; whether it settled an uncertain purchase, and how.
@@ -309,31 +333,23 @@ impl Account {
         settled
     }
 
-    /// Settle an uncertain purchase from the reading after it: points that
-    /// were not spent mean MAM did not sell it; points spent and what they buy
-    /// arrived mean it did. Anything else waits for the owner.
+    /// Settle an uncertain purchase from the reading after it: VIP that ends
+    /// later means MAM sold it; points that were not spent mean it did not.
+    /// Points spent without longer VIP waits for the owner.
     fn settle(&mut self, after: &UserData) -> Option<(Purchase, PurchaseOutcome)> {
         let record = self
             .last_purchase
             .as_mut()
             .filter(|record| record.outcome == Some(PurchaseOutcome::Uncertain))?;
         let made = record.before.and_then(|before| match record.purchase {
-            Purchase::Vip => Some(if after.vip_until > before.vip_until {
-                Sale::Made
-            } else {
-                Sale::NotMade
-            }),
-            Purchase::Upload(amount) => {
-                let gib = u64::from(amount.into_inner());
-                let price = UPLOAD_PRICE_PER_GIB.times(gib);
-                let spent = before.points.less(after.points);
-                let credited = after.uploaded.less(before.uploaded) >= ByteSize::gib(gib);
-                match (spent.times(2) >= price, credited) {
-                    (false, _) => Some(Sale::NotMade),
-                    (true, true) => Some(Sale::Made),
-                    (true, false) => None,
-                }
-            }
+            Purchase::Vip => match (
+                after.vip_until > before.vip_until,
+                after.points < before.points,
+            ) {
+                (true, _) => Some(Sale::Made),
+                (false, false) => Some(Sale::NotMade),
+                (false, true) => None,
+            },
         });
         let outcome = made.map_or(PurchaseOutcome::Unresolved, |sale| {
             PurchaseOutcome::Settled {
@@ -510,24 +526,11 @@ impl Account {
         });
         let data = self.fresh(now, since).filter(|_| !waiting)?;
         let affordable = |cost: Points| data.points >= reserve.plus(cost);
-        let backed_off = |wanted: Purchase| {
-            self.refused.is_some_and(|(refused, at)| {
-                same_kind(refused, wanted) && now.saturating_duration_since(at) < REFUSAL_BACKOFF
-            })
-        };
-        if let Some(cost) = self.vip_cost(data, wall)
-            && affordable(cost)
-            && !backed_off(Purchase::Vip)
-        {
-            return Some(Purchase::Vip);
-        }
-        let below_target =
-            data.buffer() < UPLOAD_BUFFER || data.ratio().is_some_and(|ratio| ratio < RATIO_TARGET);
-        let upload = Purchase::Upload(UploadCredit::try_new(UPLOAD_STEP).ok()?);
-        (below_target
-            && affordable(UPLOAD_PRICE_PER_GIB.times(u64::from(UPLOAD_STEP)))
-            && !backed_off(upload))
-        .then_some(upload)
+        let backed_off = self
+            .refused
+            .is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_BACKOFF);
+        let cost = self.vip_cost(data, wall)?;
+        (affordable(cost) && !backed_off).then_some(Purchase::Vip)
     }
 
     /// The expected price of renewing VIP now, when it is due for renewal.
@@ -544,7 +547,6 @@ impl Account {
             sent: now,
             before: self.data().map(|data| Before {
                 points: data.points,
-                uploaded: data.uploaded,
                 vip_until: data.vip_until,
             }),
             vip_weeks: self.data().and_then(|data| vip_weeks(data, wall)),
@@ -577,7 +579,7 @@ impl Account {
                 .unwrap_or(self.vip_price_per_week);
         }
         if let PurchaseOutcome::Refused(_) = outcome {
-            self.refused = Some((record.purchase, now));
+            self.refused = Some(now);
         }
         record.outcome = Some(outcome);
     }
@@ -614,8 +616,4 @@ fn vip_weeks(data: &UserData, now: SystemTime) -> Option<VipWeeks> {
     Some(VipWeeks(
         (bought.saturating_mul(100) / WEEK.as_secs()).max(100),
     ))
-}
-
-fn same_kind(left: Purchase, right: Purchase) -> bool {
-    std::mem::discriminant(&left) == std::mem::discriminant(&right)
 }

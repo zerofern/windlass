@@ -9,9 +9,9 @@ use crate::core::{
     ExitIpFailure, Findings, Freeleech, HistoryEvent, Hold, IdleTorrents, IpFinding, LeaseRenewal,
     MamEvent, MamFailure, MamPauseEvent, MamReply, MamRequest, MamRequestMode, MappingFailure,
     NotificationEvent, PersonalFreeleech, PortFinding, PortForwardingEvent, Purchase,
-    QbittorrentEvent, QbittorrentFailure, Registration, RegistryEvent, Sale, SeedboxConfirmation,
-    SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode, SyncScope, TimerName,
-    TorrentCommand, TunnelEvent, VipTorrent, Wedge,
+    QbittorrentEvent, QbittorrentFailure, Registration, RegistryEvent, Sale, SavedRatioGuard,
+    SeedboxConfirmation, SessionRejection, SettingsEvent, Snatched, StartupEvent, StartupMode,
+    SyncScope, TimerName, TorrentCommand, TunnelEvent, VipTorrent, Wedge,
 };
 
 /// History categories, used for filtering.
@@ -90,6 +90,25 @@ const fn timer(name: TimerName) -> &'static str {
         TimerName::NotificationGrace => "notification grace period",
         TimerName::NotificationRetry => "notification retry",
         TimerName::Mam => "MAM work",
+    }
+}
+
+/// A size in the largest binary unit that keeps it at 1 or more.
+pub(super) fn size(bytes: ByteSize) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes.bytes();
+    let mut unit = 0;
+    let mut tenths = 0;
+    while value >= 1024 && unit + 1 < UNITS.len() {
+        tenths = (value % 1024) * 10 / 1024;
+        value /= 1024;
+        unit += 1;
+    }
+    let unit = UNITS.get(unit).copied().unwrap_or("B");
+    if unit == "B" {
+        format!("{value} {unit}")
+    } else {
+        format!("{value}.{tenths} {unit}")
     }
 }
 
@@ -218,7 +237,28 @@ pub(super) fn hold(hold: Hold) -> String {
             "{count} unsatisfied torrents of MAM's limit of {limit} leave no slot after the reserve of 2"
         ),
         Hold::NoWedge => String::from("the torrent needs a wedge and none is left"),
+        Hold::RatioUsed => String::from(
+            "MAM counted downloaded bytes against the ratio; downloads stay stopped until you check",
+        ),
+        Hold::RatioGuardUnknown => {
+            String::from("Windlass has not read whether ratio was used before, so it cannot tell")
+        }
         Hold::NotBookmarked => String::from("the queued torrents are no longer bookmarked"),
+    }
+}
+
+/// The ratio guard as storage keeps it.
+fn saved_ratio_guard(guard: &SavedRatioGuard) -> String {
+    match guard {
+        crate::core::SavedRatioGuard::Unset => String::from("no downloaded figure watched yet"),
+        crate::core::SavedRatioGuard::Watching(downloaded) => {
+            format!("watching MAM's downloaded figure of {}", size(*downloaded))
+        }
+        crate::core::SavedRatioGuard::Tripped(used) => format!(
+            "ratio used: MAM counted {} on {}; downloads stopped until you check",
+            size(used.counted()),
+            timestamp(used.at)
+        ),
     }
 }
 
@@ -249,7 +289,6 @@ fn looked_up(listing: &Bookmark) -> String {
 
 pub(super) fn purchase(purchase: Purchase) -> String {
     match purchase {
-        Purchase::Upload(amount) => format!("{amount} GiB of upload credit"),
         Purchase::Vip => String::from("VIP, filled to 90 days"),
     }
 }
@@ -353,10 +392,12 @@ fn mam(event: &MamEvent) -> String {
         MamEvent::StateRead {
             last_registration,
             last_reminder,
+            ratio_guard,
         } => format!(
-            "MAM state read: last seedbox registration {}, last visit reminder {}",
+            "MAM state read: last seedbox registration {}, last visit reminder {}, {}",
             optional_time(*last_registration),
-            optional_time(*last_reminder)
+            optional_time(*last_reminder),
+            saved_ratio_guard(ratio_guard)
         ),
         MamEvent::StateReadFailed => {
             String::from("MAM state could not be read; seedbox registration waits")
@@ -371,6 +412,13 @@ fn mam(event: &MamEvent) -> String {
         MamEvent::PurchaseChecked {
             sale: Sale::NotMade,
         } => String::from("You checked on MAM: the uncertain purchase did not go through"),
+        MamEvent::RatioUseChecked => {
+            String::from("You checked on MAM what used ratio; downloads may run again")
+        }
+        MamEvent::RatioGuardSaved => String::from("Ratio guard saved"),
+        MamEvent::RatioGuardSaveFailed => String::from(
+            "Ratio guard could not be saved; after a restart MAM's downloaded figure is compared with the last one saved",
+        ),
         MamEvent::ReminderSaved => String::from("MAM visit reminder time saved"),
         MamEvent::ReminderSaveFailed => String::from("MAM visit reminder time could not be saved"),
     }
@@ -820,6 +868,9 @@ pub(super) fn action(action: &Action) -> String {
                 "Record a seedbox registration attempt at {}",
                 timestamp(*at)
             )
+        }
+        Action::SaveRatioGuard { guard } => {
+            format!("Save the ratio guard: {}", saved_ratio_guard(guard))
         }
         Action::SaveReminder { at } => {
             format!("Record the MAM visit reminder at {}", timestamp(*at))
@@ -1376,7 +1427,7 @@ mod tests {
             Asn, BookmarkPage, ByteSize, ClientStanding, FetchedTorrent, Hold, IpObservation,
             MamEvent, MamFailure, MamReply, MamRequest, MamTorrentId, Points, PointsReserve,
             Purchase, Registration, SessionRejection, TimerName, TorrentCommand, TorrentHash,
-            UploadCredit, UserData,
+            UserData,
         };
 
         let id = timer_actions()
@@ -1505,7 +1556,25 @@ mod tests {
                 MamEvent::StateRead {
                     last_registration: None,
                     last_reminder: Some(SystemTime::UNIX_EPOCH),
+                    ratio_guard: crate::core::SavedRatioGuard::Unset,
                 },
+                MamEvent::StateRead {
+                    last_registration: None,
+                    last_reminder: None,
+                    ratio_guard: crate::core::SavedRatioGuard::Watching(ByteSize::new(1 << 30)),
+                },
+                MamEvent::StateRead {
+                    last_registration: None,
+                    last_reminder: None,
+                    ratio_guard: crate::core::SavedRatioGuard::Tripped(crate::core::RatioUse {
+                        before: ByteSize::new(1 << 30),
+                        after: ByteSize::new(3 << 29),
+                        at: SystemTime::UNIX_EPOCH,
+                    }),
+                },
+                MamEvent::RatioUseChecked,
+                MamEvent::RatioGuardSaved,
+                MamEvent::RatioGuardSaveFailed,
                 MamEvent::StateReadFailed,
                 MamEvent::RegistrationAttemptSaved,
                 MamEvent::RegistrationAttemptSaveFailed,
@@ -1566,7 +1635,7 @@ mod tests {
         }));
         assert!(rotated.contains("new cookie") && !rotated.contains("rotated"));
 
-        let upload = Purchase::Upload(UploadCredit::try_new(50)?);
+        let upload = Purchase::Vip;
         for entry in [
             Action::WritePointsReserve {
                 reserve: PointsReserve::default(),
@@ -1580,6 +1649,9 @@ mod tests {
             },
             Action::SaveReminder {
                 at: SystemTime::UNIX_EPOCH,
+            },
+            Action::SaveRatioGuard {
+                guard: crate::core::SavedRatioGuard::Unset,
             },
             Action::QbittorrentCommand {
                 command: TorrentCommand::Stop(vec![hash.clone()]),
@@ -1666,6 +1738,8 @@ mod tests {
             },
             Hold::NoWedge,
             Hold::NotBookmarked,
+            Hold::RatioUsed,
+            Hold::RatioGuardUnknown,
         ]
         .into_iter()
         .chain(

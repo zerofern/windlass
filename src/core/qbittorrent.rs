@@ -295,12 +295,6 @@ impl ByteSize {
         Self(bytes)
     }
 
-    /// This many GiB, saturating.
-    #[must_use]
-    pub const fn gib(gib: u64) -> Self {
-        Self(gib.saturating_mul(1 << 30))
-    }
-
     /// The number of bytes.
     #[must_use]
     pub const fn bytes(self) -> u64 {

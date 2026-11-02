@@ -10,6 +10,8 @@ SQLite persistence, and native systemd services on NixOS.
 - [Feature Briefs](.workflow/features/) contain the agreed and proposed flows.
 - [Flows](docs/flows.md) maps what Windlass does, flow by flow, with how each is
   tested and the end-to-end tests still planned.
+- [MAM rules](docs/mam-rules.md) lists what Windlass must never do on MAM, and
+  the tests that prove it.
 - [Project instructions](AGENTS.md) define coding and testing conventions.
 
 ## Proof of concept
@@ -119,10 +121,14 @@ Windlass saves it and uses it from then on.
   only once MAM has shown which IP and ASN it sees. It registers that IP as the
   seedbox when it changes, at most once an hour, counting every attempt across
   restarts.
-- It reads the account every 15 minutes, and its client list every 30.
-- It keeps VIP, renewing it within 14 days of expiry, and buys upload credit in
-  50 GiB steps when the upload buffer falls below 25 GiB or the ratio below 3.0.
-  Purchases never take points below the reserve set on the settings page, 20,000
+- It reads the account every 15 minutes, or every 5 while a download it added
+  is running, and its client list every 30.
+- It never uses ratio: it only downloads what MAM does not count against it. If
+  MAM's downloaded figure rises anyway, Windlass stops every download it added
+  and starts none until you say on the dashboard that you checked. The figure
+  is saved, so a rise while Windlass was stopped is caught after a restart.
+- It keeps VIP, renewing it within 14 days of expiry. It never buys upload
+  credit: Windlass never uses ratio, so it has no use for it. Purchases never take points below the reserve set on the settings page, 20,000
   by default, and an uncertain purchase stops further buying until MAM is read again.
 - It lists your bookmarks every 15 minutes and queues them. Bookmarks MAM reports
   as snatched before are listed under Torrents but wait for you to press

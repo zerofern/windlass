@@ -136,6 +136,7 @@ pub fn router(
         .route("/notifications/test", post(send_test_notification))
         .route("/torrents/redownload", post(redownload))
         .route("/mam/purchase/checked", post(purchase_checked))
+        .route("/mam/ratio/checked", post(ratio_checked))
         .route("/static/app.css", get(stylesheet))
         .route("/static/app.js", get(script))
         .route("/favicon.ico", get(StatusCode::NO_CONTENT))
@@ -425,6 +426,13 @@ async fn purchase_checked(AppState(app): AppState<App>, Form(form): Form<Checked
         .send(Event::Mam(MamEvent::PurchaseChecked { sale }))
         .await
     {
+        Ok(()) => back(Some(Location::Status.path())).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn ratio_checked(AppState(app): AppState<App>) -> Response {
+    match app.send(Event::Mam(MamEvent::RatioUseChecked)).await {
         Ok(()) => back(Some(Location::Status.path())).into_response(),
         Err(response) => response,
     }

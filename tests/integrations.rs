@@ -621,8 +621,16 @@ const UNWANTED: &str = "2222222222222222222222222222222222222222";
 
 #[tokio::test]
 async fn qbittorrent_is_brought_to_match_the_registry() -> TestResult {
-    // A first run adopts the unwanted torrent; the owner then marks it removed.
-    let fake = FakeQbittorrent::with(&[(UNWANTED, complete("stalledUP"))]);
+    // A first run adopts the unwanted torrent, which seeded past the 96-hour
+    // target; the owner then marks it removed.
+    let fake = FakeQbittorrent::with(&[(
+        UNWANTED,
+        FakeTorrent {
+            completion_on: 1_700_000_000,
+            seeding_time: 97 * 3600,
+            ..complete("stalledUP")
+        },
+    )]);
     let webui = fake_qbittorrent(Arc::clone(&fake)).await?;
     let integrations = Integrations {
         tunnel: None,

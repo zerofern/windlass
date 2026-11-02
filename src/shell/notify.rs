@@ -15,7 +15,7 @@ use crate::core::{
     SettingName, StartupMode, SwitchBlock, TorrentCount, Urgency,
 };
 
-use super::describe::{hold, purchase, qbittorrent_failure, rejection, timestamp};
+use super::describe::{hold, purchase, qbittorrent_failure, rejection, size, timestamp};
 
 /// MAM's main page, where the visit reminder leads.
 const MAM_HOME: &str = "https://www.myanonamouse.net/";
@@ -406,6 +406,21 @@ pub(super) fn message(notice: &Notice) -> Message {
                 Urgency::Normal => 4,
             },
         ),
+        Notice::RatioUsed { counted } => at_mam(
+            "Ratio used: downloads stopped",
+            format!(
+                "MAM counted {} of downloads against your ratio, which Windlass never does on purpose. Every download Windlass added is stopped. Find out on MAM what used it, then say on the dashboard that you checked.",
+                size(*counted)
+            ),
+            5,
+        ),
+        Notice::RatioUseChecked => at_mam(
+            "Downloads may run again",
+            String::from(
+                "You checked what used ratio, so Windlass watches MAM's downloaded figure from now on and lets downloads run.",
+            ),
+            2,
+        ),
         Notice::RatioRestored => at_mam(
             "Ratio back above 2.0",
             String::from("MAM reports a ratio of 2.0 or more."),
@@ -679,7 +694,7 @@ mod tests {
     use crate::core::{
         ClientStanding, DeliveryFailure, EntryCount, Hold, Notice, NotificationEvent, NtfyTopic,
         Points, Port, Purchase, Push, QbittorrentFailure, SessionRejection, SettingName,
-        StartupMode, SwitchBlock, UploadCredit, VpnServer,
+        StartupMode, SwitchBlock, VpnServer,
     };
     use crate::core::{NoticeCount, Partials, TorrentCount, UnsatisfiedCount, UnsatisfiedLimit};
 
@@ -767,7 +782,7 @@ mod tests {
             ]
             .map(|setting| Notice::SettingNotSaved { setting }),
         );
-        notices.extend(mam_notices()?);
+        notices.extend(mam_notices());
         Ok(notices)
     }
 
@@ -775,8 +790,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one list of every MAM notice reads best together"
     )]
-    fn mam_notices() -> Result<Vec<Notice>, Box<dyn Error + Send + Sync>> {
-        let upload = Purchase::Upload(UploadCredit::try_new(50)?);
+    fn mam_notices() -> Vec<Notice> {
         let mut notices = vec![
             Notice::MamSessionAccepted,
             Notice::SeedboxNotRegistered,
@@ -797,6 +811,10 @@ mod tests {
                 urgency: crate::core::Urgency::Urgent,
             },
             Notice::RatioRestored,
+            Notice::RatioUsed {
+                counted: crate::core::ByteSize::new(50 << 20),
+            },
+            Notice::RatioUseChecked,
             Notice::UnsatisfiedNearLimit {
                 count: UnsatisfiedCount::new(121),
                 limit: UnsatisfiedLimit::new(150),
@@ -848,15 +866,15 @@ mod tests {
             },
             Notice::SeedingOnTrack,
             Notice::PurchaseMade {
-                purchase: upload,
-                points: Points::new(35_000),
-            },
-            Notice::PurchaseMade {
                 purchase: Purchase::Vip,
                 points: Points::new(35_000),
             },
-            Notice::PurchaseRefused { purchase: upload },
-            Notice::PurchaseUncertain { purchase: upload },
+            Notice::PurchaseRefused {
+                purchase: Purchase::Vip,
+            },
+            Notice::PurchaseUncertain {
+                purchase: Purchase::Vip,
+            },
             Notice::WedgeNotSpent,
             Notice::MamVisitReminder,
             Notice::MamClientListed,
@@ -920,11 +938,13 @@ mod tests {
                 },
                 Hold::NoWedge,
                 Hold::NotBookmarked,
+                Hold::RatioUsed,
+                Hold::RatioGuardUnknown,
                 Hold::MamUnavailable,
             ]
             .map(|hold| Notice::DownloadsHeld { hold }),
         );
-        Ok(notices)
+        notices
     }
 
     #[test]

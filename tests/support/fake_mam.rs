@@ -37,7 +37,6 @@ use sha1::{Digest, Sha1};
 const GIB: u64 = 1 << 30;
 const DAY: Duration = Duration::from_hours(24);
 const WEEK: Duration = Duration::from_hours(7 * 24);
-const UPLOAD_PRICE_PER_GIB: f64 = 500.0;
 const VIP_PRICE_PER_WEEK: f64 = 1250.0;
 const SIGNED_OUT: &str = "Error, you are not signed in <br />";
 
@@ -768,26 +767,6 @@ fn buy(world: &mut World, query: &Query) -> Value {
     let refuse = |message: &str| json!({ "success": false, "error": message });
     let now = world.now();
     match query.get("spendtype") {
-        Some("upload") => {
-            let Some(amount) = query
-                .get("amount")
-                .and_then(|amount| amount.parse::<u64>().ok())
-            else {
-                return refuse("Invalid amount specified");
-            };
-            if amount < 50 {
-                return refuse("Invalid amount specified");
-            }
-            let price = amount as f64 * UPLOAD_PRICE_PER_GIB;
-            if price > world.account.points {
-                return refuse("Not enough points");
-            }
-            world.account.points -= price;
-            world.account.uploaded += amount * GIB;
-            json!({ "success": true, "type": "upload", "amount": amount,
-                    "seedbonus": world.account.points, "uploaded": world.account.uploaded,
-                    "downloaded": world.account.downloaded, "ratio": "inf." })
-        }
         Some("VIP") if query.get("duration") == Some("max") => {
             let target = now + 90 * DAY;
             let current = world
@@ -810,6 +789,12 @@ fn buy(world: &mut World, query: &Query) -> Value {
             world.account.class = String::from("VIP");
             json!({ "success": true, "type": "VIP", "amount": (weeks * 100.0).round() / 100.0,
                     "seedbonus": world.account.points })
+        }
+        Some("upload") => {
+            world
+                .violations
+                .push(String::from("upload credit, which Windlass never buys"));
+            refuse("Not allowed")
         }
         Some(kind @ ("gift" | "sendWedge")) => {
             world

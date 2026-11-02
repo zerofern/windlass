@@ -20,9 +20,9 @@ use serde::Serialize;
 use crate::core::{FailureCount, HttpStatus};
 
 use super::{
-    Action, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover, Findings,
-    Hold, Mam, MamSession, NoticeCount, Partials, Points, Port, PortForwarding, Protection,
-    Purchase, Qbittorrent, QbittorrentFailure, Ratio, Registry, ReportedVersion, Sale,
+    Action, ByteSize, ClientStanding, ClockReading, Connectability, Desired, EntryCount, Failover,
+    Findings, Hold, Mam, MamSession, NoticeCount, Partials, Points, Port, PortForwarding,
+    Protection, Purchase, Qbittorrent, QbittorrentFailure, Ratio, Registry, ReportedVersion, Sale,
     SeedboxStatus, SessionRejection, SettingsState, StartupMode, SwitchAllowance, TimerId,
     TimerName, TorrentCount, TorrentState, Tunnel, UnsatisfiedCount, UnsatisfiedLimit, VpnServer,
     registry::SEEDING_TARGET, timer::Timers,
@@ -341,6 +341,14 @@ pub enum Notice {
     },
     /// The ratio is 2.0 or more again.
     RatioRestored,
+    /// MAM counted downloaded bytes against the ratio, so every download
+    /// stopped until the owner checks.
+    RatioUsed {
+        /// The bytes MAM counted.
+        counted: ByteSize,
+    },
+    /// The owner checked what used ratio; downloads may run again.
+    RatioUseChecked,
     /// Unsatisfied torrents reached 80% of MAM's limit.
     UnsatisfiedNearLimit {
         /// MAM's count.
@@ -485,6 +493,7 @@ impl Notice {
             | Self::SeedboxRegistered { .. }
             | Self::MamIpKnown
             | Self::RatioRestored
+            | Self::RatioUseChecked
             | Self::UnsatisfiedBelowLimit
             | Self::UnsatisfiedSeeding
             | Self::MamFlagsCleared
@@ -516,6 +525,7 @@ impl Notice {
             | Self::MamIpUnknown { .. }
             | Self::MamStateUnreadable
             | Self::RatioLow { .. }
+            | Self::RatioUsed { .. }
             | Self::UnsatisfiedNearLimit { .. }
             | Self::UnsatisfiedNotSeeding { .. }
             | Self::MamFlagged { .. }

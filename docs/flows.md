@@ -4,6 +4,8 @@ What Windlass does, one flow at a time. For each flow: what triggers it, what
 Windlass does and promises, where the decisions live, how it is tested today, and
 the end-to-end test it still needs. The feature briefs under
 `.workflow/features/` hold the rules and their reasons; this page is the map.
+[MAM rules](mam-rules.md) lists what must never happen on MAM, and the tests
+that prove it.
 
 ## How Windlass is tested
 
@@ -38,10 +40,11 @@ core scenarios with simulated time, and end to end only for their wiring.
 | 12 | Admit a download: gates and the wedge decision | Yes | Yes | – |
 | 13 | Fetch and add a download | Yes | Yes | – |
 | 14 | Keep running downloads free | Yes | Yes | – |
+| 14a | Never use ratio: stop everything if MAM counts a download | Yes | Yes | – |
 | 15 | Watch the account | Yes | **No** | – |
 | 16 | Check MAM's client list (A5) | Yes | **No** | – |
 | 17 | Keep qBittorrent connectable (A6) | Yes | **No** | – |
-| 18 | Spend points: VIP and upload credit | Yes | Yes | – |
+| 18 | Spend points: VIP | Yes | Yes | – |
 | 19 | Settle an uncertain purchase | Yes | Yes | – |
 | 20 | Remind the owner weekly | Yes | – | – |
 | 21 | Deliver notifications | Yes | Yes (web) | Yes |
@@ -127,8 +130,10 @@ core scenarios with simulated time, and end to end only for their wiring.
 
 - **Trigger:** every qBittorrent poll (10 seconds).
 - **Does:** adopts torrents it finds; starts stopped ones; selects every file;
-  removes torrents marked removed; adds fetched torrents from the kept file; keeps
-  held torrents stopped. Rows are never deleted. qBittorrent versions MAM does not
+  removes torrents marked removed, but only once they seeded 96 hours or never
+  downloaded anything; adds fetched torrents from the kept file; keeps unfinished
+  held torrents stopped, while a held torrent that completed anyway becomes
+  active and seeds. Rows are never deleted. qBittorrent versions MAM does not
   allow are reported and block downloads.
 - **Where:** `core/registry.rs`, `core/qbittorrent.rs`, `shell/qbittorrent.rs`.
 - **Tested:** `tests/registry_core.rs`, `tests/integrations_core.rs`,
@@ -238,13 +243,34 @@ core scenarios with simulated time, and end to end only for their wiring.
   `core/mam/mod.rs` (`follow_downloads`).
 - **Tested:** `tests/mam_core.rs`; E5 and E5b end to end.
 - **Known limit:** MAM gives no end time for site-wide freeleech, so up to about
-  15 minutes of a download can fall after it ends.
+  15 minutes of a download can fall after it ends. Flow 14a catches it if that
+  happens.
+
+### 14a. Never use ratio
+
+- **Trigger:** every account reading: every 5 minutes while a download Windlass
+  added is running, every 15 otherwise; the owner's check on the dashboard.
+- **Does:** Windlass only downloads what MAM does not count against the ratio,
+  so MAM's downloaded figure must never rise. The figure is saved and compared
+  across restarts, so bytes counted while Windlass was stopped are caught too.
+  When it rises, even by one byte, Windlass stops every unfinished download it
+  added, starts none, pushes an urgent notice, and stays stopped across
+  restarts until the owner says on the dashboard that they checked. Then it
+  watches from the latest figure. A lower figure, such as a correction by
+  staff, is watched from then on. If the saved figure cannot be read, no
+  download starts.
+- **Where:** `core/mam/ratio_guard.rs`, `core/mam/mod.rs` (`follow_downloads`),
+  `shell/storage.rs` (`mam_state`), `shell/web/mam_pages.rs`.
+- **Tested:** `tests/mam_core.rs` (`ratio_use_*`, `the_first_reading_sets_*`,
+  `without_the_saved_guard_*`), storage and dashboard unit tests, and E9 end to
+  end.
 
 ## Account safety and spending
 
 ### 15. Watch the account
 
-- **Trigger:** every account reading (15 minutes; client list every 30).
+- **Trigger:** every account reading (15 minutes, or 5 while a download runs;
+  client list every 30).
 - **Does:** reports a ratio below 2.0 (urgent below 1.1), unsatisfied torrents at
   80% of MAM's limit, unsatisfied torrents not seeding, partial downloads, tracker
   errors and other red categories, MAM notification counts, points below the
@@ -278,19 +304,19 @@ core scenarios with simulated time, and end to end only for their wiring.
 - **End to end:** wiring only (the lease renewal reaches the gateway); the
   30-minute judgement stays in the core tests.
 
-### 18. Spend points: VIP and upload credit
+### 18. Spend points: VIP
 
 - **Does:** renews VIP within 14 days of its end, priced from the last purchase;
-  buys 50 GiB of upload credit when the buffer is under 25 GiB or the ratio under
-  3.0; never below the points reserve; backs off 6 hours after a refusal.
+  never below the points reserve; backs off 6 hours after a refusal. Upload
+  credit is never bought: Windlass never uses ratio.
 - **Where:** `core/mam/account.rs` (`wanted_purchase`).
-- **Tested:** `tests/mam_core.rs`; E1 covers a VIP renewal and E4 upload credit.
+- **Tested:** `tests/mam_core.rs`; E1 and E4 cover VIP renewals.
 
 ### 19. Settle an uncertain purchase
 
 - **Does:** a purchase whose answer was lost is settled from the next reading,
-  which comes early, about a minute later (points not spent, a later VIP end, or
-  credit arrived); otherwise the dashboard asks the owner, and nothing is bought
+  which comes early, about a minute later (a later VIP end means MAM sold it;
+  points not spent mean it did not); otherwise the dashboard asks the owner, and nothing is bought
   until they answer.
 - **Where:** `core/mam/account.rs` (`settle`, `checked`), `shell/web/mam_pages.rs`.
 - **Tested:** `tests/mam_core.rs`; the route in `tests/web.rs`; E4.
@@ -347,11 +373,12 @@ and a fake qBittorrent, driven over HTTP.
 | E1. A pasted cookie leads to a registered seedbox and a wedged download | 9, 10, 12, 13, 18 | `a_pasted_cookie_leads_to_a_registered_seedbox_and_a_wedged_download` |
 | E2. A refused session is reported and stops requests | 9 | `a_refused_session_is_reported_and_stops_requests` |
 | E3. A snatched bookmark waits; "Download again" downloads it | 11, 12, 13 | `a_snatched_bookmark_waits_until_the_owner_downloads_it_again` |
-| E4. An uncertain purchase is settled from the dashboard; upload credit is bought | 18, 19 | `an_uncertain_purchase_is_settled_on_the_dashboard` |
+| E4. An uncertain VIP renewal is settled from the dashboard and bought again | 18, 19 | `an_uncertain_purchase_is_settled_on_the_dashboard` |
 | E5. A freeleech download needs no wedge; after its freeleech ends and Windlass restarts, the bookmark listing shows it and it is wedged, without registering again within the hour | 10, 12, 14, 22 | `a_download_whose_freeleech_ends_is_wedged_after_a_restart` |
 | E5b. A download no longer free and no longer bookmarked is looked up by itself, stopped with no wedge left, and resumed once free | 14, 22 | `a_download_that_cannot_be_wedged_stops_and_resumes_when_free` |
 | E6, E7. Restarts and request counts are checked inside E5 and E5b: no lookup for a bookmarked download, one for an un-bookmarked one, no second registration, no broken rule | 10, 14, 22 | (in E5, E5b) |
 | E8. Account flags and the client list produce notices and holds | 15, 16 | Planned, after the client list capture |
+| E9. Ratio counted while Windlass was stopped stops the download after a restart, across another restart, until the owner checks on the dashboard | 14a, 22 | `ratio_use_stops_downloads_until_the_owner_checks` |
 
 Each test starts Windlass, which waits a minute before its first IP lookup, so
 the end-to-end tests take about three minutes in all.

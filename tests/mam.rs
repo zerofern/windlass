@@ -33,8 +33,8 @@ use tokio::{sync::watch, task::JoinHandle};
 use tower::ServiceExt;
 use windlass::{
     core::{
-        Desired, Event, MamSession, PurchaseOutcome, Registry, SeedboxStatus, StartupEvent,
-        StartupMode, State as CoreState,
+        Delivery, Desired, Event, MamSession, Notice, PurchaseOutcome, RatioGuard, Registry,
+        SeedboxStatus, StartupEvent, StartupMode, State as CoreState,
     },
     runner::{Observation, Runner},
     shell::{
@@ -618,9 +618,10 @@ async fn a_snatched_bookmark_waits_until_the_owner_downloads_it_again() -> TestR
 #[tokio::test]
 async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
     let mam = FakeMam::start().await?;
+    let day = Duration::from_hours(24);
     mam.with(|world| {
-        // Little upload beyond downloads, so upload credit is wanted.
-        world.account.uploaded = 20 * GIB;
+        // VIP ends tomorrow, so a renewal is wanted.
+        world.account.vip_until = SystemTime::now().checked_add(day);
         world.account.points = 100_000.5;
         world.fail("/json/bonusBuy.php", fake_mam::Fault::Status(500), 1);
     });
@@ -639,7 +640,7 @@ async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
     windlass
         .wait(|observation| outcome(observation) == Some(PurchaseOutcome::Uncertain))
         .await?;
-    // MAM took points but shows no credit, so the next reading cannot tell.
+    // MAM took points but VIP ends no later, so the next reading cannot tell.
     mam.with(|world| world.account.points -= 25_000.0);
     let _ = windlass
         .wait(|observation| outcome(observation) == Some(PurchaseOutcome::Unresolved))
@@ -657,7 +658,11 @@ async fn an_uncertain_purchase_is_settled_on_the_dashboard() -> TestResult {
     windlass
         .wait(|observation| matches!(outcome(observation), Some(PurchaseOutcome::Made(_))))
         .await?;
-    assert_eq!(mam.with(|world| world.account.uploaded), Some(70 * GIB));
+    let renewed = mam.with(|world| world.account.vip_until).flatten();
+    assert!(
+        renewed.is_some_and(|until| until > SystemTime::now() + 80 * day),
+        "{renewed:?}"
+    );
     assert_eq!(sent(&mam, "/json/bonusBuy.php").len(), 2);
     windlass.stop().await
 }
@@ -793,6 +798,80 @@ async fn a_download_that_cannot_be_wedged_stops_and_resumes_when_free() -> TestR
         })
         .await?;
     assert_eq!(sent(&mam, "/tor/download.php"), [format!("tid={BOOK}")]);
+    assert_eq!(mam.violations(), Vec::<String>::new());
+    windlass.stop().await
+}
+
+/// The ratio guard: MAM counts bytes downloaded against the ratio while
+/// Windlass was stopped. After the restart the download stops, and it stays
+/// stopped across another restart until the owner checks on the dashboard.
+#[tokio::test]
+async fn ratio_use_stops_downloads_until_the_owner_checks() -> TestResult {
+    let mam = FakeMam::start().await?;
+    let mut book = Torrent::bookmarked("A Free Book", GIB);
+    book.free = true;
+    let hash = book.hash();
+    mam.with(|world| {
+        world.torrents.insert(BOOK, book);
+    });
+    let qbittorrent = qbittorrent_adding(vec![hash.clone()]);
+    let webui = fake_qbittorrent(Arc::clone(&qbittorrent)).await?;
+    let windlass = Windlass::start(&mam, webui).await?;
+    windlass.connect().await?;
+    windlass.in_qbittorrent(&hash).await?;
+
+    mam.with(|world| world.account.downloaded += GIB);
+    let windlass = windlass.restart(&mam, webui).await?;
+    let _ = windlass
+        .wait(|observation| {
+            record(observation, BOOK).is_some_and(|row| row.desired == Desired::Held)
+        })
+        .await?;
+    assert!(windlass.noticed("Ratio used: downloads stopped").await?);
+    // The stop is pushed to the owner's phone; ntfy does not answer here, so
+    // the push waits to be sent again.
+    let pushed = |observation: &Observation| {
+        let notifications = &observation.notifications;
+        let sending = match &notifications.delivery {
+            Delivery::Sending(push) | Delivery::Retrying { push, .. } => Some(push),
+            Delivery::Idle => None,
+        };
+        sending
+            .into_iter()
+            .chain(notifications.outbox.iter())
+            .any(|push| matches!(push.notice, Notice::RatioUsed { .. }))
+    };
+    let _ = windlass.wait(pushed).await?;
+    windlass
+        .wait(|_| {
+            qbittorrent
+                .lock()
+                .is_ok_and(|fake| fake.stopped.contains(&hash))
+        })
+        .await?;
+
+    let windlass = windlass.restart(&mam, webui).await?;
+    let _ = windlass
+        .wait(|observation| matches!(observation.mam.ratio_guard, RatioGuard::Tripped(_)))
+        .await?;
+    let status = windlass.get("/").await?;
+    assert!(status.contains("I checked; let downloads run"), "{status}");
+    assert_eq!(
+        windlass.post("/mam/ratio/checked", "").await?,
+        StatusCode::SEE_OTHER
+    );
+    windlass
+        .wait(|observation| {
+            record(observation, BOOK).is_some_and(|row| row.desired == Desired::Active)
+        })
+        .await?;
+    windlass
+        .wait(|_| {
+            qbittorrent
+                .lock()
+                .is_ok_and(|fake| fake.started.contains(&hash))
+        })
+        .await?;
     assert_eq!(mam.violations(), Vec::<String>::new());
     windlass.stop().await
 }
