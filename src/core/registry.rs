@@ -454,6 +454,14 @@ impl Records {
             {
                 self.unsaved.insert(id);
             }
+            // A held torrent that completed anyway, such as one the owner
+            // started, must seed: stopping it would leave it unsatisfied.
+            let completed_while_held = self.entries.get(&id).is_some_and(|entry| {
+                entry.record.desired == Desired::Held && torrent.completed_at.is_some()
+            });
+            if completed_while_held {
+                self.set_desired(id, Desired::Active);
+            }
         }
         self.save(now.monotonic)
     }
@@ -672,14 +680,21 @@ impl Records {
                     Some((hash, session.torrents.get(hash)?))
                 })
         };
+        // A removed torrent leaves qBittorrent, files and all, only once it has
+        // seeded long enough or never downloaded anything: removing it sooner
+        // would leave it unsatisfied on MAM for good.
         let removed: Vec<TorrentHash> = present(Desired::Removed)
+            .filter(|(_, torrent)| removable(torrent))
             .map(|(hash, _)| hash.clone())
             .collect();
         if !removed.is_empty() {
             return Some(TorrentCommand::Remove(removed));
         }
+        // Only an unfinished torrent is stopped: a complete one must seed.
         let running: Vec<TorrentHash> = present(Desired::Held)
-            .filter(|(_, torrent)| !matches!(torrent.state, TorrentState::Stopped(_)))
+            .filter(|(_, torrent)| {
+                torrent.completed_at.is_none() && !matches!(torrent.state, TorrentState::Stopped(_))
+            })
             .map(|(hash, _)| hash.clone())
             .collect();
         if !running.is_empty() {
@@ -785,6 +800,15 @@ impl Entry {
 /// Whether some files are not selected. Sizes are unknown until metadata arrives.
 fn partial(torrent: &Torrent) -> bool {
     torrent.state != TorrentState::FetchingMetadata && torrent.size < torrent.total_size
+}
+
+/// Whether removing this torrent leaves nothing unsatisfied on MAM: it seeded
+/// to the target, or it never downloaded anything.
+fn removable(torrent: &Torrent) -> bool {
+    let seeded = torrent.completed_at.is_some() && torrent.seeding_time >= SEEDING_TARGET;
+    let untouched =
+        torrent.progress == Progress::default() && torrent.downloaded == ByteSize::new(0);
+    seeded || untouched
 }
 
 /// Whether a change is saved at once rather than with the periodic counters.

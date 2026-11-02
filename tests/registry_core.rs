@@ -429,6 +429,37 @@ fn a_held_download_stops_even_while_another_torrent_needs_files_selected() -> Te
 }
 
 #[test]
+fn a_held_torrent_that_completed_seeds_and_is_never_stopped() -> TestResult {
+    let row = record(
+        1,
+        Identity::Linked {
+            mam: MamTorrentId::new(1).ok_or("zero MAM id")?,
+            hash: hash('a'),
+        },
+        Desired::Held,
+    )?;
+    let mut harness = Harness::new(vec![row]);
+    // The owner started it in qBittorrent, and it finished.
+    let actions = harness.sync(vec![(
+        hash('a'),
+        TorrentUpdate {
+            progress: Progress::from_fraction(1.0),
+            completed_at: Some(Some(SystemTime::UNIX_EPOCH)),
+            ..torrent(TorrentState::Seeding, 10, 10)
+        },
+    )]);
+    assert!(
+        !matches!(command(&actions), Some(TorrentCommand::Stop(_))),
+        "{actions:?}"
+    );
+    assert_eq!(
+        harness.records().find(&hash('a')).map(|row| row.desired),
+        Some(Desired::Active)
+    );
+    Ok(())
+}
+
+#[test]
 fn starting_and_force_starting_never_add_an_unsatisfied_torrent() -> TestResult {
     let mam = MamTorrentId::new(5).ok_or("zero id")?;
     let ours = record(
@@ -505,7 +536,7 @@ fn partial_torrents_get_every_file_once_metadata_is_known() {
 }
 
 #[test]
-fn removed_torrents_are_deleted_with_their_files() -> TestResult {
+fn removed_torrents_are_deleted_only_once_nothing_is_left_unsatisfied() -> TestResult {
     let mam = MamTorrentId::new(12345).ok_or("zero MAM id")?;
     let rows = vec![
         record(
@@ -523,15 +554,35 @@ fn removed_torrents_are_deleted_with_their_files() -> TestResult {
             Identity::Mam(MamTorrentId::new(5).ok_or("zero MAM id")?),
             Desired::Removed,
         )?,
+        record(5, Identity::Client(hash('e')), Desired::Removed)?,
+        record(6, Identity::Client(hash('f')), Desired::Removed)?,
     ];
     let mut harness = Harness::new(rows);
+    let seeded = |hours: u64| TorrentUpdate {
+        progress: Progress::from_fraction(1.0),
+        completed_at: Some(Some(SystemTime::UNIX_EPOCH)),
+        seeding_time: Some(Duration::from_hours(hours)),
+        ..torrent(TorrentState::Seeding, 10, 10)
+    };
+    let untouched = TorrentUpdate {
+        progress: Progress::from_fraction(0.0),
+        downloaded: Some(ByteSize::new(0)),
+        ..torrent(TorrentState::Stopped(Completion::Incomplete), 10, 10)
+    };
     let actions = harness.sync(vec![
-        (hash('a'), torrent(TorrentState::Seeding, 10, 10)),
+        // Seeded past the 96-hour target: removed.
+        (hash('a'), seeded(97)),
         (hash('b'), torrent(TorrentState::Seeding, 10, 10)),
+        // Short of the target, or partly downloaded: kept, or it would stay
+        // unsatisfied on MAM for good.
+        (hash('e'), seeded(80)),
+        (hash('f'), torrent(TorrentState::Downloading, 10, 10)),
+        // Never downloaded anything: removed.
+        (hash('c'), untouched),
     ]);
     assert_eq!(
         command(&actions),
-        Some(&TorrentCommand::Remove(vec![hash('a')])),
+        Some(&TorrentCommand::Remove(vec![hash('a'), hash('c')])),
         "a removed row absent from qBittorrent needs nothing"
     );
     let adopted = saved(&actions)

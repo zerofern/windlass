@@ -486,6 +486,30 @@ fn nothing_is_sent_until_mam_is_enabled_unpaused_and_protected() {
 }
 
 #[test]
+fn nothing_is_sent_to_mam_in_the_first_minute_after_a_start() {
+    // A previous run may have just sent requests, so a crash loop can never
+    // send faster than a running Windlass would.
+    let (mut harness, started) = Harness::begin(Setup::default());
+    assert!(requests(&started).is_empty(), "{started:?}");
+    assert_eq!(
+        timer(&started, TimerName::Mam).map(|(_, after)| after),
+        Some(windlass::core::LOOKUP_SPACING)
+    );
+    harness.advance(Duration::from_secs(59));
+    let actions = harness.send(Event::Mam(MamEvent::ReminderSaved));
+    assert!(requests(&actions).is_empty(), "{actions:?}");
+    harness.advance(Duration::from_secs(1));
+    let Some((id, _)) = timer(&started, TimerName::Mam) else {
+        unreachable!("no MAM timer in {started:?}");
+    };
+    let actions = harness.send(Event::TimerExpired {
+        name: TimerName::Mam,
+        id,
+    });
+    assert_eq!(requests(&actions), [MamRequest::LookUpIp]);
+}
+
+#[test]
 fn without_a_cookie_only_the_ip_is_observed() {
     let (mut harness, actions) = Harness::start(Setup {
         cookie: None,

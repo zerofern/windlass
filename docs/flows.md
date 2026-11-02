@@ -128,8 +128,10 @@ core scenarios with simulated time, and end to end only for their wiring.
 
 - **Trigger:** every qBittorrent poll (10 seconds).
 - **Does:** adopts torrents it finds; starts stopped ones; selects every file;
-  removes torrents marked removed; adds fetched torrents from the kept file; keeps
-  held torrents stopped. Rows are never deleted. qBittorrent versions MAM does not
+  removes torrents marked removed, but only once they seeded 96 hours or never
+  downloaded anything; adds fetched torrents from the kept file; keeps unfinished
+  held torrents stopped, while a held torrent that completed anyway becomes
+  active and seeds. Rows are never deleted. qBittorrent versions MAM does not
   allow are reported and block downloads.
 - **Where:** `core/registry.rs`, `core/qbittorrent.rs`, `shell/qbittorrent.rs`.
 - **Tested:** `tests/registry_core.rs`, `tests/integrations_core.rs`,
